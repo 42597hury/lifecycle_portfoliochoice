@@ -7,7 +7,6 @@ Contains:
 
 Dependencies: numpy, numba, model, solver (for diagnostic constants and FOC functions)
 """
-# Hello
 
 import numpy as np
 from numba import njit
@@ -675,9 +674,6 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
 # Strategy: pick one retirement age, sweep all (i_s, z_i, s_i) for that age,
 # evaluate FOCs at corners, and classify why each call fails.
 
-from numba import njit
-from math import exp
-
 @njit
 def diagnose_newton_failures_retirement(
     wealth_grid, savings_grid, z_grid, N_state,
@@ -750,7 +746,7 @@ def diagnose_newton_failures_retirement(
                 s_val = savings_grid[s_i]
                 failure_reasons[i_s, 4] += 1  # total_calls
                 
-                _, _, _, exit_code, foc_resid = solve_portfolio_2d_retirement(
+                _, _, _, exit_code, _ = solve_portfolio_2d_retirement(
                     s_val, z_i, i_s,
                     wealth_grid, c_slice, pens, annuity_factor_is,
                     Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,

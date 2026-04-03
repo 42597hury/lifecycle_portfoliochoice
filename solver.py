@@ -632,7 +632,9 @@ def solve_portfolio_unconstrained_retirement(s_val, z_idx, i_s,
                                               singular_det=1e-15, grad_step_size=0.05,
                                               step_damp=0.3, grad_denom_eps=1e-10,
                                               min_wealth_inv=1e-10, min_consumption=1e-10,
-                                   prob_skip=1e-12):
+                                              prob_skip=1e-12,
+                                              use_line_search=True, max_backtrack_iter=10,
+                                              line_search_max_step=2.0):
     """Unconstrained Newton for (alpha_stock, alpha_bond) in retirement.
     No short-sale or leverage constraints."""
 
@@ -649,23 +651,21 @@ def solve_portfolio_unconstrained_retirement(s_val, z_idx, i_s,
         0.0, 0.0, s_val, z_idx, i_s,
         wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
 
     a_s = init_s
     a_b = init_b
-    e_last = 0.0
-    err = 1.0
+
+    # Initial evaluation outside loop so trial-point eval is reused each iteration
+    fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement(
+        a_s, a_b, s_val, z_idx, i_s,
+        wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
+    err = (fs * fs + fb * fb) ** 0.5
 
     for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_retirement(
-            a_s, a_b, s_val, z_idx, i_s,
-            wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-            Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
         if err < tol * scale:
             return a_s, a_b, e_last, EC_INTERIOR, err / scale
 
@@ -678,14 +678,54 @@ def solve_portfolio_unconstrained_retirement(s_val, z_idx, i_s,
             step_s = -(Jbb * fs - Jsb * fb) * inv_d
             step_b = -(-Jsb * fs + Jss * fb) * inv_d
 
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc = step_damp / slen
-            step_s *= sc
-            step_b *= sc
+        if use_line_search:
+            # Cap raw step then backtrack to find alpha that reduces residual
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > line_search_max_step:
+                cap = line_search_max_step / slen
+                step_s *= cap
+                step_b *= cap
 
-        a_s += step_s
-        a_b += step_b
+            alpha = 1.0
+            found = False
+            fs_new = fs; fb_new = fb; Jss_new = Jss; Jbb_new = Jbb; Jsb_new = Jsb
+            e_new = e_last; err_new = err
+            for _bt in range(max_backtrack_iter):
+                a_s_t = a_s + alpha * step_s
+                a_b_t = a_b + alpha * step_b
+                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_retirement(
+                    a_s_t, a_b_t, s_val, z_idx, i_s,
+                    wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
+                    Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma, psi, beta, b_bar,
+                    min_wealth_inv, min_consumption, prob_skip)
+                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
+                if err_t < err:
+                    fs_new = fs_t; fb_new = fb_t; Jss_new = Jss_t; Jbb_new = Jbb_t; Jsb_new = Jsb_t
+                    e_new = e_t; err_new = err_t
+                    a_s = a_s_t; a_b = a_b_t
+                    found = True
+                    break
+                alpha *= 0.5
+
+            if found:
+                fs = fs_new; fb = fb_new; Jss = Jss_new; Jbb = Jbb_new; Jsb = Jsb_new
+                e_last = e_new; err = err_new
+            # else: no decrease found — keep current point, J, err unchanged
+        else:
+            # Original behaviour: clip step and apply blindly
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > step_damp:
+                cap = step_damp / slen
+                step_s *= cap
+                step_b *= cap
+            a_s += step_s
+            a_b += step_b
+            fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement(
+                a_s, a_b, s_val, z_idx, i_s,
+                wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
+                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma, psi, beta, b_bar,
+                min_wealth_inv, min_consumption, prob_skip)
+            err = (fs * fs + fb * fb) ** 0.5
 
     return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
 
@@ -1111,11 +1151,13 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
                                            gamma, psi, beta, b_bar,
                                            init_s=0.1, init_b=0.4,
                                            tol=1e-7, max_iter=30,
-                                              tiny_savings=1e-6,
-                                              singular_det=1e-15, grad_step_size=0.05,
-                                              step_damp=0.3, grad_denom_eps=1e-10,
-                                              min_wealth_inv=1e-10, min_consumption=1e-10,
-                                   prob_skip=1e-12):
+                                           tiny_savings=1e-6,
+                                           singular_det=1e-15, grad_step_size=0.05,
+                                           step_damp=0.3, grad_denom_eps=1e-10,
+                                           min_wealth_inv=1e-10, min_consumption=1e-10,
+                                           prob_skip=1e-12,
+                                           use_line_search=True, max_backtrack_iter=10,
+                                           line_search_max_step=2.0):
     """Unconstrained Newton for (alpha_stock, alpha_bond) at working age.
     No short-sale or leverage constraints."""
 
@@ -1134,24 +1176,22 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
         Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
 
     a_s = init_s
     a_b = init_b
-    e_last = 0.0
-    err = 1.0
+
+    # Initial evaluation outside loop so trial-point eval is reused each iteration
+    fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working(
+        a_s, a_b, s_val, z_idx, i_s,
+        wealth_grid, c_next_full, income_next_table, annuity_factor_is,
+        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        eps_nodes, eps_weights, gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
+    err = (fs * fs + fb * fb) ** 0.5
 
     for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_working(
-            a_s, a_b, s_val, z_idx, i_s,
-            wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-            Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
-            eps_nodes, eps_weights, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
         if err < tol * scale:
             return a_s, a_b, e_last, EC_INTERIOR, err / scale
 
@@ -1164,14 +1204,56 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
             step_s = -(Jbb * fs - Jsb * fb) * inv_d
             step_b = -(-Jsb * fs + Jss * fb) * inv_d
 
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc = step_damp / slen
-            step_s *= sc
-            step_b *= sc
+        if use_line_search:
+            # Cap raw step then backtrack to find alpha that reduces residual
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > line_search_max_step:
+                cap = line_search_max_step / slen
+                step_s *= cap
+                step_b *= cap
 
-        a_s += step_s
-        a_b += step_b
+            alpha = 1.0
+            found = False
+            fs_new = fs; fb_new = fb; Jss_new = Jss; Jbb_new = Jbb; Jsb_new = Jsb
+            e_new = e_last; err_new = err
+            for _bt in range(max_backtrack_iter):
+                a_s_t = a_s + alpha * step_s
+                a_b_t = a_b + alpha * step_b
+                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_working(
+                    a_s_t, a_b_t, s_val, z_idx, i_s,
+                    wealth_grid, c_next_full, income_next_table, annuity_factor_is,
+                    Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                    eps_nodes, eps_weights, gamma, psi, beta, b_bar,
+                    min_wealth_inv, min_consumption, prob_skip)
+                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
+                if err_t < err:
+                    fs_new = fs_t; fb_new = fb_t; Jss_new = Jss_t; Jbb_new = Jbb_t; Jsb_new = Jsb_t
+                    e_new = e_t; err_new = err_t
+                    a_s = a_s_t; a_b = a_b_t
+                    found = True
+                    break
+                alpha *= 0.5
+
+            if found:
+                fs = fs_new; fb = fb_new; Jss = Jss_new; Jbb = Jbb_new; Jsb = Jsb_new
+                e_last = e_new; err = err_new
+            # else: no decrease found — keep current point, J, err unchanged
+        else:
+            # Original behaviour: clip step and apply blindly
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > step_damp:
+                cap = step_damp / slen
+                step_s *= cap
+                step_b *= cap
+            a_s += step_s
+            a_b += step_b
+            fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working(
+                a_s, a_b, s_val, z_idx, i_s,
+                wealth_grid, c_next_full, income_next_table, annuity_factor_is,
+                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                eps_nodes, eps_weights, gamma, psi, beta, b_bar,
+                min_wealth_inv, min_consumption, prob_skip)
+            err = (fs * fs + fb * fb) ** 0.5
 
     return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
 
@@ -1494,7 +1576,10 @@ def _solve_retirement_step_jit(wealth_grid, savings_grid, z_grid, N_state,
                         singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
                         step_damp=sc.step_damp_unconstrained, grad_denom_eps=sc.grad_denom_eps,
                         min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold)
+                        prob_skip=sc.prob_skip_threshold,
+                        use_line_search=sc.use_line_search,
+                        max_backtrack_iter=sc.max_backtrack_iter,
+                        line_search_max_step=sc.line_search_max_step)
 
                 # -- Diagnostic tracking --
                 diag_int[i_s, 10] += 1  # DI_TOTAL_CALLS
@@ -1669,7 +1754,10 @@ def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
                         singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
                         step_damp=sc.step_damp_unconstrained, grad_denom_eps=sc.grad_denom_eps,
                         min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold)
+                        prob_skip=sc.prob_skip_threshold,
+                        use_line_search=sc.use_line_search,
+                        max_backtrack_iter=sc.max_backtrack_iter,
+                        line_search_max_step=sc.line_search_max_step)
 
                 # -- Diagnostic tracking --
                 diag_int[i_s, 10] += 1  # DI_TOTAL_CALLS

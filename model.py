@@ -132,8 +132,13 @@ class SolverConfig(NamedTuple):
 
     # --- Step control ---
     step_damp_constrained: float = 0.2         # max Newton step length (constrained)
-    step_damp_unconstrained: float = 0.3       # max Newton step length (unconstrained)
+    step_damp_unconstrained: float = 0.3       # max Newton step length (unconstrained, line search off)
     grad_step_size: float = 0.05               # gradient descent step when Jacobian singular
+
+    # --- Backtracking line search (unconstrained solver only) ---
+    use_line_search: bool = True               # enable backtracking line search
+    max_backtrack_iter: int = 10               # max halvings: alpha_min = 1/2^10 ≈ 0.001
+    line_search_max_step: float = 2.0          # raw step cap before backtracking (replaces step_damp when on)
 
     # --- Thresholds ---
     tiny_savings: float = 1e-6                 # below this, skip solver (all-bills)

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \":*)",
+      "Bash(python -c \":*)",
+      "WebFetch(domain:sylvaincatherine.net)",
+      "WebFetch(domain:www.federalreserve.gov)",
+      "Bash(python3:*)"
+    ]
+  }
+}

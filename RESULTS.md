@@ -396,7 +396,7 @@ Also report: Equity premium (E[xr] = 5.36%), Bond premium (E[xb] = 2.36%),
 M[xb, y_nom] = -39.4 (bond duration coefficient).
 
 **Source:** `model` attributes and `var.py` outputs. All numbers are already 
-in the MODEL_DESIGN.md document.
+in the DESIGN.md document.
 
 ---
 
@@ -624,6 +624,269 @@ households see a smaller income drop).
 
 ---
 
+---
+
+## FIGURE 13 — Portfolio Allocation Fan Chart (Distribution over Agents)
+
+**Goal:** Show not just the mean portfolio path but how much cross-sectional
+dispersion there is at each age. Adapted from the old two-asset model's
+alpha fan chart.
+
+**Data source:** Simulation output.
+
+**Computation:**
+```
+For each age index t:
+    alive_mask = sim["alive"][:, t]
+    as_vals  = sim["alpha_s"][alive_mask, t]
+    ab_vals  = sim["alpha_b"][alive_mask, t]
+    abill_vals = 1.0 - as_vals - ab_vals
+
+    as_pcts = np.percentile(as_vals,  [10, 25, 50, 75, 90])
+    ab_pcts = np.percentile(ab_vals,  [10, 25, 50, 75, 90])
+    as_mean = np.mean(as_vals)
+    ab_mean = np.mean(ab_vals)
+```
+
+**Plot:** Two panels (stocks, bonds). Each panel: x-axis = age, y-axis = share.
+- Light shaded band: p10–p90
+- Darker shaded band: p25–p75
+- Solid line: mean
+- Dashed line: median (p50)
+Vertical dashed line at retirement.
+
+**What to check:** If all agents behave similarly (narrow bands), portfolio
+choice is primarily driven by age/lifecycle. Wide bands indicate large role
+for cross-sectional heterogeneity in wealth, income state, or financial state.
+
+---
+
+## FIGURE 14 — Wealth Composition over the Lifecycle
+
+**Goal:** Decompose total lifetime resources into human capital, social security
+(pension PV), and financial wealth. A key motivating figure for why young
+agents hold fewer bonds (their human capital is implicitly bond-like).
+
+**Data source:** `pc` arrays and simulation output.
+
+**Computation:**
+```
+For each age t and representative income state z_idx = mid_z:
+
+    # Financial wealth: median simulated wealth at this age
+    alive = sim["alive"][:, t]
+    fin_wealth[t] = np.median(sim["x"][alive, t])
+
+    # Human capital: PV of expected labor income from t to retire_age
+    # Use a flat discount rate r_discount (e.g. 0.02 annual, or use
+    # pc.r_bill_grid.mean() as the risk-free rate)
+    hc[t] = 0.0
+    if ages[t] < model.retire_age:
+        for s in range(t, retire_t):
+            # Expected income at age s, averaging over transitory shocks
+            e_income = np.dot(pc.eps_weights, pc.working_income[s, z_idx, :])
+            # Cumulative survival t -> s
+            cum_surv = np.prod(pc.survival_probs_2d[t:s, z_idx])
+            # Discount
+            discount = (1.0 + r_discount) ** (-(s - t))
+            hc[t] += cum_surv * discount * e_income
+
+    # Social Security PV: PV of expected pension from retire_age onward
+    ss_pv[t] = 0.0
+    pension = pc.pension_after_tax[retire_t, z_idx]  # constant across ages
+    for s in range(max(t, retire_t), n_age):
+        cum_surv = np.prod(pc.survival_probs_2d[t:s, z_idx])
+        discount = (1.0 + r_discount) ** (-(s - t))
+        ss_pv[t] += cum_surv * discount * pension
+```
+
+**Plot:** Single stacked area chart. x-axis = age (22–99), y-axis = model units.
+Three stacked components (bottom to top):
+1. Human capital (warm color, largest when young)
+2. Social Security PV (medium color, rises near retirement)
+3. Financial wealth (cool color, grows mid-life then declines)
+Vertical dashed line at retirement.
+
+**Economic story:** When young, the agent's implicit total wealth is dominated
+by human capital. Since HC pays out over a long horizon like a bond, young
+agents have high implicit bond exposure — motivating low explicit bond holdings
+as a hedge. As HC is depleted at retirement, explicit bond demand rises.
+
+---
+
+## FIGURE 15 — Wealth Distribution at Key Ages
+
+**Goal:** Show how the cross-sectional wealth distribution evolves.
+
+**Data source:** Simulation output.
+
+**Computation:**
+```
+target_ages = [30, 45, 60, 75]
+For each age:
+    alive = sim["alive"][:, t]
+    wealth_vals = sim["x"][alive, t]
+    # Plot histogram (density=True, ~50 bins)
+    # Mark mean and median
+```
+
+**Plot:** 1×4 panel (one subplot per age). Each subplot: histogram of
+cash-on-hand for alive agents. Mark mean (vertical solid line) and median
+(dashed). Use a consistent x-axis scale across panels or log-scale.
+
+**What to check:** Right skew that increases with age; median well below mean
+at older ages indicating growing wealth inequality.
+
+---
+
+## FIGURE 16 — Cross-Sectional Dispersion over the Lifecycle
+
+**Goal:** Show how heterogeneity in wealth and consumption changes with age.
+
+**Data source:** Simulation output.
+
+**Computation:**
+```
+For each age t:
+    alive = sim["alive"][:, t]
+    sigma_w[t] = np.std(sim["x"][alive, t])
+    sigma_c[t] = np.std(sim["c"][alive, t])
+    cv_w[t]    = sigma_w[t] / np.mean(sim["x"][alive, t])   # coeff of variation
+    cv_c[t]    = sigma_c[t] / np.mean(sim["c"][alive, t])
+```
+
+**Plot:** Two panels.
+- **Panel A:** σ of wealth and σ of consumption over age (levels).
+- **Panel B:** Coefficient of variation (σ/mean) for each — normalizes for
+  the fact that mean wealth grows over time.
+Vertical dashed line at retirement.
+
+---
+
+## FIGURE 17 — Savings Rate over the Lifecycle
+
+**Goal:** Validate that the model produces realistic hump-shaped savings
+behaviour.
+
+**Data source:** Simulation output.
+
+**Computation:**
+```
+For each age t:
+    alive = sim["alive"][:, t]
+    # Savings rate: savings / cash-on-hand
+    x_vals = sim["x"][alive, t]
+    s_vals = sim["savings"][alive, t]
+    rate_vals = s_vals / np.maximum(x_vals, 1e-10)
+    rate_vals = rate_vals[np.isfinite(rate_vals)]
+
+    sav_mean[t]  = np.mean(rate_vals)
+    sav_std[t]   = np.std(rate_vals)
+    sav_med[t]   = np.median(rate_vals)
+```
+
+**Plot:** Single panel. x-axis = age, y-axis = savings rate.
+- Solid line: mean savings rate
+- Shaded band: mean ± 1 std
+- Dashed line: median
+- Horizontal line at 0 (dissaving visible in retirement)
+Vertical dashed line at retirement.
+
+**What to check:** Positive savings during working life (especially mid-career),
+turning negative in retirement as agents run down wealth.
+
+---
+
+## FIGURE 18 — Interest Rate Duration Profile
+
+**Goal:** The central economic mechanism figure. Show that as human capital
+duration declines with age, optimal bond holdings rise — households hedge
+their implicit bond exposure by holding explicit bonds later in life.
+
+**Data source:** `pc` arrays; portfolio policy `B_mat`.
+
+**Computation:**
+```
+r_discount = pc.r_bill_grid.mean()    # use mean real bill rate as discount
+bond_maturity = 10                     # 10-year bond (matches b_bar)
+
+For each age t and z_idx = mid_z:
+
+    # 1. Human capital duration: weighted average time to payment
+    hc_val = 0.0; hc_dur_num = 0.0
+    for s in range(t, retire_t):
+        e_income = np.dot(pc.eps_weights, pc.working_income[s, z_idx, :])
+        cum_surv = np.prod(pc.survival_probs_2d[t:s, z_idx])
+        discount = (1 + r_discount) ** (-(s - t))
+        pv = cum_surv * discount * e_income
+        hc_val     += pv
+        hc_dur_num += (s - t) * pv       # years ahead × PV
+    hc_duration[t] = hc_dur_num / hc_val if hc_val > 1e-10 else 0.0
+
+    # 2. Social Security duration
+    pension = pc.pension_after_tax[retire_t, z_idx]
+    ss_val = 0.0; ss_dur_num = 0.0
+    for s in range(max(t, retire_t), n_age):
+        cum_surv = np.prod(pc.survival_probs_2d[t:s, z_idx])
+        discount = (1 + r_discount) ** (-(s - t))
+        pv = cum_surv * discount * pension
+        ss_val     += pv
+        ss_dur_num += (s - t) * pv
+    ss_duration[t] = ss_dur_num / ss_val if ss_val > 1e-10 else 0.0
+
+    # 3. Portfolio duration
+    alpha_b_t = B_mat[t, z_idx, mid_s, i_w_rep]
+    port_duration[t] = alpha_b_t * bond_maturity   # bill duration = 0, stock = 0
+```
+
+**Plot:** Single panel. x-axis = age, y-axis = duration in years.
+Four lines:
+- HC duration (solid, warm color) — long and declining
+- SS duration (dashed, warm color) — shorter, also declining
+- Portfolio duration (solid, cool color) — rising as bond share rises
+- Reference line at `bond_maturity = 10` years (dotted, gray)
+Vertical dashed line at retirement.
+
+**Economic story:** Young agents have high-duration HC → already implicitly
+holding long-duration assets → hold fewer bonds. As HC depletes, they shift
+into explicit bonds to maintain duration balance. Quantifies the "bonds as
+hedge for HC" argument.
+
+---
+
+## FIGURE 19 — Bond Premium Sensitivity
+
+**Goal:** Show how portfolio allocation (especially bonds) responds to changes
+in the bond excess return. In the new model this is controlled by the mean
+of `xb` in the VAR — analogous to the term premium in the old model.
+
+**Note:** This requires multiple solves with modified VAR configurations.
+In the new model, change `z_bar[ret_idx[1]]` (the unconditional mean of `xb`)
+to simulate different bond premia, while keeping all other VAR parameters fixed.
+
+**Method:**
+```
+bond_premia = [-0.01, 0.00, 0.01, 0.02, 0.03]   # annual excess return levels
+
+For each bp in bond_premia:
+    # Modify the annualized var_config: shift z_bar for xb
+    var_config_bp = dict(var_config)
+    z_bar_new = np.array(var_config["z_bar"])
+    z_bar_new[return_indices[1]] += (bp - baseline_xb_mean)
+    # Also adjust Phi_0_ret to be consistent with new z_bar
+    var_config_bp["z_bar"] = z_bar_new.tolist()
+    # Re-build model and solve
+```
+
+**Plot:** Two panels (stock share, bond share) over age.
+One line per bond premium level, coloured by premium magnitude (viridis).
+
+**Economic story:** Higher bond premium → more bond demand throughout the
+lifecycle. Shows the substitution effect between stocks and bonds as the
+relative return changes.
+
+---
+
 ## IMPLEMENTATION ORDER
 
 ### Phase 1: Figures from a single solve + one simulation
@@ -642,18 +905,25 @@ households see a smaller income drop).
 11. **Table 2** — Simulation summary statistics (from `sim`)
 12. **Figure 10** — Consumption-to-wealth ratio (from `sim`)
 13. **Figure 7** — Hedging demand spread (from `S_mat, B_mat`, stationary dist)
+14. **Figure 13** — Portfolio allocation fan chart (percentile bands from `sim`)
+15. **Figure 14** — Wealth composition stacked area (HC + SS PV + financial from `sim`)
+16. **Figure 15** — Wealth distribution histograms at ages 30, 45, 60, 75 (from `sim`)
+17. **Figure 16** — Cross-sectional dispersion: σ wealth and σ consumption over age (from `sim`)
+18. **Figure 17** — Savings rate fan chart: mean ± 1 std, median (from `sim`)
 
 ### Phase 2: Requires additional solves
 *Each item needs one extra backward induction.*
 
-14. **Figure 8** — Social Security decomposition (solve with pension=0)
-15. **Figure 9** — Risk aversion sensitivity (solves at γ=2,5,8)
-16. **Table 3** — Welfare costs, rules 1–5 approximation (modified simulations)
+19. **Figure 8** — Social Security decomposition (solve with pension=0)
+20. **Figure 9** — Risk aversion sensitivity (solves at γ=2,5,8)
+21. **Table 3** — Welfare costs, rules 1–5 approximation (modified simulations)
+22. **Figure 18** — Interest rate duration profile: HC duration, SS duration, portfolio duration (requires HC/SS present-value pass)
+23. **Figure 19** — Bond premium sensitivity: multiple solves varying E[xb] (5–7 solves)
 
 ### Phase 3: Full decompositions
 *More expensive, for a polished paper.*
 
-17. **Figure 7 full version** — IID solve for clean hedging decomposition
-18. **Table 3** rules 6–7 — Re-solve with restricted asset menus
-19. No-labor-income solve (pure financial wealth model, CCV comparison)
-20. Grid convergence check (resolve at 7×7×7 or 9×9×9)
+24. **Figure 7 full version** — IID solve for clean hedging decomposition
+25. **Table 3** rules 6–7 — Re-solve with restricted asset menus
+26. No-labor-income solve (pure financial wealth model, CCV comparison)
+27. Grid convergence check (resolve at 7×7×7 or 9×9×9)

@@ -19,13 +19,13 @@ thin orchestration notebook. The current source-of-truth layout is:
 - `var.py` -- VAR estimation, state/return partitioning, quarterly-to-annual compounding,
   and hardcoded fallback parameter builders
 - `discretization.py` -- Rouwenhorst discretization and transitory-shock quadrature
-- `earnings_dependent_mortality.py` -- calibration of age- and earnings-dependent
+- `mortality.py` -- calibration of age- and earnings-dependent
   survival probabilities
 - `precompute.py` -- `build_model()` factory and `Precompute` container for all
   discretized arrays consumed by the solver
 - `solver.py` -- Numba-accelerated backward induction solver (EGM + 2D Newton)
 - `diagnostics.py` -- pre-solve calibration reports and targeted Newton failure analysis
-- `TIPS_LIFECYCLE_MODEL_new.ipynb` -- orchestration notebook that imports the modules
+- `main.ipynb` -- orchestration notebook that imports the modules
   above and runs the end-to-end workflow
 
 Execution in the refactored codebase follows this sequence:
@@ -124,7 +124,7 @@ valid. Within each FOC function call, `psi` is scalar (fixed for that `z_i`), so
 `prob_death` is constant across the `(j_z, i_e)` inner loops. The bequest contribution
 is still accumulated once per `j_s`, not per `(j_z, i_e)`.
 
-**Implementation:** See `earnings_dependent_mortality.py` for the calibration module.
+**Implementation:** See `mortality.py` for the calibration module.
 Key function: `calibrate_earnings_dependent_mortality(start_age, terminal_age, z_grid,
 rho, pz, mu_eta1, sigma_eta1, mu_eta2, sigma_eta2)` returns `(survival_probs_2d,
 chi_vec, diagnostics)`.
@@ -439,7 +439,7 @@ def partition_var(Phi_full, Omega_full, z_bar, state_idx, ret_idx,
 
 This section is organized by **module responsibility** rather than notebook cell order.
 `model.py` holds the immutable economic specification and stateless helpers; `var.py`,
-`discretization.py`, and `earnings_dependent_mortality.py` generate calibrated inputs;
+`discretization.py`, and `mortality.py` generate calibrated inputs;
 `precompute.py` assembles the solver-facing numerical objects; and `diagnostics.py`
 provides reporting/debugging utilities around the core model.
 
@@ -786,7 +786,7 @@ def _validate_conditional_returns(self):
     """
 ```
 
-`Precompute.__init__()` is also where `earnings_dependent_mortality.py` is invoked:
+`Precompute.__init__()` is also where `mortality.py` is invoked:
 it calls `calibrate_earnings_dependent_mortality(...)` and stores the resulting
 `survival_probs_2d` on the precompute object, alongside the grids and income tables.
 

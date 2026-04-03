@@ -6,20 +6,28 @@ Build one quarterly dataset with all variables below. Two VARs will be estimated
 
 ---
 
-## VAR System 1: Nominal Bond System (CCV replication)
+## VAR System 1: Nominal Bond System
 
-**Sample: 1952Q2 – 2025Q4 (approx 295 observations)**
+**Sample: 1980Q1 – 2025Q4 (approx 183 observations)**
 
-State vector (6 variables, ordered):
+State vector (5 variables, ordered):
 
 | # | Variable | Symbol | Definition | Units |
 |---|----------|--------|------------|-------|
 | 1 | Real bill rate | `rtb` | Ex post real return on 3-month T-bill: nominal bill rate minus realized CPI inflation over the quarter | Quarterly log return (not annualized) |
 | 2 | Excess stock return | `xr` | Log total return on CRSP value-weighted market portfolio minus log gross bill return | Quarterly log excess return |
 | 3 | Excess nominal bond return | `xb` | Log total return on constant-maturity 10-year nominal zero-coupon bond minus log gross bill return | Quarterly log excess return |
-| 4 | Nominal bill yield | `y_nom` | 3-month Treasury bill yield (annualized in raw data, convert to quarterly) | Quarterly yield level |
+| 4 | Nominal bill yield | `y_nom` | 10-year nominal yield (SVENY10, annualized in raw data, convert to quarterly) | Quarterly yield level |
 | 5 | Log dividend-price ratio | `dp` | Log of trailing 12-month dividends divided by current price for S&P 500 / CRSP VW index | Log ratio (level, not return) |
-| 6 | Yield spread | `spr` | 10-year nominal yield minus 3-month bill yield | Quarterly spread (level) |
+
+**Partition into state variables and returns:**
+
+| Role | Variables | VAR indices |
+|------|-----------|-------------|
+| State variables (discretized on DP grid) | `rtb`, `y_nom`, `dp` | 0, 3, 4 |
+| Return variables (integrated out via conditional distribution) | `xr`, `xb` | 1, 2 |
+
+**Index within state vector:** `rtb`=0, `y_nom`=1, `dp`=2. The bill rate (`bill_rate_index_in_state=0`) and the annuity yield (`annuity_yield_index_in_state=1`, i.e. `y_nom`) are referenced by these within-state indices in the model object.
 
 ---
 
@@ -96,14 +104,15 @@ Construction:
 Note: Check for missing values pre-2003. Start sample where TIPSY10 is reliably available.
 ```
 
-### 5. Nominal bill yield (`y_nom`) — System 1 only
+### 5. Nominal long yield (`y_nom`) — System 1 only
 
 ```
-Source: FRED TB3MS (monthly, secondary market 3-month T-bill rate, percent per annum)
+Source: GSW nominal yield curve (feds200628.csv from Federal Reserve), SVENY10
 Construction:
   - Use end-of-quarter value (March, June, September, December)
-  - Convert to quarterly: y_nom = TB3MS / 400
-  - Or keep in annualized percent if preferred (just be consistent)
+  - Convert to quarterly decimal: y_nom = SVENY10 / 400
+Note: This is the 10-year nominal yield, not the short rate. It enters the model
+as the annuity pricing yield for bequest utility (annuity_yield_index_in_state=1).
 ```
 
 ### 6. Log dividend-price ratio (`dp`)
@@ -117,17 +126,7 @@ Construction:
   - Use end-of-quarter values
 ```
 
-### 7. Yield spread (`spr`) — System 1 only
-
-```
-Source: GSW nominal yield curve SVENY10 and FRED TB3MS
-Construction:
-  - spr = SVENY10/100 - TB3MS/100 (both in same units, either quarterly or annualized)
-  - Use end-of-quarter values
-  - Keep in same units as y_nom for consistency
-```
-
-### 8. Real long yield (`y_real`) — System 2 only
+### 7. Real long yield (`y_real`) — System 2 only
 
 ```
 Source: GSW TIPS yield curve TIPSY10 (percent per annum)
@@ -151,7 +150,7 @@ All variables use **end-of-quarter** timing:
 For the VAR `z_{t+1} = Phi_0 + Phi_1 * z_t + v_{t+1}`:
 - `z_t` is observed at end of quarter t
 - Returns (`rtb`, `xr`, `xb`, `xtips`) dated t+1 are realized over quarter t+1
-- State variables (`y_nom`, `dp`, `spr`, `y_real`) dated t+1 are observed at end of quarter t+1
+- State variables (`y_nom`, `dp`, `y_real`) dated t+1 are observed at end of quarter t+1
 
 This means row t of the dataset has:
 - Returns earned during quarter t
@@ -167,7 +166,6 @@ Keep everything in **natural quarterly units** (not annualized, not in percent):
 - Returns: quarterly log returns as decimals (e.g., 0.02 = 2% per quarter)
 - Yields: quarterly yields as decimals (e.g., 0.01 = 1% per quarter = 4% annualized)
 - dp: log ratio, no conversion needed
-- spr: quarterly spread as decimal
 
 This matches CCV's convention. Standard deviations and VAR coefficients will be directly comparable to CCV Table 2 after accounting for the quarterly scaling.
 
@@ -177,12 +175,12 @@ This matches CCV's convention. Standard deviations and VAR coefficients will be 
 
 Produce a single CSV file: `var_dataset.csv`
 
-Columns: `date, rtb, xr, xb, y_nom, dp, spr, xtips, y_real`
+Columns: `date, rtb, xr, xb, y_nom, dp, xtips, y_real`
 
-- `xb`, `y_nom`, `spr` will have values from 1952 onward
+- `xb`, `y_nom` will have values from 1980 onward
 - `xtips`, `y_real` will have values from ~2003 onward (NaN before)
 - All other columns available for full sample
 
 This single file supports both VARs:
-- System 1: select columns `[rtb, xr, xb, y_nom, dp, spr]`, drop rows with NaN
+- System 1: select columns `[rtb, xr, xb, y_nom, dp]`, drop rows with NaN
 - System 2: select columns `[rtb, xr, xtips, dp, y_real]`, drop rows with NaN

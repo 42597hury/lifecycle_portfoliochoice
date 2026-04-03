@@ -396,7 +396,7 @@ def build_var_config_from_dataset(
 
 
 def build_tips_system2_var_config(
-    csv_path=r"TIPS_MODEL/var_dataset.csv",
+    csv_path="var/var_dataset.csv",
     state_indices=(0, 3, 4),
     return_indices=(1, 2),
     bill_rate_index_in_state=0,
@@ -424,7 +424,7 @@ def build_tips_system2_var_config(
 
 
 def build_nominal_system1_var_config(
-    csv_path=r"TIPS_MODEL/var_dataset.csv",
+    csv_path="var/var_dataset.csv",
     state_indices=(0, 3, 4),
     return_indices=(1, 2),
     bill_rate_index_in_state=0,

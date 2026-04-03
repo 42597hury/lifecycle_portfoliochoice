@@ -5,7 +5,7 @@ Contains:
   - Precompute class — all arrays consumed by the solver
   - build_model() — factory assembling LifecyclePortfolioModel from configs
 
-Dependencies: model, var, discretization, earnings_dependent_mortality
+Dependencies: model, var, discretization, mortality
 """
 
 import numpy as np
@@ -20,7 +20,7 @@ from discretization import (
     rouwenhorst_multivariate, discretize_income_ar1_mixture,
     get_eps_quadrature_corrected, get_return_quadrature,
 )
-from earnings_dependent_mortality import calibrate_earnings_dependent_mortality
+from mortality import calibrate_earnings_dependent_mortality
 
 
 # =============================================================================

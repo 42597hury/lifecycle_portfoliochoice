@@ -289,18 +289,43 @@ def disposable_income_working(y_gross):
     return taxable_income - tax
 
 
-def compute_pension_after_tax(z_grid):
-    """Social Security benefits with progressive formula and taxes."""
-    z = np.asarray(z_grid, dtype=float)
-    career_rank = np.exp(z)
-    pension = np.zeros_like(career_rank)
+def compute_pension_after_tax(z_grid, avg_det):
+    """
+    Social Security benefits following Catherine (2025, eq. 19).
 
-    m = career_rank <= 0.21
-    pension[m] = career_rank[m] * 0.90
-    m = (career_rank > 0.21) & (career_rank <= 1.25)
-    pension[m] = 0.189 + (career_rank[m] - 0.21) * 0.32
-    m = career_rank > 1.25
-    pension[m] = 0.5218 + (career_rank[m] - 1.25) * 0.15
+    Parameters
+    ----------
+    z_grid : array, shape (n_z,)
+        Persistent income grid (log, mean-zero).
+    avg_det : float
+        Mean of exp(f(age)) over working ages. Converts the persistent
+        component exp(z) to an AIME proxy: AIME(z) = exp(z) * avg_det.
+
+    Returns
+    -------
+    pension_net : array, shape (n_z,)
+        After-tax annual pension benefit in model units.
+    """
+    z = np.asarray(z_grid, dtype=float)
+
+    # AIME: career-average earnings, capped at taxable maximum (2.5 * L_bar)
+    # Catherine eq. (20): AIYE = L_bar_t * sum min{L_tilde_is, 2.5}
+    aime = np.minimum(np.exp(z) * avg_det, 2.5)
+
+    # PIA formula -- Catherine eq. (19)
+    b1, b2 = 0.21, 1.25
+    r1, r2, r3 = 0.90, 0.32, 0.15
+
+    pension = np.zeros_like(aime)
+
+    lo = aime <= b1
+    pension[lo] = aime[lo] * r1
+
+    mid = (aime > b1) & (aime <= b2)
+    pension[mid] = r1 * b1 + r2 * (aime[mid] - b1)
+
+    hi = aime > b2
+    pension[hi] = r1 * b1 + r2 * (b2 - b1) + r3 * (aime[hi] - b2)
 
     tax = np.zeros_like(pension)
     m = pension <= 0.18

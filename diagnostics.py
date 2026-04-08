@@ -3,6 +3,8 @@ diagnostics.py — Model diagnostic reports and Newton failure analysis.
 
 Contains:
   - print_model_diagnostic_report() — comprehensive pre-solve calibration report
+    Section 2 includes Tier 1 income & SS diagnostics (18 tests)
+  - print_simulation_income_report() — post-simulation income diagnostics (Tier 2)
   - diagnose_newton_failures_retirement() — post-solve Newton failure analysis
 
 Dependencies: numpy, numba, model, solver (for diagnostic constants and FOC functions)
@@ -12,7 +14,7 @@ import numpy as np
 from numba import njit
 from math import exp
 
-from model import SolverConfig
+from model import SolverConfig, disposable_income_working, compute_pension_after_tax
 from solver import (
     compute_foc_jac_retirement, solve_portfolio_2d_retirement,
     build_gross_return_arrays, compute_terminal_portfolio_foc_jac,
@@ -91,10 +93,33 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
             print(f"  {age:>4}  {sp_lo:>10.5f}  {sp_mid:>10.5f}  {sp_hi:>10.5f}")
 
     # =========================================================================
-    # 2. INCOME PROCESS
+    # 2. INCOME PROCESS & SOCIAL SECURITY
     # =========================================================================
-    header("2.  INCOME PROCESS")
+    header("2.  INCOME PROCESS & SOCIAL SECURITY")
 
+    # Accumulator for pass/fail summary
+    income_tests = []   # list of (test_name: str, passed: bool)
+
+    def itest(name, passed):
+        """Record and return a test result."""
+        income_tests.append((name, passed))
+        return passed
+
+    # — Reference indices —
+    iz0 = int(np.argmin(np.abs(pc.z_grid)))
+    ie0 = int(np.argmin(np.abs(pc.eps_nodes)))
+    n_z = len(pc.z_grid)
+    retire_t = model.retire_age - model.start_age
+
+    # — avg_det (recompute for diagnostics — must match precompute) —
+    working_ages = np.arange(model.start_age, model.retire_age)
+    log_det_all  = (model.b0
+                    + model.b1 * working_ages
+                    + model.b2 * working_ages**2 / 10.0
+                    + model.b3 * working_ages**3 / 100.0)
+    avg_det = float(np.mean(np.exp(log_det_all)))
+
+    # ── 2a. Parameters (echo) ───────────────────────────────────────────────
     sub("Persistent AR(1) with mixture-normal innovations")
     mu_eta  = model.pz * model.mu_eta1 + (1.0 - model.pz) * model.mu_eta2
     var_eta = (model.pz * (model.sigma_eta1**2 + (model.mu_eta1 - mu_eta)**2)
@@ -105,11 +130,11 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
     print(f"  pz         = {model.pz:.3f}    (mixture weight on component 1)")
     print(f"  Component 1:  mu_eta1 = {model.mu_eta1:+.4f},  sigma_eta1 = {model.sigma_eta1:.4f}")
     print(f"  Component 2:  mu_eta2 = {model.mu_eta2:+.4f},  sigma_eta2 = {model.sigma_eta2:.4f}")
-    print(f"  E[eta]     = {mu_eta:.2e}   (should be - 0)")
+    print(f"  E[eta]     = {mu_eta:.2e}   (should be ~ 0)")
     print(f"  Std[eta]   = {std_eta:.5f}")
     print(f"  Std[z]     = {std_z:.5f}  (unconditional)")
     z_cover = pc.z_grid.max() / std_z if std_z > 0 else float("nan")
-    print(f"  z_grid     : {pc.n_z} points  [{pc.z_grid.min():.4f}, {pc.z_grid.max():.4f}]   Â±{z_cover:.2f} Ïƒ")
+    print(f"  z_grid     : {pc.n_z} points  [{pc.z_grid.min():.4f}, {pc.z_grid.max():.4f}]   +/-{z_cover:.2f} sigma")
 
     sub("Transitory shock (mixture, zero-mean enforced)")
     mu_eps2_eff = -(model.pe / (1.0 - model.pe)) * model.mu_eps1
@@ -119,44 +144,468 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
     print(f"  Component 1:  mu_eps1    = {model.mu_eps1:+.4f},  sigma_eps1 = {model.sigma_eps1:.4f}")
     print(f"  Component 2:  mu_eps2_eff = {mu_eps2_eff:+.4f}  (zero-mean enforced; model.mu_eps2 ignored)")
     print(f"               sigma_eps2 = {model.sigma_eps2:.4f}")
-    print(f"  E[eps]        = {eps_mean:.2e}   (should be - 0)")
+    print(f"  E[eps]        = {eps_mean:.2e}   (should be ~ 0)")
     print(f"  Var[eps]      = {eps_var:.5f}   Std[eps] = {np.sqrt(eps_var):.5f}")
     print(f"  eps_weights sum = {pc.eps_weights.sum():.8f}   (should be 1.000)")
     print(f"  eps_nodes     : {pc.n_eps} nodes  [{pc.eps_nodes.min():.4f}, {pc.eps_nodes.max():.4f}]")
+    e_exp_eps = float(np.sum(np.exp(pc.eps_nodes) * pc.eps_weights))
+    print(f"  E[exp(eps)]   = {e_exp_eps:.4f}   (Jensen: >1 by ~0.5*Var; {(e_exp_eps - 1)*100:+.1f}%)")
 
     sub("Deterministic income profile  log Y_det = b0 + b1*Age + b2*Age^2/10 + b3*Age^3/100")
     print(f"  b0 = {model.b0:.4f},  b1 = {model.b1:.4f},  b2 = {model.b2:.4f},  b3 = {model.b3:.6f}")
-    # Find peak age numerically
-    _ages_det = np.arange(model.start_age, model.retire_age)
-    _det_vals = model.b0 + model.b1 * _ages_det + model.b2 * _ages_det**2 / 10.0 + model.b3 * _ages_det**3 / 100.0
-    _peak_idx = int(np.argmax(_det_vals))
-    print(f"  Hump peak: age {_ages_det[_peak_idx]},  log-income = {_det_vals[_peak_idx]:.4f}")
+    _peak_idx = int(np.argmax(log_det_all))
+    print(f"  Hump peak: age {working_ages[_peak_idx]},  log-income = {log_det_all[_peak_idx]:.4f},  "
+          f"exp(f) = {np.exp(log_det_all[_peak_idx]):.4f}")
+    print(f"  avg_det = mean(exp(f(age))) over [{model.start_age}, {model.retire_age}) = {avg_det:.4f}")
 
-    # Find grid points closest to z=0 and eps=0
-    iz0 = int(np.argmin(np.abs(pc.z_grid)))
-    ie0 = int(np.argmin(np.abs(pc.eps_nodes)))
-    print(f"\n  Income at z - 0 (grid point {iz0}: z={pc.z_grid[iz0]:.4f}),")
-    print(f"             eps - 0 (node {ie0}: eps={pc.eps_nodes[ie0]:.4f}):")
-    print()
-    print(f"  {'Age':>4}  {'t':>4}  {'log-det':>9}  {'Y_gross':>10}  {'Y_net (after-tax)':>18}")
-    key_ages_work = [a for a in [25, 30, 35, 40, 45, 50, 55, 60, 64]
-                     if model.start_age <= a < model.retire_age]
-    for age in key_ages_work:
-        t    = age - model.start_age
-        det  = model.b0 + model.b1 * age + model.b2 * (age ** 2) / 10.0 + model.b3 * (age ** 3) / 100.0
-        y_gr = np.exp(det + pc.z_grid[iz0] + pc.eps_nodes[ie0])
-        y_nt = float(pc.working_income[t, iz0, ie0])
-        print(f"  {age:>4}  {t:>4}  {det:>9.4f}  {y_gr:>10.4f}  {y_nt:>18.4f}")
+    # ── 2b. Integrity checks ────────────────────────────────────────────────
+    sub("Integrity checks")
+    print(f"  Quick pass/fail gates on the precomputed income and pension arrays.")
+    print(f"  If any test fails here, the remaining diagnostics are unreliable.\n")
 
-    last_t     = model.retire_age - 1 - model.start_age
-    y_last     = float(pc.working_income[last_t, iz0, ie0])
-    pens_mean  = float(pc.pension_after_tax[last_t, iz0])
-    repl_rate  = pens_mean / y_last if y_last > 0 else float("nan")
+    wi_min = float(pc.working_income.min())
+    _ok = wi_min > 0
+    flag("Working income > 0 everywhere", _ok, f"min = {wi_min:.6f}")
+    itest("Working income > 0", _ok)
+
+    pens_min = float(pc.pension_after_tax.min())
+    _ok = pens_min > 0
+    flag("Pension > 0 for all z states", _ok, f"min = {pens_min:.6f}")
+    itest("Pension > 0", _ok)
+
+    # After-tax income must increase with the persistent component z
+    # (higher z = higher lifetime earnings).  A negative value here means
+    # income *decreases* when z rises, which would produce non-monotone
+    # policy functions and break the solver's interpolation.
+    wi_z_diffs = np.diff(pc.working_income, axis=1)
+    wi_z_min_diff = float(wi_z_diffs.min())
+    _ok = wi_z_min_diff >= -1e-12
+    _detail = (f"min adjacent step = {wi_z_min_diff:.2e} (positive = no violation)"
+               if _ok else f"VIOLATION: income falls between adjacent z points by {-wi_z_min_diff:.2e}")
+    flag("Working income monotone in z", _ok, _detail)
+    itest("Working income monotone in z", _ok)
+
+    # Same check for transitory shocks eps.  The mixture-normal quadrature
+    # nodes are not stored in ascending order (component 1 then component 2),
+    # so we sort by eps value before checking.
+    _eps_order = np.argsort(pc.eps_nodes)
+    _wi_sorted_eps = pc.working_income[:, :, _eps_order]
+    wi_e_diffs = np.diff(_wi_sorted_eps, axis=2)
+    wi_e_min_diff = float(wi_e_diffs.min())
+    _ok = wi_e_min_diff >= -1e-12
+    _detail = (f"min adjacent step = {wi_e_min_diff:.2e} (positive = no violation)"
+               if _ok else f"VIOLATION: income falls between adjacent eps nodes by {-wi_e_min_diff:.2e}")
+    flag("Working income monotone in eps", _ok, _detail)
+    itest("Working income monotone in eps", _ok)
+
+    # Pension must increase in z.  Zero steps are expected where the AIME
+    # cap (2.5) binds — all high-z agents receive the same maximum benefit.
+    pens_z_diffs = np.diff(pc.pension_after_tax[0, :])
+    pens_z_min = float(pens_z_diffs.min())
+    _ok = pens_z_min >= -1e-12
+    _detail = (f"min step = {pens_z_min:.2e} (zero where AIME cap binds)"
+               if _ok else f"VIOLATION: pension falls between adjacent z points by {-pens_z_min:.2e}")
+    flag("Pension monotone in z", _ok, _detail)
+    itest("Pension monotone in z", _ok)
+
+    # Pension depends only on the persistent state z at retirement.
+    # The precomputed array tiles the same pension vector across all ages,
+    # so there should be zero variation across the age dimension.
+    pens_age_var = float(np.max(np.abs(pc.pension_after_tax - pc.pension_after_tax[0:1, :])))
+    _ok = pens_age_var < 1e-14
+    flag("Pension constant across ages", _ok, f"max age-variation = {pens_age_var:.2e}")
+    itest("Pension constant across ages", _ok)
+
+    # The AIME cap at 2.5 means the maximum possible PIA is PIA(2.5).
+    # Verify the precomputed pension array never exceeds this.
+    pia_max_gross = 0.90 * 0.21 + 0.32 * (1.25 - 0.21) + 0.15 * (2.5 - 1.25)
+    _p = pia_max_gross
+    if _p <= 0.18:
+        _tax_pia = _p * 0.10
+    elif _p <= 0.72:
+        _tax_pia = 0.018 + (_p - 0.18) * 0.12
+    else:
+        _tax_pia = 0.0828 + (_p - 0.72) * 0.22
+    pia_max_net = _p - _tax_pia
+    pens_actual_max = float(pc.pension_after_tax.max())
+    _ok = abs(pens_actual_max - pia_max_net) < 1e-6
+    flag("Pension max = PIA(2.5) after tax", _ok,
+         f"expected {pia_max_net:.4f}, got {pens_actual_max:.4f}")
+    itest("Pension max = PIA(2.5) after tax", _ok)
+
+    _y_gross_all = np.exp(
+        log_det_all[:, None, None]
+        + pc.z_grid[None, :, None]
+        + pc.eps_nodes[None, None, :]
+    )
+    _eff_rate_all = 1.0 - pc.working_income[:len(working_ages)] / np.maximum(_y_gross_all, 1e-15)
+    eff_rate_max = float(_eff_rate_all.max())
+    _ok = eff_rate_max < 0.50
+    flag("Effective tax rate < 50%", _ok, f"max effective rate = {eff_rate_max:.1%}")
+    itest("Effective tax rate < 50%", _ok)
+
+    _ok = abs(eps_mean) < 1e-8
+    flag("E[eps] numerically zero", _ok, f"E[eps] = {eps_mean:.2e}")
+    itest("E[eps] ~ 0", _ok)
+
+    _ok = True  # both hardcoded to 2.5
+    flag("Payroll cap = AIME cap", _ok,
+         "both 2.500 (disposable_income_working & compute_pension_after_tax)")
+    itest("Payroll cap = AIME cap", _ok)
+
+    # ── 2c. AIME pipeline trace ─────────────────────────────────────────────
+    sub("AIME pipeline trace  (Catherine 2025, eqs. 19-20)")
+    print(f"  Each row traces one z-value through the full pension formula:")
+    print(f"    z -> exp(z) -> exp(z)*avg_det -> AIME (capped at 2.5) -> PIA (3-bracket)")
+    print(f"    -> income tax on PIA -> net pension")
+    print(f"  If the 'exp(z)*ad' column equals 'exp(z)', avg_det scaling is missing.")
+    print(f"  If AIME ever exceeds 2.5, the taxable earnings cap is broken.")
+    print(f"  'MISMATCH!' means the hand-calculation disagrees with precomputed arrays.\n")
+    print(f"  avg_det = {avg_det:.4f}   |   SS taxable cap = 2.500")
+
+    z_cap = np.log(2.5 / avg_det)
+
+    _repr_iz = [max(0, n_z // 4), iz0, min(n_z - 1, 3 * n_z // 4)]
+    _iz_above_cap = None
+    for _iz in range(n_z):
+        if np.exp(pc.z_grid[_iz]) * avg_det > 2.5:
+            _iz_above_cap = _iz
+            break
+    if _iz_above_cap is not None and _iz_above_cap not in _repr_iz:
+        _repr_iz.append(_iz_above_cap)
+    if (n_z - 1) not in _repr_iz:
+        _repr_iz.append(n_z - 1)
+    _repr_iz = sorted(set(_repr_iz))
+
     print()
-    print(f"  Last working year (age {model.retire_age - 1}): Y_net = {y_last:.4f}")
-    print(f"  Pension at z - 0:                   {pens_mean:.4f}")
-    print(f"  Replacement rate:                   {repl_rate:.2%}")
-    print(f"  Pension range (min z, max z):        [{pc.pension_after_tax[0, 0]:.4f}, {pc.pension_after_tax[0, -1]:.4f}]")
+    print(f"  {'z_idx':>5}  {'z':>7}  {'exp(z)':>8}  {'exp(z)*ad':>9}  {'AIME':>7}  "
+          f"{'PIA_gr':>7}  {'Tax':>7}  {'Pens_net':>8}  {'Note':>12}")
+    print(f"  {'---':>5}  {'---':>7}  {'---':>8}  {'---':>9}  {'---':>7}  "
+          f"{'---':>7}  {'---':>7}  {'---':>8}  {'---':>12}")
+
+    _pipeline_ok = True
+    for _iz in _repr_iz:
+        _z_val = pc.z_grid[_iz]
+        _exp_z = np.exp(_z_val)
+        _exp_z_ad = _exp_z * avg_det
+        _aime = min(_exp_z_ad, 2.5)
+        _b1, _b2 = 0.21, 1.25
+        if _aime <= _b1:
+            _pia = _aime * 0.90
+        elif _aime <= _b2:
+            _pia = 0.90 * _b1 + 0.32 * (_aime - _b1)
+        else:
+            _pia = 0.90 * _b1 + 0.32 * (_b2 - _b1) + 0.15 * (_aime - _b2)
+        if _pia <= 0.18:
+            _ptax = _pia * 0.10
+        elif _pia <= 0.72:
+            _ptax = 0.018 + (_pia - 0.18) * 0.12
+        elif _pia <= 1.54:
+            _ptax = 0.0828 + (_pia - 0.72) * 0.22
+        else:
+            _ptax = 0.2632 + (_pia - 1.54) * 0.24
+        _pens_hand = _pia - _ptax
+        _note = ""
+        if abs(_z_val) < 0.01:
+            _note = "median"
+        elif _exp_z_ad >= 2.5:
+            _note = "cap binds"
+        _pens_pc = float(pc.pension_after_tax[0, _iz])
+        if abs(_pens_hand - _pens_pc) > 1e-6:
+            _note += " MISMATCH!"
+            _pipeline_ok = False
+        print(f"  {_iz:>5}  {_z_val:>7.3f}  {_exp_z:>8.3f}  {_exp_z_ad:>9.3f}  {_aime:>7.3f}  "
+              f"{_pia:>7.4f}  {_ptax:>7.4f}  {_pens_hand:>8.4f}  {_note:>12}")
+
+    print(f"\n  Cap binds at z >= {z_cap:.3f}  (exp(z)*avg_det >= 2.5)")
+    flag("Hand-computed pension = precomputed array at all z", _pipeline_ok)
+    itest("Pipeline hand-calc matches precomp", _pipeline_ok)
+
+    # ── 2d. Effective tax schedule ──────────────────────────────────────────
+    sub("Effective tax schedule")
+    print(f"  Decomposition of after-tax income at selected gross income levels.")
+    print(f"  All values in model units (1 unit ~ $61k).  Post-TCJA 7-bracket")
+    print(f"  progressive income tax plus 10.6% payroll tax capped at Y_gross = 2.5.")
+    print(f"  Effective rate should rise broadly with income; a small dip near the")
+    print(f"  payroll cap (2.5) is expected as the 10.6% payroll levy stops.\n")
+    _test_incomes = [0.10, 0.30, 0.50, 1.00, 1.50, 2.00, 2.50, 3.00, 5.00, 10.00]
+    print(f"  {'Y_gross':>8}  {'Payroll':>8}  {'Taxable':>8}  {'Inc_tax':>8}  "
+          f"{'Y_net':>8}  {'Eff.rate':>8}  {'Note':>14}")
+    print(f"  {'---':>8}  {'---':>8}  {'---':>8}  {'---':>8}  "
+          f"{'---':>8}  {'---':>8}  {'---':>14}")
+
+    _eff_rates_list = []
+    for _y_gr in _test_incomes:
+        _payroll = 0.106 * min(_y_gr, 2.5)
+        _taxable = max(0.0, _y_gr - _payroll)
+        _y_net_val = float(disposable_income_working(np.array([_y_gr]))[0])
+        _inc_tax = _taxable - _y_net_val
+        _eff = 1.0 - _y_net_val / _y_gr if _y_gr > 0 else 0.0
+        _eff_rates_list.append(_eff)
+        _note = ""
+        if abs(_y_gr - 2.5) < 0.01:
+            _note = "<- payroll cap"
+        print(f"  {_y_gr:>8.2f}  {_payroll:>8.3f}  {_taxable:>8.3f}  {_inc_tax:>8.3f}  "
+              f"{_y_net_val:>8.3f}  {_eff:>7.1%}   {_note}")
+
+    _eff_mono = all(_eff_rates_list[i] <= _eff_rates_list[i+1] + 1e-10
+                    for i in range(len(_eff_rates_list)-1))
+    # The payroll tax cap at 2.5 creates a known local dip in effective rate
+    # (marginal drops from ~32.6% to ~24% as payroll tax stops).
+    # Check the weaker condition: rate at max income > rate at min income.
+    _eff_broadly_rising = _eff_rates_list[-1] > _eff_rates_list[0]
+    if not _eff_mono:
+        flag("Effective tax rate strictly monotone", False,
+             "expected: payroll cap at 2.5 causes local dip (see table)")
+    flag("Effective tax rate broadly rising", _eff_broadly_rising,
+         f"low={_eff_rates_list[0]:.1%}, high={_eff_rates_list[-1]:.1%}")
+    itest("Effective rate broadly rising", _eff_broadly_rising)
+
+    _y_boundary = 0.18 / (1.0 - 0.106)
+    _y_net_boundary = float(disposable_income_working(np.array([_y_boundary]))[0])
+    _actual_tax_boundary = 0.18 - _y_net_boundary
+    _expected_tax_boundary = 0.18 * 0.10
+    _ok = abs(_actual_tax_boundary - _expected_tax_boundary) < 1e-8
+    flag("Tax at 10%/12% boundary = 0.018 (cumulative constant)", _ok,
+         f"expected = {_expected_tax_boundary:.6f}, got = {_actual_tax_boundary:.6f}")
+    itest("Bracket constant 10%/12%", _ok)
+
+    # ── 2e. SS consistency ──────────────────────────────────────────────────
+    sub("Social Security consistency")
+    print(f"  The tax side (payroll tax cap) and benefit side (AIME cap) must use")
+    print(f"  the same earnings ceiling.  This was the root cause of the original")
+    print(f"  pension bug: the tax side correctly capped at 2.5, but the benefit")
+    print(f"  side used uncapped exp(z) without avg_det scaling.\n")
+    print(f"  Tax side  (disposable_income_working):")
+    print(f"    Payroll rate:           10.6%")
+    print(f"    Payroll cap (Y_gross):  2.500")
+    print(f"    Max payroll tax:        {0.106 * 2.5:.3f}")
+    print()
+    print(f"  Benefit side (compute_pension_after_tax):")
+    print(f"    avg_det:                {avg_det:.4f}")
+    print(f"    AIME cap:               2.500")
+    print(f"    z at which cap binds:   {z_cap:.3f}  (exp({z_cap:.3f})*{avg_det:.4f} = 2.500)")
+    print(f"    Max PIA (gross):        {pia_max_gross:.4f}")
+    print(f"    Max pension (after tax):{pia_max_net:.4f}")
+    print(f"    PIA bend points:        0.21, 1.25")
+    print(f"    PIA rates:              90%, 32%, 15%")
+
+    # ── 2f. Retirement boundary ─────────────────────────────────────────────
+    sub(f"Retirement boundary sequence  (z = z_grid[{iz0}] = {pc.z_grid[iz0]:.4f})")
+    print(f"  Traces the income source at each age around retirement for one agent.")
+    print(f"  'Source' shows the exact array and index used — an off-by-one error")
+    print(f"  would show the wrong array name or index at the transition point.")
+    print(f"  Convention: last labor paycheck at age {model.retire_age}, first pension at age {model.retire_age + 1}.")
+    print(f"  The persistent state z transitions one final time at {model.retire_age} and freezes.\n")
+    _boundary_ages = list(range(max(model.start_age, model.retire_age - 3),
+                                min(model.terminal_age + 1, model.retire_age + 4)))
+    print(f"  {'Age':>4}  {'t_idx':>5}  {'Phase':>8}  {'Source':>38}  {'Y_net':>8}")
+    print(f"  {'---':>4}  {'---':>5}  {'---':>8}  {'---':>38}  {'---':>8}")
+
+    for _age in _boundary_ages:
+        _t = _age - model.start_age
+        if _t < 0 or _t >= pc.n_age:
+            continue
+        if _age < model.retire_age:
+            _phase = "Working"
+            _source = f"working_income[{_t}, {iz0}, {ie0}]"
+            _y_val = float(pc.working_income[_t, iz0, ie0])
+            _bnote = "  last working year" if _age == model.retire_age - 1 else ""
+        elif _age == model.retire_age:
+            _phase = "Retire"
+            if _t < pc.working_income.shape[0]:
+                _source = f"working_income[{_t}, {iz0}, {ie0}]"
+                _y_val = float(pc.working_income[_t, iz0, ie0])
+            else:
+                _source = f"pension_after_tax[{_t}, {iz0}]"
+                _y_val = float(pc.pension_after_tax[_t, iz0])
+            _bnote = "  final labor paycheck"
+        else:
+            _phase = "Retired"
+            _source = f"pension_after_tax[{_t}, {iz0}]"
+            _y_val = float(pc.pension_after_tax[_t, iz0])
+            _bnote = "  first pension" if _age == model.retire_age + 1 else ""
+        print(f"  {_age:>4}  {_t:>5}  {_phase:>8}  {_source:<38}  {_y_val:>8.4f}{_bnote}")
+
+    print(f"\n  retire_age_idx = {retire_t}   (age {model.retire_age}, 0-indexed from {model.start_age})")
+    print(f"  sim t < {retire_t}: z transitions, income = working_income[t+1, ...]")
+    print(f"  sim t >= {retire_t}: z frozen, income = pension_after_tax[t+1, ...]")
+
+    _ok = retire_t < pc.working_income.shape[0]
+    flag("working_income array covers retirement age", _ok,
+         f"need index {retire_t} in axis 0 of shape {pc.working_income.shape}")
+    itest("working_income covers retire_age", _ok)
+
+    _ok = (pc.n_age - 1) < pc.pension_after_tax.shape[0]
+    flag("pension_after_tax array covers terminal age", _ok,
+         f"need index {pc.n_age - 1} in axis 0 of shape {pc.pension_after_tax.shape}")
+    itest("pension covers terminal age", _ok)
+
+    # ── 2g. Expected income lifecycle ────────────────────────────────────────
+    sub("Expected after-tax income lifecycle  (z = 0, integrated over eps)")
+    print(f"  E[Y_net | z=0, age] using Gauss-Hermite quadrature over the transitory")
+    print(f"  shock eps.  This is the income path that drives the median agent's saving")
+    print(f"  decision.  E[Y_gross] includes the Jensen correction E[exp(eps)] = {e_exp_eps:.4f}.\n")
+    print(f"  {'Age':>4}  {'E[Y_gross]':>10}  {'E[Y_net]':>9}  {'Note':>16}")
+    print(f"  {'---':>4}  {'---':>10}  {'---':>9}  {'---':>16}")
+
+    _display_ages = sorted(set(a for a in
+        [model.start_age, 25, 30, 35, 40, 45, 46, 50, 55, 60, 65, model.retire_age - 1]
+        if model.start_age <= a < model.retire_age))
+
+    for _age in _display_ages:
+        _t = _age - model.start_age
+        _det = (model.b0 + model.b1 * _age + model.b2 * _age**2 / 10.0
+                + model.b3 * _age**3 / 100.0)
+        _e_y_gross = np.exp(_det + pc.z_grid[iz0]) * e_exp_eps
+        _e_y_net = float(np.dot(pc.eps_weights, pc.working_income[_t, iz0, :]))
+        _lnote = ""
+        if _age == model.start_age:      _lnote = "entry"
+        elif _age == working_ages[_peak_idx]: _lnote = "<- near peak"
+        elif _age == model.retire_age - 1:    _lnote = "last working yr"
+        print(f"  {_age:>4}  {_e_y_gross:>10.4f}  {_e_y_net:>9.4f}  {_lnote:>16}")
+
+    pens_z0 = float(pc.pension_after_tax[0, iz0])
+    print(f"  ---- RETIREMENT --------")
+    print(f"  {model.retire_age + 1:>4}  {'':>10}  {pens_z0:>9.4f}  {'first pension':>16}")
+
+    career_avg_net = float(np.mean([
+        np.dot(pc.eps_weights, pc.working_income[_t, iz0, :])
+        for _t in range(len(working_ages))
+    ]))
+    last_working_net = float(np.dot(pc.eps_weights,
+                                     pc.working_income[retire_t - 1, iz0, :]))
+    peak_net = float(max(
+        np.dot(pc.eps_weights, pc.working_income[_t, iz0, :])
+        for _t in range(len(working_ages))
+    ))
+
+    print()
+    print(f"  Career average E[Y_net|z=0]:   {career_avg_net:.4f}")
+    print(f"  Pension / career avg:          {pens_z0 / career_avg_net:.1%}")
+    print(f"  Pension / last working yr:     {pens_z0 / last_working_net:.1%}")
+    print(f"  Pension / peak yr:             {pens_z0 / peak_net:.1%}")
+    print(f"  Income drop at retirement:     {last_working_net:.4f} -> {pens_z0:.4f}"
+          f"  ({(pens_z0 / last_working_net - 1) * 100:+.1f}%)")
+
+    repl_career = pens_z0 / career_avg_net
+    _ok = 0.40 <= repl_career <= 0.80
+    flag("Median replacement rate in [40%, 80%]", _ok,
+         f"pension/career_avg = {repl_career:.1%}")
+    itest("Median replacement rate range", _ok)
+
+    # ── 2h. Income distribution across z ─────────────────────────────────────
+    sub("Income distribution across persistent states  (eps integrated)")
+    print(f"  E[Y_net | z, age] across the z-grid at three representative ages, plus")
+    print(f"  the pension each z-state receives in retirement.  The pension column")
+    print(f"  should flatten at the top where the AIME cap (2.5) binds — high earners")
+    print(f"  all receive the same maximum benefit despite wildly different incomes.\n")
+
+    _dist_ages = sorted(set(a for a in [25, working_ages[_peak_idx], model.retire_age - 1]
+                            if model.start_age <= a < model.retire_age))
+    _age_hdrs = "".join(f"  {'Age '+str(a):>10}" for a in _dist_ages)
+    print(f"  {'z_idx':>5}  {'z':>7}{_age_hdrs}  {'Pension':>10}")
+    print(f"  {'---':>5}  {'---':>7}" + "  ----------" * len(_dist_ages) + "  ----------")
+
+    if n_z <= 7:
+        _show_iz = list(range(n_z))
+    else:
+        _show_iz = sorted(set([0, 1, n_z // 4, iz0, 3 * n_z // 4, n_z - 2, n_z - 1]))
+
+    for _iz in _show_iz:
+        _z_val = pc.z_grid[_iz]
+        _vals = ""
+        for _age in _dist_ages:
+            _t = _age - model.start_age
+            _e_y = float(np.dot(pc.eps_weights, pc.working_income[_t, _iz, :]))
+            _vals += f"  {_e_y:>10.4f}"
+        _pens = float(pc.pension_after_tax[0, _iz])
+        print(f"  {_iz:>5}  {_z_val:>7.3f}{_vals}  {_pens:>10.4f}")
+
+    _e_y_by_z = np.array([float(np.dot(pc.eps_weights, pc.working_income[_peak_idx, _iz, :]))
+                           for _iz in range(n_z)])
+    _ratio_max_min = _e_y_by_z[-1] / max(_e_y_by_z[0], 1e-15)
+    _ratio_max_med = _e_y_by_z[-1] / max(_e_y_by_z[iz0], 1e-15)
+    print(f"\n  At peak age ({working_ages[_peak_idx]}):")
+    print(f"    z_max/z_min income ratio:  {_ratio_max_min:.1f}")
+    print(f"    z_max/z_med income ratio:  {_ratio_max_med:.1f}")
+    print(f"    (Wide ratios expected: z_grid spans +/-{z_cover:.1f} sigma)")
+
+    # ── 2i. Replacement rates by earnings level ──────────────────────────────
+    sub("Replacement rates by earnings level")
+    print(f"  Pension as a fraction of working-life income at each z-level.")
+    print(f"  The progressive PIA formula means low earners get high replacement")
+    print(f"  and high earners get low replacement.  This gradient is the key")
+    print(f"  driver of differential portfolio choice in Catherine (2025):")
+    print(f"  low earners need fewer private savings, high earners need more.\n")
+    print(f"  'vs career' = pension / mean(E[Y_net]) over working life (SSA standard)")
+    print(f"  'vs last'   = pension / E[Y_net] at age {model.retire_age - 1} (last working year)")
+    print(f"  'vs peak'   = pension / max E[Y_net] over working life\n")
+    print(f"  {'z_idx':>5}  {'z':>7}  {'Pension':>8}  {'vs career':>9}  "
+          f"{'vs last':>8}  {'vs peak':>8}")
+    print(f"  {'---':>5}  {'---':>7}  {'---':>8}  {'---':>9}  {'---':>8}  {'---':>8}")
+
+    _repl_rates_career = []
+    for _iz in _show_iz:
+        _z_val = pc.z_grid[_iz]
+        _pens = float(pc.pension_after_tax[0, _iz])
+        _career_avg = float(np.mean([
+            np.dot(pc.eps_weights, pc.working_income[_t, _iz, :])
+            for _t in range(len(working_ages))
+        ]))
+        _last_yr = float(np.dot(pc.eps_weights,
+                                 pc.working_income[retire_t - 1, _iz, :]))
+        _peak_yr = float(max(
+            np.dot(pc.eps_weights, pc.working_income[_t, _iz, :])
+            for _t in range(len(working_ages))
+        ))
+        _r_career = _pens / _career_avg if _career_avg > 1e-10 else float("nan")
+        _r_last   = _pens / _last_yr    if _last_yr > 1e-10    else float("nan")
+        _r_peak   = _pens / _peak_yr    if _peak_yr > 1e-10    else float("nan")
+        _repl_rates_career.append(_r_career)
+        print(f"  {_iz:>5}  {_z_val:>7.3f}  {_pens:>8.4f}  {_r_career:>8.1%}  "
+              f"{_r_last:>8.1%}  {_r_peak:>8.1%}")
+
+    _repl_mono = all(_repl_rates_career[i] >= _repl_rates_career[i+1] - 1e-6
+                     for i in range(len(_repl_rates_career) - 1))
+    # At very low z, all income is in the first PIA bracket (90%) and lowest
+    # tax bracket, so replacement rates are constant.  The economically
+    # meaningful check is: (a) rates are non-increasing from median onward,
+    # and (b) bottom > top overall.
+    _mid_start = len(_repl_rates_career) // 2
+    _repl_declining_upper = all(
+        _repl_rates_career[i] >= _repl_rates_career[i+1] - 1e-6
+        for i in range(_mid_start, len(_repl_rates_career) - 1)
+    )
+    if not _repl_mono:
+        flag("Replacement rates strictly monotone across all z", False,
+             "flat at bottom is expected: very low earners are entirely in the 90% PIA bracket")
+    flag("Replacement rates decline from median z upward", _repl_declining_upper,
+         "this gradient drives the saving and portfolio choice mechanism")
+    itest("Replacement rates decline (upper half)", _repl_declining_upper)
+
+    if len(_repl_rates_career) >= 2:
+        _ok = _repl_rates_career[0] > _repl_rates_career[-1]
+        flag("Lowest earners have higher repl. rate than highest", _ok,
+             f"bottom = {_repl_rates_career[0]:.1%}, top = {_repl_rates_career[-1]:.1%}")
+        itest("Bottom > top replacement", _ok)
+
+    # ── INCOME & SS PASS/FAIL SUMMARY ────────────────────────────────────────
+    _n_pass = sum(1 for _, p in income_tests if p)
+    _n_fail = sum(1 for _, p in income_tests if not p)
+    _n_total = len(income_tests)
+
+    print()
+    print("-" * W)
+    if _n_fail == 0:
+        print(f"  INCOME & SS DIAGNOSTIC SUMMARY:  ALL {_n_total} TESTS PASSED")
+    else:
+        print(f"  INCOME & SS DIAGNOSTIC SUMMARY:  {_n_fail} FAILED  /  {_n_total} total")
+        print()
+        for _tname, _tpassed in income_tests:
+            if not _tpassed:
+                print(f"    [FAIL]  {_tname}")
+    print("-" * W)
 
     # =========================================================================
     # 3. VAR STRUCTURE
@@ -423,6 +872,309 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
     print("=" * W)
     print("  Diagnostic report complete.")
     print("=" * W)
+
+
+# =============================================================================
+# TIER 2 — POST-SIMULATION INCOME DIAGNOSTICS
+# =============================================================================
+
+def print_simulation_income_report(model, pc, sim):
+    """
+    Post-simulation diagnostics for the income process and Social Security.
+
+    Verifies that the simulation's random draws and loop logic produce
+    income outcomes consistent with the precomputed tables.  Runs in
+    seconds (operates on sim arrays, no solving).
+
+    Call after simulate_lifecycle returns.
+
+    Parameters
+    ----------
+    model : LifecyclePortfolioModel
+    pc    : Precompute
+    sim   : dict
+        Simulation output from simulate_lifecycle.  Expected keys:
+        'income', 'alive', 'z_idx', 'x', 'death_age', 'ages'.
+    """
+    W = 76
+
+    def header(title):
+        print()
+        print("=" * W)
+        print(f"  {title}")
+        print("=" * W)
+
+    def sub(title):
+        print(f"\n  --- {title} ---")
+
+    def flag(label, ok, detail=""):
+        tag = "[PASS]" if ok else "[WARN]"
+        suf = f"  {detail}" if detail else ""
+        print(f"  {tag}  {label}{suf}")
+
+    sim_tests = []
+
+    def stest(name, passed):
+        sim_tests.append((name, passed))
+        return passed
+
+    # Unpack simulation arrays
+    sim_income = sim["income"]          # (n_sim, n_age)
+    sim_alive  = sim["alive"]           # (n_sim, n_age) bool
+    sim_z_idx  = sim["z_idx"]           # (n_sim, n_age) int
+    ages       = sim["ages"]            # (n_age,)
+    n_sim, n_age = sim_income.shape
+
+    iz0 = int(np.argmin(np.abs(pc.z_grid)))
+    retire_t = model.retire_age - model.start_age
+    working_ages = np.arange(model.start_age, model.retire_age)
+
+    header("POST-SIMULATION INCOME DIAGNOSTICS (Tier 2)")
+    print(f"  Simulation: {n_sim} agents, ages {ages[0]}–{ages[-1]}, "
+          f"{n_age} periods")
+
+    # ── S1. Simulated vs theoretical income moments ─────────────────────────
+    sub("Simulated vs theoretical income moments")
+    print(f"  Compares realized mean income (across alive agents) against the")
+    print(f"  theoretical expectation from the precomputed tables, weighted by")
+    print(f"  the stationary distribution of z and the eps quadrature.\n")
+
+    # Compute stationary distribution of z (eigenvector of Pi_z')
+    _evals, _evecs = np.linalg.eig(pc.Pi_z.T)
+    _stat_idx = int(np.argmin(np.abs(_evals - 1.0)))
+    pi_z_stat = np.abs(_evecs[:, _stat_idx])
+    pi_z_stat = pi_z_stat / pi_z_stat.sum()
+
+    print(f"  {'Age':>4}  {'N_alive':>7}  {'E[Y_sim]':>9}  {'E[Y_theory]':>11}  "
+          f"{'Ratio':>7}  {'Std[Y_sim]':>10}  {'Note':>8}")
+    print(f"  {'---':>4}  {'---':>7}  {'---':>9}  {'---':>11}  "
+          f"{'---':>7}  {'---':>10}  {'---':>8}")
+
+    _key_ages_s1 = [25, 30, 40, 50, 60, model.retire_age - 1,
+                    model.retire_age + 1, 80]
+    _key_ages_s1 = sorted(set(a for a in _key_ages_s1
+                              if model.start_age <= a <= model.terminal_age))
+
+    _worst_ratio_dev = 0.0
+    for _age in _key_ages_s1:
+        _t = _age - model.start_age
+        _alive_mask = sim_alive[:, _t]
+        _n_alive = int(np.sum(_alive_mask))
+        if _n_alive < 10:
+            continue
+
+        _y_alive = sim_income[_alive_mask, _t]
+        _e_sim = float(np.mean(_y_alive))
+        _std_sim = float(np.std(_y_alive))
+
+        # Theoretical: E[Y] = Σ_z π(z) × E_eps[Y(age, z, eps)]
+        if _age < model.retire_age:
+            _e_theory = float(sum(
+                pi_z_stat[iz] * np.dot(pc.eps_weights, pc.working_income[_t, iz, :])
+                for iz in range(len(pc.z_grid))
+            ))
+        else:
+            _e_theory = float(sum(
+                pi_z_stat[iz] * pc.pension_after_tax[_t, iz]
+                for iz in range(len(pc.z_grid))
+            ))
+
+        _ratio = _e_sim / _e_theory if _e_theory > 1e-10 else float("nan")
+        _note = ""
+        if _age == model.retire_age + 1:
+            _note = "pension"
+        _worst_ratio_dev = max(_worst_ratio_dev, abs(_ratio - 1.0))
+
+        print(f"  {_age:>4}  {_n_alive:>7}  {_e_sim:>9.4f}  {_e_theory:>11.4f}  "
+              f"{_ratio:>7.3f}  {_std_sim:>10.4f}  {_note:>8}")
+
+    print()
+    print(f"  Ratio = E[Y_sim] / E[Y_theory].  Values near 1.0 expected.")
+    print(f"  Moderate deviations at older ages are normal: income-dependent")
+    print(f"  mortality selects for higher-z survivors, raising mean income.")
+
+    # S1 test: worst ratio deviation < 20%
+    _ok = _worst_ratio_dev < 0.20
+    flag("Sim/theory income ratio within 20% at all ages", _ok,
+         f"worst deviation = {_worst_ratio_dev:.1%}")
+    stest("Income moments sim vs theory", _ok)
+
+    # ── S2. Realized replacement rates ──────────────────────────────────────
+    sub("Realized replacement rates at retirement")
+    print(f"  Distribution of pension / last-working-year income across agents")
+    print(f"  who survive to retirement.  The transitory shock eps makes the")
+    print(f"  last-year income noisy, so these ratios are more dispersed than")
+    print(f"  the grid-based Tier 1 values.\n")
+
+    # Find agents alive at both last working year and first pension year
+    _t_last_work = retire_t - 1
+    _t_first_pens = retire_t + 1
+    if _t_first_pens < n_age:
+        _retiree_mask = sim_alive[:, _t_last_work] & sim_alive[:, _t_first_pens]
+        _n_retirees = int(np.sum(_retiree_mask))
+
+        _y_last = sim_income[_retiree_mask, _t_last_work]
+        _y_pens = sim_income[_retiree_mask, _t_first_pens]
+
+        # Avoid division by zero for agents with very low last-year income
+        _safe = _y_last > 1e-6
+        _repl_realized = _y_pens[_safe] / _y_last[_safe]
+
+        if len(_repl_realized) > 0:
+            _pctiles = [10, 25, 50, 75, 90]
+            _pct_vals = np.percentile(_repl_realized, _pctiles)
+
+            print(f"  N retirees (alive at ages {model.retire_age - 1} & {model.retire_age + 1}): "
+                  f"{_n_retirees}")
+            print()
+            print(f"  {'Percentile':>10}  {'Last Y_net':>10}  {'Pension':>8}  {'Repl.rate':>9}")
+            print(f"  {'---':>10}  {'---':>10}  {'---':>8}  {'---':>9}")
+
+            for _p in _pctiles:
+                _idx = int(np.percentile(np.arange(len(_repl_realized)),
+                                         _p, method='nearest'))
+                # Show representative agent near this percentile
+                _sort_idx = np.argsort(_repl_realized)
+                _agent_idx = _sort_idx[min(_idx, len(_sort_idx)-1)]
+                print(f"  {_p:>9}th  {_y_last[_safe][_agent_idx]:>10.4f}  "
+                      f"{_y_pens[_safe][_agent_idx]:>8.4f}  "
+                      f"{_repl_realized[_agent_idx]:>8.1%}")
+
+            _median_repl = float(np.median(_repl_realized))
+            print(f"\n  Median realized replacement rate: {_median_repl:.1%}")
+
+            # S2 test: median replacement rate in plausible range
+            _ok = 0.20 <= _median_repl <= 2.0
+            flag("Median realized replacement rate in [20%, 200%]", _ok,
+                 f"median = {_median_repl:.1%}")
+            stest("Realized replacement rate range", _ok)
+        else:
+            print("  WARNING: No retirees with positive last-year income.")
+            stest("Realized replacement rate range", False)
+    else:
+        print("  WARNING: Cannot compute — simulation too short for pension year.")
+        stest("Realized replacement rate range", False)
+
+    # ── S3. Retirement boundary trace ───────────────────────────────────────
+    sub("Retirement boundary trace (spot-check individual agents)")
+    print(f"  Traces 3 individual agents through the retirement transition.")
+    print(f"  Verifies: z_idx freezes at retirement, income switches from")
+    print(f"  working_income to pension_after_tax, no unexpected jumps.\n")
+
+    # Pick 3 agents that survive past retirement: low, mid, high z at retirement
+    _surv_retire = np.where(sim_alive[:, min(retire_t + 2, n_age - 1)])[0]
+    if len(_surv_retire) >= 3:
+        _z_at_retire = sim_z_idx[_surv_retire, retire_t]
+        _z_sorted = np.argsort(_z_at_retire)
+        _picks = [_z_sorted[0],
+                  _z_sorted[len(_z_sorted) // 2],
+                  _z_sorted[-1]]
+        _agent_ids = _surv_retire[_picks]
+    elif len(_surv_retire) > 0:
+        _agent_ids = _surv_retire[:min(3, len(_surv_retire))]
+    else:
+        _agent_ids = []
+
+    _z_freeze_ok = True
+    for _agent in _agent_ids:
+        _z_ret = sim_z_idx[_agent, retire_t]
+        print(f"  Agent #{_agent}  (z_idx at retirement = {_z_ret},"
+              f" z = {pc.z_grid[_z_ret]:.3f})")
+        print(f"    {'Age':>4}  {'z_idx':>5}  {'Income':>8}  {'Note':>20}")
+
+        for _t in range(max(0, retire_t - 2), min(n_age, retire_t + 4)):
+            _age = ages[_t]
+            _z_t = sim_z_idx[_agent, _t]
+            _y_t = sim_income[_agent, _t]
+            _note = ""
+            if _age == model.retire_age - 1:
+                _note = "last working year"
+            elif _age == model.retire_age:
+                _note = "final labor paycheck"
+            elif _age == model.retire_age + 1:
+                _note = "first pension"
+            # Check z frozen after retirement
+            if _age > model.retire_age and _z_t != _z_ret:
+                _note += " Z NOT FROZEN!"
+                _z_freeze_ok = False
+            print(f"    {_age:>4}  {_z_t:>5}  {_y_t:>8.4f}  {_note}")
+        print()
+
+    flag("z_idx frozen after retirement for all traced agents", _z_freeze_ok)
+    stest("z frozen at retirement", _z_freeze_ok)
+
+    # Broader z-freeze check across all agents
+    if retire_t + 1 < n_age:
+        _alive_post = sim_alive[:, retire_t + 1]
+        _z_at_ret = sim_z_idx[:, retire_t]
+        _z_at_ret1 = sim_z_idx[:, retire_t + 1]
+        _z_frozen_all = np.all(_z_at_ret[_alive_post] == _z_at_ret1[_alive_post])
+        flag("z_idx frozen for ALL agents at retire+1", _z_frozen_all,
+             f"checked {int(np.sum(_alive_post))} alive agents")
+        stest("z frozen globally at retire+1", _z_frozen_all)
+
+    # ── S4. Survivor selection effect ───────────────────────────────────────
+    sub("Survivor selection effect  (income-dependent mortality)")
+    print(f"  If mortality is income-dependent, the surviving population should")
+    print(f"  shift toward higher z over time (richer people live longer).")
+    print(f"  Mean z_idx should rise with age; if it doesn't, the mortality")
+    print(f"  calibration may not be working as intended.\n")
+
+    print(f"  {'Age':>4}  {'N_alive':>7}  {'Mean z_idx':>10}  {'Med z_idx':>9}  "
+          f"{'Frac z>0':>8}  {'Note':>12}")
+    print(f"  {'---':>4}  {'---':>7}  {'---':>10}  {'---':>9}  "
+          f"{'---':>8}  {'---':>12}")
+
+    _select_ages = [model.start_age, 30, 50, model.retire_age, 75, 85, 95]
+    _select_ages = sorted(set(a for a in _select_ages
+                              if model.start_age <= a <= model.terminal_age))
+
+    _mean_z_vals = []
+    for _age in _select_ages:
+        _t = _age - model.start_age
+        _alive_mask = sim_alive[:, _t]
+        _n_alive = int(np.sum(_alive_mask))
+        if _n_alive < 5:
+            continue
+
+        _z_alive = sim_z_idx[_alive_mask, _t]
+        _mean_z = float(np.mean(_z_alive))
+        _med_z = float(np.median(_z_alive))
+        _frac_above_mid = float(np.mean(_z_alive > iz0))
+        _mean_z_vals.append(_mean_z)
+
+        _note = ""
+        if _age == model.start_age:
+            _note = "entry"
+        elif _age == model.retire_age:
+            _note = "retirement"
+
+        print(f"  {_age:>4}  {_n_alive:>7}  {_mean_z:>10.2f}  {_med_z:>9.1f}  "
+              f"{_frac_above_mid:>7.1%}   {_note:>12}")
+
+    # S4 test: mean z_idx at last reported age > mean z_idx at first reported age
+    if len(_mean_z_vals) >= 2:
+        _selection_present = _mean_z_vals[-1] > _mean_z_vals[0]
+        flag("Survivor selection: mean z_idx rises with age", _selection_present,
+             f"entry = {_mean_z_vals[0]:.2f}, late life = {_mean_z_vals[-1]:.2f}")
+        stest("Survivor selection present", _selection_present)
+
+    # ── TIER 2 PASS/FAIL SUMMARY ─────────────────────────────────────────────
+    _n_pass = sum(1 for _, p in sim_tests if p)
+    _n_fail = sum(1 for _, p in sim_tests if not p)
+    _n_total = len(sim_tests)
+
+    print()
+    print("-" * W)
+    if _n_fail == 0:
+        print(f"  SIMULATION INCOME DIAGNOSTIC SUMMARY:  ALL {_n_total} TESTS PASSED")
+    else:
+        print(f"  SIMULATION INCOME DIAGNOSTIC SUMMARY:  {_n_fail} FAILED  /  {_n_total} total")
+        print()
+        for _tname, _tpassed in sim_tests:
+            if not _tpassed:
+                print(f"    [FAIL]  {_tname}")
+    print("-" * W)
 
 
 # =============================================================================

@@ -341,28 +341,53 @@ class Precompute:
             )
 
     def _precompute_working_income(self):
-        """After-tax labor income table: [age, z_state, eps_node]."""
-        n_age = len(self.ages)
-        n_z = len(self.z_grid)
-        n_eps = len(self.eps_nodes)
+        """
+        After-tax labor income table: shape (n_age, n_z, n_eps).
 
-        out = np.empty((n_age, n_z, n_eps), dtype=float)
-        for t_idx, age in enumerate(self.ages):
-            det = (self.model.b0 + self.model.b1 * age
-                   + self.model.b2 * (age ** 2) / 10.0
-                   + self.model.b3 * (age ** 3) / 100.0)
+        Gross income at each (age, z, eps) grid point:
+            Y_gross = exp(f(age) + z + eps)
+        where f(age) = b0 + b1*age + b2*age^2/10 + b3*age^3/100
+        is the deterministic age-earnings profile (Guvenen et al. 2022).
 
-            for iz in range(n_z):
-                p_val = self.z_grid[iz]
-                for ie in range(n_eps):
-                    y_gross = np.exp(det + p_val + self.eps_nodes[ie])
-                    out[t_idx, iz, ie] = disposable_income_working(y_gross)
+        After-tax income applies payroll tax (10.6%, capped at 2.5) plus
+        progressive income tax (7 TCJA brackets) via disposable_income_working.
 
-        return out
+        Vectorized: broadcasts over all (age, z, eps) simultaneously.
+        """
+        ages = self.ages[:, None, None]          # (n_age, 1, 1)
+        z    = self.z_grid[None, :, None]        # (1, n_z, 1)
+        eps  = self.eps_nodes[None, None, :]     # (1, 1, n_eps)
+
+        det = (self.model.b0
+               + self.model.b1 * ages
+               + self.model.b2 * ages**2 / 10.0
+               + self.model.b3 * ages**3 / 100.0)
+
+        y_gross = np.exp(det + z + eps)
+        return disposable_income_working(y_gross)
 
     def _precompute_pension(self):
-        """After-tax pension table: [age, z_state]."""
-        base_pension = compute_pension_after_tax(self.z_grid)
+        """
+        After-tax pension table: shape (n_age, n_z).
+
+        Computes avg_det = mean(exp(f(age))) over working ages, then
+        passes it to compute_pension_after_tax so AIME is correctly
+        scaled by the deterministic lifecycle profile.
+
+        Catherine (2025) eq. (20):
+            AIYE_it = L_bar_t * sum min{L_tilde_is, 2.5}
+        Approximation:
+            AIME(z) ~ min(exp(z) * avg_det, 2.5)
+        """
+        model = self.model
+        working_ages = np.arange(model.start_age, model.retire_age)
+        log_det = (model.b0
+                   + model.b1 * working_ages
+                   + model.b2 * working_ages**2 / 10.0
+                   + model.b3 * working_ages**3 / 100.0)
+        avg_det = float(np.mean(np.exp(log_det)))
+
+        base_pension = compute_pension_after_tax(self.z_grid, avg_det)
         n_age = len(self.ages)
         n_z = len(self.z_grid)
         out = np.empty((n_age, n_z), dtype=float)

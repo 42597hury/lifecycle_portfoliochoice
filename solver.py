@@ -1533,15 +1533,16 @@ def _solve_retirement_step_jit(wealth_grid, savings_grid, z_grid, N_state,
         diag_float[i_s, 3] = 2.0   # DF_MIN_ALPHA_S (init high)
         diag_float[i_s, 5] = 2.0   # DF_MIN_ALPHA_B (init high)
 
+        # Scratch buffers reused across z_i (size invariant; fully overwritten each z_i)
+        temp_x = np.empty(n_savings + 1)
+        temp_c = np.empty(n_savings + 1)
+        temp_s = np.empty(n_savings + 1)
+        temp_b = np.empty(n_savings + 1)
+
         for z_i in range(n_z):
             psi = psi_vec[z_i]
             c_next_slice    = c_next_full[z_i, :, :]  # (N_state, n_w)
             pension_next    = pension_1d[z_i]
-
-            temp_x = np.empty(n_savings + 1)
-            temp_c = np.empty(n_savings + 1)
-            temp_s = np.empty(n_savings + 1)
-            temp_b = np.empty(n_savings + 1)
 
             # Anchor at zero savings
             temp_x[0] = sc.egm_anchor;  temp_c[0] = sc.egm_anchor
@@ -1715,12 +1716,14 @@ def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
         diag_float[i_s, 3] = 2.0   # DF_MIN_ALPHA_S (init high)
         diag_float[i_s, 5] = 2.0   # DF_MIN_ALPHA_B (init high)
 
+        # Scratch buffers reused across z_i (size invariant; fully overwritten each z_i)
+        temp_x = np.empty(n_savings + 1)
+        temp_c = np.empty(n_savings + 1)
+        temp_s = np.empty(n_savings + 1)
+        temp_b = np.empty(n_savings + 1)
+
         for z_i in range(n_z):
             psi = psi_vec[z_i]
-            temp_x = np.empty(n_savings + 1)
-            temp_c = np.empty(n_savings + 1)
-            temp_s = np.empty(n_savings + 1)
-            temp_b = np.empty(n_savings + 1)
 
             temp_x[0] = sc.egm_anchor;  temp_c[0] = sc.egm_anchor
             temp_s[0] = 0.0;    temp_b[0] = 0.0

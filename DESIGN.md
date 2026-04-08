@@ -210,13 +210,81 @@ Calibration (Guvenen et al. 2022):
 After-tax income uses a post-TCJA progressive tax schedule (7 brackets: 10%, 12%,
 22%, 24%, 32%, 35%, 37%). The income process is independent of the VAR.
 
-**Retirement income:** At `retire_age` (67), the persistent state `z` freezes
-and the agent receives Social Security pension with a progressive replacement
-rate based on `exp(z)` (career earnings rank). The last `z` transition occurs
-between `retire_age - 1` and `retire_age` (age 66→67); the realized `z` at 67
-determines pension for all subsequent periods. The working-age solver handles
-age 66 (last labor income at 67), and the retirement solver handles ages 67+
-(first pension payment at 68).
+**Retirement income (Social Security pension):** At `retire_age` (67), the
+persistent state `z` freezes and the agent receives a Social Security pension
+that follows the U.S. SSA Primary Insurance Amount (PIA) formula as in
+Catherine (2025), Section 3.4, eqs. (17)–(20). The pension is constant in
+levels for the rest of life (no further indexation in model units).
+
+The benefit is a piecewise-linear function of **AIME** (Average Indexed
+Monthly/Yearly Earnings), *not* of `exp(z)` directly. AIME is the career
+average of total income, capped at the SSA taxable maximum of `2.5 × L̄`
+(where the wage index `L̄ = 1` in model units):
+
+```
+AIYE_it = L̄_t · Σ_{s=t0}^{t} min{ L̃_is, 2.5 }          (Catherine eq. 20)
+L̃_is   = L_is / L̄_s
+```
+
+In our model gross income is `exp(f(age) + z + ε)` where `f(age)` is the
+deterministic age-earnings profile and `ε` averages to zero. With a stationary
+wage index, AIME for a worker at persistent state `z` is approximated by
+
+```
+AIME(z) ≈ min( exp(z) · avg_det , 2.5 )
+avg_det  = mean_{age ∈ [start_age, retire_age)} exp(f(age))
+f(age)   = b0 + b1·age + b2·age²/10 + b3·age³/100
+```
+
+With the calibrated `(b0, b1, b2, b3)`, `avg_det ≈ 0.5069`, so the median
+worker (`z = 0`) has AIME ≈ 0.507 — *not* 1.0. Multiplying by `avg_det`
+converts the persistent component to a career-average level; the 2.5 cap
+makes the benefit side consistent with the payroll-tax cap already used in
+`disposable_income_working` (`payroll_tax = 0.106 · min(y, 2.5)`).
+
+The PIA formula (Catherine eq. 19) applies SSA-style bend points and
+replacement rates to AIME:
+
+```
+            ⎧ r1 · AIME                                              if AIME ≤ b1
+PIA(AIME) = ⎨ r1·b1 + r2·(AIME − b1)                                 if b1 < AIME ≤ b2
+            ⎩ r1·b1 + r2·(b2−b1) + r3·(AIME − b2)                    if AIME > b2
+
+bend points: b1 = 0.21,  b2 = 1.25
+rates:       r1 = 0.90,  r2 = 0.32,  r3 = 0.15
+```
+
+The gross PIA is then taxed by the same 7-bracket progressive income-tax
+schedule used for labor income, yielding `pension_after_tax(z)`. Because
+`avg_det` and the bend points do not depend on age, the precomputed table
+`pension_after_tax` of shape `(n_age, n_z)` is just the `(n_z,)` vector
+tiled across all ages.
+
+Resulting calibration (n_z = 11 grid):
+
+| z          | AIME            | pension after-tax |
+|------------|-----------------|-------------------|
+| `z = 0`    | 0.507           | ≈ 0.254           |
+| `z ≈ 1.12` | 1.554           | ≈ 0.503           |
+| `z ≥ 1.6`  | 2.5 (cap binds) | ≈ 0.628           |
+
+This gives a replacement rate of ≈ 63% relative to career-average after-tax
+income at `z = 0`, and a much smaller cross-sectional dispersion than an
+uncapped `exp(z)`-based scheme would produce.
+
+**Timing.** The last `z` transition occurs between `retire_age − 1` and
+`retire_age` (age 66 → 67); the realized `z` at 67 determines the pension
+for all subsequent periods. The working-age solver handles age 66 (last
+labor income at 67), and the retirement solver handles ages 67+ (first
+pension payment at 68).
+
+**Implementation:**
+- `compute_pension_after_tax(z_grid, avg_det)` in `model.py` — applies the
+  AIME cap, the PIA piecewise formula, and the income-tax schedule.
+- `_precompute_pension(self)` in `precompute.py` — computes `avg_det` from
+  the model's `(b0, b1, b2, b3)` over `[start_age, retire_age)` and tiles
+  `compute_pension_after_tax(z_grid, avg_det)` across ages into
+  `pension_after_tax` of shape `(n_age, n_z)`.
 
 ---
 
@@ -566,7 +634,7 @@ create_utility_functions(gamma)          # Returns u, u_prime, u_prime_inv
 mixture_cdf(x, p, mu1, sigma1, mu2, sigma2)
 mixture_quantile(q, p, mu1, sigma1, mu2, sigma2)
 disposable_income_working(y_gross)       # Progressive tax on labor income
-compute_pension_after_tax(z_grid)        # Social Security benefit formula
+compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_det, 2.5)
 ```
 
 ### 3.4 var.py and precompute.py -- VAR Parameter Handling

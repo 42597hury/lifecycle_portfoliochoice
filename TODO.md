@@ -2,24 +2,9 @@
 
 **Project:** Lifecycle Portfolio Choice Model with Stocks, Nominal Bonds, and Bills  
 **Deadline:** 18 May 2026  
-**Last updated:** 7 April 2026  
+**Last updated:** 8 April 2026  
 
 Status markers: `[ ]` open, `[~]` in progress, `[x]` done
-
----
-
-## RECENT FIXES (verify before removing)
-
-- [~] **0. Pension AIME calibration fix** (2026-04-07)
-  - `compute_pension_after_tax` in `model.py` now takes `(z_grid, avg_det)` and applies the SSA PIA formula to `AIME(z) = min(exp(z) * avg_det, 2.5)` per Catherine (2025) eqs. (19)–(20), instead of feeding raw `exp(z)` with no cap.
-  - `_precompute_pension` in `precompute.py` computes `avg_det = mean(exp(f(age)))` over `[start_age, retire_age)` (≈ 0.5069) and passes it through.
-  - DESIGN.md §1 retirement-income section rewritten to document the new formula.
-  - Sanity numbers: pension at z=0 ≈ 0.254 (was 0.392), cap binds for z ≥ ~1.6 at ≈ 0.628 (was 26.6 at z_max). Replacement rate at z=0 ≈ 63% of career-average after-tax income.
-  - **Qualifier — verify before removing this item:**
-    - Re-solve the model end-to-end and confirm the solver still converges cleanly (no new Newton failures, no NaN/Inf).
-    - Run diagnostics and confirm `pension_after_tax` numbers match the expected table in `PENSION_FIX_HANDOFF.md` §5.1.
-    - Re-run a baseline simulation and confirm the qualitative effects are present: more working-life saving, lower early-retirement consumption, higher explicit bond demand.
-    - Only after these three checks pass should this item be marked `[x]` and deleted.
 
 ---
 
@@ -55,30 +40,46 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
 
 ## MODEL CALIBRATION CHECKS
 
-- [ ] **5. Pin down the money unit**
-  - Compute `det = b0 + b1*40 + b2*40²/10 + b3*40³/100` with b0=-6.142, b1=0.304, b2=-0.051, b3=0.002586
-  - Compute `exp(det)` at age 40 with z=0, eps=0 — this is median gross income in model units
-  - Compare to US median household income (~$70k in 2023 real dollars)
-  - Determine the scaling factor: if `exp(det) ≈ 0.55`, then 1.0 model unit ≈ $127k
-  - Verify this scaling is consistent with Catherine (2025) — check their Table 1 or calibration section
-  - Document the mapping explicitly: "1 model unit = $X in 2023 real dollars"
+- [x] **5. Pin down the money unit** — RESOLVED 8 Apr 2026
+  - **1 model unit = SS Wage Index ≈ $54,100 (2019 dollars)**
+  - Source: Catherine (2025) Section 5.1: "Households enter working life with 0.1× the national wage index in net worth, the equivalent of $5,400 in 2019."
+  - Previous estimate of ~$61k was wrong (used 2023 brackets instead of 2019)
+  - **Action:** Update any documentation that references "$61k" to "$54,100 (2019)"
 
-- [ ] **6. Initial wealth calibration**
-  - The `0.1` default in `simulation.py` `_initialize_initial_wealth()` is flagged with a TODO
-  - Using the unit from item 5, check what `0.1` means in real dollars (e.g., 0.1 × $127k = $12.7k)
-  - Compare to SCF data on median net worth of 22-year-olds
-  - Catherine (2025) uses "0.1 × national wage index" — verify this is what you're implementing
-  - Consider whether the initial wealth distribution matters for results (sensitivity check)
+- [x] **6. Initial wealth calibration** — RESOLVED 8 Apr 2026
+  - `initial_wealth = 0.1` = 0.1 × $54,100 = $5,410
+  - Matches Catherine (2025) exactly: "0.1 × national wage index = $5,400"
+  - No change needed
 
-- [ ] **7. Confirm income/return unit consistency**
-  - Income is in real terms (age-earnings polynomial from Catherine 2025)
-  - Returns are in real terms (rtb = nominal bill rate minus CPI inflation; xr, xb are excess over rtb)
-  - Check: `exp(det(age=40)) ≈ 0.5` in model units, and `wealth_max = 200` means ~$25M — is that enough headroom?
-  - Check: `pension_after_tax` at median z gives a replacement rate of ~40-60% of last working income
-  - Check: the tax brackets in `disposable_income_working()` align with the model unit (thresholds at 0.18, 0.72, 1.54, etc. should correspond to real bracket boundaries in model dollars)
-  - Check: bequest `annuity_factor` at median y_nom gives A ≈ 8–9, meaning the heir spreads wealth over ~8-9 years of consumption — sensible for a 10-year horizon
+- [x] **7. Confirm income/return unit consistency** — RESOLVED 8 Apr 2026
+  - All tax brackets match 2019 TCJA single-filer schedule at $54,100/unit to within 1–2%:
+    - 10%/12% boundary: 0.18 × $54,100 = $9,738 vs real $9,700
+    - 12%/22%: 0.72 × $54,100 = $38,952 vs real $39,475
+    - 22%/24%: 1.54 × $54,100 = $83,314 vs real $84,200
+    - 24%/32%: 2.94 × $54,100 = $159,054 vs real $160,725
+    - 32%/35%: 3.73 × $54,100 = $201,793 vs real $204,100
+    - 35%/37%: 9.32 × $54,100 = $504,212 vs real $510,300
+  - Payroll cap: 2.5 × $54,100 = $135,250 vs real 2019 SS taxable max $132,900 — consistent
+  - Pension replacement rates verified correct at multiple z values:
+    - z=0: 62% of career-avg after-tax, 74% of last-year after-tax, 49% of peak-year after-tax
+    - The ~49% vs peak is closest to the SSA headline "~40%" figure
+    - Rates decline progressively with earnings (98.8% at z_min → 0.7% at z_max)
+  - SSA PIA bend points (0.21 and 1.25) match 2019 SSA thresholds to within 2%
+  - Returns are real by VAR construction — no additional adjustment needed
+  - wealth_max = 200 = ~$10.8M — adequate ceiling
 
-- [ ] **8. Document inflation treatment in thesis**
+- [x] **8. Pension formula fix** — RESOLVED 8 Apr 2026
+  - `compute_pension_after_tax` now takes `avg_det` parameter
+  - Input: `aime = min(exp(z) * avg_det, 2.5)` — scales by career-average deterministic income, caps at SSA taxable max
+  - `_precompute_pension` computes `avg_det` from model's age-earnings coefficients
+  - `diagnostics.py` includes full AIME pipeline trace with hand-calculation cross-check
+  - DESIGN.md updated with complete pension formula documentation
+
+- [x] **9. Memory fix — hoist temp array allocation** — RESOLVED 8 Apr 2026
+  - `temp_x/c/s/b` moved from inside `for z_i` to just after `for i_s in prange`
+  - Applies to both `_solve_retirement_step_jit` and `_solve_working_age_step_jit`
+
+- [ ] **10. Document inflation treatment in thesis**
   - Returns are real by VAR construction: rtb = nominal bill minus CPI inflation; xr and xb are excess returns (inflation cancels)
   - Portfolio return R_port is therefore a gross real return — consumption and wealth are in real terms
   - Bequest annuity factor uses nominal yield y_nom by design (Catherine 2025): the heir purchases a nominal annuity, so inflation erodes bequests — this is an intentional economic channel
@@ -89,37 +90,37 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
 
 ## RETURNS & VAR QUALITY
 
-- [ ] **9. VAR moment validation**
+- [ ] **11. VAR moment validation**
   - Simulate the standalone annual VAR forward (10,000 draws, 200 periods, burn 100)
   - Compare simulated means to `z_bar`: rtb ≈ -0.08%, xr ≈ 5.36%, xb ≈ 2.36%, y_nom ≈ 3.65%, dp ≈ -4.15
   - Compare simulated stds and autocorrelations to sample estimates
   - Check: no explosive paths, stationary distribution looks reasonable
   - Plot marginal histograms of each variable from simulation vs sample
 
-- [ ] **10. Annualization verification**
+- [ ] **12. Annualization verification**
   - Confirm `annualize_var_config` output: annual xr mean ≈ 5.4%, xb ≈ 2.4%
   - Check Phi_11 diagonal after annualization: rtb persistence should drop, y_nom and dp stay high
   - Verify `mean_return_ratio ≈ 4.0` for both xr and xb (exact for sums of quarterly returns)
 
-- [ ] **11. Conditional return economic sense check**
+- [ ] **13. Conditional return economic sense check**
   - Inspect `mu_r[i,j,:]` for a few state transitions
   - Check: when dp is high (high expected returns), conditional E[xr] should be higher
   - Check: when y_nom rises, conditional E[xb] should be negative (bond prices fall)
   - Check: the `M` matrix signs make economic sense (M captures how state innovations predict return residuals)
 
-- [ ] **12. Residual variance check**
+- [ ] **14. Residual variance check**
   - The partition reports variance explained by conditioning: xb should be ~99.5% explained (bond returns are nearly deterministic given state)
   - xr residual should be larger — stocks are noisier
   - Check: `Sigma_r_cond` diagonal values are reasonable (residual annual stock vol ~13%, bond vol ~1%)
 
-- [ ] **13. Nominal vs real yield investigation**
+- [ ] **15. Nominal vs real yield investigation**
   - y_nom conflates real rate and expected inflation channels
   - These have opposite implications for hedging demand (Nijman et al. 2005, Figure 2)
   - TIPS system data available (`build_tips_system2_var_config`) but short sample (~87 obs vs 183)
   - Decision needed: run TIPS system as robustness (Option B) or discuss as limitation (Option A)
   - At minimum, document this conflation in the thesis
 
-- [ ] **14. Predictability sensitivity**
+- [ ] **16. Predictability sensitivity**
   - Consider: alternative sample windows (post-2000, post-GFC)
   - Consider: shrinking Phi_21 toward zero to show what happens when predictability is turned off
   - Consider: comparing restricted vs unrestricted VAR estimation
@@ -129,13 +130,13 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
 
 ## RESULTS & FIGURES
 
-- [ ] **15. Code Phase 1 figures** (18 items from RESULTS.md, one solve + one sim)
+- [ ] **17. Code Phase 1 figures** (18 items from RESULTS.md, one solve + one sim)
   - Tables 1, 2, 4
   - Figures 1–7, 10–17
   - All use baseline solve + one simulation — no re-solving needed
   - Write as a single `results.py` module taking `(model, pc, C_mat, S_mat, B_mat, sim)`
 
-- [ ] **16. Code Phase 2 figures** (requires additional solves)
+- [ ] **18. Code Phase 2 figures** (requires additional solves)
   - Figure 8: Social Security decomposition (solve with pension=0)
   - Figure 9: Risk aversion sensitivity (solves at γ=2, 5, 8)
   - Table 3: Welfare costs of approximation rules
@@ -143,47 +144,40 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
   - Figure 19: Bond premium sensitivity (5–7 solves varying E[xb])
   - Only if time allows after Phase 1
 
-- [ ] **17. Decide on Phase 3 scope**
+- [ ] **19. Decide on Phase 3 scope**
   - Figure 7 full version (IID solve for clean hedging decomposition)
   - Table 3 rules 6–7 (restricted asset menus)
   - No-labor-income solve (pure financial model, CCV comparison)
-  - Grid convergence check (included in production ladder, item 19)
+  - Grid convergence check (included in production ladder, item 21)
 
 ---
 
 ## PRODUCTION RUN
 
-- [ ] **18. AWS instance setup**
+- [ ] **20. AWS instance setup**
   - Instance type: c5.4xlarge (16 vCPUs, 32 GB RAM) or similar
   - Peak memory estimate: ~3.5 GB — comfortable on 32 GB
   - Set up environment: Python 3.10+, numba, numpy, scipy, matplotlib
 
-- [ ] **19. Grid convergence ladder**
+- [ ] **21. Grid convergence ladder**
   - Solve at 5×5×5 → 7×7×7 → 9×9×9 → 10×10×10
   - At each step check: all diagnostics clean, Newton convergence > 99%, no NaN/Inf
   - Compare median portfolio shares at key ages (30, 45, 67, 80) across grid sizes
   - Policy functions should converge — if 9×9×9 and 10×10×10 agree closely, the solution is stable
   - Only the 10×10×10 step is expensive; the rest are quick sanity gates
 
-- [ ] **20. Solver output checklist**
+- [ ] **22. Solver output checklist**
   - Confirm `run_lifecycle_solver` prints per-age convergence table
   - Confirm `policy_io.save_policy_bundle` saves arrays + diagnostics + metadata
   - Verify saved bundle can be reloaded with `load_policy_bundle`
   - Save the full `disc_config` and `solver_config` in metadata for reproducibility
 
-- [x] **21. Memory fix — hoist temp array allocation**
-  - In `_solve_retirement_step_jit`: move `temp_x/c/s/b = np.empty(...)` from inside `for z_i` to just after `for i_s in prange`
-  - In `_solve_working_age_step_jit`: same fix
-  - Currently creates 3.4M needless allocations per full solve (4 arrays × 11 z × 1000 states × 77 ages)
-  - Not a crash risk but creates allocation overhead and GC pressure inside Numba's runtime
-  - Quick fix: literally move 4 lines up by one indentation level, contents are overwritten each z_i anyway
-
-- [ ] **22. Production solve (10×10×10)**
+- [ ] **23. Production solve (10×10×10)**
   - `disc_config = DiscretizationConfig(state_grid_sizes=(10,10,10), n_ret_nodes_1d=3, ...)`
   - Expected runtime: several hours (dominated by working-age periods)
   - Save full policy bundle to disk immediately after solve
 
-- [ ] **23. Production simulation + regenerate all figures**
+- [ ] **24. Production simulation + regenerate all figures**
   - Run 10k-path simulation from production arrays
   - Regenerate all Phase 1 figures from production output
   - These are the figures that go in the thesis
@@ -192,14 +186,14 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
 
 ## CODE QUALITY CHECKS
 
-- [ ] **24. Wealth grid ceiling check**
+- [ ] **25. Wealth grid ceiling check**
   - After simulation, check `max(sim["x"])` across all alive agents
   - If any agent's cash-on-hand exceeds `wealth_max=200`, `fast_interp_1d` uses linear extrapolation
   - For consumption this is likely fine (MPC is well-behaved at the boundary)
   - For portfolio shares, extrapolation could push values outside [0,1] — check `sim["alpha_s"]` and `sim["alpha_b"]` ranges
   - If ceiling is hit, raise `wealth_max` or add a runtime warning
 
-- [ ] **25. Terminal solver speed**
+- [ ] **26. Terminal solver speed**
   - `solve_portfolio_2d_terminal_exact` calls `scipy.optimize.minimize` (Python, not Numba)
   - At 10×10×10: 1,000 states × up to 5 starting points × potential SLSQP fallback
   - Estimate: 15–30 minutes for terminal age alone

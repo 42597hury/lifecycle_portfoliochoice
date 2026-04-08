@@ -253,6 +253,84 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
          "both 2.500 (disposable_income_working & compute_pension_after_tax)")
     itest("Payroll cap = AIME cap", _ok)
 
+    # ── 2b½. Persistent income transition quality ────────────────────────────
+    sub("Persistent income transition quality (Pi_z)")
+    print(f"  Checks whether the discretized z-transition matches the true AR(1)")
+    print(f"  with mixture-normal innovations.  Moments computed at z = 0 (mid row).\n")
+
+    # True innovation moments from mixture parameters
+    _e_eta3 = (model.pz * (model.mu_eta1**3 + 3 * model.mu_eta1 * model.sigma_eta1**2)
+               + (1.0 - model.pz) * (model.mu_eta2**3 + 3 * model.mu_eta2 * model.sigma_eta2**2))
+    _true_skew = _e_eta3 / max(var_eta**1.5, 1e-15)
+    _e_eta4 = (model.pz * (model.mu_eta1**4 + 6 * model.mu_eta1**2 * model.sigma_eta1**2 + 3 * model.sigma_eta1**4)
+               + (1.0 - model.pz) * (model.mu_eta2**4 + 6 * model.mu_eta2**2 * model.sigma_eta2**2 + 3 * model.sigma_eta2**4))
+    _true_kurt = _e_eta4 / max(var_eta**2, 1e-15)
+
+    print(f"  True innovation moments (mixture-normal):")
+    print(f"    Mean     = {mu_eta:.4f}")
+    print(f"    Variance = {var_eta:.5f}")
+    print(f"    Skewness = {_true_skew:+.3f}    (negative: large downward shocks from component 1)")
+    print(f"    Kurtosis = {_true_kurt:.2f}     (fat tails; Gaussian = 3.0)")
+    print()
+
+    # Discretized transition moments from Pi_z at mid row
+    _dz_vals = pc.z_grid - pc.z_grid[iz0]
+    _disc_mean = float(np.dot(pc.Pi_z[iz0], pc.z_grid))
+    _disc_e2 = float(np.dot(pc.Pi_z[iz0], _dz_vals**2))
+    _disc_e1 = float(np.dot(pc.Pi_z[iz0], _dz_vals))
+    _disc_var = _disc_e2 - _disc_e1**2
+    _disc_e3 = float(np.dot(pc.Pi_z[iz0], _dz_vals**3))
+    _disc_e4 = float(np.dot(pc.Pi_z[iz0], _dz_vals**4))
+    _disc_skew = (_disc_e3 - 3 * _disc_e1 * _disc_var - _disc_e1**3) / max(_disc_var**1.5, 1e-15) if _disc_var > 0 else 0.0
+    _disc_kurt = _disc_e4 / max(_disc_var**2, 1e-15) if _disc_var > 0 else 0.0
+
+    _true_cond_mean = model.rho * pc.z_grid[iz0]
+
+    print(f"  Discretized transition moments (Pi_z, mid row iz={iz0}, z={pc.z_grid[iz0]:.4f}):")
+    print(f"    E[z'|z=0]  = {_disc_mean:+.5f}   (true = {_true_cond_mean:+.5f},  error = {_disc_mean - _true_cond_mean:+.1e})")
+    print(f"    Variance   = {_disc_var:.5f}   (true = {var_eta:.5f},  ratio = {_disc_var / var_eta:.2f})")
+    print(f"    Skewness   = {_disc_skew:+.3f}     (true = {_true_skew:+.3f})")
+    print(f"    Kurtosis   = {_disc_kurt:.2f}      (true = {_true_kurt:.2f})")
+    print()
+
+    _p_down = float(sum(pc.Pi_z[iz0, j] for j in range(iz0)))
+    _p_stay = float(pc.Pi_z[iz0, iz0])
+    _p_up = float(sum(pc.Pi_z[iz0, j] for j in range(iz0 + 1, n_z)))
+    _n_reachable = int(np.sum(pc.Pi_z[iz0, :] > 1e-10))
+
+    print(f"  Transition direction at z = 0:")
+    print(f"    P(down) = {_p_down:.4f}    P(stay) = {_p_stay:.4f}    P(up) = {_p_up:.4f}")
+    print(f"    Reachable states from mid: {_n_reachable} of {n_z}")
+    print()
+
+    _dz = pc.z_grid[1] - pc.z_grid[0] if n_z > 1 else float("inf")
+    _dz_ratio = _dz / std_eta if std_eta > 0 else float("inf")
+    print(f"  Grid resolution:")
+    print(f"    n_z = {n_z},  dz = {_dz:.4f},  dz / sigma_eta = {_dz_ratio:.2f}")
+    print(f"    Recommended: dz / sigma_eta <= 1.0 for Tauchen with mixture innovations")
+    print()
+
+    _escape_probs = np.array([1.0 - pc.Pi_z[i, i] for i in range(n_z)])
+    _n_absorbing = int(np.sum(_escape_probs < 1e-10))
+
+    _cond_mean_err = abs(_disc_mean - _true_cond_mean)
+    _ok = _cond_mean_err < 0.01
+    flag("Conditional mean error < 0.01", _ok,
+         f"|E[z'|z=0] - rho*z| = {_cond_mean_err:.1e}")
+    itest("Pi_z conditional mean", _ok)
+
+    _ok = _p_up > 1e-6
+    flag("Upward transitions exist from mid state", _ok,
+         f"P(up) = {_p_up:.4f}" + ("" if _ok else
+         " — discretization cannot represent mean-reversion from below"))
+    itest("Pi_z upward transitions", _ok)
+
+    _ok = _n_absorbing == 0
+    flag("No absorbing states in Pi_z", _ok,
+         f"{_n_absorbing} absorbing rows" + ("" if _ok else
+         f" — rows {list(np.where(_escape_probs < 1e-10)[0])}"))
+    itest("Pi_z no absorbing states", _ok)
+
     # ── 2c. AIME pipeline trace ─────────────────────────────────────────────
     sub("AIME pipeline trace  (Catherine 2025, eqs. 19-20)")
     print(f"  Each row traces one z-value through the full pension formula:")

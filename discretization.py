@@ -138,11 +138,20 @@ def discretize_income_ar1_mixture(rho, p, mu1, sigma1, mu2, sigma2, N, n_stds=3)
     Pi_z = np.zeros((N, N), dtype=float)
     for i, z_t in enumerate(z_grid):
         mean_next = rho * z_t
-        for j, z_next in enumerate(z_grid):
-            upper = z_next + half_bin - mean_next
-            lower = z_next - half_bin - mean_next
-            Pi_z[i, j] = mixture_cdf(upper, p, mu1, sigma1, mu2, sigma2) - mixture_cdf(lower, p, mu1, sigma1, mu2, sigma2)
-        Pi_z[i, :] /= np.maximum(Pi_z[i, :].sum(), 1e-300)
+        for j in range(N):
+            if j == 0:
+                upper = z_grid[j] + half_bin - mean_next
+                Pi_z[i, j] = mixture_cdf(upper, p, mu1, sigma1, mu2, sigma2)
+            elif j == N - 1:
+                lower = z_grid[j] - half_bin - mean_next
+                Pi_z[i, j] = 1.0 - mixture_cdf(lower, p, mu1, sigma1, mu2, sigma2)
+            else:
+                upper = z_grid[j] + half_bin - mean_next
+                lower = z_grid[j] - half_bin - mean_next
+                Pi_z[i, j] = mixture_cdf(upper, p, mu1, sigma1, mu2, sigma2) - mixture_cdf(lower, p, mu1, sigma1, mu2, sigma2)
+        row_sum = Pi_z[i, :].sum()
+        if abs(row_sum - 1.0) > 1e-8:
+            Pi_z[i, :] /= row_sum
 
     return z_grid, Pi_z
 

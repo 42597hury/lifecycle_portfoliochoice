@@ -53,8 +53,10 @@ mid_w   = n_w // 2                     # mid wealth grid (approximate)
 retire_t = model.retire_age - model.start_age   # index of retirement age
 ```
 
-Simulation config: `n_sim = 10_000`, `return_draw_mode = "monte_carlo"`, 
-`initial_z = "normal"`, `initial_state = "stationary"`, `seed = 2025`.
+Simulation config: `n_sim = 10_000`, `return_draw_mode = "monte_carlo"`,
+`initial_z = "normal"`, `initial_z_normal_std = 0.652`,
+`initial_state = "median"`, `seed = 42`.
+(Source of truth: `sim_defaults` in `main.ipynb`.)
 
 ---
 

@@ -175,3 +175,159 @@ def load_policy_bundle(
             metadata = json.load(f)
 
     return C_mat, S_mat, B_mat, diagnostics, metadata
+
+
+# ---------------------------------------------------------------------------
+# Simulation data save / load
+# ---------------------------------------------------------------------------
+
+def _sanitize_label(label: str) -> str:
+    """Convert a human-readable label to a safe filename stem."""
+    safe = label.strip().lower()
+    for ch in (" ", "+", "/", "\\"):
+        safe = safe.replace(ch, "_")
+    # collapse repeated underscores
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("_")
+
+
+def save_sim_data(
+    bundle_dir: str | Path,
+    sim_data: dict[str, Any],
+    label: str,
+    sim_config: dict[str, Any] | None = None,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Save simulation output arrays and metadata into a bundle's sims/ folder.
+
+    Parameters
+    ----------
+    bundle_dir
+        The solver bundle directory (must already exist with policy_arrays.npz).
+    sim_data
+        Dict returned by ``simulate_lifecycle()``.
+    label
+        Human-readable name, e.g. ``"baseline"`` or ``"high dp + high yield"``.
+    sim_config
+        Simulation configuration snapshot (seed, n_simulations, etc.).
+    overwrite
+        If False, raises FileExistsError when target files exist.
+
+    Returns
+    -------
+    Path
+        The .npz file that was written.
+    """
+    bundle = Path(bundle_dir)
+    if not (bundle / "policy_arrays.npz").exists():
+        raise FileNotFoundError(
+            f"No policy_arrays.npz in {bundle}. Save solver output first."
+        )
+
+    sims_dir = bundle / "sims"
+    sims_dir.mkdir(exist_ok=True)
+    # Also create figs/ directory for future use
+    (bundle / "figs").mkdir(exist_ok=True)
+
+    safe = _sanitize_label(label)
+    arrays_path = sims_dir / f"{safe}.npz"
+    meta_path = sims_dir / f"{safe}_meta.json"
+
+    if not overwrite:
+        existing = [p for p in (arrays_path, meta_path) if p.exists()]
+        if existing:
+            raise FileExistsError(
+                "Refusing to overwrite existing sim files: "
+                + ", ".join(str(p) for p in existing)
+            )
+
+    # Separate numpy arrays from non-array entries
+    array_kw = {}
+    non_array = {}
+    for k, v in sim_data.items():
+        if isinstance(v, np.ndarray):
+            array_kw[k] = v
+        else:
+            non_array[k] = v
+
+    np.savez_compressed(arrays_path, **array_kw)
+
+    metadata = {
+        "label": label,
+        "safe_label": safe,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "bundle_dir": str(bundle),
+        "array_keys": sorted(array_kw.keys()),
+        "array_shapes": {k: list(v.shape) for k, v in array_kw.items()},
+        "non_array_fields": _to_jsonable(non_array),
+    }
+    if sim_config is not None:
+        metadata["sim_config"] = _to_jsonable(sim_config)
+
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return arrays_path
+
+
+def load_sim_data(
+    bundle_dir: str | Path,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Load a saved simulation from a bundle's sims/ folder.
+
+    Returns
+    -------
+    tuple
+        (sim_data_dict, sim_metadata)
+    """
+    bundle = Path(bundle_dir)
+    safe = _sanitize_label(label)
+    arrays_path = bundle / "sims" / f"{safe}.npz"
+    meta_path = bundle / "sims" / f"{safe}_meta.json"
+
+    if not arrays_path.exists():
+        available = list_sims(bundle)
+        raise FileNotFoundError(
+            f"No sim '{label}' (file: {safe}.npz) in {bundle / 'sims'}. "
+            f"Available sims: {available}"
+        )
+
+    sim_data: dict[str, Any] = {}
+    with np.load(arrays_path, allow_pickle=False) as data:
+        for k in data.files:
+            sim_data[k] = data[k]
+
+    metadata: dict[str, Any] = {}
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+    # Restore non-array fields (e.g. 'label')
+    if "non_array_fields" in metadata:
+        for k, v in metadata["non_array_fields"].items():
+            if k not in sim_data:
+                sim_data[k] = v
+
+    return sim_data, metadata
+
+
+def list_sims(bundle_dir: str | Path) -> list[str]:
+    """
+    List available simulation labels in a bundle's sims/ folder.
+
+    Returns
+    -------
+    list[str]
+        Labels derived from filenames (e.g. ``["baseline", "high_dp_high_yield"]``).
+    """
+    sims_dir = Path(bundle_dir) / "sims"
+    if not sims_dir.exists():
+        return []
+    return sorted(
+        p.stem for p in sims_dir.glob("*.npz")
+    )

@@ -105,7 +105,8 @@ class DiscretizationConfig(NamedTuple):
 
     # Income process
     n_z: int = 11                       # persistent income grid points
-    n_eps_nodes: int = 5                # Gauss-Hermite nodes (doubled internally)
+    n_eps_nodes: int = 5                # Gauss-Hermite nodes per component (doubled internally)
+    n_eta_nodes: int = 5                # Gauss-Hermite nodes per component for persistent innovation (doubled internally)
     n_ret_nodes_1d: int = 1             # Gauss-Hermite order per return dimension; K=1 -> point mass at zero residual
 
     # Validation tolerances for Rouwenhorst consistency check

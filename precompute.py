@@ -18,7 +18,7 @@ from model import (
 from var import partition_var
 from discretization import (
     rouwenhorst_multivariate, discretize_income_ar1_mixture,
-    get_eps_quadrature_corrected, get_return_quadrature,
+    get_eps_quadrature_corrected, get_eta_quadrature_mixture, get_return_quadrature,
 )
 from mortality import calibrate_earnings_dependent_mortality
 
@@ -187,6 +187,28 @@ class Precompute:
         # eps_nodes:   (n_eps,) float64 - Gauss-Hermite quadrature nodes for transitory income shock eps
         # eps_weights: (n_eps,) float64 - quadrature weights; sum(eps_weights) = 1,  E[eps] = 0 enforced
 
+        self.eta_nodes, self.eta_weights = get_eta_quadrature_mixture(model, n_nodes=disc_config.n_eta_nodes)
+        # eta_nodes:   (n_eta,) float64 - Gauss-Hermite quadrature nodes for persistent innovation eta
+        # eta_weights: (n_eta,) float64 - quadrature weights; sum(eta_weights) = 1,  E[eta] = 0 enforced
+
+        self.dz = self.z_grid[1] - self.z_grid[0]  # uniform grid spacing, used for z-interpolation in solver
+
+        # --- Deterministic age-earnings profile (used by simulation for direct income computation) ---
+        self.log_det_profile = (model.b0
+                                + model.b1 * self.ages
+                                + model.b2 * self.ages**2 / 10.0
+                                + model.b3 * self.ages**3 / 100.0)
+        # (n_age,) float64 — f(age) = b0 + b1*age + b2*age^2/10 + b3*age^3/100
+        # log_det_profile[t] corresponds to ages[t]; used as exp(log_det_profile[t] + z + eps)
+
+        _working_ages = np.arange(model.start_age, model.retire_age)
+        _log_det_working = (model.b0
+                            + model.b1 * _working_ages
+                            + model.b2 * _working_ages**2 / 10.0
+                            + model.b3 * _working_ages**3 / 100.0)
+        self.avg_det = float(np.mean(np.exp(_log_det_working)))
+        # scalar — mean of exp(f(age)) over working ages; used for AIME in pension calculation
+
         # --- Income lookup tables ---
         self.working_income = self._precompute_working_income()
         # (n_age, n_z, n_eps) float64
@@ -354,14 +376,9 @@ class Precompute:
 
         Vectorized: broadcasts over all (age, z, eps) simultaneously.
         """
-        ages = self.ages[:, None, None]          # (n_age, 1, 1)
         z    = self.z_grid[None, :, None]        # (1, n_z, 1)
         eps  = self.eps_nodes[None, None, :]     # (1, 1, n_eps)
-
-        det = (self.model.b0
-               + self.model.b1 * ages
-               + self.model.b2 * ages**2 / 10.0
-               + self.model.b3 * ages**3 / 100.0)
+        det  = self.log_det_profile[:, None, None]  # (n_age, 1, 1)
 
         y_gross = np.exp(det + z + eps)
         return disposable_income_working(y_gross)
@@ -370,7 +387,7 @@ class Precompute:
         """
         After-tax pension table: shape (n_age, n_z).
 
-        Computes avg_det = mean(exp(f(age))) over working ages, then
+        Uses self.avg_det = mean(exp(f(age))) over working ages, then
         passes it to compute_pension_after_tax so AIME is correctly
         scaled by the deterministic lifecycle profile.
 
@@ -379,15 +396,7 @@ class Precompute:
         Approximation:
             AIME(z) ~ min(exp(z) * avg_det, 2.5)
         """
-        model = self.model
-        working_ages = np.arange(model.start_age, model.retire_age)
-        log_det = (model.b0
-                   + model.b1 * working_ages
-                   + model.b2 * working_ages**2 / 10.0
-                   + model.b3 * working_ages**3 / 100.0)
-        avg_det = float(np.mean(np.exp(log_det)))
-
-        base_pension = compute_pension_after_tax(self.z_grid, avg_det)
+        base_pension = compute_pension_after_tax(self.z_grid, self.avg_det)
         n_age = len(self.ages)
         n_z = len(self.z_grid)
         out = np.empty((n_age, n_z), dtype=float)

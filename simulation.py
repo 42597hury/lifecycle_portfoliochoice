@@ -19,12 +19,13 @@ simulation follows the same timing as the Bellman problem:
 
 Income timing (MODEL_DESIGN Section 1.3):
   - Working phase (t < retire_age_idx):
-      z transitions via Pi_z; transitory eps drawn.
-      Y_{t+1} = working_income[t+1, z_{t+1}, eps_{t+1}]
+      z transitions continuously: z' = rho*z + eta, where eta is drawn from
+      the mixture distribution. Income is computed directly from continuous z:
+      Y = disposable_income(exp(f(age) + z + eps)).
   - Last working period (t = retire_age_idx - 1):
       z transitions one final time; realized z at age 67 determines pension.
   - Retirement phase (t >= retire_age_idx, age 67+):
-      z frozen and Y_{t+1} = pension_after_tax[t+1, z].
+      z frozen; pension computed directly from continuous z via PIA formula.
 
 At the terminal age, all remaining households die. Their final estate
     estate_T = savings_T * R_port_T
@@ -297,23 +298,97 @@ def _clean_constrained_shares(alpha_s: float, alpha_b: float) -> tuple:
     return alpha_s, alpha_b
 
 
+@njit(fastmath=True)
+def _scalar_disposable_income(y_gross: float) -> float:
+    """After-tax labor income for a single scalar gross income value.
+
+    Same progressive schedule as model.disposable_income_working but
+    operates on a single float for Numba compatibility.
+    """
+    payroll_tax = 0.106 * min(y_gross, 2.5)
+    taxable = max(0.0, y_gross - payroll_tax)
+
+    if taxable <= 0.18:
+        tax = taxable * 0.10
+    elif taxable <= 0.72:
+        tax = 0.018 + (taxable - 0.18) * 0.12
+    elif taxable <= 1.54:
+        tax = 0.0828 + (taxable - 0.72) * 0.22
+    elif taxable <= 2.94:
+        tax = 0.2632 + (taxable - 1.54) * 0.24
+    elif taxable <= 3.73:
+        tax = 0.5992 + (taxable - 2.94) * 0.32
+    elif taxable <= 9.32:
+        tax = 0.8520 + (taxable - 3.73) * 0.35
+    else:
+        tax = 2.8085 + (taxable - 9.32) * 0.37
+
+    return taxable - tax
+
+
+@njit(fastmath=True)
+def _scalar_pension_after_tax(z_val: float, avg_det: float) -> float:
+    """After-tax pension benefit for a single continuous z value.
+
+    AIME = min(exp(z) * avg_det, 2.5), then PIA formula, then same
+    progressive tax schedule. Matches model.compute_pension_after_tax.
+    """
+    aime = min(np.exp(z_val) * avg_det, 2.5)
+
+    # PIA formula — Catherine eq. (19)
+    b1, b2 = 0.21, 1.25
+    r1, r2, r3 = 0.90, 0.32, 0.15
+
+    if aime <= b1:
+        pension = aime * r1
+    elif aime <= b2:
+        pension = r1 * b1 + r2 * (aime - b1)
+    else:
+        pension = r1 * b1 + r2 * (b2 - b1) + r3 * (aime - b2)
+
+    # Same tax schedule
+    if pension <= 0.18:
+        tax = pension * 0.10
+    elif pension <= 0.72:
+        tax = 0.018 + (pension - 0.18) * 0.12
+    elif pension <= 1.54:
+        tax = 0.0828 + (pension - 0.72) * 0.22
+    elif pension <= 2.94:
+        tax = 0.2632 + (pension - 1.54) * 0.24
+    elif pension <= 3.73:
+        tax = 0.5992 + (pension - 2.94) * 0.32
+    elif pension <= 9.32:
+        tax = 0.8520 + (pension - 3.73) * 0.35
+    else:
+        tax = 2.8085 + (pension - 9.32) * 0.37
+
+    return pension - tax
+
+
 @njit(parallel=True)
 def simulate_lifecycle_core(
     C_mat: np.ndarray,
     S_mat: np.ndarray,
     B_mat: np.ndarray,
     wealth_grid: np.ndarray,
-    Pi_z: np.ndarray,
+    z_grid: np.ndarray,
     Pi_state: np.ndarray,
     mu_r: np.ndarray,
     ret_nodes: np.ndarray,
     ret_weights: np.ndarray,
     ret_factor: np.ndarray,
     r_bill_grid: np.ndarray,
-    working_income: np.ndarray,
-    pension_after_tax: np.ndarray,
+    log_det_profile: np.ndarray,
+    avg_det: float,
+    eps_nodes: np.ndarray,
     eps_weights: np.ndarray,
     survival_probs_2d: np.ndarray,
+    rho: float,
+    pz: float,
+    mu_eta1: float,
+    sigma_eta1: float,
+    sigma_eta2: float,
+    mu_eta2_eff: float,
     start_age: int,
     retire_age_idx: int,
     constrained: bool,
@@ -328,16 +403,29 @@ def simulate_lifecycle_core(
     """
     Numba-parallel core simulation loop over households.
 
+    z is tracked as a continuous float and policies are interpolated in z,
+    consistent with the solver's Gauss-Hermite quadrature treatment.
+    Income and pension are computed directly from continuous z (no table
+    interpolation).
+
     uniform_draws[:, t, :] slots:
       [0] survival draw
-      [1] persistent income transition draw
+      [1] mixture component draw (u < pz -> component 1)
       [2] financial state transition draw
       [3] return-node draw (quadrature mode only)
       [4] transitory income shock draw
+
+    normal_draws[:, t, :] slots:
+      [0..n_ret-1] return shocks (monte_carlo mode)
+      [n_ret]      eta standard normal for persistent income innovation
     """
     n_simulations = len(initial_x)
     n_age = C_mat.shape[0]
+    n_z = len(z_grid)
     n_ret = mu_r.shape[2]
+    dz = z_grid[1] - z_grid[0]
+    z_lo = z_grid[0]
+    z_hi = z_grid[n_z - 1]
 
     sim_x = np.zeros((n_simulations, n_age))
     sim_c = np.zeros((n_simulations, n_age))
@@ -347,7 +435,8 @@ def simulate_lifecycle_core(
     sim_R_port = np.zeros((n_simulations, n_age))
     sim_income = np.zeros((n_simulations, n_age))
     sim_estate = np.zeros((n_simulations, n_age))
-    sim_z = np.zeros((n_simulations, n_age), dtype=np.int32)
+    sim_z = np.zeros((n_simulations, n_age))
+    sim_z_idx = np.zeros((n_simulations, n_age), dtype=np.int32)
     sim_state = np.zeros((n_simulations, n_age), dtype=np.int32)
     sim_alive = np.zeros((n_simulations, n_age), dtype=np.bool_)
 
@@ -355,21 +444,40 @@ def simulate_lifecycle_core(
     estate_at_death = np.zeros(n_simulations)
 
     for i in prange(n_simulations):
-        z_idx = initial_z[i]
+        z_val = initial_z[i]
         state_idx = initial_state[i]
         x_t = initial_x[i]
         income_t = initial_income[i]
 
         for t in range(n_age):
             sim_alive[i, t] = True
-            sim_z[i, t] = z_idx
+            sim_z[i, t] = z_val
             sim_state[i, t] = state_idx
             sim_x[i, t] = x_t
             sim_income[i, t] = income_t
 
-            c_t = fast_interp_1d(x_t, wealth_grid, C_mat[t, z_idx, state_idx, :])
-            alpha_s_t = fast_interp_1d(x_t, wealth_grid, S_mat[t, z_idx, state_idx, :])
-            alpha_b_t = fast_interp_1d(x_t, wealth_grid, B_mat[t, z_idx, state_idx, :])
+            # --- z interpolation indices for policy lookup ---
+            iz_lo = int((z_val - z_lo) / dz)
+            iz_lo = max(0, min(iz_lo, n_z - 2))
+            frac_z = (z_val - z_grid[iz_lo]) / dz
+            frac_z = max(0.0, min(1.0, frac_z))
+
+            # nearest grid index (for survival lookup and diagnostics)
+            z_idx_near = iz_lo if frac_z <= 0.5 else iz_lo + 1
+            sim_z_idx[i, t] = z_idx_near
+
+            # --- Policy lookup: interpolate in z, then in wealth ---
+            c_lo = fast_interp_1d(x_t, wealth_grid, C_mat[t, iz_lo, state_idx, :])
+            c_hi = fast_interp_1d(x_t, wealth_grid, C_mat[t, iz_lo + 1, state_idx, :])
+            c_t = (1.0 - frac_z) * c_lo + frac_z * c_hi
+
+            as_lo = fast_interp_1d(x_t, wealth_grid, S_mat[t, iz_lo, state_idx, :])
+            as_hi = fast_interp_1d(x_t, wealth_grid, S_mat[t, iz_lo + 1, state_idx, :])
+            alpha_s_t = (1.0 - frac_z) * as_lo + frac_z * as_hi
+
+            ab_lo = fast_interp_1d(x_t, wealth_grid, B_mat[t, iz_lo, state_idx, :])
+            ab_hi = fast_interp_1d(x_t, wealth_grid, B_mat[t, iz_lo + 1, state_idx, :])
+            alpha_b_t = (1.0 - frac_z) * ab_lo + frac_z * ab_hi
 
             if constrained:
                 alpha_s_t, alpha_b_t = _clean_constrained_shares(alpha_s_t, alpha_b_t)
@@ -423,22 +531,39 @@ def simulate_lifecycle_core(
                 estate_at_death[i] = estate_t
                 break
 
-            if uniform_draws[i, t, 0] > survival_probs_2d[t, z_idx]:
+            # --- Survival (nearest-neighbor z lookup) ---
+            if uniform_draws[i, t, 0] > survival_probs_2d[t, z_idx_near]:
                 death_age[i] = age_t
                 estate_at_death[i] = estate_t
                 break
 
+            # --- z and income transition ---
             if t < retire_age_idx:
-                next_z_idx = draw_discrete(Pi_z[z_idx, :], uniform_draws[i, t, 1])
+                # Draw eta from mixture: component selection + normal draw
+                std_normal_eta = normal_draws[i, t, n_ret]
+                if uniform_draws[i, t, 1] < pz:
+                    eta = mu_eta1 + sigma_eta1 * std_normal_eta
+                else:
+                    eta = mu_eta2_eff + sigma_eta2 * std_normal_eta
+
+                z_next = rho * z_val + eta
+                # Clamp to grid bounds
+                z_next = max(z_lo, min(z_hi, z_next))
+
+                # Transitory shock (discrete quadrature draw)
                 eps_idx = draw_discrete(eps_weights, uniform_draws[i, t, 4])
-                income_next = working_income[t + 1, next_z_idx, eps_idx]
+
+                # Direct income computation
+                y_gross = np.exp(log_det_profile[t + 1] + z_next + eps_nodes[eps_idx])
+                income_next = _scalar_disposable_income(y_gross)
             else:
-                next_z_idx = z_idx
-                income_next = pension_after_tax[t + 1, z_idx]
+                # Retirement: z frozen, pension from continuous z
+                z_next = z_val
+                income_next = _scalar_pension_after_tax(z_val, avg_det)
 
             x_t = estate_t + income_next
             income_t = income_next
-            z_idx = next_z_idx
+            z_val = z_next
             state_idx = next_state_idx
 
     return (
@@ -451,6 +576,7 @@ def simulate_lifecycle_core(
         sim_income,
         sim_estate,
         sim_z,
+        sim_z_idx,
         sim_state,
         sim_alive,
         death_age,
@@ -513,9 +639,9 @@ def simulate_lifecycle(C_mat: np.ndarray,
     initial_wealth_normal_std : float
         Standard deviation used when `initial_wealth_distribution="normal"`.
     initial_z : {"median", "stationary", "normal"} or np.ndarray
-        How to initialize the persistent income state. The `"normal"` option
-        draws a continuous N(0, initial_z_normal_std^2) shock and bins it onto
-        the discrete `pc.z_grid`.
+        How to initialize the persistent income state. Grid indices are drawn
+        then converted to continuous z values from `pc.z_grid`. The `"normal"`
+        option draws from N(0, initial_z_normal_std^2) binned onto the grid.
     initial_z_normal_std : float
         Standard deviation used when `initial_z="normal"`.
     initial_state : {"median", "stationary"} or np.ndarray
@@ -561,19 +687,28 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     rng = np.random.default_rng(seed)
 
+    # --- Initialize z as continuous values ---
     if isinstance(initial_z, str) and initial_z == "normal":
         init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=initial_z_normal_std)
         init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
     else:
         init_z_idx = initialize_states(n_simulations, pc.n_z, pc.Pi_z, initial_z, rng)
+    # Convert grid indices to continuous z values
+    init_z_val = pc.z_grid[init_z_idx].astype(np.float64)
+
     init_state_idx = initialize_states(n_simulations, pc.N_state, pc.Pi_state, initial_state, rng)
 
+    # --- Initial income: compute directly from continuous z ---
+    # Use the vectorized model functions (outside the Numba core loop)
+    from model import disposable_income_working as _disp_inc_vec
+    from model import compute_pension_after_tax as _pension_vec
     init_eps_raw = rng.uniform(size=n_simulations)
     if retire_age_idx > 0:
         init_eps_idx = _draw_discrete_vectorized(pc.eps_weights, init_eps_raw)
-        initial_income_arr = pc.working_income[0, init_z_idx, init_eps_idx]
+        init_y_gross = np.exp(pc.log_det_profile[0] + init_z_val + pc.eps_nodes[init_eps_idx])
+        initial_income_arr = _disp_inc_vec(init_y_gross)
     else:
-        initial_income_arr = pc.pension_after_tax[0, init_z_idx]
+        initial_income_arr = _pension_vec(init_z_val, pc.avg_det)
 
     if initial_x is None:
         init_wealth_arr = _initialize_initial_wealth(
@@ -639,17 +774,21 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     uniform_draws = rng.uniform(size=(n_simulations, n_age, 5))
 
+    # normal_draws: n_ret columns for return shocks + 1 column for eta
     if return_draw_mode == "monte_carlo":
         ret_factor_arr = _build_return_factor(model.Sigma_r_cond)
-        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_ret))
+        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_ret + 1))
         use_mc_returns = True
     else:
         ret_factor_arr = np.zeros((n_ret, n_ret), dtype=float)
-        normal_draws = np.zeros((1, 1, n_ret), dtype=float)
+        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_ret + 1))
         use_mc_returns = False
 
     if verbose:
         print("\n  Running simulation...", flush=True)
+
+    # Mixture parameters for continuous eta draws
+    mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
 
     t_start = time.perf_counter()
 
@@ -658,22 +797,29 @@ def simulate_lifecycle(C_mat: np.ndarray,
         S_mat=np.ascontiguousarray(S_mat),
         B_mat=np.ascontiguousarray(B_mat),
         wealth_grid=np.ascontiguousarray(pc.wealth_grid),
-        Pi_z=np.ascontiguousarray(pc.Pi_z),
+        z_grid=np.ascontiguousarray(pc.z_grid),
         Pi_state=np.ascontiguousarray(pc.Pi_state),
         mu_r=np.ascontiguousarray(pc.mu_r),
         ret_nodes=np.ascontiguousarray(pc.ret_nodes),
         ret_weights=np.ascontiguousarray(pc.ret_weights),
         ret_factor=np.ascontiguousarray(ret_factor_arr),
         r_bill_grid=np.ascontiguousarray(pc.r_bill_grid),
-        working_income=np.ascontiguousarray(pc.working_income),
-        pension_after_tax=np.ascontiguousarray(pc.pension_after_tax),
+        log_det_profile=np.ascontiguousarray(pc.log_det_profile),
+        avg_det=float(pc.avg_det),
+        eps_nodes=np.ascontiguousarray(pc.eps_nodes),
         eps_weights=np.ascontiguousarray(pc.eps_weights),
         survival_probs_2d=np.ascontiguousarray(pc.survival_probs_2d),
+        rho=float(model.rho),
+        pz=float(model.pz),
+        mu_eta1=float(model.mu_eta1),
+        sigma_eta1=float(model.sigma_eta1),
+        sigma_eta2=float(model.sigma_eta2),
+        mu_eta2_eff=float(mu_eta2_eff),
         start_age=int(model.start_age),
         retire_age_idx=int(retire_age_idx),
         constrained=bool(model.constrained),
         use_mc_returns=use_mc_returns,
-        initial_z=np.ascontiguousarray(init_z_idx),
+        initial_z=np.ascontiguousarray(init_z_val),
         initial_state=np.ascontiguousarray(init_state_idx),
         initial_x=np.ascontiguousarray(init_x),
         initial_income=np.ascontiguousarray(initial_income_arr),
@@ -693,6 +839,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
         sim_income,
         sim_estate,
         sim_z,
+        sim_z_idx,
         sim_state,
         sim_alive,
         death_age,
@@ -728,7 +875,8 @@ def simulate_lifecycle(C_mat: np.ndarray,
         "income": sim_income,
         "estate": sim_estate,
         "estate_at_death": estate_at_death,
-        "z_idx": sim_z,
+        "z": sim_z,
+        "z_idx": sim_z_idx,
         "state_idx": sim_state,
         "alive": sim_alive,
         "death_age": death_age,

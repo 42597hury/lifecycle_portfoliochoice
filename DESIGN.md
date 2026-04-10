@@ -171,7 +171,9 @@ Start of period t+1:
 
 Income timing at the working-retirement boundary:
   - Working ages (age_t < retire_age):
-      z transitions via Pi_z, transitory shock eps drawn
+      z transitions continuously: z_{t+1} = rho * z_t + eta_{t+1}
+      where eta is drawn from the mixture-normal distribution.
+      Transitory shock eps drawn from quadrature nodes.
       Y_{t+1} = disposable_income(exp(f(age_{t+1}) + z_{t+1} + eps_{t+1}))
       where f(age) = b0 + b1*age + b2*age^2/10 + b3*age^3/100
   - Last working year (age_t = retire_age - 1 = 66):
@@ -179,10 +181,21 @@ Income timing at the working-retirement boundary:
       z transitions one last time; the realized z_{t+1} determines pension
       for all subsequent periods.
   - Retirement (age_t >= retire_age):
-      z is frozen (no Pi_z transitions, no transitory shocks).
+      z is frozen (no transitions, no transitory shocks).
       Y_{t+1} = pension(z), where z is the state carried from retirement entry.
   - Consequence: first pension payment arrives at age retire_age + 1 (= 68).
     At age retire_age (= 67), cash-on-hand includes the final labor income.
+
+  Treatment of z differs between solver and simulation:
+  - Solver: z is discrete (n_z grid points). E[V(z')] is computed via
+    Gauss-Hermite quadrature over mixture-normal eta innovations, with
+    linear interpolation of policies at off-grid z' values.
+  - Simulation: z is continuous (float64). Each period draws a continuous
+    eta from the mixture, computes z' = rho*z + eta (clamped to grid
+    bounds), and interpolates policies at the continuous z' value.
+    Income and pension are computed directly from continuous z (not
+    from precomputed tables), avoiding interpolation error in the
+    nonlinear tax function.
 ```
 
 ### 1.4 Labor Income Process
@@ -746,7 +759,17 @@ Grid coverage: ±2 sigma of the stationary distribution with N=5 points.
 
 ```python
 discretize_income_ar1_mixture(rho, p, mu1, sigma1, mu2, sigma2, N)
+    # Tauchen-style Markov chain for persistent income z. Produces z_grid
+    # and Pi_z. NOTE: Pi_z is retained for backward compatibility but is
+    # NOT used by the solver or simulation for z-transitions. The solver
+    # uses Gauss-Hermite quadrature (eta_nodes/weights); the simulation
+    # draws continuous eta from the mixture distribution.
+
 get_eps_quadrature_corrected(model, n_nodes)   # Gauss-Hermite, zero-mean enforced
+get_eta_quadrature_mixture(model, n_nodes)     # Gauss-Hermite for persistent innovation eta
+    # Both quadratures use the physicist's convention: nodes scaled by sqrt(2),
+    # weights divided by sqrt(pi). Component 2's mean is computed internally
+    # to enforce E[eta] = 0: mu_eta2_eff = -(pz/(1-pz)) * mu_eta1.
 ```
 
 ### 3.6 precompute.py -- Precompute Class
@@ -796,13 +819,18 @@ annuity_factors:  (N_state,)      A(y_nom_s, b_bar) for each financial state
 
 # === INCOME PROCESS ===
 z_grid:           (n_z,)          persistent income states (log, mean-zero)
-Pi_z:             (n_z, n_z)      income transition matrix
+Pi_z:             (n_z, n_z)      income transition matrix (retained, not used by solver/simulation)
 eps_nodes:        (n_eps,)        Gauss-Hermite nodes for transitory shock
 eps_weights:      (n_eps,)        quadrature weights; sum=1, mean=0 enforced
+eta_nodes:        (n_eta,)        Gauss-Hermite nodes for persistent innovation eta
+eta_weights:      (n_eta,)        quadrature weights; sum=1, mean=0 enforced
+dz:               float           uniform z_grid spacing (z_grid[1] - z_grid[0])
+log_det_profile:  (n_age,)        deterministic age-earnings profile f(age) for each period
+avg_det:          float           mean(exp(f(age))) over working ages; used for pension AIME
 
 # === LOOKUP TABLES ===
-working_income:   (n_age, n_z, n_eps)  after-tax labor income
-pension_after_tax:(n_age, n_z)         after-tax Social Security benefit
+working_income:   (n_age, n_z, n_eps)  after-tax labor income (solver grid lookup)
+pension_after_tax:(n_age, n_z)         after-tax Social Security benefit (solver grid lookup)
 survival_probs_2d:(n_age, n_z)         age- and earnings-dependent survival probabilities
 
 # === DIMENSIONS ===
@@ -924,8 +952,11 @@ where:
 
 The expectation integrates over:
 1. Next financial state `j_s`: weighted by `Pi_state[i_s, j_s]`
-2. Next income state `j_z`: weighted by `Pi_z[i_z, j_z]`
+2. Persistent innovation `eta`: Gauss-Hermite quadrature with `eta_weights[k_eta]`.
+   `z_next = rho * z_grid[i_z] + eta_nodes[k_eta]` is generally off-grid;
+   policies are linearly interpolated between bracketing z-grid points.
 3. Transitory shock `eps`: weighted by `eps_weights[i_eps]` (working age only)
+4. Residual return shock `k_r`: weighted by `ret_weights[k_r]`
 
 ### 4.3 Interpolation and Helper Functions
 
@@ -987,34 +1018,45 @@ pricing is fixed at the current yield.
 
 ### 4.5 FOC and Jacobian -- Working Age
 
-Same structure as retirement, with additional integration over income.
+Same structure as retirement, with additional integration over income innovations.
+
+**Gauss-Hermite quadrature over persistent innovations:** Instead of iterating
+over discrete grid points weighted by `Pi_z[i_z, j_z]`, the inner loop iterates
+over Gauss-Hermite quadrature nodes `eta_nodes[k_eta]` with weights `eta_weights[k_eta]`.
+For each node, `z_next = rho * z_grid[z_idx] + eta_nodes[k_eta]` is computed and
+bracketed on the z-grid. Policies and income are linearly interpolated between
+the two bracketing grid points `iz_lo` and `iz_lo + 1`.
 
 **Bequest hoist optimization:** The bequest marginal utility (`mu_bequest`, `mup_bequest`)
-depends only on `j_s` (through `w_inv = s_val * R_p`), not on `(j_z, i_e)`. Its
+depends only on `j_s` (through `w_inv = s_val * R_p`), not on `(k_eta, i_e)`. Its
 contribution to all 6 accumulators (foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum) is
-accumulated once at the `j_s` level, while the inner `(j_z, i_e)` loops handle only the
-alive (`psi * mu_alive`) part. This is valid because `sum(Pi_z) = sum(eps_weights) = 1`,
+accumulated once at the `j_s` level, while the inner `(k_eta, i_e)` loops handle only the
+alive (`psi * mu_alive`) part. This is valid because `sum(eta_weights) = sum(eps_weights) = 1`,
 so `sum(weight) = p_var` for each `j_s`.
 
 **Note on earnings-dependent mortality:** The FOC functions receive scalar `psi` (already
 indexed by the current `z_i` in the calling step function). Therefore `prob_death = 1 - psi`
 is constant within a single FOC call, and the bequest hoist remains valid: the bequest
-weight `p_var * prob_death` is still independent of `(j_z, i_e)` within the inner loops.
+weight `p_var * prob_death` is still independent of `(k_eta, i_e)` within the inner loops.
 
 ```python
 @njit(fastmath=True)
 def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
                              wealth_grid, c_next_full, income_next_table,
                              annuity_factor_is,
-                             Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                             z_grid, rho, eta_nodes, eta_weights, dz,
+                             Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                              eps_nodes, eps_weights,
                              gamma, psi, beta, b_bar):
     """
     Working-age FOC/Jacobian. Integrates over:
       - Next financial state j_s (weighted by Pi_state)
       - Joint return node k_r (weighted by ret_weights)
-      - Next income state j_z (weighted by Pi_z)
+      - Persistent innovation eta (Gauss-Hermite quadrature: eta_weights)
       - Transitory shock eps (weighted by eps_weights)
+
+    z_next = rho * z_grid[z_idx] + eta_nodes[k_eta] is generally off-grid;
+    consumption and income are linearly interpolated between bracketing z points.
 
     c_next_full shape: (n_z, N_state, n_w)
 
@@ -1022,8 +1064,11 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
       for j_s:                              # future macro state
           for k_r:                          # joint return node
               bequest accumulators += ...   # once per (j_s, k_r)
-              for j_z:                      # future income state
+              for k_eta:                    # persistent innovation (GH quadrature)
+                  z_next = rho * z + eta_nodes[k_eta]
+                  iz_lo, frac_z = bracket(z_next)
                   for i_e:                  # transitory shock
+                      interpolate income and consumption at (iz_lo, frac_z)
                       alive accumulators += ...
     """
 ```
@@ -1134,12 +1179,15 @@ def solve_retirement_step(wealth_grid, savings_grid, z_grid, N_state,
 def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
                            c_next_full, income_next_table,
                            annuity_factors,
-                           Pi_z, Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+                           rho, eta_nodes, eta_weights, dz,
+                           Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
                            eps_nodes, eps_weights,
                            gamma, psi_vec, beta, b_bar):
     """
     Solve one working-age period using EGM + 2D Newton.
-    Same EGM structure as retirement but with income integration.
+    Same EGM structure as retirement but with income integration via
+    Gauss-Hermite quadrature over persistent innovations (eta_nodes/weights)
+    and linear z-interpolation of policies at off-grid z' values.
     psi_vec: (n_z,) survival probs for this age, indexed by z.
     """
 ```
@@ -1229,10 +1277,13 @@ post-solve diagnostic report.
 | `r_bill_grid` | (N_state,) | Log real bill rate at each state |
 | `annuity_factors` | (N_state,) | A(y_nom, b_bar) annuity factor per state |
 | `z_grid` | (n_z,) | Persistent income states |
-| `Pi_z` | (n_z, n_z) | Income transition matrix |
+| `Pi_z` | (n_z, n_z) | Income transition matrix (retained, not used by solver/simulation) |
 | `eps_nodes/weights` | (n_eps,) | Gauss-Hermite quadrature for transitory shocks |
-| `working_income` | (n_age, n_z, n_eps) | After-tax labor income table |
-| `pension_after_tax` | (n_age, n_z) | After-tax pension table |
+| `eta_nodes/weights` | (n_eta,) | Gauss-Hermite quadrature for persistent innovation eta |
+| `log_det_profile` | (n_age,) | Deterministic age-earnings profile f(age) per period |
+| `avg_det` | scalar | Mean of exp(f(age)) over working ages; for pension AIME |
+| `working_income` | (n_age, n_z, n_eps) | After-tax labor income table (solver grid lookup) |
+| `pension_after_tax` | (n_age, n_z) | After-tax pension table (solver grid lookup) |
 
 ### 5.2 Policy Function Shapes
 
@@ -1260,12 +1311,12 @@ post-solve diagnostic report.
 
 Per Newton evaluation, the inner loop iterates over:
 - N_state financial state transitions (125 or 343)
-- Working age: x n_z income states (11) x n_eps transitory nodes (10)
+- Working age: x n_eta persistent innovation nodes (10) x n_eps transitory nodes (10)
 
 | Config | Retirement | Working |
 |--------|-----------|---------|
-| N_state=125 | 125 iters | 13,750 iters |
-| N_state=343 | 343 iters | 37,730 iters |
+| N_state=125 | 125 iters | 12,500 iters |
+| N_state=343 | 343 iters | 34,300 iters |
 
 ### 6.2 Bequest Hoist Optimization
 

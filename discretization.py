@@ -185,6 +185,34 @@ def get_eps_quadrature_corrected(model, n_nodes=3):
     return eps_nodes, eps_weights
 
 
+def get_eta_quadrature_mixture(model, n_nodes=5):
+    """Persistent income innovation quadrature using Gauss-Hermite.
+
+    Same approach as get_eps_quadrature_corrected but for the persistent
+    innovation eta.  Component 2's mean is computed internally to enforce
+    E[eta] = 0:  mu_eta2_effective = -(pz/(1-pz)) * mu_eta1.
+    """
+    nodes, weights = roots_hermite(n_nodes)
+    weights = weights / np.sqrt(np.pi)
+    nodes = nodes * np.sqrt(2.0)
+
+    e1 = nodes * model.sigma_eta1 + model.mu_eta1
+    w1 = weights * model.pz
+
+    mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
+    e2 = nodes * model.sigma_eta2 + mu_eta2_eff
+    w2 = weights * (1.0 - model.pz)
+
+    eta_nodes = np.concatenate([e1, e2])
+    eta_weights = np.concatenate([w1, w2])
+
+    mean_check = np.sum(eta_nodes * eta_weights)
+    if abs(mean_check) > 1e-10:
+        print(f"WARNING: eta quadrature mean = {mean_check:.6e} (should be near 0)")
+
+    return eta_nodes, eta_weights
+
+
 def get_return_quadrature(model, n_nodes=1):
     """Residual return quadrature for N(0, Sigma_r_cond).
 

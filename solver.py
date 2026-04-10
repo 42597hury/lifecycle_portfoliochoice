@@ -738,7 +738,8 @@ def solve_portfolio_unconstrained_retirement(s_val, z_idx, i_s,
 def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
                              wealth_grid, c_next_full, income_next_table,
                              annuity_factor_is,
-                             Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                             z_grid, rho, eta_nodes, eta_weights, dz,
+                             Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                              eps_nodes, eps_weights,
                              gamma, psi, beta, b_bar,
                              min_wealth_inv=1e-10, min_consumption=1e-10,
@@ -751,7 +752,8 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
     euler_sum = 0.0
 
     N_state = Pi_state.shape[1]
-    n_z     = Pi_z.shape[1]
+    n_z     = len(z_grid)
+    n_eta   = len(eta_nodes)
     n_eps   = len(eps_nodes)
     n_ret_quad = len(ret_weights)
 
@@ -795,23 +797,40 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
             J_bb  += jac_b * Rex_b * Rex_b
             J_sb  += jac_b * Rex_s * Rex_b
 
-            # -- alive contribution: inner loops over income uncertainty --
-            for j_z in range(n_z):
-                p_z = Pi_z[z_idx, j_z]
-                if p_z < prob_skip:
+            # -- alive contribution: quadrature over persistent and transitory innovations --
+            for k_eta in range(n_eta):
+                w_eta = eta_weights[k_eta]
+                if w_eta < prob_skip:
                     continue
 
-                p_out = p_state_ret * p_z
+                # Next-period z (continuous, generally between grid points)
+                z_next = rho * z_grid[z_idx] + eta_nodes[k_eta]
+
+                # Bracket z_next on the uniform z_grid
+                iz_lo = int((z_next - z_grid[0]) / dz)
+                iz_lo = max(0, min(iz_lo, n_z - 2))
+                frac_z = (z_next - z_grid[iz_lo]) / dz
+                frac_z = max(0.0, min(1.0, frac_z))
+
+                p_out_base = p_state_ret * w_eta
 
                 for i_e in range(n_eps):
-                    weight = p_out * eps_weights[i_e]
+                    weight = p_out_base * eps_weights[i_e]
 
-                    income_next = income_next_table[j_z, i_e]
+                    # Interpolate income in z
+                    income_next = ((1.0 - frac_z) * income_next_table[iz_lo, i_e]
+                                   + frac_z * income_next_table[iz_lo + 1, i_e])
                     x_next = w_inv + income_next
 
-                    c_row  = c_next_full[j_z, j_s, :]
-                    c_next, mpc = fast_interp_1d_with_slope(x_next, wealth_grid, c_row)
+                    # Interpolate consumption in z: two wealth interps, then blend
+                    c_lo, mpc_lo = fast_interp_1d_with_slope(
+                        x_next, wealth_grid, c_next_full[iz_lo, j_s, :])
+                    c_hi, mpc_hi = fast_interp_1d_with_slope(
+                        x_next, wealth_grid, c_next_full[iz_lo + 1, j_s, :])
+
+                    c_next = (1.0 - frac_z) * c_lo + frac_z * c_hi
                     c_next = max(c_next, min_consumption)
+                    mpc = (1.0 - frac_z) * mpc_lo + frac_z * mpc_hi
                     mpc = max(0.0, min(1.0, mpc))
 
                     mu_alive  = c_next ** (-gamma)
@@ -839,7 +858,8 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
 def solve_portfolio_2d_working(s_val, z_idx, i_s,
                                 wealth_grid, c_next_full, income_next_table,
                                 annuity_factor_is,
-                                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                                z_grid, rho, eta_nodes, eta_weights, dz,
+                                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                                 eps_nodes, eps_weights,
                                 gamma, psi, beta, b_bar,
                                 init_s=0.1, init_b=0.4,
@@ -857,7 +877,8 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
         _, _, _, _, _, e = compute_foc_jac_working(
             0.0, 0.0, s_val, z_idx, i_s,
             wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-            Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+            z_grid, rho, eta_nodes, eta_weights, dz,
+            Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
             eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
@@ -866,7 +887,8 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
     fs0, fb0, _, _, _, e0 = compute_foc_jac_working(
         0.0, 0.0, s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        z_grid, rho, eta_nodes, eta_weights, dz,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)  # FOC scale for relative tolerance
@@ -877,7 +899,8 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
     fs1, fb1, _, _, _, e1 = compute_foc_jac_working(
         1.0, 0.0, s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        z_grid, rho, eta_nodes, eta_weights, dz,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
     if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
@@ -887,7 +910,8 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
     fs2, fb2, _, _, _, e2 = compute_foc_jac_working(
         0.0, 1.0, s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        z_grid, rho, eta_nodes, eta_weights, dz,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
     if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
@@ -901,9 +925,10 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
             fs, fb, Jss, _, _, e = compute_foc_jac_working(
                 a_s, 0.0, s_val, z_idx, i_s,
                 wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                z_grid, rho, eta_nodes, eta_weights, dz,
+                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                 eps_nodes, eps_weights, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
+                min_wealth_inv, min_consumption, prob_skip)
             if abs(fs) < tol * scale:
                 break
             if abs(Jss) < singular_det:
@@ -920,9 +945,10 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
             fs, fb, _, Jbb, _, e = compute_foc_jac_working(
                 0.0, a_b, s_val, z_idx, i_s,
                 wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                z_grid, rho, eta_nodes, eta_weights, dz,
+                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                 eps_nodes, eps_weights, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
+                min_wealth_inv, min_consumption, prob_skip)
             if abs(fb) < tol * scale:
                 break
             if abs(Jbb) < singular_det:
@@ -942,9 +968,10 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
             fs, fb, Jss, Jbb, Jsb, e = compute_foc_jac_working(
                 a_s, a_b, s_val, z_idx, i_s,
                 wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                z_grid, rho, eta_nodes, eta_weights, dz,
+                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                 eps_nodes, eps_weights, gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip)
+                min_wealth_inv, min_consumption, prob_skip)
             g = fs - fb
             if abs(g) < tol * scale:
                 break
@@ -965,7 +992,8 @@ def solve_portfolio_2d_working(s_val, z_idx, i_s,
         fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_working(
             a_s, a_b, s_val, z_idx, i_s,
             wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-            Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+            z_grid, rho, eta_nodes, eta_weights, dz,
+            Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
             eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
         e_last = e_sum
@@ -1146,7 +1174,8 @@ def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_stock_next, R
 def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
                                            wealth_grid, c_next_full, income_next_table,
                                            annuity_factor_is,
-                                           Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                                           z_grid, rho, eta_nodes, eta_weights, dz,
+                                           Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                                            eps_nodes, eps_weights,
                                            gamma, psi, beta, b_bar,
                                            init_s=0.1, init_b=0.4,
@@ -1165,7 +1194,8 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
         _, _, _, _, _, e = compute_foc_jac_working(
             0.0, 0.0, s_val, z_idx, i_s,
             wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-            Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+            z_grid, rho, eta_nodes, eta_weights, dz,
+            Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
             eps_nodes, eps_weights, gamma, psi, beta, b_bar,
             min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
@@ -1174,7 +1204,8 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
     _, _, _, _, _, e0 = compute_foc_jac_working(
         0.0, 0.0, s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        z_grid, rho, eta_nodes, eta_weights, dz,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
         min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
@@ -1186,7 +1217,8 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
     fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working(
         a_s, a_b, s_val, z_idx, i_s,
         wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-        Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+        z_grid, rho, eta_nodes, eta_weights, dz,
+        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
         eps_nodes, eps_weights, gamma, psi, beta, b_bar,
         min_wealth_inv, min_consumption, prob_skip)
     err = (fs * fs + fb * fb) ** 0.5
@@ -1222,7 +1254,8 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
                 fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_working(
                     a_s_t, a_b_t, s_val, z_idx, i_s,
                     wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-                    Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                    z_grid, rho, eta_nodes, eta_weights, dz,
+                    Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                     eps_nodes, eps_weights, gamma, psi, beta, b_bar,
                     min_wealth_inv, min_consumption, prob_skip)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
@@ -1250,7 +1283,8 @@ def solve_portfolio_unconstrained_working(s_val, z_idx, i_s,
             fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working(
                 a_s, a_b, s_val, z_idx, i_s,
                 wealth_grid, c_next_full, income_next_table, annuity_factor_is,
-                Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                z_grid, rho, eta_nodes, eta_weights, dz,
+                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                 eps_nodes, eps_weights, gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             err = (fs * fs + fb * fb) ** 0.5
@@ -1673,7 +1707,8 @@ def solve_retirement_step(wealth_grid, savings_grid, z_grid, N_state,
 @njit(parallel=True)
 def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
                                 c_next_full, income_next_table,
-                                annuity_factors, Pi_z, Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+                                annuity_factors, rho, eta_nodes, eta_weights, dz,
+                                Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
                                 eps_nodes, eps_weights,
                                 gamma, psi_vec, beta, b_bar,
                                 constrained, solver_config):
@@ -1735,7 +1770,8 @@ def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
                     opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_2d_working(
                     s_val, z_i, i_s,
                     wealth_grid, c_next_full, income_next_table,
-                    annuity_factor_is, Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                    annuity_factor_is, z_grid, rho, eta_nodes, eta_weights, dz,
+                    Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                     eps_nodes, eps_weights, gamma, psi, beta, b_bar,
                     init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter,
@@ -1749,7 +1785,8 @@ def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
                     opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_unconstrained_working(
                     s_val, z_i, i_s,
                     wealth_grid, c_next_full, income_next_table,
-                    annuity_factor_is, Pi_z, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
+                    annuity_factor_is, z_grid, rho, eta_nodes, eta_weights, dz,
+                    Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
                     eps_nodes, eps_weights, gamma, psi, beta, b_bar,
                     init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter_unconstrained,
@@ -1830,7 +1867,8 @@ def _solve_working_age_step_jit(wealth_grid, savings_grid, z_grid, N_state,
 
 def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
                            c_next_full, income_next_table,
-                           annuity_factors, Pi_z, Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+                           annuity_factors, rho, eta_nodes, eta_weights, dz,
+                           Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
                            eps_nodes, eps_weights,
                            gamma, psi_vec, beta, b_bar,
                            constrained=True, solver_config=None):
@@ -1839,7 +1877,8 @@ def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
     return _solve_working_age_step_jit(
         wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, income_next_table,
-        annuity_factors, Pi_z, Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+        annuity_factors, rho, eta_nodes, eta_weights, dz,
+        Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
         eps_nodes, eps_weights,
         gamma, psi_vec, beta, b_bar,
         constrained, solver_config)
@@ -1904,7 +1943,10 @@ def run_lifecycle_solver(model, pc, n_s_points=None, solver_config=None, verbose
 
     # ---- Transitions and returns ----
     Pi_state        = pc.Pi_state
-    Pi_z            = pc.Pi_z
+    rho             = model.rho
+    eta_nodes       = pc.eta_nodes
+    eta_weights     = pc.eta_weights
+    dz              = pc.dz
     mu_r            = pc.mu_r
     ret_nodes       = pc.ret_nodes
     ret_weights     = pc.ret_weights
@@ -1996,7 +2038,8 @@ def run_lifecycle_solver(model, pc, n_s_points=None, solver_config=None, verbose
             c, a_s, a_b, _di, _df = solve_working_age_step(
                 w_grid, s_grid, z_grid, N_state,
                 c_next, working_income_table[t + 1, :, :],
-                annuity_factors, Pi_z, Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+                annuity_factors, rho, eta_nodes, eta_weights, dz,
+                Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config)
             label = "WORK  "

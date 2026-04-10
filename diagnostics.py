@@ -253,18 +253,50 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
          "both 2.500 (disposable_income_working & compute_pension_after_tax)")
     itest("Payroll cap = AIME cap", _ok)
 
-    # ── 2b½. Persistent income transition quality ────────────────────────────
-    sub("Persistent income transition quality (Pi_z)")
-    print(f"  Checks whether the discretized z-transition matches the true AR(1)")
-    print(f"  with mixture-normal innovations.  Moments computed at z = 0 (mid row).\n")
-
-    # True innovation moments from mixture parameters
+    # True innovation moments from mixture parameters (used by both eta quadrature and Pi_z diagnostics)
     _e_eta3 = (model.pz * (model.mu_eta1**3 + 3 * model.mu_eta1 * model.sigma_eta1**2)
                + (1.0 - model.pz) * (model.mu_eta2**3 + 3 * model.mu_eta2 * model.sigma_eta2**2))
     _true_skew = _e_eta3 / max(var_eta**1.5, 1e-15)
     _e_eta4 = (model.pz * (model.mu_eta1**4 + 6 * model.mu_eta1**2 * model.sigma_eta1**2 + 3 * model.sigma_eta1**4)
                + (1.0 - model.pz) * (model.mu_eta2**4 + 6 * model.mu_eta2**2 * model.sigma_eta2**2 + 3 * model.sigma_eta2**4))
     _true_kurt = _e_eta4 / max(var_eta**2, 1e-15)
+
+    # ── 2b½. Eta quadrature quality ───────────────────────────────────────────
+    sub("Persistent innovation quadrature (eta)")
+    print(f"  Gauss-Hermite quadrature over the mixture-normal persistent innovation.")
+    print(f"  This is used by the solver for E[V(z')|z].  Pi_z is now simulation-only.\n")
+
+    _eta_mean = float(np.sum(pc.eta_nodes * pc.eta_weights))
+    _eta_var  = float(np.sum(pc.eta_nodes**2 * pc.eta_weights)) - _eta_mean**2
+    _eta_e3   = float(np.sum(pc.eta_nodes**3 * pc.eta_weights))
+    _eta_skew = (_eta_e3 - 3 * _eta_mean * _eta_var - _eta_mean**3) / max(_eta_var**1.5, 1e-15) if _eta_var > 0 else 0.0
+    _eta_e4   = float(np.sum(pc.eta_nodes**4 * pc.eta_weights))
+    _eta_kurt = _eta_e4 / max(_eta_var**2, 1e-15) if _eta_var > 0 else 0.0
+
+    print(f"  True innovation moments (mixture-normal):")
+    print(f"    Mean     = {mu_eta:.4f},  Variance = {var_eta:.5f}")
+    print(f"    Skewness = {_true_skew:+.3f},  Kurtosis = {_true_kurt:.2f}")
+    print()
+    print(f"  Quadrature moments ({len(pc.eta_nodes)} nodes):")
+    print(f"    Mean     = {_eta_mean:+.2e}   (true = 0)")
+    print(f"    Variance = {_eta_var:.5f}   (true = {var_eta:.5f},  ratio = {_eta_var / var_eta:.4f})")
+    print(f"    Skewness = {_eta_skew:+.3f}     (true = {_true_skew:+.3f})")
+    print(f"    Kurtosis = {_eta_kurt:.2f}      (true = {_true_kurt:.2f})")
+    print()
+
+    _ok = abs(_eta_mean) < 1e-10
+    flag("Eta quadrature mean ~= 0", _ok, f"mean = {_eta_mean:.2e}")
+    itest("Eta quadrature mean", _ok)
+
+    _ok = abs(_eta_var / var_eta - 1.0) < 0.05
+    flag("Eta quadrature variance within 5%", _ok,
+         f"ratio = {_eta_var / var_eta:.4f}")
+    itest("Eta quadrature variance", _ok)
+
+    # ── 2b¾. Persistent income transition quality (Pi_z, simulation-only) ───
+    sub("Persistent income transition quality (Pi_z — used for simulation only)")
+    print(f"  NOTE: Pi_z is no longer used by the solver (replaced by eta quadrature).")
+    print(f"  It remains in use for forward simulation draws.\n")
 
     print(f"  True innovation moments (mixture-normal):")
     print(f"    Mean     = {mu_eta:.4f}")
@@ -830,6 +862,7 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
         ("N_state", pc.N_state, f"joint VAR states  ({'Ã—'.join(str(n) for n in pc.state_grid_sizes)})"),
         ("n_state", model.n_state, "slow-state variables"),
         ("n_ret",   model.n_ret,   "return variables (integrated)"),
+        ("n_eta",   len(pc.eta_nodes), f"persistent innovation nodes  (= 2 x {len(pc.eta_nodes) // 2} GH nodes)"),
     ]
     dims.append(("n_ret_quad", pc.n_ret_quad,
                  f"joint return quadrature nodes  (= {pc.disc_config.n_ret_nodes_1d}^{model.n_ret})"))
@@ -905,7 +938,7 @@ def print_model_diagnostic_report(model, pc, periods_per_year=4):
          f"max deviation = {np.abs(pc.Pi_state.sum(axis=1) - 1.0).max():.2e}")
 
     pi_z_ok  = np.allclose(pc.Pi_z.sum(axis=1), 1.0, atol=1e-10)
-    flag("Pi_z row sums = 1",     pi_z_ok,
+    flag("Pi_z row sums = 1  (simulation-only; solver uses GH quadrature)", pi_z_ok,
          f"max deviation = {np.abs(pc.Pi_z.sum(axis=1) - 1.0).max():.2e}")
 
     try:
@@ -1015,13 +1048,11 @@ def print_simulation_income_report(model, pc, sim):
     sub("Simulated vs theoretical income moments")
     print(f"  Compares realized mean income (across alive agents) against the")
     print(f"  theoretical expectation from the precomputed tables, weighted by")
-    print(f"  the stationary distribution of z and the eps quadrature.\n")
+    print(f"  the simulated z-distribution at each age.\n")
+    print(f"  This tests whether the income lookup tables correctly predict income")
+    print(f"  given agents' actual z-states, independent of z-transition quality.\n")
 
-    # Compute stationary distribution of z (eigenvector of Pi_z')
-    _evals, _evecs = np.linalg.eig(pc.Pi_z.T)
-    _stat_idx = int(np.argmin(np.abs(_evals - 1.0)))
-    pi_z_stat = np.abs(_evecs[:, _stat_idx])
-    pi_z_stat = pi_z_stat / pi_z_stat.sum()
+    n_z = len(pc.z_grid)
 
     print(f"  {'Age':>4}  {'N_alive':>7}  {'E[Y_sim]':>9}  {'E[Y_theory]':>11}  "
           f"{'Ratio':>7}  {'Std[Y_sim]':>10}  {'Note':>8}")
@@ -1045,16 +1076,20 @@ def print_simulation_income_report(model, pc, sim):
         _e_sim = float(np.mean(_y_alive))
         _std_sim = float(np.std(_y_alive))
 
-        # Theoretical: E[Y] = Σ_z π(z) × E_eps[Y(age, z, eps)]
+        # Theoretical: use simulated z-distribution as weights
+        _z_alive = sim_z_idx[_alive_mask, _t]
+        _z_counts = np.bincount(_z_alive, minlength=n_z)
+        _z_fracs = _z_counts / _z_counts.sum()
+
         if _age < model.retire_age:
             _e_theory = float(sum(
-                pi_z_stat[iz] * np.dot(pc.eps_weights, pc.working_income[_t, iz, :])
-                for iz in range(len(pc.z_grid))
+                _z_fracs[iz] * np.dot(pc.eps_weights, pc.working_income[_t, iz, :])
+                for iz in range(n_z)
             ))
         else:
             _e_theory = float(sum(
-                pi_z_stat[iz] * pc.pension_after_tax[_t, iz]
-                for iz in range(len(pc.z_grid))
+                _z_fracs[iz] * pc.pension_after_tax[_t, iz]
+                for iz in range(n_z)
             ))
 
         _ratio = _e_sim / _e_theory if _e_theory > 1e-10 else float("nan")
@@ -1068,8 +1103,8 @@ def print_simulation_income_report(model, pc, sim):
 
     print()
     print(f"  Ratio = E[Y_sim] / E[Y_theory].  Values near 1.0 expected.")
-    print(f"  Moderate deviations at older ages are normal: income-dependent")
-    print(f"  mortality selects for higher-z survivors, raising mean income.")
+    print(f"  E[Y_theory] uses the simulated z-distribution at each age, so the")
+    print(f"  test validates income tables independent of z-transition quality.")
 
     # S1 test: worst ratio deviation < 20%
     _ok = _worst_ratio_dev < 0.20

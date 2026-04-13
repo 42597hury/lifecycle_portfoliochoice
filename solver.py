@@ -174,6 +174,38 @@ def fast_interp_1d_with_slope(x, x_grid, y_grid):
 
 
 @njit(fastmath=True)
+def find_bracket(x, grid):
+    """Binary search for interpolation bracket on a sorted grid.
+
+    Returns (iw, frac_w, inv_dw) where:
+      grid[iw] <= x < grid[iw+1]
+      frac_w = (x - grid[iw]) / dw
+      inv_dw = 1.0 / dw
+    Clamps to valid range: iw in [0, len(grid)-2].
+    """
+    n = len(grid)
+    if x <= grid[0]:
+        dw = grid[1] - grid[0] + 1e-30
+        return 0, 0.0, 1.0 / dw
+    if x >= grid[n - 1]:
+        dw = grid[n - 1] - grid[n - 2] + 1e-30
+        return n - 2, 1.0, 1.0 / dw
+    lo = 0
+    hi = n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) >> 1
+        if grid[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+    dw = grid[hi] - grid[lo]
+    if dw < 1e-30:
+        return lo, 0.0, 0.0
+    frac = (x - grid[lo]) / dw
+    return lo, frac, 1.0 / dw
+
+
+@njit(fastmath=True)
 def project_to_triangle(alpha_s, alpha_b):
     """Project (alpha_s, alpha_b) onto feasible region: >=0, sum<=1."""
     alpha_s = max(0.0, alpha_s)
@@ -822,11 +854,14 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
                                    + frac_z * income_next_table[iz_lo + 1, i_e])
                     x_next = w_inv + income_next
 
-                    # Interpolate consumption in z: two wealth interps, then blend
-                    c_lo, mpc_lo = fast_interp_1d_with_slope(
-                        x_next, wealth_grid, c_next_full[iz_lo, j_s, :])
-                    c_hi, mpc_hi = fast_interp_1d_with_slope(
-                        x_next, wealth_grid, c_next_full[iz_lo + 1, j_s, :])
+                    # One bracket search, two direct reads
+                    iw, frac_w, inv_dw = find_bracket(x_next, wealth_grid)
+
+                    c_lo = (1.0 - frac_w) * c_next_full[iz_lo, j_s, iw] + frac_w * c_next_full[iz_lo, j_s, iw + 1]
+                    c_hi = (1.0 - frac_w) * c_next_full[iz_lo + 1, j_s, iw] + frac_w * c_next_full[iz_lo + 1, j_s, iw + 1]
+
+                    mpc_lo = (c_next_full[iz_lo, j_s, iw + 1] - c_next_full[iz_lo, j_s, iw]) * inv_dw
+                    mpc_hi = (c_next_full[iz_lo + 1, j_s, iw + 1] - c_next_full[iz_lo + 1, j_s, iw]) * inv_dw
 
                     c_next = (1.0 - frac_z) * c_lo + frac_z * c_hi
                     c_next = max(c_next, min_consumption)

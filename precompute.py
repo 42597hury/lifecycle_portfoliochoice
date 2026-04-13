@@ -179,6 +179,7 @@ class Precompute:
             mu2=model.mu_eta2,
             sigma2=model.sigma_eta2,
             N=disc_config.n_z,
+            n_stds=disc_config.n_stds,
         )
         # z_grid: (n_z,) float64 - persistent income states (log deviation from mean, mean-zero by construction)
         # Pi_z:   (n_z, n_z) float64 - Pi_z[iz, jz] = P(z_{t+1}=jz | z_t=iz)

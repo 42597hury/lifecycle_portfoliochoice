@@ -679,6 +679,8 @@ def simulate_lifecycle(C_mat: np.ndarray,
         print(f"  Ages:                {model.start_age} to {model.terminal_age} ({n_age} periods)")
         print(f"  Retirement age:      {model.retire_age} (index {retire_age_idx})")
         print(f"  Income x fin state:  {pc.n_z} z x {pc.N_state} s = {pc.n_z * pc.N_state:,} combined states")
+        print(f"  Eta quad nodes:      {len(pc.eta_nodes)} (K={pc.disc_config.n_eta_nodes} per component)")
+        print(f"  Eps quad nodes:      {len(pc.eps_nodes)} (K={pc.disc_config.n_eps_nodes} per component)")
         print(f"  Return quad nodes:   {pc.n_ret_quad} (K={pc.disc_config.n_ret_nodes_1d} per dim)")
         print(f"  Return draw mode:    {return_draw_mode}")
         if return_draw_mode == "monte_carlo":

@@ -104,10 +104,11 @@ class DiscretizationConfig(NamedTuple):
     state_grid_sizes: tuple = (5, 5, 5)
 
     # Income process
-    n_z: int = 11                       # persistent income grid points
-    n_eps_nodes: int = 5                # Gauss-Hermite nodes per component (doubled internally)
-    n_eta_nodes: int = 5                # Gauss-Hermite nodes per component for persistent innovation (doubled internally)
-    n_ret_nodes_1d: int = 1             # Gauss-Hermite order per return dimension; K=1 -> point mass at zero residual
+    n_z: int = 7                        # persistent income grid points
+    n_stds: float = 3.0                 # z-grid covers ±n_stds unconditional std devs
+    n_eps_nodes: int = 3                # Gauss-Hermite nodes per component (doubled internally)
+    n_eta_nodes: int = 3                # Gauss-Hermite nodes per component for persistent innovation (doubled internally)
+    n_ret_nodes_1d: int = 2             # Gauss-Hermite order per return dimension
 
     # Validation tolerances for Rouwenhorst consistency check
     consistency_tol_warn: float = 2e-2

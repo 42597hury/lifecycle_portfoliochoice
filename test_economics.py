@@ -18,9 +18,10 @@ from policy_io import load_policy_bundle
 from precompute import Precompute, build_model
 from model import (
     DiscretizationConfig, disposable_income_working, compute_pension_after_tax,
+    scalar_disposable_income,
 )
 from simulation import (
-    simulate_lifecycle, _scalar_disposable_income, _scalar_pension_after_tax,
+    simulate_lifecycle, _scalar_pension_after_tax,
     fast_interp_1d,
 )
 
@@ -79,7 +80,7 @@ def main():
     C, S, B, model, pc = setup()
 
     # Force Numba compilation
-    _ = _scalar_disposable_income(1.0)
+    _ = scalar_disposable_income(1.0)
     _ = _scalar_pension_after_tax(0.0, 1.0)
     _ = fast_interp_1d(0.5, np.array([0.0, 1.0]), np.array([0.0, 1.0]))
 
@@ -155,60 +156,24 @@ def main():
     # ==================================================================
     print()
     print("=" * 70)
-    print("E2. INCOME INTERPOLATION ERROR: solver vs simulation approach")
+    print("E2. SCALAR vs VECTORIZED INCOME CONSISTENCY")
     print("=" * 70)
-    # The solver interpolates after-tax income between grid points:
-    #   income = (1-frac) * table[iz_lo, ie] + frac * table[iz_lo+1, ie]
-    # The simulation computes:
-    #   income = tax(exp(f(age) + z_continuous + eps))
-    # These differ because tax(.) is nonlinear. Quantify the max error.
-
-    max_interp_errors = []
-    max_rel_errors = []
-
+    # After the on-the-fly refactor, the solver uses scalar_disposable_income
+    # at continuous z. Verify it matches the vectorized table at grid points.
+    max_diff = 0.0
     for t_test in [0, 10, 20, 30, 44]:
-        worst_abs = 0.0
-        worst_rel = 0.0
-        for ie in range(len(pc.eps_nodes)):
-            for iz in range(pc.n_z - 1):
-                z_lo = pc.z_grid[iz]
-                z_hi = pc.z_grid[iz + 1]
-                inc_lo = pc.working_income[t_test, iz, ie]
-                inc_hi = pc.working_income[t_test, iz + 1, ie]
+        for iz in range(pc.n_z):
+            for ie in range(len(pc.eps_nodes)):
+                y_gross = np.exp(pc.log_det_profile[t_test]
+                                 + pc.z_grid[iz] + pc.eps_nodes[ie])
+                inc_scalar = scalar_disposable_income(y_gross)
+                inc_table  = pc.working_income[t_test, iz, ie]
+                max_diff = max(max_diff, abs(inc_scalar - inc_table))
 
-                # Sample 20 interior points
-                for frac in np.linspace(0.01, 0.99, 20):
-                    z_mid = z_lo + frac * (z_hi - z_lo)
-
-                    # Solver approach: interpolate table
-                    inc_interp = (1 - frac) * inc_lo + frac * inc_hi
-
-                    # Simulation approach: compute directly
-                    y_gross = np.exp(pc.log_det_profile[t_test]
-                                     + z_mid + pc.eps_nodes[ie])
-                    inc_direct = _scalar_disposable_income(y_gross)
-
-                    abs_err = abs(inc_interp - inc_direct)
-                    rel_err = abs_err / max(abs(inc_direct), 1e-15)
-                    worst_abs = max(worst_abs, abs_err)
-                    worst_rel = max(worst_rel, rel_err)
-
-        max_interp_errors.append(worst_abs)
-        max_rel_errors.append(worst_rel)
-
-    print("  Income interpolation error (solver interp vs simulation exact):")
-    ages_tested = [model.start_age + t for t in [0, 10, 20, 30, 44]]
-    for age, abs_e, rel_e in zip(ages_tested, max_interp_errors, max_rel_errors):
-        print(f"    Age {age:>2}: max |abs err| = {abs_e:.6e}, "
-              f"max |rel err| = {rel_e:.4%}")
-
-    overall_max_rel = max(max_rel_errors)
-    test("Income interp error < 5% (relative)",
-         overall_max_rel < 0.05,
-         f"max rel err = {overall_max_rel:.4%}")
-    test("Income interp error < 1% (relative)",
-         overall_max_rel < 0.01,
-         f"max rel err = {overall_max_rel:.4%}")
+    print(f"  Max |scalar - vectorized table| at grid points: {max_diff:.2e}")
+    test("Scalar == vectorized at grid points",
+         max_diff < 1e-12,
+         f"max diff = {max_diff:.2e}")
 
     # ==================================================================
     print()
@@ -442,7 +407,7 @@ def main():
     # Simple check: working income at z=0, typical eps should differ from
     # pension at z=0
     pension_at_z0 = _scalar_pension_after_tax(0.0, pc.avg_det)
-    working_at_z0 = _scalar_disposable_income(
+    working_at_z0 = scalar_disposable_income(
         np.exp(pc.log_det_profile[retire_t] + 0.0 + 0.0)
     )
     test("Working income != pension at z=0 (distinct formulas)",

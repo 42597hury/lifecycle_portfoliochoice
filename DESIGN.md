@@ -646,7 +646,8 @@ def bequest_marginal_inv(mu, A, gamma, b_bar):
 create_utility_functions(gamma)          # Returns u, u_prime, u_prime_inv
 mixture_cdf(x, p, mu1, sigma1, mu2, sigma2)
 mixture_quantile(q, p, mu1, sigma1, mu2, sigma2)
-disposable_income_working(y_gross)       # Progressive tax on labor income
+disposable_income_working(y_gross)       # Progressive tax on labor income (vectorized)
+scalar_disposable_income(y_gross)        # Same schedule, scalar float — Numba-callable from solver hot loop
 compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_det, 2.5)
 ```
 
@@ -829,7 +830,7 @@ log_det_profile:  (n_age,)        deterministic age-earnings profile f(age) for 
 avg_det:          float           mean(exp(f(age))) over working ages; used for pension AIME
 
 # === LOOKUP TABLES ===
-working_income:   (n_age, n_z, n_eps)  after-tax labor income (solver grid lookup)
+working_income:   (n_age, n_z, n_eps)  after-tax labor income table (simulation warmup + diagnostics; solver computes income on the fly — §4.5)
 pension_after_tax:(n_age, n_z)         after-tax Social Security benefit (solver grid lookup)
 survival_probs_2d:(n_age, n_z)         age- and earnings-dependent survival probabilities
 
@@ -1024,8 +1025,38 @@ Same structure as retirement, with additional integration over income innovation
 over discrete grid points weighted by `Pi_z[i_z, j_z]`, the inner loop iterates
 over Gauss-Hermite quadrature nodes `eta_nodes[k_eta]` with weights `eta_weights[k_eta]`.
 For each node, `z_next = rho * z_grid[z_idx] + eta_nodes[k_eta]` is computed and
-bracketed on the z-grid. Policies and income are linearly interpolated between
-the two bracketing grid points `iz_lo` and `iz_lo + 1`.
+bracketed on the z-grid. Consumption policy is linearly interpolated between the
+two bracketing grid points `iz_lo` and `iz_lo + 1`; income is **not** interpolated
+(see below).
+
+**Income computed on the fly (no table interpolation):** Next-period gross income
+
+```
+y_gross = exp( f(t+1) + ρ·z_grid[z_idx] + η_k + ε_j )
+```
+
+is evaluated directly via `scalar_disposable_income(y_gross)` (the scalar,
+Numba-JIT'd companion to the vectorized `disposable_income_working`). This
+replaces the earlier scheme of interpolating the precomputed `working_income`
+table in `z`, which introduced a chord-overshoot bias of ~14–17% between grid
+points because the tax schedule is nonlinear. The solver now uses the exact same
+gross-to-net mapping as the simulation.
+
+To keep the hot loop free of transcendentals, the exponential is factored once
+per FOC call:
+
+```
+base_det_z = exp( f(t+1) + ρ·z_grid[z_idx] )          # 1 exp (hoisted)
+exp_eta[k] = exp( η_k )      for k in 0..n_eta-1      # n_eta exps (hoisted)
+exp_eps[j] = exp( ε_j )      for j in 0..n_eps-1      # n_eps exps (hoisted)
+
+y_gross    = base_det_z · exp_eta[k_eta] · exp_eps[i_e]   # inside hot loop: 2 muls
+```
+
+Total transcendentals per FOC call: `n_eta + n_eps + 1` (typically ~8), versus
+`N_state · n_ret_quad · n_eta · n_eps` (typically ~4,500) if `exp()` were left
+inline. The two small `exp_eta` / `exp_eps` buffers are allocated inside the
+`@njit` function and fit comfortably in L1 cache.
 
 **Bequest hoist optimization:** The bequest marginal utility (`mu_bequest`, `mup_bequest`)
 depends only on `j_s` (through `w_inv = s_val * R_p`), not on `(k_eta, i_e)`. Its
@@ -1039,10 +1070,16 @@ indexed by the current `z_i` in the calling step function). Therefore `prob_deat
 is constant within a single FOC call, and the bequest hoist remains valid: the bequest
 weight `p_var * prob_death` is still independent of `(k_eta, i_e)` within the inner loops.
 
+**Note on `z_next` clamping:** The z-bracketing for consumption-policy interpolation
+clamps `iz_lo` and `frac_z` to `[0, n_z-2]` and `[0, 1]`. The income computation uses
+the raw `z_next = ρ·z + η_k` without clamping — the tax function is well-defined at
+every real `z`, so tail realizations get more accurate income than they would under a
+clamped table lookup.
+
 ```python
 @njit(fastmath=True)
 def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
-                             wealth_grid, c_next_full, income_next_table,
+                             wealth_grid, c_next_full, log_det_next,
                              annuity_factor_is,
                              z_grid, rho, eta_nodes, eta_weights, dz,
                              Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
@@ -1056,19 +1093,27 @@ def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
       - Transitory shock eps (weighted by eps_weights)
 
     z_next = rho * z_grid[z_idx] + eta_nodes[k_eta] is generally off-grid;
-    consumption and income are linearly interpolated between bracketing z points.
+    consumption is linearly interpolated in z. Income is evaluated exactly
+    via scalar_disposable_income(exp(log_det_next + rho*z + eta + eps))
+    with the exp() factored into precomputed per-node tables.
 
+    log_det_next: scalar float = f(age_{t+1}), the deterministic age-earnings
+                  profile evaluated at next period's age.
     c_next_full shape: (n_z, N_state, n_w)
 
     Loop structure (after bequest hoist):
+      precompute exp_eta[k], exp_eps[j], base_det_z    # outside all loops
       for j_s:                              # future macro state
           for k_r:                          # joint return node
               bequest accumulators += ...   # once per (j_s, k_r)
               for k_eta:                    # persistent innovation (GH quadrature)
                   z_next = rho * z + eta_nodes[k_eta]
-                  iz_lo, frac_z = bracket(z_next)
+                  iz_lo, frac_z = bracket(z_next)       # for consumption policy only
+                  det_z_eta = base_det_z * exp_eta[k_eta]
                   for i_e:                  # transitory shock
-                      interpolate income and consumption at (iz_lo, frac_z)
+                      y_gross     = det_z_eta * exp_eps[i_e]
+                      income_next = scalar_disposable_income(y_gross)
+                      interpolate consumption at (iz_lo, frac_z)
                       alive accumulators += ...
     """
 ```
@@ -1177,7 +1222,7 @@ def solve_retirement_step(wealth_grid, savings_grid, z_grid, N_state,
 ```python
 @njit(parallel=True)
 def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
-                           c_next_full, income_next_table,
+                           c_next_full, log_det_next,
                            annuity_factors,
                            rho, eta_nodes, eta_weights, dz,
                            Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
@@ -1187,8 +1232,14 @@ def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
     Solve one working-age period using EGM + 2D Newton.
     Same EGM structure as retirement but with income integration via
     Gauss-Hermite quadrature over persistent innovations (eta_nodes/weights)
-    and linear z-interpolation of policies at off-grid z' values.
-    psi_vec: (n_z,) survival probs for this age, indexed by z.
+    and linear z-interpolation of the consumption policy at off-grid z'
+    values. Income at each quadrature node is computed on the fly from
+    log_det_next, z_grid[z_i], eta_nodes[k_eta], eps_nodes[i_e] via
+    scalar_disposable_income — no table interpolation (§4.5).
+
+    log_det_next: scalar = f(age_{t+1}). Master solver passes
+                  pc.log_det_profile[t+1].
+    psi_vec:      (n_z,) survival probs for this age, indexed by z.
     """
 ```
 
@@ -1282,7 +1333,7 @@ post-solve diagnostic report.
 | `eta_nodes/weights` | (n_eta,) | Gauss-Hermite quadrature for persistent innovation eta |
 | `log_det_profile` | (n_age,) | Deterministic age-earnings profile f(age) per period |
 | `avg_det` | scalar | Mean of exp(f(age)) over working ages; for pension AIME |
-| `working_income` | (n_age, n_z, n_eps) | After-tax labor income table (solver grid lookup) |
+| `working_income` | (n_age, n_z, n_eps) | After-tax labor income table (retained for simulation warmup and diagnostics; solver now computes income on the fly — §4.5) |
 | `pension_after_tax` | (n_age, n_z) | After-tax pension table (solver grid lookup) |
 
 ### 5.2 Policy Function Shapes

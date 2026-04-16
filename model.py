@@ -13,6 +13,7 @@ Dependencies: numpy, scipy (no project imports)
 """
 
 import numpy as np
+from numba import njit
 from scipy.stats import norm
 from typing import NamedTuple, Callable
 
@@ -49,12 +50,12 @@ class LifecyclePortfolioModel(NamedTuple):
     pz: float
     mu_eta1: float
     sigma_eta1: float
-    mu_eta2: float
+    mu_eta2: float   # DERIVED (not free): pinned by E[eta]=0, so mu_eta2 = -(pz/(1-pz))*mu_eta1. Quadrature recomputes from this formula; stored value here is informational and may be ignored.
     sigma_eta2: float
     pe: float
     mu_eps1: float
     sigma_eps1: float
-    mu_eps2: float   # NOTE: overridden in get_eps_quadrature_corrected (zero-mean enforcement)
+    mu_eps2: float   # DERIVED (not free): pinned by E[eps]=0, so mu_eps2 = -(pe/(1-pe))*mu_eps1. Quadrature recomputes from this formula; stored value here is informational and may be ignored.
     sigma_eps2: float
 
     # Partitioned VAR structure
@@ -289,6 +290,44 @@ def disposable_income_working(y_gross):
     tax[m] = 2.8085 + (taxable_income[m] - 9.32) * 0.37
 
     return taxable_income - tax
+
+
+@njit(fastmath=True)
+def scalar_disposable_income(y_gross):
+    """After-tax labor income for a single scalar gross income value.
+
+    Identical tax schedule to disposable_income_working() but operates
+    on a single float for use inside Numba-compiled solver loops.
+
+    Parameters
+    ----------
+    y_gross : float
+        Gross labor income in model units.
+
+    Returns
+    -------
+    float
+        Disposable (after-tax, after-payroll) income.
+    """
+    payroll_tax = 0.106 * min(y_gross, 2.5)
+    taxable = max(0.0, y_gross - payroll_tax)
+
+    if taxable <= 0.18:
+        tax = taxable * 0.10
+    elif taxable <= 0.72:
+        tax = 0.018 + (taxable - 0.18) * 0.12
+    elif taxable <= 1.54:
+        tax = 0.0828 + (taxable - 0.72) * 0.22
+    elif taxable <= 2.94:
+        tax = 0.2632 + (taxable - 1.54) * 0.24
+    elif taxable <= 3.73:
+        tax = 0.5992 + (taxable - 2.94) * 0.32
+    elif taxable <= 9.32:
+        tax = 0.8520 + (taxable - 3.73) * 0.35
+    else:
+        tax = 2.8085 + (taxable - 9.32) * 0.37
+
+    return taxable - tax
 
 
 def compute_pension_after_tax(z_grid, avg_det):

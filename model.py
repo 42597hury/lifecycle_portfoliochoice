@@ -103,6 +103,7 @@ class DiscretizationConfig(NamedTuple):
 
     # Financial state VAR discretization
     state_grid_sizes: tuple = (5, 5, 5)
+    state_grid_scale: float = 1.0                      # grid coverage scaling; ~0.85 for N=5 debug
 
     # Income process
     n_z: int = 7                        # persistent income grid points
@@ -110,10 +111,7 @@ class DiscretizationConfig(NamedTuple):
     n_eps_nodes: int = 3                # Gauss-Hermite nodes per component (doubled internally)
     n_eta_nodes: int = 3                # Gauss-Hermite nodes per component for persistent innovation (doubled internally)
     n_ret_nodes_1d: int = 2             # Gauss-Hermite order per return dimension
-
-    # Validation tolerances for Rouwenhorst consistency check
-    consistency_tol_warn: float = 2e-2
-    consistency_tol_error: float = 1e-1
+    n_state_quad_nodes: int = 3         # GH order per state dimension for state innovation quadrature
 
 
 # =============================================================================
@@ -200,14 +198,14 @@ def annuity_factor(y_ann, b_bar):
 
     A(y) = sum_{k=1}^{b_bar} (1+y)^{-k} = (1 - (1+y)^{-b_bar}) / y
 
-    Using the 10-year nominal bond yield (y_nom * 4) as the discount rate is
+    Using the 10-year nominal bond yield (y_nom) as the discount rate is
     coherent because the bequest horizon b_bar equals the bond maturity: the
     heir receives a consumption stream of the same length and the nominal bond
     is the natural pricing instrument for that stream.
 
     Parameters
     ----------
-    y_ann : float or array  Annual nominal yield (e.g. y_nom_quarterly * 4).
+    y_ann : float or array  Annual nominal yield (y_nom is already in annual decimal).
     b_bar : int             Bequest horizon in years (= bond maturity = 10).
     """
     y_ann = np.asarray(y_ann, dtype=float)

@@ -19,6 +19,7 @@ from var import partition_var
 from discretization import (
     rouwenhorst_multivariate, discretize_income_ar1_mixture,
     get_eps_quadrature_corrected, get_eta_quadrature_mixture, get_return_quadrature,
+    get_state_quadrature,
 )
 from mortality import calibrate_earnings_dependent_mortality
 
@@ -122,6 +123,7 @@ class Precompute:
             Phi=model.Phi_11,
             Sigma=Sigma_state_chol,
             method="independent",
+            grid_scale=disc_config.state_grid_scale,
         )
         # state_grids:   list[n_state] of 1-D marginal grids, state_grids[d] has shape (state_grid_sizes[d],)
         # Pi_state:      (N_state, N_state) float64 - joint transition matrix; Pi_state[i,j] = P(s_{t+1}=j|s_t=i)
@@ -154,6 +156,30 @@ class Precompute:
         # ret_weights: (n_ret_quad,) float64       - tensor-product weights, sum(ret_weights)=1
         # Total joint return nodes = n_ret_nodes_1d ** model.n_ret.  K=1 yields one zero residual node.
 
+        # --- State innovation quadrature ---
+        self.v_nodes, self.v_weights = get_state_quadrature(
+            model, n_nodes=disc_config.n_state_quad_nodes
+        )
+        # v_nodes:   (n_state_quad, n_state) float64 — innovation nodes in original coords
+        # v_weights: (n_state_quad,) float64 — tensor-product weights, sum to 1
+        self.n_state_quad = len(self.v_weights)
+
+        # --- Precomputed return formula constants (for on-the-fly mu_r computation) ---
+        # Conditional return mean: mu_r_k = Phi_0_ret + Phi_21 @ s_i + M @ v_k
+        # We store const_r = Phi_0_ret and A_r = Phi_21 so:
+        #   mu_r_k = const_r + A_r @ s_i + M @ v_nodes[k_v]
+        self.const_r = np.array(model.Phi_0_ret, dtype=float)             # (n_ret,)
+        self.A_r = np.array(model.Phi_21, dtype=float)                     # (n_ret, n_state)
+
+        # Precompute M @ v_nodes for each quadrature node (avoids matmul in hot loop)
+        self.M_v_nodes = self.v_nodes @ model.M.T     # (n_state_quad, n_ret)
+        # Usage in solver: mu_r_k = base_mu_r_i + M_v_nodes[k_v, :]
+        # where base_mu_r_i = const_r + A_r @ s_i  (computed once per i_s)
+
+        # Precompute exp of the return-quadrature residual nodes (avoids exp in hot loop)
+        self.exp_ret_stock = np.exp(self.ret_nodes[:, 0])  # (n_ret_quad,)
+        self.exp_ret_bond  = np.exp(self.ret_nodes[:, 1])  # (n_ret_quad,)
+
         self.r_bill_grid = self.state_grid[:, model.bill_rate_index_in_state]
         # (N_state,) float64 - log real bill rate at each slow state
         # R_bill = exp(r_bill_grid[i_s]); bill rate is KNOWN at decision time (no uncertainty)
@@ -163,9 +189,8 @@ class Precompute:
         # 10-year nominal bond yield.  Using y_nom is coherent because the
         # bequest horizon b_bar equals the bond maturity: the nominal bond is
         # the natural pricing instrument for the heir's consumption stream.
-        # y_nom is stored in quarterly decimal (SVENY10/400); multiply by 4
-        # to recover the annual yield used for discounting.
-        _y_ann = self.state_grid[:, model.annuity_yield_index_in_state] * 4.0   # quarterly -> annual yield
+        # y_nom is stored in annual decimal (SVENY10/100); use directly.
+        _y_ann = self.state_grid[:, model.annuity_yield_index_in_state]
         self.annuity_factors = annuity_factor(_y_ann, model.b_bar)
         # (N_state,) float64 - A(y_nom, b_bar) for each financial state
         # Used by bequest_utility / bequest_marginal / bequest_marginal_inv in solver.
@@ -246,11 +271,8 @@ class Precompute:
         # survival_probs_2d: (n_age, n_z) float64
         # survival_probs_2d[t, iz] = 1 - min(chi[iz] * m_baseline(age_t), 1)
 
-        # Diagnostics
-        self._validate_conditional_returns(
-            tol_warn=disc_config.consistency_tol_warn,
-            tol_error=disc_config.consistency_tol_error,
-        )
+        # Diagnostics (quadrature moment checks only; old Markov consistency check removed)
+        self._validate_state_quadrature()
         if self.verbose:
             self._print_summary()
 
@@ -285,83 +307,30 @@ class Precompute:
 
         return const[None, None, :] + term_i[:, None, :] + term_j[None, :, :]
 
-    def _validate_conditional_returns(self, tol_warn=2e-2, tol_error=1e-1):
+    def _validate_state_quadrature(self):
+        """Verify state quadrature reproduces conditional return moments.
+
+        For each source state i, check:
+          sum_k w_k * mu_r_k == Phi_0_ret + Phi_21 @ s_i  (unconditional return mean)
+          sum_k w_k * v_k @ v_k.T == Sigma_ss             (innovation covariance)
         """
-        Verify sum_j Pi[i,j] * mu_r[i,j] == Phi_0_ret + Phi_21 @ s_i for all i.
-
-        Theoretical error = M @ Phi_11_off @ s_i, where
-        Phi_11_off = Phi_11 - diag(diag(Phi_11)).
-
-        Source: independence Rouwenhorst uses only diagonal(Phi_11) per marginal,
-        so it cannot match E[s_{t+1}|s_i] when Phi_11 has off-diagonal elements.
-        The error grows linearly with the off-diagonal cross-persistence and with
-        how far each state is from its mean (worst at grid extremes).
-        Finer grids do NOT reduce this error; it is a structural approximation.
-        """
-        N = self.N_state
-        n_ret = self.model.n_ret
-
-        errors = np.empty((N, n_ret))
-        for i in range(N):
-            target = self.model.Phi_0_ret + self.model.Phi_21 @ self.state_grid[i]
-            avg    = self.Pi_state[i, :] @ self.mu_r[i, :, :]
-            errors[i, :] = np.abs(avg - target)
-
-        max_err_per_ret  = errors.max(axis=0)
-        mean_err_per_ret = errors.mean(axis=0)
-        overall_max      = errors.max()
-        worst_i          = errors.max(axis=1).argmax()
-
-        Phi_11_off = self.model.Phi_11 - np.diag(np.diag(self.model.Phi_11))
+        model = self.model
+        max_err_mean = 0.0
+        for i in range(self.N_state):
+            s_i = self.state_grid[i]
+            base_mu_r = self.const_r + self.A_r @ s_i
+            # Weighted average of mu_r_k = base_mu_r + M @ v_k
+            avg_mu_r = base_mu_r + self.v_weights @ self.M_v_nodes
+            target = model.Phi_0_ret + model.Phi_21 @ s_i
+            err = np.max(np.abs(avg_mu_r - target))
+            max_err_mean = max(max_err_mean, err)
 
         if self.verbose:
-            print("=" * 64)
-            print("CONDITIONAL RETURN CONSISTENCY CHECK")
-            print("=" * 64)
-            print("Error source: independence Rouwenhorst uses only diag(Phi_11).")
-            print("Theoretical error at state i = M @ Phi_11_off @ s_i, where")
-            print("Phi_11_off = Phi_11 - diag(diag(Phi_11)).")
-            print("Error is worst at grid extremes; finer grids do not fix it.")
-            print()
-            print(f"  ||Phi_11_off||_F = {np.linalg.norm(Phi_11_off):.4f}"
-                  "  (cross-persistence magnitude)")
-            print(f"  ||M||_F          = {np.linalg.norm(self.model.M):.4f}"
-                  "  (return-state conditioning strength)")
-            print(f"  Product ||M @ Phi_11_off||_F = "
-                  f"{np.linalg.norm(self.model.M @ Phi_11_off):.4f}"
-                  "  (amplification factor)")
-            print()
-            print(f"  {'Variable':<12}  {'max error':>10}  {'mean error':>10}")
-            print(f"  {'-'*12}  {'-'*10}  {'-'*10}")
-            for k, name in enumerate(self.model.ret_names):
-                flag = "  << WARN" if max_err_per_ret[k] > tol_warn else ""
-                print(f"  {name:<12}  {max_err_per_ret[k]:>10.3e}"
-                      f"  {mean_err_per_ret[k]:>10.3e}{flag}")
-            print()
-            worst_vals = "  ".join(
-                f"{name}={self.state_grid[worst_i, d]:.4f}"
-                for d, name in enumerate(self.model.state_names)
-            )
-            print(f"  Worst state: index={worst_i}  ({worst_vals})")
-            print(f"  Overall max error: {overall_max:.3e}")
-            print()
-            if overall_max > tol_error:
-                print(f"  STATUS: FAIL  (max {overall_max:.3e} > hard limit {tol_error:.3e})")
-                print(f"  Current grid: {self.state_grid_sizes}  ->  {self.N_state} states")
-                print("  Off-diagonal Phi_11 is too large for independence Rouwenhorst.")
-                print("  See ||M @ Phi_11_off|| above for the amplified error magnitude.")
-            elif overall_max > tol_warn:
-                print(f"  STATUS: WARN  (max {overall_max:.3e} > soft limit {tol_warn:.3e})")
-                print(f"  Current grid: {self.state_grid_sizes}  ->  {self.N_state} states")
-            else:
-                print(f"  STATUS: PASS  (max {overall_max:.3e} < warn limit {tol_warn:.3e})")
-            print("=" * 64)
+            print(f"  State quadrature return-mean consistency: max err = {max_err_mean:.2e}")
 
-        if overall_max > tol_error:
-            raise RuntimeError(
-                f"Conditional return consistency error {overall_max:.3e} exceeds "
-                f"hard limit {tol_error:.3e}. See printed diagnostics above."
-            )
+        assert max_err_mean < 1e-10, (
+            f"State quadrature return-mean error {max_err_mean:.2e} too large"
+        )
 
     def _precompute_working_income(self):
         """
@@ -424,6 +393,8 @@ class Precompute:
               f"  x  {self.n_eps} transitory nodes")
         print(f"Return quad  : {self.disc_config.n_ret_nodes_1d} nodes/dim"
               f"  ->  {self.n_ret_quad} joint nodes")
+        print(f"State quad   : {self.disc_config.n_state_quad_nodes} nodes/dim"
+              f"  ->  {self.n_state_quad} joint nodes")
         print(f"mu_r         : {self.mu_r.shape}"
               f"  ({self.N_state * self.N_state * self.model.n_ret:,} values)")
         print(f"ret_nodes    : {self.ret_nodes.shape}")

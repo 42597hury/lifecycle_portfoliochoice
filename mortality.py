@@ -206,8 +206,8 @@ def life_expectancy_at_40(chi, m_table=None, max_age=119):
     for age in range(40, max_age + 1):
         m_base = m_table.get(age, 1.0)
         m_adj = min(chi * m_base, 1.0)
-        le_sum += survival
         survival *= (1.0 - m_adj)
+        le_sum += survival
         if survival < 1e-15:
             break
 

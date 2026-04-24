@@ -377,6 +377,18 @@ def simulate_lifecycle_core(
     initial_income: np.ndarray,
     uniform_draws: np.ndarray,
     normal_draws: np.ndarray,
+    # --- Continuous state transition arrays ---
+    use_continuous_state: bool,
+    state_grid: np.ndarray,
+    state_grids_0: np.ndarray,
+    state_grids_1: np.ndarray,
+    state_grids_2: np.ndarray,
+    L_ss: np.ndarray,
+    Phi_0_state: np.ndarray,
+    Phi_11: np.ndarray,
+    const_r: np.ndarray,
+    A_r: np.ndarray,
+    M_matrix: np.ndarray,
 ) -> tuple:
     """
     Numba-parallel core simulation loop over households.
@@ -389,13 +401,14 @@ def simulate_lifecycle_core(
     uniform_draws[:, t, :] slots:
       [0] survival draw
       [1] mixture component draw (u < pz -> component 1)
-      [2] financial state transition draw
+      [2] financial state transition draw (unused when use_continuous_state=True)
       [3] return-node draw (quadrature mode only)
       [4] transitory income shock draw
 
     normal_draws[:, t, :] slots:
       [0..n_ret-1] return shocks (monte_carlo mode)
       [n_ret]      eta standard normal for persistent income innovation
+      [n_ret+1..n_ret+n_state] state innovation standard normals (when use_continuous_state=True)
     """
     n_simulations = len(initial_x)
     n_age = C_mat.shape[0]
@@ -475,11 +488,51 @@ def simulate_lifecycle_core(
             sim_alpha_s[i, t] = alpha_s_t
             sim_alpha_b[i, t] = alpha_b_t
 
-            next_state_idx = draw_discrete(Pi_state[state_idx, :], uniform_draws[i, t, 2])
-
             R_bill = np.exp(r_bill_grid[state_idx])
-            mu_xr = mu_r[state_idx, next_state_idx, 0]
-            mu_xb = mu_r[state_idx, next_state_idx, 1]
+
+            if use_continuous_state:
+                # Draw v^s = L_ss @ z where z ~ N(0, I)
+                n_state = L_ss.shape[0]
+                v_s_0 = 0.0; v_s_1 = 0.0; v_s_2 = 0.0
+                for kk in range(n_state):
+                    zz = normal_draws[i, t, n_ret + 1 + kk]
+                    v_s_0 += L_ss[0, kk] * zz
+                    v_s_1 += L_ss[1, kk] * zz
+                    v_s_2 += L_ss[2, kk] * zz
+
+                # Propagate state
+                s_cur = state_grid[state_idx]
+                s_next_0 = Phi_0_state[0] + Phi_11[0, 0] * s_cur[0] + Phi_11[0, 1] * s_cur[1] + Phi_11[0, 2] * s_cur[2] + v_s_0
+                s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * s_cur[0] + Phi_11[1, 1] * s_cur[1] + Phi_11[1, 2] * s_cur[2] + v_s_1
+                s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * s_cur[0] + Phi_11[2, 1] * s_cur[1] + Phi_11[2, 2] * s_cur[2] + v_s_2
+
+                # Conditional return mean from continuous v^s
+                mu_xr = const_r[0] + A_r[0, 0] * s_cur[0] + A_r[0, 1] * s_cur[1] + A_r[0, 2] * s_cur[2] + M_matrix[0, 0] * v_s_0 + M_matrix[0, 1] * v_s_1 + M_matrix[0, 2] * v_s_2
+                mu_xb = const_r[1] + A_r[1, 0] * s_cur[0] + A_r[1, 1] * s_cur[1] + A_r[1, 2] * s_cur[2] + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
+
+                # Find nearest grid point for next period's policy lookup
+                N1_s = len(state_grids_1); N2_s = len(state_grids_2)
+                # Clamp and find nearest index per dimension
+                best_d0 = 0; best_dist = abs(s_next_0 - state_grids_0[0])
+                for dd in range(1, len(state_grids_0)):
+                    d = abs(s_next_0 - state_grids_0[dd])
+                    if d < best_dist:
+                        best_dist = d; best_d0 = dd
+                best_d1 = 0; best_dist = abs(s_next_1 - state_grids_1[0])
+                for dd in range(1, N1_s):
+                    d = abs(s_next_1 - state_grids_1[dd])
+                    if d < best_dist:
+                        best_dist = d; best_d1 = dd
+                best_d2 = 0; best_dist = abs(s_next_2 - state_grids_2[0])
+                for dd in range(1, N2_s):
+                    d = abs(s_next_2 - state_grids_2[dd])
+                    if d < best_dist:
+                        best_dist = d; best_d2 = dd
+                next_state_idx = best_d0 * N1_s * N2_s + best_d1 * N2_s + best_d2
+            else:
+                next_state_idx = draw_discrete(Pi_state[state_idx, :], uniform_draws[i, t, 2])
+                mu_xr = mu_r[state_idx, next_state_idx, 0]
+                mu_xb = mu_r[state_idx, next_state_idx, 1]
 
             if use_mc_returns:
                 xr_res = 0.0
@@ -671,6 +724,13 @@ def simulate_lifecycle(C_mat: np.ndarray,
     if isinstance(initial_z, str) and initial_z == "normal":
         init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=initial_z_normal_std)
         init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
+    elif isinstance(initial_z, str) and initial_z == "stationary":
+        # Unconditional distribution of z: N(0, sigma_z^2) where sigma_z^2 = Var(eta) / (1 - rho^2)
+        var_eta = (model.pz * (model.sigma_eta1**2 + model.mu_eta1**2)
+                   + (1 - model.pz) * (model.sigma_eta2**2 + model.mu_eta2**2))
+        sigma_z = np.sqrt(var_eta / (1.0 - model.rho**2))
+        init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=sigma_z)
+        init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
     else:
         init_z_idx = initialize_states(n_simulations, pc.n_z, pc.Pi_z, initial_z, rng)
     # Convert grid indices to continuous z values
@@ -754,14 +814,17 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     uniform_draws = rng.uniform(size=(n_simulations, n_age, 5))
 
-    # normal_draws: n_ret columns for return shocks + 1 column for eta
+    # normal_draws: n_ret columns for return shocks + 1 column for eta + n_state for state innovations
+    n_state = int(model.n_state)
+    use_continuous_state = hasattr(pc, 'v_nodes')  # True if state quadrature was set up
+    n_normal_cols = n_ret + 1 + (n_state if use_continuous_state else 0)
     if return_draw_mode == "monte_carlo":
         ret_factor_arr = _build_return_factor(model.Sigma_r_cond)
-        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_ret + 1))
+        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
         use_mc_returns = True
     else:
         ret_factor_arr = np.zeros((n_ret, n_ret), dtype=float)
-        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_ret + 1))
+        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
         use_mc_returns = False
 
     if verbose:
@@ -771,6 +834,31 @@ def simulate_lifecycle(C_mat: np.ndarray,
     mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
 
     t_start = time.perf_counter()
+
+    # Prepare continuous state transition arrays
+    if use_continuous_state:
+        L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
+            0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)))
+        state_grid_arr = np.ascontiguousarray(pc.state_grid)
+        sg0 = np.ascontiguousarray(pc.state_grids[0])
+        sg1 = np.ascontiguousarray(pc.state_grids[1])
+        sg2 = np.ascontiguousarray(pc.state_grids[2])
+        Phi_0_state_arr = np.ascontiguousarray(model.Phi_0_state)
+        Phi_11_arr = np.ascontiguousarray(model.Phi_11)
+        const_r_arr = np.ascontiguousarray(pc.const_r)
+        A_r_arr = np.ascontiguousarray(pc.A_r)
+        M_matrix_arr = np.ascontiguousarray(model.M)
+    else:
+        L_ss_arr = np.empty((0, 0), dtype=float)
+        state_grid_arr = np.empty((0, 0), dtype=float)
+        sg0 = np.empty(0, dtype=float)
+        sg1 = np.empty(0, dtype=float)
+        sg2 = np.empty(0, dtype=float)
+        Phi_0_state_arr = np.empty(0, dtype=float)
+        Phi_11_arr = np.empty((0, 0), dtype=float)
+        const_r_arr = np.empty(0, dtype=float)
+        A_r_arr = np.empty((0, 0), dtype=float)
+        M_matrix_arr = np.empty((0, 0), dtype=float)
 
     results = simulate_lifecycle_core(
         C_mat=np.ascontiguousarray(C_mat),
@@ -805,6 +893,17 @@ def simulate_lifecycle(C_mat: np.ndarray,
         initial_income=np.ascontiguousarray(initial_income_arr),
         uniform_draws=np.ascontiguousarray(uniform_draws),
         normal_draws=np.ascontiguousarray(normal_draws),
+        use_continuous_state=use_continuous_state,
+        state_grid=state_grid_arr,
+        state_grids_0=sg0,
+        state_grids_1=sg1,
+        state_grids_2=sg2,
+        L_ss=L_ss_arr,
+        Phi_0_state=Phi_0_state_arr,
+        Phi_11=Phi_11_arr,
+        const_r=const_r_arr,
+        A_r=A_r_arr,
+        M_matrix=M_matrix_arr,
     )
 
     elapsed = time.perf_counter() - t_start

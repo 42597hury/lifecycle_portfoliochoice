@@ -14,6 +14,7 @@ Dependencies: numpy, scipy (no project imports)
 import numpy as np
 from scipy.special import roots_hermite
 from scipy.stats import norm
+import warnings
 
 
 # =============================================================================
@@ -71,19 +72,39 @@ def rouwenhorst_univariate(N, mu, rho, sigma):
     return y_grid, Pi
 
 
-def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma, method="independent"):
-    """
-    Multivariate Rouwenhorst with independence approximation across dimensions.
 
-    Parameters:
-        N_vec: list of grid sizes per state variable
-        mu: intercept in z' = mu + Phi z + eps
-        Phi: persistence matrix
-        Sigma: Cholesky factor of eps covariance
+def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma, method="independent",
+                             grid_scale=1.0):
     """
-    if method != "independent":
-        raise NotImplementedError("Only method='independent' is currently implemented")
+    Multivariate Markov chain approximation for a Gaussian VAR(1).
 
+    Uses independence Rouwenhorst: Kronecker product of marginal chains.
+    The resulting Pi_state is retained for backward compatibility (simulation
+    fallback) but the solver uses Gauss-Hermite quadrature for state
+    transitions, which handles cross-correlations exactly.
+
+    Parameters
+    ----------
+    N_vec : list of int
+        Grid sizes per state variable, e.g. [7, 7, 7].
+    mu : ndarray, shape (d,)
+        Intercept in z' = mu + Phi z + eps.
+    Phi : ndarray, shape (d, d)
+        Persistence matrix.
+    Sigma : ndarray, shape (d, d)
+        Cholesky factor of innovation covariance (Sigma @ Sigma.T = Omega).
+    grid_scale : float, optional
+        Unused (kept for API compatibility).
+
+    Returns
+    -------
+    state_grids : list of d 1-D arrays
+        Marginal grids per dimension.
+    Pi_state : ndarray, shape (N_total, N_total)
+        Transition matrix (independence approximation).
+    state_indices : ndarray, shape (N_total, d), dtype int
+        Multi-index into marginal grids.
+    """
     N_vec = np.asarray(N_vec, dtype=int)
     k = len(N_vec)
     if Phi.shape != (k, k):
@@ -262,3 +283,49 @@ def get_return_quadrature(model, n_nodes=1):
     ret_nodes = z_nodes @ transform.T
 
     return ret_nodes, ret_weights
+
+
+def get_state_quadrature(model, n_nodes=3):
+    """State innovation quadrature for N(0, Sigma_ss).
+
+    Constructs K^n_state tensor-product Gauss-Hermite nodes for integrating
+    over the state innovation v^s ~ N(0, Sigma_ss). Used by the solver to
+    replace the discrete Markov chain Pi_state.
+
+    Parameters
+    ----------
+    model : LifecyclePortfolioModel
+        Supplies `n_state` and `Sigma_ss`.
+    n_nodes : int
+        Gauss-Hermite order per state dimension. Total nodes = n_nodes ** n_state.
+
+    Returns
+    -------
+    v_nodes : ndarray, shape (K_total, n_state)
+        Innovation quadrature nodes in the original coordinate system.
+    v_weights : ndarray, shape (K_total,)
+        Tensor-product quadrature weights summing to one.
+    """
+    if n_nodes < 1:
+        raise ValueError("n_nodes must be >= 1 for state quadrature")
+
+    n_state = int(model.n_state)
+
+    nodes_1d, weights_1d = roots_hermite(n_nodes)
+    weights_1d = weights_1d / np.sqrt(np.pi)
+    nodes_1d = nodes_1d * np.sqrt(2.0)
+
+    # Tensor product in standard-normal space
+    grid_1d = np.meshgrid(*([nodes_1d] * n_state), indexing="ij")
+    weight_1d = np.meshgrid(*([weights_1d] * n_state), indexing="ij")
+
+    z_nodes = np.stack([g.ravel() for g in grid_1d], axis=1)     # (K_total, n_state)
+    v_weights = np.prod(np.stack(weight_1d, axis=0), axis=0).ravel()  # (K_total,)
+
+    # Transform from standard normal to N(0, Sigma_ss) via Cholesky
+    Sigma = 0.5 * (np.asarray(model.Sigma_ss, dtype=float)
+                    + np.asarray(model.Sigma_ss, dtype=float).T)
+    L = np.linalg.cholesky(Sigma)
+    v_nodes = z_nodes @ L.T       # (K_total, n_state)
+
+    return v_nodes, v_weights

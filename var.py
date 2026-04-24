@@ -1,11 +1,12 @@
 """
-var.py — VAR estimation, partitioning, and annualization.
+var.py — VAR estimation and partitioning.
 
 Contains:
   - partition_var() — split full VAR into state/return blocks
   - VAR estimation from CSV (restricted and unrestricted)
   - Convenience wrappers for nominal/TIPS systems
-  - annualize_var_config() — quarterly → annual compounding
+  - annualize_var_config() — quarterly → annual compounding (legacy, not used
+    when VAR is estimated directly at annual frequency)
   - Hardcoded VAR parameter fallbacks
 
 Dependencies: numpy, pandas (for CSV), statsmodels (for unrestricted VAR)
@@ -211,7 +212,13 @@ def estimate_var1_from_csv(csv_path, columns, trend="c"):
     else:
         const = np.zeros(len(columns), dtype=float)
 
-    z_bar = np.linalg.solve(np.eye(len(columns)) - Phi, const)
+    # Use sample means as z_bar (CCV convention, footnote 5).
+    # OLS intercept + (I-Phi)^{-1} gives a biased stationary mean when
+    # state variables have near-unit-root persistence.  Setting z_bar to
+    # sample means and recomputing const = (I-Phi) @ z_bar keeps OLS
+    # slopes and covariances intact while centering the grid correctly.
+    z_bar = data.mean().to_numpy()
+    const = (np.eye(len(columns)) - Phi) @ z_bar
 
     y_true = data.iloc[1:, :].to_numpy()
     y_hat = res.fittedvalues.to_numpy()
@@ -293,7 +300,10 @@ def estimate_restricted_var1_from_csv(csv_path, columns, state_indices, trend="c
     for k, j in enumerate(state_indices):
         Phi[:, j] = slope_mat[k, :]
 
-    z_bar = np.linalg.solve(np.eye(n) - Phi, const)
+    # Use sample means as z_bar (CCV convention, footnote 5).
+    # See estimate_var1_from_csv docstring for rationale.
+    z_bar = data.mean().to_numpy()
+    const = (np.eye(n) - Phi) @ z_bar
 
     coef_table = pd.DataFrame(coeffs, index=regressor_names, columns=columns)
 
@@ -396,7 +406,7 @@ def build_var_config_from_dataset(
 
 
 def build_tips_system2_var_config(
-    csv_path="var/var_dataset.csv",
+    csv_path="data/var_dataset.csv",
     state_indices=(0, 3, 4),
     return_indices=(1, 2),
     bill_rate_index_in_state=0,
@@ -424,7 +434,7 @@ def build_tips_system2_var_config(
 
 
 def build_nominal_system1_var_config(
-    csv_path="var/var_dataset.csv",
+    csv_path="data/var_dataset.csv",
     state_indices=(0, 3, 4),
     return_indices=(1, 2),
     bill_rate_index_in_state=0,
@@ -433,20 +443,23 @@ def build_nominal_system1_var_config(
     estimation="restricted",
 ):
     """
-    Nominal bond analog of System 2.
+    Nominal bond system (System 1).
     columns = [rtb, xr, xb, y_nom, dp]
     States: rtb(0), y_nom(3), dp(4)   Returns: xr(1), xb(2)
-    Sample: ~1980 Q1 - 2025 Q4, T=183 (vs T=87 for TIPS system).
+    Sample: 1962–2025, T=63 annual observations.
 
-    rtb   = ex-post real bill return (TB3MS lagged / 400 - log(CPI_t/CPI_{t-1}))
-    xr    = excess real stock return (RTRP log-return - rtb)
-    xb    = excess nominal bond return; inflation cancels in excess returns so
-            this equals the excess real bond return as well
-    y_nom = 10-year nominal yield (SVENY10_t / 400)
-    dp    = log dividend-price ratio (log level)
+    Data is at ANNUAL frequency — returns are calendar-year sums of quarterly
+    log returns, levels are Q4 (end-of-year) values. The VAR is estimated
+    directly at annual frequency; no quarterly→annual compounding is needed.
 
-    Partition indices are identical to System 2: state_indices=[0,3,4],
-    return_indices=[1,2], bill_rate_index_in_state=0.
+    rtb   = annual real bill return (sum of 4 quarterly rtb)
+    xr    = annual excess real stock return (sum of 4 quarterly xr)
+    xb    = annual excess nominal bond return (sum of 4 quarterly xb)
+    y_nom = 10-year nominal yield, Q4 value (SVENY10 / 100, annual decimal)
+    dp    = log dividend-price ratio, Q4 value (log level)
+
+    Partition indices: state_indices=[0,3,4], return_indices=[1,2],
+    bill_rate_index_in_state=0.
     """
     columns = ["rtb", "xr", "xb", "y_nom", "dp"]
     return build_var_config_from_dataset(
@@ -653,18 +666,15 @@ def annualize_var_config(var_config, h=4):
 #   Columns  : [rtb, xr, xb, y_nom, dp]
 #   States   : rtb(0), y_nom(3), dp(4)   Returns: xr(1), xb(2)
 #   Estimation: restricted VAR(1), lagged returns excluded from all equations
-#   Omega    : from unrestricted VAR residuals (standard in state-return architecture)
-#   Sample   : 1980-03-31 to 2025-12-31  T=183 quarterly observations
-#   Data src : SVENY10 (GSW feds200628), TB3MS (FRED), CPI (FRED), Shiller RTRP, ie_data.xls
+#   Omega    : from restricted VAR residuals
+#   Frequency: ANNUAL (estimated directly on annual data)
+#   Sample   : 1962–2025, T=63 annual observations
+#   Data src : GSW feds200628 (NSS params), TB3MS (FRED), CPIAUCSL (FRED),
+#              Shiller RTRP + ie_data.xls
 #
-# !! IMPORTANT: VAR is estimated at QUARTERLY frequency.
-# !! If the DP solver uses ANNUAL periods (ages 25-80, beta=0.96), you must
-# !! annualise these matrices before passing to build_model():
-# !!   Phi_annual  = Phi_quarterly @ Phi_quarterly @ Phi_quarterly @ Phi_quarterly
-# !!                 (matrix power 4, or np.linalg.matrix_power(Phi, 4))
-# !!   Omega_annual = sum of 4-step innovation covariance (more complex; see below)
-# !! Using quarterly parameters in an annual model understates returns (by ~4x)
-# !! and overstates state persistence.
+# Returns are calendar-year sums of quarterly log returns.
+# Levels (y_nom, dp) are Q4 (end-of-year) values.
+# These parameters are ready for the annual DP solver — no compounding needed.
 # =============================================================================
 
 # Variable order: [rtb, xr, xb, y_nom, dp]
@@ -672,48 +682,51 @@ _NOM_COLS   = ["rtb", "xr", "xb", "y_nom", "dp"]
 _STATE_IDX  = [0, 3, 4]   # rtb, y_nom, dp
 _RET_IDX    = [1, 2]      # xr, xb
 
-# --- Unconditional means (quarterly decimal) ---
-# Annualised: rtb=-0.33%/yr  xr=+5.36%/yr  xb=+2.36%/yr  y_nom=+3.65%/yr  dp=-4.148 (log level)
+# --- Unconditional means (sample means, CCV convention) ---
+# z_bar = sample mean of each variable over 1962–2025 (T=64).
+# Using sample means instead of (I-Phi)^{-1} @ const_OLS avoids
+# the amplification of near-unit-root estimation error (see CCV
+# footnote 5).  const is then recomputed as (I-Phi) @ z_bar.
 _Z_BAR = np.array([
-    -8.34998757e-04,   # rtb   = -0.33%/yr real bill rate
-     1.33971778e-02,   # xr    = +5.36%/yr excess stock return
-     5.90140636e-03,   # xb    = +2.36%/yr excess nominal bond return
-     9.12159768e-03,   # y_nom = +3.65%/yr 10-year nominal yield (SVENY10)
-    -4.14849497e+00,   # dp    = -4.148    log dividend-price ratio
+     +6.973252977844e-03,   # rtb   = +0.70%/yr real bill rate
+     +5.492004676593e-02,   # xr    = +5.49%/yr excess stock return
+     +1.945019508430e-02,   # xb    = +1.95%/yr excess nominal bond return
+     +5.777224036114e-02,   # y_nom = 5.78% p.a. 10-year nominal yield (annual decimal)
+     -3.670204273186e+00,   # dp    = -3.670    log dividend-price ratio
 ])
 
-# --- Intercept vector c  (quarterly) ---
+# --- Intercept vector c = (I - Phi) @ z_bar  (annual) ---
 _CONST = np.array([
-    -1.80395400e-02,   # rtb
-     3.08321600e-01,   # xr
-    -3.26518200e-02,   # xb
-     1.43097000e-03,   # y_nom
-    -2.59384330e-01,   # dp
+     -8.015300644532e-02,   # rtb
+     +6.806375126678e-01,   # xr
+     -3.624744795491e-01,   # xb
+     +3.901470405114e-02,   # y_nom
+     -5.675806782898e-01,   # dp
 ])
 
-# --- AR(1) coefficient matrix Phi  (quarterly, restricted: return-lag columns = 0) ---
+# --- AR(1) coefficient matrix Phi  (annual, restricted: return-lag columns = 0) ---
 # Rows = z_{t+1} equations, Cols = z_t predictors
 # Phi[i, j] = coefficient on lagged z_j in equation for z_i
 # Return columns (1=xr, 2=xb) are zero by restriction.
 #
 #          L.rtb        L.xr   L.xb    L.y_nom       L.dp
 _PHI = np.array([
-    [ 2.50280563e-01,  0.0,    0.0,   6.64815958e-01, -2.73577227e-03],  # rtb
-    [ 5.47898136e-01,  0.0,    0.0,  -3.61859878e+00,  6.30251519e-02],  # xr
-    [-4.07263720e-01,  0.0,    0.0,   1.49978933e+00, -5.91363571e-03],  # xb
-    [ 8.43938656e-03,  0.0,    0.0,   9.57201184e-01,  2.49133416e-04],  # y_nom
-    [-1.09728419e+00,  0.0,    0.0,   2.87318397e+00,  9.44013413e-01],  # dp
+    [ +4.317806756640e-01,  0.0,  0.0,  +5.533331663342e-01,  -1.420848622420e-02],  # rtb
+    [ +9.941864729943e-01,  0.0,  0.0,  -2.554989215210e+00,  +1.321568753455e-01],  # xr
+    [ +9.498930261866e-01,  0.0,  0.0,  +1.133431192929e+00,  -8.441491205617e-02],  # xb
+    [ -8.366904702718e-02,  0.0,  0.0,  +8.712629906926e-01,  +8.444716115983e-03],  # y_nom
+    [ -1.736269954260e+00,  0.0,  0.0,  +2.055355527366e+00,  +8.744087249498e-01],  # dp
 ])
 
-# --- Residual covariance matrix Omega  (quarterly, from unrestricted VAR) ---
-# Diagonal std devs (annualised): rtb=1.26%  xr=14.46%  xb=11.94%  y_nom=0.30%  dp=0.076
+# --- Residual covariance matrix Omega  (annual) ---
+# Diagonal std devs: rtb=1.65%  xr=15.96%  xb=10.49%  y_nom=1.02%  dp=16.82%
 #          rtb          xr           xb           y_nom        dp
 _OMEGA = np.array([
-    [ 3.95595584e-05, -2.58579310e-05,  1.17037505e-04, -3.15218298e-06,  2.65077118e-05],  # rtb
-    [-2.58579310e-05,  5.22952531e-03, -3.52798917e-04,  8.06645511e-06, -5.33055869e-03],  # xr
-    [ 1.17037505e-04, -3.52798917e-04,  3.56188480e-03, -8.98808775e-05,  3.89367599e-04],  # xb
-    [-3.15218298e-06,  8.06645511e-06, -8.98808775e-05,  2.28000460e-06, -9.06427166e-06],  # y_nom
-    [ 2.65077118e-05, -5.33055869e-03,  3.89367599e-04, -9.06427166e-06,  5.73108875e-03],  # dp
+    [ +2.716807621819e-04,  +5.044381831999e-04,  +1.761932079930e-04,  -2.646935561100e-05,  -5.120640342789e-04],  # rtb
+    [ +5.044381831999e-04,  +2.546064446589e-02,  +2.673592303313e-03,  -2.396349328200e-04,  -2.527017286652e-02],  # xr
+    [ +1.761932079930e-04,  +2.673592303313e-03,  +1.100365536980e-02,  -1.056337198359e-03,  -1.775978636589e-03],  # xb
+    [ -2.646935561100e-05,  -2.396349328200e-04,  -1.056337198359e-03,  +1.040288234819e-04,  +1.595932821758e-04],  # y_nom
+    [ -5.120640342789e-04,  -2.527017286652e-02,  -1.775978636589e-03,  +1.595932821758e-04,  +2.830159094619e-02],  # dp
 ])
 
 
@@ -723,11 +736,10 @@ def build_nominal_system1_var_config_hardcoded():
     Use when var_dataset.csv is unavailable.
     Identical structure to build_nominal_system1_var_config() output.
 
-    WARNING: parameters are quarterly. See frequency note above.
+    Parameters are at ANNUAL frequency — ready for the annual DP solver.
     """
-    print("Using HARDCODED VAR parameters (nominal System 1, quarterly, T=183).")
-    print("  Sample: 1980-03-31 to 2025-12-31")
-    print("  !! Read frequency warning in cell 8B before use in annual DP solver.")
+    print("Using HARDCODED VAR parameters (nominal System 1, annual, T=63).")
+    print("  Sample: 1962–2025 (annual)")
     return {
         "z_bar":                  _Z_BAR.copy(),
         "Phi":                    _PHI.copy(),
@@ -745,54 +757,3 @@ def build_nominal_system1_var_config_hardcoded():
         "residual_correlation":   None,
         "equation_r2":            None,
     }
-
-
-# =============================================================================
-# HARDCODED ANNUAL VAR PARAMETERS  (derived from quarterly above)
-# =============================================================================
-# Derived by annualize_var_config(_CONST, _PHI, _OMEGA, h=4).
-# Use these if you want a hardcoded annual fallback.
-#
-#   Phi_21_annual  = Phi_21 @ (I + Phi11 + Phi11^2 + Phi11^3)   -- cumulative sum
-#   c_r_annual     = 4*c_r + Phi_21 @ correction @ c_s
-#   Omega_rs_annual = correctly accounts for within-year state noise
-#
-# Mean annual returns (annualised by 4x quarterly):
-#   xr = 5.36%/yr  (quarterly mean x4)
-#   xb = 2.36%/yr  (quarterly mean x4)
-# =============================================================================
-
-_ANN_CONST = np.array([-0.01883853,  1.08364778, -0.08666615,  0.00454395, -0.87108414])
-
-#          [s/r, s: rtb  y_nom   dp  |  r: xr   xb]   return cols are 0 by restriction
-_ANN_PHI = np.array([[ 1.69494487e-02,  0.00000000e+00,  0.00000000e+00,
-             7.75294692e-01, -2.63848727e-03],
-           [ 4.07706249e-01,  0.00000000e+00,  0.00000000e+00,
-            -1.15339468e+01,  2.22854466e-01],
-           [-4.85835159e-01,  0.00000000e+00,  0.00000000e+00,
-             4.65334874e+00, -1.62517112e-02],
-           [ 9.27614826e-03,  0.00000000e+00,  0.00000000e+00,
-             8.61133510e-01,  7.88120296e-04],
-           [-1.19573205e+00,  0.00000000e+00,  0.00000000e+00,
-             7.57961104e+00,  8.06930563e-01]])
-
-_ANN_OMEGA = np.array([[ 4.48423138e-05,  7.41425361e-05, -7.92967578e-05,
-             6.51135756e-07, -1.42390122e-05],
-           [ 7.41425361e-05,  1.74769285e-02,  6.69564294e-04,
-            -2.70924130e-05, -1.74774631e-02],
-           [-7.92967578e-05,  6.69564294e-04,  1.25968804e-02,
-            -3.13792998e-04, -3.97880400e-04],
-           [ 6.51135756e-07, -2.70924130e-05, -3.13792998e-04,
-             7.94891334e-06,  1.34192037e-05],
-           [-1.42390122e-05, -1.74774631e-02, -3.97880400e-04,
-             1.34192037e-05,  1.96116803e-02]])
-
-def build_nominal_system1_var_config_annual_hardcoded():
-    """Fallback: annual var_config using hardcoded annual parameter estimates."""
-    var_config_ann = build_nominal_system1_var_config_hardcoded()
-    var_config_ann["Phi"]   = _ANN_PHI.tolist()
-    var_config_ann["const"] = _ANN_CONST.tolist()
-    var_config_ann["Omega"] = _ANN_OMEGA.tolist()
-    var_config_ann["_annualized"] = True
-    var_config_ann["_periods_per_annual"] = 4
-    return var_config_ann

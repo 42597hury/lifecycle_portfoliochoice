@@ -396,14 +396,14 @@ def calibrate_earnings_dependent_mortality(
         print()
         print(f"  {'z':>8} {'pctile':>7} {'chi':>8} {'target':>8} "
               f"{'actual':>8} {'err(yr)':>8}")
-        print(f"  {'─'*8} {'─'*7} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+        print(f"  {'-'*8} {'-'*7} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
         for i in range(len(z_grid)):
             print(f"  {z_grid[i]:8.4f} {percentiles[i]:7.1f} {chi_vec[i]:8.5f} "
                   f"{target_ages[i]:8.2f} {actual_ages[i]:8.2f} "
                   f"{errors[i]:+8.5f}")
 
         print()
-        print(f"  Survival probs at key ages (lowest z → highest z):")
+        print(f"  Survival probs at key ages (lowest z -> highest z):")
         for age in [40, 50, 60, 70, 80, 90]:
             if start_age <= age <= terminal_age:
                 t = age - start_age
@@ -413,7 +413,7 @@ def calibrate_earnings_dependent_mortality(
 
         # Life expectancy gap summary
         le_gap = actual_ages[-1] - actual_ages[0]
-        print(f"\n  LE gap (top z − bottom z): {le_gap:.1f} years")
+        print(f"\n  LE gap (top z - bottom z): {le_gap:.1f} years")
         print(f"  Max calibration error:     {np.max(np.abs(errors)):.2e} years")
         print("=" * W)
 
@@ -445,6 +445,6 @@ if __name__ == "__main__":
     )
 
     print(f"\nOutput shapes:")
-    print(f"  survival_probs_2d : {surv_2d.shape}  (n_age × n_z)")
+    print(f"  survival_probs_2d : {surv_2d.shape}  (n_age x n_z)")
     print(f"  chi_vec           : {chi.shape}")
     print(f"\n  Ready for integration into LifecyclePortfolioModel.")

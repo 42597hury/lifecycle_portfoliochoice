@@ -355,7 +355,6 @@ def simulate_lifecycle_core(
     ret_nodes: np.ndarray,
     ret_weights: np.ndarray,
     ret_factor: np.ndarray,
-    r_bill_grid: np.ndarray,
     log_det_profile: np.ndarray,
     avg_det: float,
     eps_nodes: np.ndarray,
@@ -488,8 +487,6 @@ def simulate_lifecycle_core(
             sim_alpha_s[i, t] = alpha_s_t
             sim_alpha_b[i, t] = alpha_b_t
 
-            R_bill = np.exp(r_bill_grid[state_idx])
-
             if use_continuous_state:
                 # Draw v^s = L_ss @ z where z ~ N(0, I)
                 n_state = L_ss.shape[0]
@@ -506,9 +503,10 @@ def simulate_lifecycle_core(
                 s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * s_cur[0] + Phi_11[1, 1] * s_cur[1] + Phi_11[1, 2] * s_cur[2] + v_s_1
                 s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * s_cur[0] + Phi_11[2, 1] * s_cur[1] + Phi_11[2, 2] * s_cur[2] + v_s_2
 
-                # Conditional return mean from continuous v^s
-                mu_xr = const_r[0] + A_r[0, 0] * s_cur[0] + A_r[0, 1] * s_cur[1] + A_r[0, 2] * s_cur[2] + M_matrix[0, 0] * v_s_0 + M_matrix[0, 1] * v_s_1 + M_matrix[0, 2] * v_s_2
-                mu_xb = const_r[1] + A_r[1, 0] * s_cur[0] + A_r[1, 1] * s_cur[1] + A_r[1, 2] * s_cur[2] + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
+                # Conditional return mean from continuous v^s (3 returns: rtb, xr, xb)
+                mu_rtb = const_r[0] + A_r[0, 0] * s_cur[0] + A_r[0, 1] * s_cur[1] + A_r[0, 2] * s_cur[2] + M_matrix[0, 0] * v_s_0 + M_matrix[0, 1] * v_s_1 + M_matrix[0, 2] * v_s_2
+                mu_xr  = const_r[1] + A_r[1, 0] * s_cur[0] + A_r[1, 1] * s_cur[1] + A_r[1, 2] * s_cur[2] + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
+                mu_xb  = const_r[2] + A_r[2, 0] * s_cur[0] + A_r[2, 1] * s_cur[1] + A_r[2, 2] * s_cur[2] + M_matrix[2, 0] * v_s_0 + M_matrix[2, 1] * v_s_1 + M_matrix[2, 2] * v_s_2
 
                 # Find nearest grid point for next period's policy lookup
                 N1_s = len(state_grids_1); N2_s = len(state_grids_2)
@@ -531,22 +529,27 @@ def simulate_lifecycle_core(
                 next_state_idx = best_d0 * N1_s * N2_s + best_d1 * N2_s + best_d2
             else:
                 next_state_idx = draw_discrete(Pi_state[state_idx, :], uniform_draws[i, t, 2])
-                mu_xr = mu_r[state_idx, next_state_idx, 0]
-                mu_xb = mu_r[state_idx, next_state_idx, 1]
+                mu_rtb = mu_r[state_idx, next_state_idx, 0]
+                mu_xr  = mu_r[state_idx, next_state_idx, 1]
+                mu_xb  = mu_r[state_idx, next_state_idx, 2]
 
             if use_mc_returns:
+                rtb_res = 0.0
                 xr_res = 0.0
                 xb_res = 0.0
                 for k in range(n_ret):
                     shock_k = normal_draws[i, t, k]
-                    xr_res += ret_factor[0, k] * shock_k
-                    xb_res += ret_factor[1, k] * shock_k
+                    rtb_res += ret_factor[0, k] * shock_k
+                    xr_res += ret_factor[1, k] * shock_k
+                    xb_res += ret_factor[2, k] * shock_k
+                R_bill = np.exp(mu_rtb + rtb_res)
                 R_stock = R_bill * np.exp(mu_xr + xr_res)
                 R_bond = R_bill * np.exp(mu_xb + xb_res)
             else:
                 ret_idx = draw_discrete(ret_weights, uniform_draws[i, t, 3])
-                R_stock = R_bill * np.exp(mu_xr + ret_nodes[ret_idx, 0])
-                R_bond = R_bill * np.exp(mu_xb + ret_nodes[ret_idx, 1])
+                R_bill = np.exp(mu_rtb + ret_nodes[ret_idx, 0])
+                R_stock = R_bill * np.exp(mu_xr + ret_nodes[ret_idx, 1])
+                R_bond = R_bill * np.exp(mu_xb + ret_nodes[ret_idx, 2])
 
             alpha_bill_t = 1.0 - alpha_s_t - alpha_b_t
             R_port = alpha_s_t * R_stock + alpha_b_t * R_bond + alpha_bill_t * R_bill
@@ -871,7 +874,6 @@ def simulate_lifecycle(C_mat: np.ndarray,
         ret_nodes=np.ascontiguousarray(pc.ret_nodes),
         ret_weights=np.ascontiguousarray(pc.ret_weights),
         ret_factor=np.ascontiguousarray(ret_factor_arr),
-        r_bill_grid=np.ascontiguousarray(pc.r_bill_grid),
         log_det_profile=np.ascontiguousarray(pc.log_det_profile),
         avg_det=float(pc.avg_det),
         eps_nodes=np.ascontiguousarray(pc.eps_nodes),

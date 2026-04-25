@@ -16,8 +16,8 @@ thin orchestration notebook. The current source-of-truth layout is:
 
 - `model.py` -- immutable economic model objects plus stateless utility, bequest, tax,
   and income helpers
-- `var.py` -- VAR estimation, state/return partitioning, quarterly-to-annual compounding,
-  and hardcoded fallback parameter builders
+- `var.py` -- VAR estimation, state/return partitioning, and hardcoded fallback
+  parameter builders
 - `discretization.py` -- Rouwenhorst discretization and transitory-shock quadrature
 - `mortality.py` -- calibration of age- and earnings-dependent
   survival probabilities
@@ -30,7 +30,7 @@ thin orchestration notebook. The current source-of-truth layout is:
 
 Execution in the refactored codebase follows this sequence:
 
-1. Build or load quarterly VAR parameters in `var.py`, then annualize them.
+1. Estimate or load annual VAR parameters in `var.py`.
 2. Combine the baseline economic calibration and VAR configuration via
    `precompute.build_model()`.
 3. Instantiate `Precompute(model, disc_config=DiscretizationConfig(...))` to create
@@ -311,11 +311,11 @@ The financial state vector has 5 variables:
 z_t = [rtb_t, xr_t, xb_t, y_nom_t, dp_t]
 
 Variable ordering:
-  Index 0: rtb    -- ex-post real bill rate (annual, sum of 4 quarterly returns)
-  Index 1: xr     -- log excess real stock return (annual, sum of 4 quarterly returns)
-  Index 2: xb     -- log excess nominal bond return (annual, sum of 4 quarterly returns)
+  Index 0: rtb    -- ex-post real bill rate (annual)
+  Index 1: xr     -- log excess real stock return (annual)
+  Index 2: xb     -- log excess nominal bond return (annual)
   Index 3: y_nom  -- 10-year nominal yield (SVENY10 / 100, annual decimal)
-  Index 4: dp     -- log dividend-price ratio (log level, Q4 value)
+  Index 4: dp     -- log dividend-price ratio (log level, annual)
 ```
 
 Dynamics:
@@ -329,43 +329,17 @@ where:
   z_bar                      unconditional means (5,)
 ```
 
-**Estimation:** The VAR is estimated by restricted OLS at **quarterly frequency**
-(T=183 observations, 1980 Q1 to 2025 Q4) from `var_dataset.csv`. The restriction
-is that lagged return columns are excluded from all equations (Phi_12 = 0, Phi_22 = 0).
-The residual covariance Omega comes from the unrestricted residuals.
+**Estimation:** The VAR is estimated by restricted OLS directly at **annual frequency**
+(T=63 observations, 1962--2025) from `var_dataset.csv`. The restriction is that lagged
+return columns are excluded from all equations (Phi_12 = 0, Phi_22 = 0). The residual
+covariance Omega comes from the unrestricted residuals.
 
-**Annualization:** Because the DP model uses annual periods (ages 25-80, beta=0.96),
-the quarterly VAR is **compounded to annual frequency** before passing to the solver.
-The annual "return" is the sum of four quarterly returns. The compounding formulas
-(see Section 2.1.1) preserve the stationary mean z_bar exactly.
+**z_bar convention (CCV):** The unconditional mean z_bar is set to the sample mean of
+the data, not (I - Phi)^{-1} @ const_OLS. The intercept is then backed out as
+c = (I - Phi) @ z_bar. This follows Campbell, Chan & Viceira (2003) and ensures the
+discretization grid is centered on data moments.
 
 Note: ages 22-99 gives 78 annual periods.
-
-### 2.1.1 Quarterly-to-Annual Compounding
-
-Let h=4 (quarters per year), P_k = Phi_11^k, C_k = sum_{j=0}^k P_j.
-
-**State dynamics (exact):**
-```
-Phi_11_ann = Phi_11^4
-c_s_ann    = C_{h-1} @ c_s
-Omega_ss_ann = sum_{k=0}^{3} P_k @ Omega_ss @ P_k'
-```
-
-**Cumulative annual return (sum of h quarterly returns):**
-```
-Phi_21_ann = Phi_21 @ C_{h-1}
-c_r_ann    = h*c_r + Phi_21 @ [sum_{k=1}^{3} C_{k-1}] @ c_s
-```
-
-Note: Phi_21_ann != [Phi^4]_{21}. The latter gives the h-step-ahead return,
-not the cumulative sum. The sum formula is required.
-
-**Verification:** The mean annual return exactly equals h times the mean quarterly
-return: c_r_ann + Phi_21_ann @ z_bar_s = h * (c_r + Phi_21 @ z_bar_s).
-
-**Stationary mean z_bar:** Invariant to time aggregation -- same quarterly or annual.
-The discretization grid is therefore unchanged by compounding.
 
 ### 2.2 Partition into State Variables and Returns
 
@@ -474,8 +448,8 @@ the tensor-product rule has `K_eff = K^n_ret` joint residual-return nodes.
 The baseline `K=1` case is the old point-mass approximation at `mu_r[i,j]`.
 
 **Why K=1 is accurate:**
-- Conditioning on `s_{t+1}` (especially y_nom via `M[xb,y_nom]=-39.4`) explains
-  ~99.5% of bond return variance. The xb residual is near-degenerate.
+- Conditioning on `s_{t+1}` (especially y_nom via `M[xb,y_nom]=-10.2`) explains
+  ~97.8% of bond return variance. The xb residual is near-degenerate.
 - Stock residual variance is larger but the portfolio FOC effect is second-order:
   the Jensen's inequality bias scales as `gamma*(gamma+1)*sigma_resid^2`, which
   is small when `sigma_resid` is already modest after conditioning.
@@ -500,9 +474,9 @@ def partition_var(Phi_full, Omega_full, z_bar, state_idx, ret_idx,
     Partition a full VAR(1) into state sub-VAR and return equations.
 
     Parameters:
-        Phi_full:        (n, n) full transition matrix (annual after compounding)
-        Omega_full:      (n, n) full innovation covariance
-        z_bar:           (n,) unconditional means (same quarterly or annual)
+        Phi_full:        (n, n) full transition matrix (annual)
+        Omega_full:      (n, n) full innovation covariance (annual)
+        z_bar:           (n,) unconditional means (sample means, CCV convention)
         state_idx:       list of indices for state variables, e.g. [0, 3, 4]
         ret_idx:         list of indices for returns, e.g. [1, 2]
         variable_names:  optional list of names for diagnostics
@@ -657,24 +631,20 @@ compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_d
 The workflow from raw data to model:
 
 ```python
-# Step 1: Estimate quarterly VAR from CSV
-var_config_q, var_res, var_data = build_nominal_system1_var_config(
+# Step 1: Estimate annual VAR from CSV (restricted OLS, CCV z_bar convention)
+var_config = estimate_restricted_var1_from_csv(
     csv_path="var_dataset.csv",
     # columns = ['rtb', 'xr', 'xb', 'y_nom', 'dp']
     # state_indices = [0, 3, 4]    (rtb, y_nom, dp)
     # return_indices = [1, 2]      (xr, xb)
-    # estimation = "restricted"    (Phi_12=0, Phi_22=0)
+    # restriction: Phi_12=0, Phi_22=0
 )
 
-# Step 2: Compound quarterly -> annual
-# Annual "return" = sum of 4 quarterly returns (not 4-step-ahead)
-var_config = annualize_var_config(var_config_q, h=4)
-
-# Step 3: Build model
+# Step 2: Build model
 base_config = build_base_config_legacy_defaults()
 model = build_model(base_config, var_config)
 
-# Step 4: Precompute
+# Step 3: Precompute
 disc_config = DiscretizationConfig(
     state_grid_sizes=(5, 5, 5),
     n_z=11,
@@ -682,10 +652,10 @@ disc_config = DiscretizationConfig(
 )
 pc = Precompute(model, disc_config=disc_config)
 
-# Step 5: Optional calibration report
+# Step 4: Optional calibration report
 print_model_diagnostic_report(model, pc, periods_per_year=1)
 
-# Step 6: Solve
+# Step 5: Solve
 C_mat, S_mat, B_mat, diagnostics = run_lifecycle_solver(
     model,
     pc,
@@ -693,25 +663,23 @@ C_mat, S_mat, B_mat, diagnostics = run_lifecycle_solver(
 )
 ```
 
-**Fallback hardcoded parameters** now live in `var.py` rather than notebook cells.
-Use `build_nominal_system1_var_config_hardcoded()` for quarterly parameters and
-`build_nominal_system1_var_config_annual_hardcoded()` for already-annualized ones
-when `var_dataset.csv` is unavailable.
+**Fallback hardcoded parameters** live in `var.py` as module-level arrays
+(`_Z_BAR`, `_PHI`, `_OMEGA`). These are annual estimates directly.
 
 **Key annual parameter values:**
 
 ```
-z_bar = [-8.35e-4,  1.34e-2,  5.90e-3,  9.12e-3, -4.148]
-        [ rtb,       xr,       xb,       y_nom,    dp   ]
+z_bar = [+0.00697, +0.05492, +0.01945, +0.05777, -3.670]
+        [ rtb,      xr,       xb,       y_nom,     dp  ]
 
-Annual means: rtb=-0.33%/yr  xr=+5.36%/yr  xb=+2.36%/yr  y_nom=+3.65%/yr
+Annual means: rtb=+0.70%  xr=+5.49%  xb=+1.95%  y_nom=5.78%
 
 Annual Phi_11 diagonal (state persistence):
-  rtb:   0.017   (nearly iid annually)
-  y_nom: 0.861
-  dp:    0.807
+  rtb:   0.432
+  y_nom: 0.871
+  dp:    0.874
 
-M[xb, y_nom] = -39.4    (bond duration; 1 unit rise in y_nom -> -39.4 in xb)
+M[xb, y_nom] = -10.23   (bond duration; 1 unit rise in y_nom -> -10.2 in xb)
 ```
 
 ### 3.5 discretization.py -- Discretization Functions
@@ -1347,13 +1315,13 @@ post-solve diagnostic report.
 
 ### 5.3 VAR Variables
 
-| Variable | Description | Quarterly decimal | Annual equivalent |
-|----------|-------------|-------------------|-------------------|
-| `rtb` | Real bill rate | sum of 4 quarterly (TB3MS_lag/400 - d(log CPI)) | ~+0.08%/yr |
-| `xr` | Excess stock return | sum of 4 quarterly (log(RTRP) - rtb) | ~5.01%/yr |
-| `xb` | Excess nominal bond return | sum of 4 quarterly (bond - rtb) | ~2.16%/yr |
-| `y_nom` | 10-year nominal yield | SVENY10/100 (annual decimal, Q4 value) | ~4.50%/yr |
-| `dp` | Log dividend-price ratio | log level (Q4 value) | -3.924 |
+| Variable | Description | Units | Sample mean |
+|----------|-------------|-------|-------------|
+| `rtb` | Ex-post real bill rate | annual decimal | +0.70% |
+| `xr` | Log excess real stock return | annual decimal | +5.49% |
+| `xb` | Log excess nominal bond return | annual decimal | +1.95% |
+| `y_nom` | 10-year nominal yield (SVENY10/100) | annual decimal | 5.78% |
+| `dp` | Log dividend-price ratio | log level | -3.670 |
 
 ---
 

@@ -90,32 +90,6 @@ _EC_TO_DI = np.array([
 # HELPERS: INTERPOLATION AND SIMPLEX PROJECTION
 # =============================================================================
 
-@njit(fastmath=True)
-def fast_interp_slope_1d(x, x_grid, y_grid):
-    """
-    Slope of the piecewise-linear interpolant -- i.e. dc_next/dx_next (MPC).
-    Same binary search as fast_interp_1d, but returns the interval slope.
-    At the extrapolation boundaries, returns the nearest interior slope.
-    """
-    n = len(x_grid)
-    if n < 2:
-        return 0.0
-    if x <= x_grid[0]:
-        return (y_grid[1] - y_grid[0]) / (x_grid[1] - x_grid[0] + 1e-30)
-    if x >= x_grid[n - 1]:
-        return (y_grid[n-1] - y_grid[n-2]) / (x_grid[n-1] - x_grid[n-2] + 1e-30)
-    lo, hi = 0, n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if x_grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    dx = x_grid[hi] - x_grid[lo]
-    if dx < 1e-30:
-        return 0.0
-    return (y_grid[hi] - y_grid[lo]) / dx
-
 
 @njit(fastmath=True)
 def fast_interp_1d(x, x_grid, y_grid):
@@ -219,21 +193,27 @@ def project_to_triangle(alpha_s, alpha_b):
 
 @njit
 def build_gross_return_arrays(mu_r_i, ret_nodes):
-    """Build exp(mu_r + residual_node) arrays for one current financial state."""
+    """Build exp(mu_r + residual_node) arrays for one current financial state.
+
+    Returns 3 arrays (bill, stock, bond) for n_ret=3 return dimensions.
+    """
     n_state = mu_r_i.shape[0]
     n_ret_quad = ret_nodes.shape[0]
 
+    rx_bill_next = np.empty((n_state, n_ret_quad))
     rx_stock_next = np.empty((n_state, n_ret_quad))
     rx_bond_next = np.empty((n_state, n_ret_quad))
 
     for j_s in range(n_state):
-        mu_stock = mu_r_i[j_s, 0]
-        mu_bond = mu_r_i[j_s, 1]
+        mu_bill = mu_r_i[j_s, 0]
+        mu_stock = mu_r_i[j_s, 1]
+        mu_bond = mu_r_i[j_s, 2]
         for k_r in range(n_ret_quad):
-            rx_stock_next[j_s, k_r] = exp(mu_stock + ret_nodes[k_r, 0])
-            rx_bond_next[j_s, k_r] = exp(mu_bond + ret_nodes[k_r, 1])
+            rx_bill_next[j_s, k_r] = exp(mu_bill + ret_nodes[k_r, 0])
+            rx_stock_next[j_s, k_r] = exp(mu_stock + ret_nodes[k_r, 1])
+            rx_bond_next[j_s, k_r] = exp(mu_bond + ret_nodes[k_r, 2])
 
-    return rx_stock_next, rx_bond_next
+    return rx_bill_next, rx_stock_next, rx_bond_next
 
 
 @njit(fastmath=True)
@@ -356,7 +336,7 @@ def compute_foc_jac_retirement_quad(
     grids_0, grids_1, grids_2,          # marginal grids for bracketing
     N1, N2,                              # grid sizes dim 1, dim 2
     # --- Return quadrature ---
-    exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
     # --- Model parameters ---
     gamma, psi, beta, b_bar,
     min_wealth_inv=1e-10, min_consumption=1e-10,
@@ -411,9 +391,11 @@ def compute_foc_jac_retirement_quad(
         j110 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + lo2
         j111 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
 
-        # --- Conditional return mean ---
-        mu_r_stock = base_mu_r_i[0] + M_v_nodes[k_v, 0]
-        mu_r_bond  = base_mu_r_i[1] + M_v_nodes[k_v, 1]
+        # --- Conditional return mean (3 returns: rtb, xr, xb) ---
+        mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
+        mu_r_stock = base_mu_r_i[1] + M_v_nodes[k_v, 1]
+        mu_r_bond  = base_mu_r_i[2] + M_v_nodes[k_v, 2]
+        exp_mu_bill = exp(mu_r_bill)
         exp_mu_s = exp(mu_r_stock)
         exp_mu_b = exp(mu_r_bond)
 
@@ -423,6 +405,7 @@ def compute_foc_jac_retirement_quad(
             if weight < prob_skip:
                 continue
 
+            R_bill = exp_mu_bill * exp_ret_bill[k_r]
             R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
             R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
             R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
@@ -494,7 +477,7 @@ def compute_foc_jac_working_quad(
     grids_0, grids_1, grids_2,
     N1, N2,
     # --- Return quadrature ---
-    exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
     eps_nodes, eps_weights,
     # --- Model parameters ---
     gamma, psi, beta, b_bar,
@@ -566,9 +549,11 @@ def compute_foc_jac_working_quad(
         j110 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + lo2
         j111 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
 
-        # --- Conditional return mean ---
-        mu_r_stock = base_mu_r_i[0] + M_v_nodes[k_v, 0]
-        mu_r_bond  = base_mu_r_i[1] + M_v_nodes[k_v, 1]
+        # --- Conditional return mean (3 returns: rtb, xr, xb) ---
+        mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
+        mu_r_stock = base_mu_r_i[1] + M_v_nodes[k_v, 1]
+        mu_r_bond  = base_mu_r_i[2] + M_v_nodes[k_v, 2]
+        exp_mu_bill = exp(mu_r_bill)
         exp_mu_s = exp(mu_r_stock)
         exp_mu_b = exp(mu_r_bond)
 
@@ -578,6 +563,7 @@ def compute_foc_jac_working_quad(
             if p_state_ret < prob_skip:
                 continue
 
+            R_bill = exp_mu_bill * exp_ret_bill[k_r]
             R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
             R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
             R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
@@ -678,20 +664,21 @@ def _project_to_triangle_py(alpha_s, alpha_b):
     return alpha_s, alpha_b
 
 
-def _terminal_prepare_scenarios(Pi_state_row, Rx_stock_next, Rx_bond_next, ret_weights, R_bill):
+def _terminal_prepare_scenarios(Pi_state_row, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights):
     """Scenario weights and gross returns for the exact terminal objective."""
     scenario_weights = np.asarray(Pi_state_row, dtype=float)[:, None] * np.asarray(ret_weights, dtype=float)[None, :]
-    R_stock = float(R_bill) * np.asarray(Rx_stock_next, dtype=float)
-    R_bond = float(R_bill) * np.asarray(Rx_bond_next, dtype=float)
-    Rex_s = R_stock - float(R_bill)
-    Rex_b = R_bond - float(R_bill)
-    return scenario_weights, R_stock, R_bond, Rex_s, Rex_b
+    R_bill = np.asarray(Rx_bill_next, dtype=float)     # (N_state, n_ret_quad)
+    R_stock = R_bill * np.asarray(Rx_stock_next, dtype=float)
+    R_bond = R_bill * np.asarray(Rx_bond_next, dtype=float)
+    Rex_s = R_stock - R_bill
+    Rex_b = R_bond - R_bill
+    return scenario_weights, R_bill, R_stock, R_bond, Rex_s, Rex_b
 
 
 def _terminal_portfolio_moment(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, gamma):
     """Exact E[R_port^(1-gamma)] term on the terminal simplex domain."""
     alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * float(R_bill)
+    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
     bad = (scenario_weights > 0.0) & (R_port <= 0.0)
     if np.any(bad):
         return np.inf
@@ -701,7 +688,7 @@ def _terminal_portfolio_moment(alpha_s, alpha_b, R_bill, scenario_weights, R_sto
 def _terminal_portfolio_grad(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma):
     """Exact gradient of E[R_port^(1-gamma)] with respect to (alpha_s, alpha_b)."""
     alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * float(R_bill)
+    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
     bad = (scenario_weights > 0.0) & (R_port <= 0.0)
     if np.any(bad):
         return np.array([np.nan, np.nan], dtype=float)
@@ -715,7 +702,7 @@ def _terminal_portfolio_grad(alpha_s, alpha_b, R_bill, scenario_weights, R_stock
 def _terminal_portfolio_hess(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma):
     """Exact Hessian of E[R_port^(1-gamma)] with respect to (alpha_s, alpha_b)."""
     alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * float(R_bill)
+    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
     bad = (scenario_weights > 0.0) & (R_port <= 0.0)
     if np.any(bad):
         return np.full((2, 2), np.nan, dtype=float)
@@ -757,8 +744,8 @@ def _classify_terminal_solution(alpha_s, alpha_b, tol_geom):
     return EC_INTERIOR
 
 
-def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_stock_next, Rx_bond_next,
-                                      ret_weights, R_bill, gamma,
+def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next,
+                                      ret_weights, gamma,
                                       init_s=0.1, init_b=0.4,
                                       tol=1e-9, max_iter=200):
     """
@@ -769,18 +756,18 @@ def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_stock_next, Rx_bond_next
 
     The closed-form terminal consumption rule then uses the minimized moment.
     """
-    scenario_weights, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
-        Pi_state[i_s, :], Rx_stock_next, Rx_bond_next, ret_weights, R_bill
+    scenario_weights, R_bill_arr, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
+        Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights
     )
 
     def obj(x):
-        return _terminal_portfolio_moment(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, gamma)
+        return _terminal_portfolio_moment(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
 
     def jac(x):
-        return _terminal_portfolio_grad(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
+        return _terminal_portfolio_grad(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
 
     def hess(x):
-        return _terminal_portfolio_hess(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
+        return _terminal_portfolio_hess(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
 
     bounds = Bounds([0.0, 0.0], [1.0, 1.0])
     simplex = LinearConstraint(np.array([[1.0, 1.0]], dtype=float), [-np.inf], [1.0])
@@ -800,7 +787,7 @@ def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_stock_next, Rx_bond_next
     def consider_candidate(alpha_s, alpha_b):
         nonlocal best, best_moment
         alpha_s, alpha_b = _project_to_triangle_py(float(alpha_s), float(alpha_b))
-        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, gamma)
+        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
         if not np.isfinite(moment):
             return
         grad = jac(np.array([alpha_s, alpha_b], dtype=float))
@@ -849,8 +836,8 @@ def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_stock_next, Rx_bond_next
     return best
 
 
-def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_stock_next, Rx_bond_next,
-                                                  ret_weights, R_bill, gamma,
+def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next,
+                                                  ret_weights, gamma,
                                                   init_s=0.1, init_b=0.4,
                                                   tol=1e-9, max_iter=200):
     """
@@ -865,18 +852,18 @@ def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_stock_next, R
 
     Returns: (alpha_s, alpha_b, moment, exit_code, foc_resid)
     """
-    scenario_weights, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
-        Pi_state[i_s, :], Rx_stock_next, Rx_bond_next, ret_weights, R_bill
+    scenario_weights, R_bill_arr, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
+        Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights
     )
 
     def obj(x):
-        return _terminal_portfolio_moment(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, gamma)
+        return _terminal_portfolio_moment(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
 
     def jac(x):
-        return _terminal_portfolio_grad(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
+        return _terminal_portfolio_grad(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
 
     def hess(x):
-        return _terminal_portfolio_hess(x[0], x[1], R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
+        return _terminal_portfolio_hess(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
 
     starts = [
         np.array([init_s, init_b], dtype=float),
@@ -893,7 +880,7 @@ def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_stock_next, R
     def consider_candidate(alpha_s, alpha_b):
         nonlocal best, best_moment
         alpha_s, alpha_b = float(alpha_s), float(alpha_b)
-        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, gamma)
+        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
         if not np.isfinite(moment):
             return
         grad = jac(np.array([alpha_s, alpha_b], dtype=float))
@@ -944,8 +931,8 @@ def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_stock_next, R
 
 @njit(fastmath=True)
 def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
-                                        Pi_state, Rx_stock_next, Rx_bond_next, ret_weights,
-                                        R_bill, gamma,
+                                        Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights,
+                                        gamma,
                                           min_return_power=1e-15,
                                           prob_skip=1e-12):
     """
@@ -955,7 +942,7 @@ def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
     is CRRA in terminal wealth, the portfolio FOC is proportional to a^{1-gamma}
     and therefore independent of savings a (hence independent of W and c).
 
-    FOC_k = sum_j pi(j|i) * R_port(j)^{-gamma} * (R_k(j) - R_bill) = 0,  k in {s,b}
+    FOC_k = sum_j pi(j|i) * R_port(j)^{-gamma} * (R_k(j) - R_bill(j)) = 0,  k in {s,b}
     J_kl  = sum_j pi(j|i) * (-gamma) * R_port(j)^{-gamma-1} * Rex_k * Rex_l
     """
     foc_s = 0.0;  foc_b = 0.0
@@ -976,6 +963,7 @@ def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
             if weight < prob_skip:
                 continue
 
+            R_bill = Rx_bill_next[j_s, k_r]
             R_s   = R_bill * Rx_stock_next[j_s, k_r]
             R_b   = R_bill * Rx_bond_next[j_s, k_r]
             R_p   = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
@@ -996,7 +984,7 @@ def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
     return foc_s, foc_b, J_ss, J_bb, J_sb
 
 
-def solve_terminal_age(wealth_grid, annuity_factors, r_bill_grid, Pi_state, mu_r,
+def solve_terminal_age(wealth_grid, annuity_factors, Pi_state, mu_r,
                        ret_nodes, ret_weights,
                        gamma, beta, b_bar, N_state, n_z, constrained=True, solver_config=None,
                        min_return_power=1e-15, min_consumption=1e-10):
@@ -1011,13 +999,12 @@ def solve_terminal_age(wealth_grid, annuity_factors, r_bill_grid, Pi_state, mu_r
     terminal_diag_int = np.zeros(N_state, dtype=np.int64)
 
     for i_s in range(N_state):
-        R_bill = exp(r_bill_grid[i_s])
         A_is = annuity_factors[i_s]
-        Rx_stock_next, Rx_bond_next = build_gross_return_arrays(mu_r[i_s, :, :], ret_nodes)
+        Rx_bill_next, Rx_stock_next, Rx_bond_next = build_gross_return_arrays(mu_r[i_s, :, :], ret_nodes)
 
         if constrained:
             opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_2d_terminal_exact(
-                i_s, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma,
+                i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights, gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
@@ -1025,7 +1012,7 @@ def solve_terminal_age(wealth_grid, annuity_factors, r_bill_grid, Pi_state, mu_r
             )
         else:
             opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_exact(
-                i_s, Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill, gamma,
+                i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights, gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
@@ -1060,7 +1047,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                                        base_mu_r_i,
                                        Phi_0_state, Phi_11, state_grid_i,
                                        grids_0, grids_1, grids_2, N1, N2,
-                                       exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                                       exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                        gamma, psi, beta, b_bar,
                                        init_s=0.1, init_b=0.4,
                                        tol=1e-7, max_iter=20,
@@ -1080,7 +1067,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
@@ -1091,7 +1078,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
@@ -1104,7 +1091,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
     if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
@@ -1116,7 +1103,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
     if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
@@ -1132,7 +1119,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             if abs(fs) < tol * scale:
@@ -1153,7 +1140,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             if abs(fb) < tol * scale:
@@ -1177,7 +1164,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             g = fs - fb
@@ -1202,7 +1189,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
         e_last = e_sum
@@ -1243,7 +1230,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                                                    base_mu_r_i,
                                                    Phi_0_state, Phi_11, state_grid_i,
                                                    grids_0, grids_1, grids_2, N1, N2,
-                                                   exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                                                   exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                                    gamma, psi, beta, b_bar,
                                                    init_s=0.1, init_b=0.4,
                                                    tol=1e-7, max_iter=30,
@@ -1264,7 +1251,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
@@ -1274,7 +1261,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
@@ -1287,7 +1274,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
     err = (fs * fs + fb * fb) ** 0.5
@@ -1322,7 +1309,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                     v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
@@ -1346,7 +1333,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             err = (fs * fs + fb * fb) ** 0.5
@@ -1367,7 +1354,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                                      base_mu_r_i,
                                      Phi_0_state, Phi_11, state_grid_i,
                                      grids_0, grids_1, grids_2, N1, N2,
-                                     exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                                     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                      eps_nodes, eps_weights,
                                      gamma, psi, beta, b_bar,
                                      init_s=0.1, init_b=0.4,
@@ -1389,7 +1376,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1401,7 +1388,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1415,7 +1402,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1428,7 +1415,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1446,7 +1433,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1469,7 +1456,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1495,7 +1482,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1522,7 +1509,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1565,7 +1552,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                                                 base_mu_r_i,
                                                 Phi_0_state, Phi_11, state_grid_i,
                                                 grids_0, grids_1, grids_2, N1, N2,
-                                                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                                 eps_nodes, eps_weights,
                                                 gamma, psi, beta, b_bar,
                                                 init_s=0.1, init_b=0.4,
@@ -1588,7 +1575,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1600,7 +1587,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1615,7 +1602,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1652,7 +1639,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                     v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1678,7 +1665,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
                 grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
@@ -1694,11 +1681,11 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
 @njit(parallel=True)
 def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                      c_next_full, pension_1d,
-                                     annuity_factors, r_bill_grid,
+                                     annuity_factors,
                                      state_grid, grids_0, grids_1, grids_2,
                                      v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                      Phi_0_state, Phi_11,
-                                     exp_ret_stock, exp_ret_bond, ret_weights,
+                                     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                      gamma, psi_vec, beta, b_bar,
                                      constrained, solver_config):
     """Solve one retirement period using quadrature over state innovations."""
@@ -1717,14 +1704,14 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     diag_float = np.zeros((N_state, 9))
 
     for i_s in prange(N_state):
-        R_bill = exp(r_bill_grid[i_s])
         annuity_factor_is = annuity_factors[i_s]
 
-        # Precompute base_mu_r_i for this state
+        # Precompute base_mu_r_i for this state (3 returns: rtb, xr, xb)
         s_i = state_grid[i_s]
-        base_mu_r_i = np.empty(2)
+        base_mu_r_i = np.empty(3)
         base_mu_r_i[0] = const_r[0] + A_r[0, 0] * s_i[0] + A_r[0, 1] * s_i[1] + A_r[0, 2] * s_i[2]
         base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
+        base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
 
         last_a_s = sc.init_alpha_s
         last_a_b = sc.init_alpha_b
@@ -1756,7 +1743,7 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
                         grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         gamma, psi, beta, b_bar,
                         init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter,
@@ -1774,7 +1761,7 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
                         grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         gamma, psi, beta, b_bar,
                         init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter_unconstrained,
@@ -1840,11 +1827,11 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
 
 def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                c_next_full, pension_1d,
-                               annuity_factors, r_bill_grid,
+                               annuity_factors,
                                state_grid, grids_0, grids_1, grids_2,
                                v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                Phi_0_state, Phi_11,
-                               exp_ret_stock, exp_ret_bond, ret_weights,
+                               exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                gamma, psi_vec, beta, b_bar,
                                constrained=True, solver_config=None):
     if solver_config is None:
@@ -1852,11 +1839,11 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
     return _solve_retirement_step_quad_jit(
         wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, pension_1d,
-        annuity_factors, r_bill_grid,
+        annuity_factors,
         state_grid, grids_0, grids_1, grids_2,
         v_nodes, v_weights, M_v_nodes, const_r, A_r,
         Phi_0_state, Phi_11,
-        exp_ret_stock, exp_ret_bond, ret_weights,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         gamma, psi_vec, beta, b_bar,
         constrained, solver_config)
 
@@ -1869,11 +1856,10 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
 def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                       c_next_full, log_det_next,
                                       annuity_factors, rho, eta_nodes, eta_weights, dz,
-                                      r_bill_grid,
                                       state_grid, grids_0, grids_1, grids_2,
                                       v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                       Phi_0_state, Phi_11,
-                                      exp_ret_stock, exp_ret_bond, ret_weights,
+                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                       eps_nodes, eps_weights,
                                       gamma, psi_vec, beta, b_bar,
                                       constrained, solver_config):
@@ -1893,13 +1879,14 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     diag_float = np.zeros((N_state, 9))
 
     for i_s in prange(N_state):
-        R_bill = exp(r_bill_grid[i_s])
         annuity_factor_is = annuity_factors[i_s]
 
+        # Precompute base_mu_r_i for this state (3 returns: rtb, xr, xb)
         s_i = state_grid[i_s]
-        base_mu_r_i = np.empty(2)
+        base_mu_r_i = np.empty(3)
         base_mu_r_i[0] = const_r[0] + A_r[0, 0] * s_i[0] + A_r[0, 1] * s_i[1] + A_r[0, 2] * s_i[2]
         base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
+        base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
 
         last_a_s = sc.init_alpha_s
         last_a_b = sc.init_alpha_b
@@ -1930,7 +1917,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
                         grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
                         gamma, psi, beta, b_bar,
                         init_s=last_a_s, init_b=last_a_b,
@@ -1950,7 +1937,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
                         grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_stock, exp_ret_bond, ret_weights, R_bill,
+                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
                         gamma, psi, beta, b_bar,
                         init_s=last_a_s, init_b=last_a_b,
@@ -2018,11 +2005,10 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
 def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                 c_next_full, log_det_next,
                                 annuity_factors, rho, eta_nodes, eta_weights, dz,
-                                r_bill_grid,
                                 state_grid, grids_0, grids_1, grids_2,
                                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                 Phi_0_state, Phi_11,
-                                exp_ret_stock, exp_ret_bond, ret_weights,
+                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                 eps_nodes, eps_weights,
                                 gamma, psi_vec, beta, b_bar,
                                 constrained=True, solver_config=None):
@@ -2032,11 +2018,10 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, log_det_next,
         annuity_factors, rho, eta_nodes, eta_weights, dz,
-        r_bill_grid,
         state_grid, grids_0, grids_1, grids_2,
         v_nodes, v_weights, M_v_nodes, const_r, A_r,
         Phi_0_state, Phi_11,
-        exp_ret_stock, exp_ret_bond, ret_weights,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi_vec, beta, b_bar,
         constrained, solver_config)
@@ -2108,7 +2093,6 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     mu_r            = pc.mu_r
     ret_nodes       = pc.ret_nodes
     ret_weights     = pc.ret_weights
-    r_bill_grid     = pc.r_bill_grid
     annuity_factors = pc.annuity_factors
 
     # ---- State quadrature arrays ----
@@ -2121,6 +2105,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     grids_0         = pc.state_grids[0]
     grids_1         = pc.state_grids[1]
     grids_2         = pc.state_grids[2]
+    exp_ret_bill    = pc.exp_ret_bill
     exp_ret_stock   = pc.exp_ret_stock
     exp_ret_bond    = pc.exp_ret_bond
     Phi_0_state     = model.Phi_0_state
@@ -2173,7 +2158,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     if verbose >= 1:
         print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
     c_T, a_s_T, a_b_T, term_diag = solve_terminal_age(
-        w_grid, annuity_factors, r_bill_grid, Pi_state, mu_r, ret_nodes, ret_weights,
+        w_grid, annuity_factors, Pi_state, mu_r, ret_nodes, ret_weights,
         gamma, beta, b_bar, N_state, n_z, constrained=constrained, solver_config=solver_config)
     C_mat[-1] = c_T
     S_mat[-1] = a_s_T
@@ -2205,11 +2190,11 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             c, a_s, a_b, _di, _df = solve_retirement_step_quad(
                 w_grid, s_grid, z_grid, N_state,
                 c_next, pension_table[t + 1, :],
-                annuity_factors, r_bill_grid,
+                annuity_factors,
                 state_grid, grids_0, grids_1, grids_2,
                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                 Phi_0_state, Phi_11,
-                exp_ret_stock, exp_ret_bond, ret_weights,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config)
             label = "RETIRE"
         else:
@@ -2217,11 +2202,10 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 w_grid, s_grid, z_grid, N_state,
                 c_next, log_det_profile[t + 1],
                 annuity_factors, rho, eta_nodes, eta_weights, dz,
-                r_bill_grid,
                 state_grid, grids_0, grids_1, grids_2,
                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                 Phi_0_state, Phi_11,
-                exp_ret_stock, exp_ret_bond, ret_weights,
+                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config)
             label = "WORK  "

@@ -6,7 +6,7 @@ Contains:
   - rouwenhorst_multivariate() — independent Rouwenhorst across dimensions
   - discretize_income_ar1_mixture() — income AR(1) with mixture-normal innovations
   - get_eps_quadrature_corrected() — transitory shock Gauss-Hermite quadrature
-  - mixture_cdf(), mixture_quantile() — mixture-normal CDF/quantile helpers
+  - mixture_cdf() — mixture-normal CDF helper
 
 Dependencies: numpy, scipy (no project imports)
 """
@@ -24,23 +24,6 @@ import warnings
 def mixture_cdf(x, p, mu1, sigma1, mu2, sigma2):
     """CDF of two-component normal mixture."""
     return p * norm.cdf(x, loc=mu1, scale=sigma1) + (1.0 - p) * norm.cdf(x, loc=mu2, scale=sigma2)
-
-
-def mixture_quantile(q, p, mu1, sigma1, mu2, sigma2, tol=1e-10, max_iter=100):
-    """Quantile of normal mixture via bisection."""
-    lower = min(mu1 - 6.0 * sigma1, mu2 - 6.0 * sigma2)
-    upper = max(mu1 + 6.0 * sigma1, mu2 + 6.0 * sigma2)
-
-    for _ in range(max_iter):
-        mid = 0.5 * (lower + upper)
-        cdf_val = mixture_cdf(mid, p, mu1, sigma1, mu2, sigma2)
-        if abs(cdf_val - q) < tol:
-            return mid
-        if cdf_val < q:
-            lower = mid
-        else:
-            upper = mid
-    return 0.5 * (lower + upper)
 
 
 # =============================================================================

@@ -59,12 +59,12 @@ class Precompute:
       state_grid   (N_state, n_state)   joint state grid; row i = slow-state vector
       Pi_state     (N_state, N_state)   Pi_state[i,j] = P(s_{t+1}=j | s_t=i)
       mu_r         (N_state, N_state, n_ret)
-                                        mu_r[i,j,0] = E[xr    | s_t=i, s_{t+1}=j]  log excess stock return
-                                        mu_r[i,j,1] = E[xtips | s_t=i, s_{t+1}=j]  log excess TIPS return
+                                        mu_r[i,j,0] = E[rtb | s_t=i, s_{t+1}=j]  log real bill return
+                                        mu_r[i,j,1] = E[xr  | s_t=i, s_{t+1}=j]  log excess stock return
+                                        mu_r[i,j,2] = E[xb  | s_t=i, s_{t+1}=j]  log excess bond return
       ret_nodes    (n_ret_quad, n_ret)  residual log-return shocks drawn from N(0, Sigma_r_cond)
       ret_weights  (n_ret_quad,)        quadrature weights; sum=1
-      r_bill_grid  (N_state,)           log real bill rate at each slow state;
-                                        R_bill = exp(r_bill_grid[i_s])  (known at decision time)
+      exp_ret_bill (n_ret_quad,)        exp(ret_nodes[:, 0]) for rtb residuals
 
     Income:
       z_grid       (n_z,)               persistent income states (log, mean-zero)
@@ -131,23 +131,17 @@ class Precompute:
 
         self.state_grid = self._build_state_grid(self.state_grids, self.state_indices)
         # (N_state, n_state) float64 - flat Cartesian grid of slow-state vectors
-        # row i = [rtb, y_nom, dp] values at joint state i
+        # row i = [y_1, spr, cy] values at joint state i
 
         self.N_state = self.state_grid.shape[0]  # int — total joint states = prod(state_grid_sizes)
 
-        # Backward-compatibility aliases (used by Part 2 solver code)
-        self.slow_grids         = self.state_grids    # alias for state_grids
-        self.Pi_slow            = self.Pi_state        # (N_state, N_state) alias for Pi_state
-        self.slow_state_indices = self.state_indices   # (N_state, n_state) alias for state_indices
-        self.slow_grid          = self.state_grid      # (N_state, n_state) alias for state_grid
-        self.N_s                = self.N_state         # int alias for N_state
 
         # --- Conditional return means and bill rate ---
         self.mu_r = self._precompute_conditional_returns()
         # (N_state, N_state, n_ret) float64
-        # mu_r[i, j, 0] = E[xr    | s_t=i, s_{t+1}=j]  - log excess stock return, conditional on transition i-j
-        # mu_r[i, j, 1] = E[xtips | s_t=i, s_{t+1}=j]  - log excess TIPS return,  conditional on transition i-j
-        # Use exp(mu_r[i,j,k]) to get gross excess return multiplier.
+        # mu_r[i, j, 0] = E[rtb | s_t=i, s_{t+1}=j]  - log real bill return
+        # mu_r[i, j, 1] = E[xr  | s_t=i, s_{t+1}=j]  - log excess stock return
+        # mu_r[i, j, 2] = E[xb  | s_t=i, s_{t+1}=j]  - log excess bond return
 
         self.ret_nodes, self.ret_weights = get_return_quadrature(
             model, n_nodes=disc_config.n_ret_nodes_1d
@@ -177,22 +171,20 @@ class Precompute:
         # where base_mu_r_i = const_r + A_r @ s_i  (computed once per i_s)
 
         # Precompute exp of the return-quadrature residual nodes (avoids exp in hot loop)
-        self.exp_ret_stock = np.exp(self.ret_nodes[:, 0])  # (n_ret_quad,)
-        self.exp_ret_bond  = np.exp(self.ret_nodes[:, 1])  # (n_ret_quad,)
+        # Return columns are now [rtb_resid, xr_resid, xb_resid]
+        self.exp_ret_bill  = np.exp(self.ret_nodes[:, 0])  # (n_ret_quad,) — rtb residuals
+        self.exp_ret_stock = np.exp(self.ret_nodes[:, 1])  # (n_ret_quad,) — xr residuals
+        self.exp_ret_bond  = np.exp(self.ret_nodes[:, 2])  # (n_ret_quad,) — xb residuals
 
-        self.r_bill_grid = self.state_grid[:, model.bill_rate_index_in_state]
-        # (N_state,) float64 - log real bill rate at each slow state
-        # R_bill = exp(r_bill_grid[i_s]); bill rate is KNOWN at decision time (no uncertainty)
+        # No r_bill_grid — bill rate is now uncertain (part of return quadrature).
 
         # --- Bequest annuity factors (one per financial state) ---
-        # A(y_nom, b_bar): PV of b_bar annual payments of 1 discounted at the
-        # 10-year nominal bond yield.  Using y_nom is coherent because the
-        # bequest horizon b_bar equals the bond maturity: the nominal bond is
-        # the natural pricing instrument for the heir's consumption stream.
-        # y_nom is stored in annual decimal (SVENY10/100); use directly.
-        _y_ann = self.state_grid[:, model.annuity_yield_index_in_state]
-        self.annuity_factors = annuity_factor(_y_ann, model.b_bar)
-        # (N_state,) float64 - A(y_nom, b_bar) for each financial state
+        # A(y_1, spr, b_bar): PV of b_bar annual payments discounted at a
+        # linearly interpolated term structure from y_1 to y_20 = y_1 + spr.
+        _y_1 = self.state_grid[:, model.y_1_index_in_state]
+        _spr = self.state_grid[:, model.spr_index_in_state]
+        self.annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
+        # (N_state,) float64 - A(y_1, spr, b_bar) for each financial state
         # Used by bequest_utility / bequest_marginal / bequest_marginal_inv in solver.
 
         # --- Income discretization ---
@@ -398,10 +390,10 @@ class Precompute:
         print(f"mu_r         : {self.mu_r.shape}"
               f"  ({self.N_state * self.N_state * self.model.n_ret:,} values)")
         print(f"ret_nodes    : {self.ret_nodes.shape}")
-        print(f"Bill-rate idx: {self.model.bill_rate_index_in_state}"
-              f"  ({self.model.state_names[self.model.bill_rate_index_in_state]})")
-        print(f"r_bill range : [{self.r_bill_grid.min():.4f},"
-              f" {self.r_bill_grid.max():.4f}]")
+        print(f"y_1 idx in state : {self.model.y_1_index_in_state}"
+              f"  ({self.model.state_names[self.model.y_1_index_in_state]})")
+        print(f"spr idx in state : {self.model.spr_index_in_state}"
+              f"  ({self.model.state_names[self.model.spr_index_in_state]})")
         print(f"annuity_factors   : {self.annuity_factors.shape}  range=[{self.annuity_factors.min():.2f}, {self.annuity_factors.max():.2f}]")
         print(f"working_income    : {self.working_income.shape}  (n_age x n_z x n_eps)")
         print(f"pension_after_tax : {self.pension_after_tax.shape}  (n_age x n_z)")
@@ -426,13 +418,16 @@ def build_model(base_config, var_config, verbose=True):
         verbose=verbose,
     )
 
-    bill_rate_index_in_state = int(var_config["bill_rate_index_in_state"])
-    if bill_rate_index_in_state < 0 or bill_rate_index_in_state >= parts["n_state"]:
-        raise ValueError("bill_rate_index_in_state is out of bounds for state vector")
+    y_1_index_in_state = int(var_config["y_1_index_in_state"])
+    if y_1_index_in_state < 0 or y_1_index_in_state >= parts["n_state"]:
+        raise ValueError("y_1_index_in_state is out of bounds for state vector")
 
-    annuity_yield_index_in_state = int(var_config["annuity_yield_index_in_state"])
-    if annuity_yield_index_in_state < 0 or annuity_yield_index_in_state >= parts["n_state"]:
-        raise ValueError("annuity_yield_index_in_state is out of bounds for state vector")
+    spr_index_in_state = int(var_config["spr_index_in_state"])
+    if spr_index_in_state < 0 or spr_index_in_state >= parts["n_state"]:
+        raise ValueError("spr_index_in_state is out of bounds for state vector")
+
+    if y_1_index_in_state == spr_index_in_state:
+        raise ValueError("y_1_index_in_state and spr_index_in_state must be distinct")
 
     return LifecyclePortfolioModel(
         u=u,
@@ -474,8 +469,8 @@ def build_model(base_config, var_config, verbose=True):
         Sigma_rs=parts["Sigma_rs"],
         M=parts["M"],
         Sigma_r_cond=parts["Sigma_r_cond"],
-        bill_rate_index_in_state=bill_rate_index_in_state,
-        annuity_yield_index_in_state=annuity_yield_index_in_state,
+        y_1_index_in_state=y_1_index_in_state,
+        spr_index_in_state=spr_index_in_state,
         constrained=bool(base_config.get("constrained", True)),
     )
 

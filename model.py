@@ -78,8 +78,8 @@ class LifecyclePortfolioModel(NamedTuple):
     M: np.ndarray
     Sigma_r_cond: np.ndarray
 
-    bill_rate_index_in_state: int
-    annuity_yield_index_in_state: int
+    y_1_index_in_state: int       # Index of y_1 (1-year nominal yield) in state vector (= 0)
+    spr_index_in_state: int       # Index of spr (yield spread) in state vector (= 1)
 
     # Portfolio constraints
     constrained: bool            # True = no short-selling/leverage, False = unconstrained
@@ -191,25 +191,42 @@ def create_utility_functions(gamma):
 # BEQUEST UTILITY FUNCTIONS  (Catherine 2025, equations 21-22)
 # =============================================================================
 
-def annuity_factor(y_ann, b_bar):
+def annuity_factor(y_1, spr, b_bar):
     """
-    Standard fixed-rate annuity factor: PV of b_bar annual payments of 1
-    discounted at the annual nominal yield y_ann.
+    Annuity factor with linearly interpolated term structure.
 
-    A(y) = sum_{k=1}^{b_bar} (1+y)^{-k} = (1 - (1+y)^{-b_bar}) / y
+    Recovers y_20 = y_1 + spr, then interpolates discount rates between
+    y_1 (1-year yield) and y_20 (20-year yield).
 
-    Using the 10-year nominal bond yield (y_nom) as the discount rate is
-    coherent because the bequest horizon b_bar equals the bond maturity: the
-    heir receives a consumption stream of the same length and the nominal bond
-    is the natural pricing instrument for that stream.
+    A = sum_{k=1}^{b_bar} (1 + y(k))^{-k}
+    where y(k) = y_1 + spr * min(k - 1, 19) / 19
+
+    For k=1:   y(1)  = y_1.
+    For k=20:  y(20) = y_1 + spr = y_20.
+    For k>=20: y(k)  = y_20 (capped — do NOT extrapolate).
+
+    Uses DISCRETE compounding (1+y)^{-k} to match the existing codebase
+    convention.  Do NOT use exp(-y*k) — that's continuous compounding and
+    gives a ~12 bp/yr gap at y=5%, accumulating over b_bar periods.
+
+    Capping (rather than extrapolating) avoids unbounded discount rates if
+    b_bar > 20. With Catherine's b_bar = 10 the cap never binds, but the
+    defensive code documents intended behaviour.
 
     Parameters
     ----------
-    y_ann : float or array  Annual nominal yield (y_nom is already in annual decimal).
-    b_bar : int             Bequest horizon in years (= bond maturity = 10).
+    y_1 : float or array   1-year nominal yield (annual decimal).
+    spr : float or array   Yield spread: y_20 - y_1.
+    b_bar : int             Bequest horizon in years (= 10).
     """
-    y_ann = np.asarray(y_ann, dtype=float)
-    return (1.0 - (1.0 + y_ann) ** (-b_bar)) / y_ann
+    y_1 = np.asarray(y_1, dtype=float)
+    spr = np.asarray(spr, dtype=float)
+    A = np.zeros_like(y_1)
+    for k in range(1, b_bar + 1):
+        frac = min(k - 1, 19) / 19.0
+        y_k = y_1 + spr * frac
+        A += (1.0 + y_k) ** (-k)
+    return A
 
 
 def bequest_utility(W, A, gamma, b_bar):

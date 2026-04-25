@@ -690,10 +690,9 @@ def diagnose_var_pre(model, pc):
               f"State grid coverage: {name} >= 2.5 sigma",
               f"Grid spans enough of {name}'s distribution",
               f"+/-{cover:.2f} sigma")
-    ann_lo_b = pc.r_bill_grid.min() * 100
-    ann_hi_b = pc.r_bill_grid.max() * 100
-    ann_mu_b = pc.r_bill_grid.mean() * 100
-    print(f"  r_bill_grid: [{ann_lo_b:.3f}%, {ann_hi_b:.3f}%]  Mean: {ann_mu_b:.3f}%")
+    # Bill rate is now uncertain (no r_bill_grid); show y_1 state grid range instead
+    y1_grid = pc.state_grid[:, model.y_1_index_in_state]
+    print(f"  y_1 state grid: [{y1_grid.min()*100:.3f}%, {y1_grid.max()*100:.3f}%]  Mean: {y1_grid.mean()*100:.3f}%")
 
     # ── Return Distribution Quality ────────────────────────────────────
     _sub("Return Distribution Quality")
@@ -1273,12 +1272,11 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
     rows = []
 
     for i_s in range(pc.N_state):
-        R_bill = exp(pc.r_bill_grid[i_s])
-        Rx_stock_next, Rx_bond_next = build_gross_return_arrays(pc.mu_r[i_s, :, :], pc.ret_nodes)
+        Rx_bill_next, Rx_stock_next, Rx_bond_next = build_gross_return_arrays(pc.mu_r[i_s, :, :], pc.ret_nodes)
 
         if model.constrained:
             opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_2d_terminal_exact(
-                i_s, pc.Pi_state, Rx_stock_next, Rx_bond_next, pc.ret_weights, R_bill, model.gamma,
+                i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights, model.gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
@@ -1286,23 +1284,23 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
             )
         else:
             opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_exact(
-                i_s, pc.Pi_state, Rx_stock_next, Rx_bond_next, pc.ret_weights, R_bill, model.gamma,
+                i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights, model.gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
                 max_iter=max(100, 20 * solver_config.max_iter),
             )
 
-        scenario_weights, R_stock, R_bond, _, _ = _terminal_prepare_scenarios(
-            pc.Pi_state[i_s, :], Rx_stock_next, Rx_bond_next, pc.ret_weights, R_bill
+        scenario_weights, R_bill_arr, R_stock, R_bond, _, _ = _terminal_prepare_scenarios(
+            pc.Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights
         )
         moment = _terminal_portfolio_moment(
-            opt_s, opt_b, R_bill, scenario_weights, R_stock, R_bond, model.gamma
+            opt_s, opt_b, R_bill_arr, scenario_weights, R_stock, R_bond, model.gamma
         )
 
         foc_s, foc_b, J_ss, J_bb, J_sb = compute_terminal_portfolio_foc_jac(
-            opt_s, opt_b, i_s, pc.Pi_state, Rx_stock_next, Rx_bond_next, pc.ret_weights,
-            R_bill, model.gamma, solver_config.min_return_power, solver_config.prob_skip_threshold
+            opt_s, opt_b, i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights,
+            model.gamma, solver_config.min_return_power, solver_config.prob_skip_threshold
         )
         foc_norm = float(np.hypot(foc_s, foc_b))
         jac = np.array([[J_ss, J_sb], [J_sb, J_bb]], dtype=float)

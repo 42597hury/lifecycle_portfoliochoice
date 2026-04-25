@@ -588,6 +588,17 @@ and has fewer points covering the historically typical region.
       priority: likely to show benign floating-point ordering noise from
       `prange` thread scheduling, not actual bugs.
 - [ ] **Grid convergence** — policies at 5^3 vs 7^3 vs 9^3 (not yet implemented).
+- [ ] **Terminal age uses Pi_state, not quadrature** — `solve_terminal_age()`
+      (`solver.py:973`) uses the discrete Markov transition matrix `Pi_state`
+      for state transitions, while all other ages (both working and retirement)
+      use Gauss-Hermite quadrature over `N(0, Sigma_ss)`. This is an asymmetry:
+      the terminal-age portfolio allocation is computed under the independence-
+      Rouwenhorst approximation (which ignores cross-correlations in state
+      innovations) while every other age uses the exact covariance structure.
+      Impact is likely small (terminal age has minimal remaining horizon so
+      portfolio choice matters less), but should be unified for consistency.
+      Fix: rewrite `solve_terminal_age` to use `get_state_quadrature` nodes
+      instead of `Pi_state` rows, mirroring the retirement FOC approach.
 
 ### 6.13 Bugs found and fixed
 

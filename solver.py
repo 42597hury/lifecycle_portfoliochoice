@@ -26,7 +26,6 @@ import numpy as np
 from numba import njit, prange
 from math import exp
 import time
-from scipy.optimize import minimize, Bounds, LinearConstraint
 
 from model import SolverConfig, scalar_disposable_income
 
@@ -653,276 +652,57 @@ def compute_foc_jac_working_quad(
     return foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum
 
 
-def _project_to_triangle_py(alpha_s, alpha_b):
-    """Python helper matching the constrained simplex geometry used in the solver."""
-    alpha_s = max(0.0, alpha_s)
-    alpha_b = max(0.0, alpha_b)
-    if alpha_s + alpha_b > 1.0:
-        excess = 0.5 * (alpha_s + alpha_b - 1.0)
-        alpha_s = max(0.0, min(1.0, alpha_s - excess))
-        alpha_b = max(0.0, min(1.0, alpha_b - excess))
-    return alpha_s, alpha_b
+def _terminal_prepare_scenarios(state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights):
+    """Scenario weights and gross returns for the exact terminal objective.
 
-
-def _terminal_prepare_scenarios(Pi_state_row, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights):
-    """Scenario weights and gross returns for the exact terminal objective."""
-    scenario_weights = np.asarray(Pi_state_row, dtype=float)[:, None] * np.asarray(ret_weights, dtype=float)[None, :]
-    R_bill = np.asarray(Rx_bill_next, dtype=float)     # (N_state, n_ret_quad)
-    R_stock = R_bill * np.asarray(Rx_stock_next, dtype=float)
-    R_bond = R_bill * np.asarray(Rx_bond_next, dtype=float)
+    Parameters
+    ----------
+    state_weights : (n_scenarios,)  -- quadrature weights (v_weights) or Pi_state row
+    Rx_bill : (n_scenarios, n_ret_quad)  -- gross real bill returns
+    Rx_stock_mult : (n_scenarios, n_ret_quad)  -- exp(mu_xr + eps_xr), multiply by R_bill
+    Rx_bond_mult : (n_scenarios, n_ret_quad)  -- exp(mu_xb + eps_xb), multiply by R_bill
+    ret_weights : (n_ret_quad,)
+    """
+    scenario_weights = np.asarray(state_weights, dtype=float)[:, None] * np.asarray(ret_weights, dtype=float)[None, :]
+    R_bill = np.asarray(Rx_bill, dtype=float)
+    R_stock = R_bill * np.asarray(Rx_stock_mult, dtype=float)
+    R_bond = R_bill * np.asarray(Rx_bond_mult, dtype=float)
     Rex_s = R_stock - R_bill
     Rex_b = R_bond - R_bill
     return scenario_weights, R_bill, R_stock, R_bond, Rex_s, Rex_b
 
 
-def _terminal_portfolio_moment(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, gamma):
-    """Exact E[R_port^(1-gamma)] term on the terminal simplex domain."""
-    alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
-    bad = (scenario_weights > 0.0) & (R_port <= 0.0)
-    if np.any(bad):
-        return np.inf
-    return float(np.sum(scenario_weights * np.power(R_port, 1.0 - gamma)))
+def _build_terminal_quad_returns(i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes):
+    """Build gross return scenario arrays using state quadrature.
 
+    For current financial state i_s, computes conditional return means at each
+    state innovation quadrature node, then expands with return residual nodes.
 
-def _terminal_portfolio_grad(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma):
-    """Exact gradient of E[R_port^(1-gamma)] with respect to (alpha_s, alpha_b)."""
-    alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
-    bad = (scenario_weights > 0.0) & (R_port <= 0.0)
-    if np.any(bad):
-        return np.array([np.nan, np.nan], dtype=float)
-    coef = (1.0 - gamma) * scenario_weights * np.power(R_port, -gamma)
-    return np.array([
-        float(np.sum(coef * Rex_s)),
-        float(np.sum(coef * Rex_b)),
-    ], dtype=float)
-
-
-def _terminal_portfolio_hess(alpha_s, alpha_b, R_bill, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma):
-    """Exact Hessian of E[R_port^(1-gamma)] with respect to (alpha_s, alpha_b)."""
-    alpha_bill = 1.0 - alpha_s - alpha_b
-    R_port = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
-    bad = (scenario_weights > 0.0) & (R_port <= 0.0)
-    if np.any(bad):
-        return np.full((2, 2), np.nan, dtype=float)
-    coef = gamma * (gamma - 1.0) * scenario_weights * np.power(R_port, -gamma - 1.0)
-    h_ss = float(np.sum(coef * Rex_s * Rex_s))
-    h_bb = float(np.sum(coef * Rex_b * Rex_b))
-    h_sb = float(np.sum(coef * Rex_s * Rex_b))
-    return np.array([[h_ss, h_sb], [h_sb, h_bb]], dtype=float)
-
-
-def _terminal_projected_grad_residual(alpha_s, alpha_b, grad):
-    """Projected-gradient residual for constrained minimization on the simplex."""
-    proj_s, proj_b = _project_to_triangle_py(alpha_s - grad[0], alpha_b - grad[1])
-    return float(np.hypot(alpha_s - proj_s, alpha_b - proj_b))
-
-
-def _classify_terminal_solution(alpha_s, alpha_b, tol_geom):
-    """Map terminal simplex location to the existing corner/edge/interior exit codes."""
-    a_bill = 1.0 - alpha_s - alpha_b
-
-    near_s0 = abs(alpha_s) <= tol_geom
-    near_b0 = abs(alpha_b) <= tol_geom
-    near_bill0 = abs(a_bill) <= tol_geom
-    near_s1 = abs(alpha_s - 1.0) <= tol_geom
-    near_b1 = abs(alpha_b - 1.0) <= tol_geom
-
-    if near_s0 and near_b0:
-        return EC_CORNER_BILLS
-    if near_s1 and near_b0:
-        return EC_CORNER_STOCKS
-    if near_s0 and near_b1:
-        return EC_CORNER_BONDS
-    if near_b0:
-        return EC_EDGE_SB
-    if near_s0:
-        return EC_EDGE_BB
-    if near_bill0:
-        return EC_EDGE_STOCKBOND
-    return EC_INTERIOR
-
-
-def solve_portfolio_2d_terminal_exact(i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next,
-                                      ret_weights, gamma,
-                                      init_s=0.1, init_b=0.4,
-                                      tol=1e-9, max_iter=200):
+    Returns
+    -------
+    Rx_bill : (n_state_quad, n_ret_quad)  -- exp(mu_rtb + eps_rtb)
+    Rx_stock_mult : (n_state_quad, n_ret_quad)  -- exp(mu_xr + eps_xr)
+    Rx_bond_mult : (n_state_quad, n_ret_quad)  -- exp(mu_xb + eps_xb)
     """
-    Exact constrained terminal portfolio solve.
+    n_state_quad = M_v_nodes.shape[0]
+    n_ret_quad = ret_nodes.shape[0]
 
-    Minimizes E[R_port^(1-gamma)] over the portfolio simplex:
-        alpha_s >= 0, alpha_b >= 0, alpha_s + alpha_b <= 1.
+    # base conditional return mean: const_r + A_r @ s_i  (shape (3,))
+    base_mu_r = const_r + A_r @ state_grid[i_s]
 
-    The closed-form terminal consumption rule then uses the minimized moment.
-    """
-    scenario_weights, R_bill_arr, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
-        Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights
-    )
+    Rx_bill = np.empty((n_state_quad, n_ret_quad))
+    Rx_stock_mult = np.empty((n_state_quad, n_ret_quad))
+    Rx_bond_mult = np.empty((n_state_quad, n_ret_quad))
 
-    def obj(x):
-        return _terminal_portfolio_moment(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
+    for k_v in range(n_state_quad):
+        mu_r_k = base_mu_r + M_v_nodes[k_v]  # (3,): [mu_rtb, mu_xr, mu_xb]
+        for k_r in range(n_ret_quad):
+            Rx_bill[k_v, k_r] = np.exp(mu_r_k[0] + ret_nodes[k_r, 0])
+            Rx_stock_mult[k_v, k_r] = np.exp(mu_r_k[1] + ret_nodes[k_r, 1])
+            Rx_bond_mult[k_v, k_r] = np.exp(mu_r_k[2] + ret_nodes[k_r, 2])
 
-    def jac(x):
-        return _terminal_portfolio_grad(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
+    return Rx_bill, Rx_stock_mult, Rx_bond_mult
 
-    def hess(x):
-        return _terminal_portfolio_hess(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
-
-    bounds = Bounds([0.0, 0.0], [1.0, 1.0])
-    simplex = LinearConstraint(np.array([[1.0, 1.0]], dtype=float), [-np.inf], [1.0])
-
-    starts = [
-        np.array([min(max(init_s, 1e-8), 0.999), min(max(init_b, 1e-8), 0.999)], dtype=float),
-        np.array([1.0 / 3.0, 1.0 / 3.0], dtype=float),
-        np.array([0.80, 0.10], dtype=float),
-        np.array([0.10, 0.80], dtype=float),
-        np.array([0.05, 0.05], dtype=float),
-    ]
-    starts = [np.array(_project_to_triangle_py(x[0], x[1]), dtype=float) for x in starts]
-
-    best = None
-    best_moment = np.inf
-
-    def consider_candidate(alpha_s, alpha_b):
-        nonlocal best, best_moment
-        alpha_s, alpha_b = _project_to_triangle_py(float(alpha_s), float(alpha_b))
-        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
-        if not np.isfinite(moment):
-            return
-        grad = jac(np.array([alpha_s, alpha_b], dtype=float))
-        resid = np.inf if not np.all(np.isfinite(grad)) else _terminal_projected_grad_residual(alpha_s, alpha_b, grad)
-        exit_code = _classify_terminal_solution(alpha_s, alpha_b, tol_geom=max(10.0 * tol, 1e-8))
-        cand = (alpha_s, alpha_b, moment, exit_code, resid)
-        if moment < best_moment:
-            best_moment = moment
-            best = cand
-
-    # Always include exact simplex corners.
-    consider_candidate(0.0, 0.0)
-    consider_candidate(1.0, 0.0)
-    consider_candidate(0.0, 1.0)
-
-    options_tc = {
-        "gtol": tol,
-        "xtol": tol,
-        "barrier_tol": tol,
-        "maxiter": max(100, max_iter),
-        "verbose": 0,
-    }
-
-    for x0 in starts:
-        res = minimize(
-            obj, x0=x0, method="trust-constr", jac=jac, hess=hess,
-            bounds=bounds, constraints=[simplex], options=options_tc
-        )
-        if np.all(np.isfinite(res.x)):
-            consider_candidate(res.x[0], res.x[1])
-
-    if best is None or best[4] > max(10.0 * tol, 1e-7):
-        ineq = {"type": "ineq", "fun": lambda x: 1.0 - x[0] - x[1], "jac": lambda x: np.array([-1.0, -1.0])}
-        options_slsqp = {"ftol": tol, "maxiter": max(100, max_iter), "disp": False}
-        for x0 in starts:
-            res = minimize(
-                obj, x0=x0, method="SLSQP", jac=jac,
-                bounds=[(0.0, 1.0), (0.0, 1.0)], constraints=[ineq], options=options_slsqp
-            )
-            if np.all(np.isfinite(res.x)):
-                consider_candidate(res.x[0], res.x[1])
-
-    if best is None:
-        return 0.0, 0.0, np.inf, EC_NEWTON_FAIL, np.inf
-
-    return best
-
-
-def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next,
-                                                  ret_weights, gamma,
-                                                  init_s=0.1, init_b=0.4,
-                                                  tol=1e-9, max_iter=200):
-    """
-    Exact unconstrained terminal portfolio solve.
-
-    Minimizes E[R_port^(1-gamma)] over R^2 (no short-sale or leverage constraints).
-    Uses scipy trust-region optimizer with exact Hessian and multi-start.
-
-    The Hessian is guaranteed PSD in the feasible interior (where R_port > 0
-    for all positive-weight scenarios), so trust-ncg converges reliably even
-    in the ill-conditioned high-leverage region where the Numba Newton stalls.
-
-    Returns: (alpha_s, alpha_b, moment, exit_code, foc_resid)
-    """
-    scenario_weights, R_bill_arr, R_stock, R_bond, Rex_s, Rex_b = _terminal_prepare_scenarios(
-        Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights
-    )
-
-    def obj(x):
-        return _terminal_portfolio_moment(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
-
-    def jac(x):
-        return _terminal_portfolio_grad(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
-
-    def hess(x):
-        return _terminal_portfolio_hess(x[0], x[1], R_bill_arr, scenario_weights, R_stock, R_bond, Rex_s, Rex_b, gamma)
-
-    starts = [
-        np.array([init_s, init_b], dtype=float),
-        np.array([1.0 / 3.0, 1.0 / 3.0], dtype=float),
-        np.array([0.6, 0.2], dtype=float),
-        np.array([1.0, -0.5], dtype=float),
-        np.array([1.5, -1.0], dtype=float),
-        np.array([2.0, -2.0], dtype=float),
-    ]
-
-    best = None
-    best_moment = np.inf
-
-    def consider_candidate(alpha_s, alpha_b):
-        nonlocal best, best_moment
-        alpha_s, alpha_b = float(alpha_s), float(alpha_b)
-        moment = _terminal_portfolio_moment(alpha_s, alpha_b, R_bill_arr, scenario_weights, R_stock, R_bond, gamma)
-        if not np.isfinite(moment):
-            return
-        grad = jac(np.array([alpha_s, alpha_b], dtype=float))
-        resid = np.inf if not np.all(np.isfinite(grad)) else float(np.hypot(grad[0], grad[1]))
-        cand = (alpha_s, alpha_b, moment, EC_INTERIOR, resid)
-        if moment < best_moment:
-            best_moment = moment
-            best = cand
-
-    options_ncg = {
-        "gtol": tol,
-        "maxiter": max(100, max_iter),
-    }
-
-    for x0 in starts:
-        if not np.isfinite(obj(x0)):
-            continue
-        try:
-            res = minimize(obj, x0=x0, method="trust-ncg", jac=jac, hess=hess,
-                           options=options_ncg)
-            if np.all(np.isfinite(res.x)):
-                consider_candidate(res.x[0], res.x[1])
-        except Exception:
-            continue
-
-    # BFGS fallback if trust-ncg failed for all starts.
-    if best is None or best[4] > max(10.0 * tol, 1e-7):
-        options_bfgs = {"gtol": tol, "maxiter": max(200, 2 * max_iter)}
-        for x0 in starts:
-            if not np.isfinite(obj(x0)):
-                continue
-            try:
-                res = minimize(obj, x0=x0, method="BFGS", jac=jac, options=options_bfgs)
-                if np.all(np.isfinite(res.x)):
-                    consider_candidate(res.x[0], res.x[1])
-            except Exception:
-                continue
-
-    if best is None:
-        return 0.0, 0.0, np.inf, EC_NEWTON_FAIL, np.inf
-
-    return best
 
 
 # =============================================================================
@@ -930,8 +710,8 @@ def solve_portfolio_unconstrained_terminal_exact(i_s, Pi_state, Rx_bill_next, Rx
 # =============================================================================
 
 @njit(fastmath=True)
-def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
-                                        Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights,
+def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b,
+                                        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
                                         gamma,
                                           min_return_power=1e-15,
                                           prob_skip=1e-12):
@@ -942,53 +722,285 @@ def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b, i_s,
     is CRRA in terminal wealth, the portfolio FOC is proportional to a^{1-gamma}
     and therefore independent of savings a (hence independent of W and c).
 
-    FOC_k = sum_j pi(j|i) * R_port(j)^{-gamma} * (R_k(j) - R_bill(j)) = 0,  k in {s,b}
-    J_kl  = sum_j pi(j|i) * (-gamma) * R_port(j)^{-gamma-1} * Rex_k * Rex_l
+    Uses state quadrature (v_weights) for scenario weighting, consistent with
+    the rest of the solver.
+
+    FOC_k = sum_{k_v,k_r} w_v * w_r * R_port^{-gamma} * (R_k - R_bill) = 0
+    J_kl  = sum_{k_v,k_r} w_v * w_r * (-gamma) * R_port^{-gamma-1} * Rex_k * Rex_l
+
+    Parameters
+    ----------
+    state_weights : (n_state_quad,) -- v_weights from state quadrature
+    Rx_bill : (n_state_quad, n_ret_quad) -- exp(mu_rtb + eps_rtb)
+    Rx_stock_mult : (n_state_quad, n_ret_quad) -- exp(mu_xr + eps_xr)
+    Rx_bond_mult : (n_state_quad, n_ret_quad) -- exp(mu_xb + eps_xb)
     """
     foc_s = 0.0;  foc_b = 0.0
     J_ss  = 0.0;  J_bb  = 0.0;  J_sb  = 0.0
+    euler_sum = 0.0
     a_bill = 1.0 - alpha_s - alpha_b
 
-    N_state = Pi_state.shape[1]
+    n_state_quad = len(state_weights)
     n_ret_quad = len(ret_weights)
-    for j_s in range(N_state):
-        pi_s = Pi_state[i_s, j_s]
-        if pi_s < prob_skip:
+    for k_v in range(n_state_quad):
+        w_v = state_weights[k_v]
+        if w_v < prob_skip:
             continue
         for k_r in range(n_ret_quad):
             p_ret = ret_weights[k_r]
             if p_ret < prob_skip:
                 continue
-            weight = pi_s * p_ret
+            weight = w_v * p_ret
             if weight < prob_skip:
                 continue
 
-            R_bill = Rx_bill_next[j_s, k_r]
-            R_s   = R_bill * Rx_stock_next[j_s, k_r]
-            R_b   = R_bill * Rx_bond_next[j_s, k_r]
-            R_p   = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
-            Rex_s = R_s - R_bill
-            Rex_b = R_b - R_bill
+            R_bill_kr = Rx_bill[k_v, k_r]
+            R_s   = R_bill_kr * Rx_stock_mult[k_v, k_r]
+            R_b   = R_bill_kr * Rx_bond_mult[k_v, k_r]
+            R_p   = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill_kr
+            Rex_s = R_s - R_bill_kr
+            Rex_b = R_b - R_bill_kr
 
             Rp_mg  = max(R_p, min_return_power) ** (-gamma)
             Rp_mg1 = max(R_p, min_return_power) ** (-gamma - 1.0)
 
             foc_s += weight * Rp_mg * Rex_s
             foc_b += weight * Rp_mg * Rex_b
+            euler_sum += weight * Rp_mg * R_p   # = weight * R_p^{1-gamma}
 
             jac   = weight * (-gamma) * Rp_mg1
             J_ss += jac * Rex_s * Rex_s
             J_bb += jac * Rex_b * Rex_b
             J_sb += jac * Rex_s * Rex_b
 
-    return foc_s, foc_b, J_ss, J_bb, J_sb
+    return foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum
 
 
-def solve_terminal_age(wealth_grid, annuity_factors, Pi_state, mu_r,
+# =============================================================================
+# CONSTRAINED TERMINAL PORTFOLIO SOLVER (NJIT)
+# =============================================================================
+
+@njit(fastmath=True)
+def solve_portfolio_2d_terminal_constrained_njit(
+        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
+        gamma,
+        init_s=0.1, init_b=0.4,
+        tol=1e-7, max_iter=20,
+        corner_tol=1e-8,
+        edge_max_iter=8, edge_accept_factor=10.0,
+        singular_det=1e-15, grad_step_size=0.05,
+        step_damp=0.2, grad_denom_eps=1e-10,
+        min_return_power=1e-15, prob_skip=1e-12):
+    """
+    Constrained 2D Newton for the terminal portfolio problem.
+
+    Mirrors solve_portfolio_2d_retirement_quad but without continuation value,
+    income, or state interpolation — only the bequest FOC matters.
+
+    Corner → edge → interior Newton with projection onto the simplex.
+
+    Returns: (alpha_s, alpha_b, euler_sum, exit_code, normalized_error)
+    """
+    # --- Helper: evaluate terminal FOC at (a_s, a_b) ---
+    def _foc(a_s, a_b):
+        return compute_terminal_portfolio_foc_jac(
+            a_s, a_b, state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult,
+            ret_weights, gamma, min_return_power, prob_skip)
+
+    # Corner: all bills
+    fs0, fb0, _, _, _, e0 = _foc(0.0, 0.0)
+    scale = max(abs(e0), 1.0)
+    if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
+        return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
+
+    # Corner: all stocks
+    fs1, fb1, _, _, _, e1 = _foc(1.0, 0.0)
+    if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
+        return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
+
+    # Corner: all bonds
+    fs2, fb2, _, _, _, e2 = _foc(0.0, 1.0)
+    if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
+        return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
+
+    # Edge: stocks + bills (alpha_b = 0)
+    if fs0 > 0.0 and fs1 < 0.0:
+        a_s = fs0 / (fs0 - fs1)
+        fs = fs0
+        for _ in range(edge_max_iter):
+            fs, fb, Jss, _, _, e = _foc(a_s, 0.0)
+            if abs(fs) < tol * scale:
+                break
+            if abs(Jss) < singular_det:
+                break
+            a_s = max(0.0, min(1.0, a_s - fs / Jss))
+        if abs(fs) < tol * scale * edge_accept_factor and fb <= tol * scale:
+            return a_s, 0.0, e, EC_EDGE_SB, abs(fs) / scale
+
+    # Edge: bonds + bills (alpha_s = 0)
+    if fb0 > 0.0 and fb2 < 0.0:
+        a_b = fb0 / (fb0 - fb2)
+        fb = fb0
+        for _ in range(edge_max_iter):
+            fs, fb, _, Jbb, _, e = _foc(0.0, a_b)
+            if abs(fb) < tol * scale:
+                break
+            if abs(Jbb) < singular_det:
+                break
+            a_b = max(0.0, min(1.0, a_b - fb / Jbb))
+        if abs(fb) < tol * scale * edge_accept_factor and fs <= tol * scale:
+            return 0.0, a_b, e, EC_EDGE_BB, abs(fb) / scale
+
+    # Edge: stocks + bonds (alpha_bill = 0, alpha_s + alpha_b = 1)
+    g1 = fs1 - fb1
+    g2 = fs2 - fb2
+    if g1 * g2 < 0.0:
+        a_s = g2 / (g2 - g1)
+        g = g2
+        for _ in range(edge_max_iter):
+            a_b = 1.0 - a_s
+            fs, fb, Jss, Jbb, Jsb, e = _foc(a_s, a_b)
+            g = fs - fb
+            if abs(g) < tol * scale:
+                break
+            dg = Jss - 2.0 * Jsb + Jbb
+            if abs(dg) < singular_det:
+                break
+            a_s = max(0.0, min(1.0, a_s - g / dg))
+        if abs(fs - fb) < tol * scale * edge_accept_factor and fs >= -tol * scale:
+            return a_s, 1.0 - a_s, e, EC_EDGE_STOCKBOND, abs(g) / scale
+
+    # Interior Newton with projection
+    a_s = init_s
+    a_b = init_b
+    e_last = 0.0
+    err = 1.0
+
+    for _ in range(max_iter):
+        fs, fb, Jss, Jbb, Jsb, e_sum = _foc(a_s, a_b)
+        e_last = e_sum
+
+        err = (fs * fs + fb * fb) ** 0.5
+        if err < tol * scale:
+            return a_s, a_b, e_last, EC_INTERIOR, err / scale
+
+        det = Jss * Jbb - Jsb * Jsb
+        if abs(det) < singular_det:
+            step_s = grad_step_size * fs / (err + grad_denom_eps)
+            step_b = grad_step_size * fb / (err + grad_denom_eps)
+        else:
+            inv_d = 1.0 / det
+            step_s = -(Jbb * fs - Jsb * fb) * inv_d
+            step_b = -(-Jsb * fs + Jss * fb) * inv_d
+
+        slen = (step_s * step_s + step_b * step_b) ** 0.5
+        if slen > step_damp:
+            sc = step_damp / slen
+            step_s *= sc
+            step_b *= sc
+
+        a_s, a_b = project_to_triangle(a_s + step_s, a_b + step_b)
+
+    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
+
+
+# =============================================================================
+# UNCONSTRAINED TERMINAL PORTFOLIO SOLVER (NJIT)
+# =============================================================================
+
+@njit(fastmath=True)
+def solve_portfolio_unconstrained_terminal_njit(
+        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
+        gamma,
+        init_s=0.1, init_b=0.4,
+        tol=1e-7, max_iter=30,
+        singular_det=1e-15, grad_step_size=0.05,
+        step_damp=0.3, grad_denom_eps=1e-10,
+        min_return_power=1e-15, prob_skip=1e-12,
+        use_line_search=True, max_backtrack_iter=10,
+        line_search_max_step=2.0):
+    """
+    Unconstrained 2D Newton for the terminal portfolio problem.
+
+    Mirrors solve_portfolio_unconstrained_retirement_quad but without
+    continuation value, income, or state interpolation.
+
+    Interior Newton with optional backtracking line search, no simplex
+    projection (allows leverage and short-selling).
+
+    Returns: (alpha_s, alpha_b, euler_sum, exit_code, normalized_error)
+    """
+    def _foc(a_s, a_b):
+        return compute_terminal_portfolio_foc_jac(
+            a_s, a_b, state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult,
+            ret_weights, gamma, min_return_power, prob_skip)
+
+    # Scale from all-bills evaluation
+    _, _, _, _, _, e0 = _foc(0.0, 0.0)
+    scale = max(abs(e0), 1.0)
+
+    a_s = init_s
+    a_b = init_b
+
+    fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
+    err = (fs * fs + fb * fb) ** 0.5
+
+    for _ in range(max_iter):
+        if err < tol * scale:
+            return a_s, a_b, e_last, EC_INTERIOR, err / scale
+
+        det = Jss * Jbb - Jsb * Jsb
+        if abs(det) < singular_det:
+            step_s = grad_step_size * fs / (err + grad_denom_eps)
+            step_b = grad_step_size * fb / (err + grad_denom_eps)
+        else:
+            inv_d = 1.0 / det
+            step_s = -(Jbb * fs - Jsb * fb) * inv_d
+            step_b = -(-Jsb * fs + Jss * fb) * inv_d
+
+        if use_line_search:
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > line_search_max_step:
+                cap = line_search_max_step / slen
+                step_s *= cap
+                step_b *= cap
+
+            alpha = 1.0
+            for _bt in range(max_backtrack_iter):
+                a_s_t = a_s + alpha * step_s
+                a_b_t = a_b + alpha * step_b
+                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = _foc(a_s_t, a_b_t)
+                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
+                if err_t < err:
+                    fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
+                    e_last = e_t; err = err_t
+                    a_s = a_s_t; a_b = a_b_t
+                    break
+                alpha *= 0.5
+        else:
+            slen = (step_s * step_s + step_b * step_b) ** 0.5
+            if slen > step_damp:
+                cap = step_damp / slen
+                step_s *= cap
+                step_b *= cap
+            a_s += step_s
+            a_b += step_b
+            fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
+            err = (fs * fs + fb * fb) ** 0.5
+
+    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
+
+
+def solve_terminal_age(wealth_grid, annuity_factors,
+                       state_grid, const_r, A_r, M_v_nodes, v_weights,
                        ret_nodes, ret_weights,
                        gamma, beta, b_bar, N_state, n_z, constrained=True, solver_config=None,
                        min_return_power=1e-15, min_consumption=1e-10):
-    """Solve the terminal age exactly on the constrained portfolio simplex."""
+    """Solve the terminal age using state quadrature (consistent with rest of solver).
+
+    Integrates over state innovation quadrature nodes (v_nodes via M_v_nodes)
+    and return residual nodes (ret_nodes) to compute E[R_port^(1-gamma)].
+    """
     if solver_config is None:
         solver_config = SolverConfig()
 
@@ -1000,23 +1012,27 @@ def solve_terminal_age(wealth_grid, annuity_factors, Pi_state, mu_r,
 
     for i_s in range(N_state):
         A_is = annuity_factors[i_s]
-        Rx_bill_next, Rx_stock_next, Rx_bond_next = build_gross_return_arrays(mu_r[i_s, :, :], ret_nodes)
+
+        # Build return scenario arrays from state quadrature
+        Rx_bill, Rx_stock_mult, Rx_bond_mult = _build_terminal_quad_returns(
+            i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes
+        )
 
         if constrained:
-            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_2d_terminal_exact(
-                i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights, gamma,
+            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_2d_terminal_constrained_njit(
+                v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights, gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
-                max_iter=max(100, 20 * solver_config.max_iter),
+                max_iter=solver_config.max_iter,
             )
         else:
-            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_exact(
-                i_s, Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, ret_weights, gamma,
+            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_njit(
+                v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights, gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
-                max_iter=max(100, 20 * solver_config.max_iter),
+                max_iter=solver_config.max_iter,
             )
 
         terminal_diag_int[i_s] = exit_code
@@ -2158,7 +2174,9 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     if verbose >= 1:
         print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
     c_T, a_s_T, a_b_T, term_diag = solve_terminal_age(
-        w_grid, annuity_factors, Pi_state, mu_r, ret_nodes, ret_weights,
+        w_grid, annuity_factors,
+        state_grid, const_r, A_r, M_v_nodes, v_weights,
+        ret_nodes, ret_weights,
         gamma, beta, b_bar, N_state, n_z, constrained=constrained, solver_config=solver_config)
     C_mat[-1] = c_T
     S_mat[-1] = a_s_T

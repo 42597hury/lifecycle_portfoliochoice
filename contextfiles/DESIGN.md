@@ -65,19 +65,21 @@ the bequest is valued as the utility of spreading wealth W over b_bar years of
 consumption via an annuity:
 
 ```
-b(W, r_f) = b_bar * (W / A(y_nom))^(1-gamma) / (1-gamma)
+b(W, y_1, spr) = b_bar * (W / A(y_1, spr))^(1-gamma) / (1-gamma)
 
 where:
-  C_bar    = W / A(y_nom)          flow-equivalent consumption
-  A(y_nom) = (1 - (1+y_ann)^{-b_bar}) / y_ann    annuity factor
-  y_ann    = y_nom                 annual nominal yield (y_nom = SVENY10/100, annual decimal)
-  b_bar    = 10                    bequest horizon in years = bond maturity
+  C_bar      = W / A(y_1, spr)        flow-equivalent consumption
+  A(y_1,spr) = sum_{k=1}^{b_bar} (1 + y(k))^{-k}    annuity factor
+  y(k)       = y_1 + spr * min(k-1, 19) / 19          interpolated yield
+  b_bar      = 10                      bequest horizon in years
 ```
 
-The annuity factor A prices a 10-year consumption stream at the current 10-year
-nominal bond yield. This is coherent: the bequest horizon equals the bond maturity,
-so the nominal bond is the natural pricing instrument. No expectations hypothesis
-or term structure model is needed -- the current yield is applied as a flat rate.
+The annuity factor A prices a 10-year consumption stream using a linearly
+interpolated term structure between the 1-year yield y_1 and the 20-year AAA
+yield y_20 = y_1 + spr. For k=1, y(1) = y_1; for k=20, y(20) = y_20; for
+k > 20, y(k) = y_20 (capped, no extrapolation). With b_bar=10, only yields
+up to k=10 matter. Uses discrete compounding (1+y)^{-k} to match the codebase
+convention.
 
 **Calibration:** `gamma = 3`, `beta = 0.96`, `b_bar = 10`.
 
@@ -133,9 +135,17 @@ chi_vec, diagnostics)`.
 
 | Asset | Return | Risk | Role |
 |-------|--------|------|------|
-| Bills | `R_bill = exp(rtb_t)` | Risk-free (known at t) | Safe asset, numeraire |
-| Stocks | `R_stock = R_bill * exp(xr_{t+1})` | Risky (excess return uncertain) | Equity exposure |
-| Nominal bonds | `R_bond = R_bill * exp(xb_{t+1})` | Risky (excess return uncertain) | Duration exposure |
+| Bills | `R_bill = exp(rtb)` | Uncertain (inflation risk) | Safe-ish asset, numeraire |
+| Stocks | `R_stock = R_bill * exp(xr)` | Risky (excess return uncertain) | Equity exposure |
+| Nominal bonds | `R_bond = R_bill * exp(xb)` | Risky (excess return uncertain) | Duration exposure |
+
+**All three returns are uncertain.** The bill rate `rtb = log(1+y_1) - pi` is
+uncertain because realized inflation is unknown at decision time. Excess returns
+`xr` and `xb` are nominal-minus-nominal (CCV convention): they subtract the log
+nominal bill return `log(1+y_1)`, so inflation appears in `rtb` only.
+
+**Recovery identities:** `R_bill = exp(rtb)`, `R_stock = exp(rtb + xr)`,
+`R_bond = exp(rtb + xb)`. All three use the SAME quadrature node (joint draw).
 
 The agent chooses portfolio weights `(alpha_stock, alpha_bond)` with the remainder
 `alpha_bill = 1 - alpha_stock - alpha_bond` invested in bills.
@@ -152,19 +162,18 @@ alpha_stock + alpha_bond <= 1     (alpha_bill >= 0, no borrowing)
 ```
 Start of period t:
   - Agent observes state (W_t, s_t, z_t)
-  - s_t = (rtb_t, y_nom_t, dp_t) -- observable financial states
-  - Bill rate R_bill = exp(rtb_t) is KNOWN at decision time
+  - s_t = (y_1_t, spr_t, cy_t) -- observable financial states (known at end of year t)
   - Agent chooses consumption c_t and portfolio (alpha_stock, alpha_bond)
   - Savings: a_t = W_t - c_t
 
 Between t and t+1:
-  - Financial state transitions: s_{t+1} drawn from Pi_state[i_s, :]
-  - Excess returns realized: xr_{t+1}, xb_{t+1}
-    conditional on (s_t=i, s_{t+1}=j): (xr,xb) ~ N(mu_r[i,j], Sigma_r_cond)
+  - State innovation v^s_{t+1} drawn; next state s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s
+  - Returns realized: rtb_{t+1}, xr_{t+1}, xb_{t+1}
+    conditional on (s_t, v^s): (rtb,xr,xb) ~ N(mu_r, Sigma_r_cond)
+    where mu_r = Phi_0_ret + Phi_21 @ s_t + M @ v^s
   - Income realized: Y_{t+1} depends on age (see below)
-  - Portfolio gross return:
-      R_port = alpha_s * R_bill * exp(xr) + alpha_b * R_bill * exp(xb)
-                                          + alpha_bill * R_bill
+  - Portfolio gross real return:
+      R_port = alpha_s * exp(rtb+xr) + alpha_b * exp(rtb+xb) + alpha_bill * exp(rtb)
 
 Start of period t+1:
   - Cash-on-hand: W_{t+1} = a_t * R_port + Y_{t+1}
@@ -226,42 +235,42 @@ After-tax income uses a post-TCJA progressive tax schedule (7 brackets: 10%, 12%
 **Retirement income (Social Security pension):** At `retire_age` (67), the
 persistent state `z` freezes and the agent receives a Social Security pension
 that follows the U.S. SSA Primary Insurance Amount (PIA) formula as in
-Catherine (2025), Section 3.4, eqs. (17)–(20). The pension is constant in
+Catherine (2025), Section 3.4, eqs. (17)--(20). The pension is constant in
 levels for the rest of life (no further indexation in model units).
 
 The benefit is a piecewise-linear function of **AIME** (Average Indexed
 Monthly/Yearly Earnings), *not* of `exp(z)` directly. AIME is the career
-average of total income, capped at the SSA taxable maximum of `2.5 × L̄`
-(where the wage index `L̄ = 1` in model units):
+average of total income, capped at the SSA taxable maximum of `2.5 * L_bar`
+(where the wage index `L_bar = 1` in model units):
 
 ```
-AIYE_it = L̄_t · Σ_{s=t0}^{t} min{ L̃_is, 2.5 }          (Catherine eq. 20)
-L̃_is   = L_is / L̄_s
+AIYE_it = L_bar_t * sum_{s=t0}^{t} min{ L_tilde_is, 2.5 }  (Catherine eq. 20)
+L_tilde_is = L_is / L_bar_s
 ```
 
-In our model gross income is `exp(f(age) + z + ε)` where `f(age)` is the
-deterministic age-earnings profile and `ε` averages to zero. With a stationary
+In our model gross income is `exp(f(age) + z + eps)` where `f(age)` is the
+deterministic age-earnings profile and `eps` averages to zero. With a stationary
 wage index, AIME for a worker at persistent state `z` is approximated by
 
 ```
-AIME(z) ≈ min( exp(z) · avg_det , 2.5 )
-avg_det  = mean_{age ∈ [start_age, retire_age)} exp(f(age))
-f(age)   = b0 + b1·age + b2·age²/10 + b3·age³/100
+AIME(z) = min( exp(z) * avg_det , 2.5 )
+avg_det  = mean_{age in [start_age, retire_age)} exp(f(age))
+f(age)   = b0 + b1*age + b2*age^2/10 + b3*age^3/100
 ```
 
-With the calibrated `(b0, b1, b2, b3)`, `avg_det ≈ 0.5069`, so the median
-worker (`z = 0`) has AIME ≈ 0.507 — *not* 1.0. Multiplying by `avg_det`
+With the calibrated `(b0, b1, b2, b3)`, `avg_det ~ 0.5069`, so the median
+worker (`z = 0`) has AIME ~ 0.507 -- *not* 1.0. Multiplying by `avg_det`
 converts the persistent component to a career-average level; the 2.5 cap
 makes the benefit side consistent with the payroll-tax cap already used in
-`disposable_income_working` (`payroll_tax = 0.106 · min(y, 2.5)`).
+`disposable_income_working` (`payroll_tax = 0.106 * min(y, 2.5)`).
 
 The PIA formula (Catherine eq. 19) applies SSA-style bend points and
 replacement rates to AIME:
 
 ```
-            ⎧ r1 · AIME                                              if AIME ≤ b1
-PIA(AIME) = ⎨ r1·b1 + r2·(AIME − b1)                                 if b1 < AIME ≤ b2
-            ⎩ r1·b1 + r2·(b2−b1) + r3·(AIME − b2)                    if AIME > b2
+            { r1 * AIME                                              if AIME <= b1
+PIA(AIME) = { r1*b1 + r2*(AIME - b1)                                if b1 < AIME <= b2
+            { r1*b1 + r2*(b2-b1) + r3*(AIME - b2)                   if AIME > b2
 
 bend points: b1 = 0.21,  b2 = 1.25
 rates:       r1 = 0.90,  r2 = 0.32,  r3 = 0.15
@@ -277,24 +286,24 @@ Resulting calibration (n_z = 11 grid):
 
 | z          | AIME            | pension after-tax |
 |------------|-----------------|-------------------|
-| `z = 0`    | 0.507           | ≈ 0.254           |
-| `z ≈ 1.12` | 1.554           | ≈ 0.503           |
-| `z ≥ 1.6`  | 2.5 (cap binds) | ≈ 0.628           |
+| `z = 0`    | 0.507           | ~ 0.254           |
+| `z ~ 1.12` | 1.554           | ~ 0.503           |
+| `z >= 1.6` | 2.5 (cap binds) | ~ 0.628           |
 
-This gives a replacement rate of ≈ 63% relative to career-average after-tax
+This gives a replacement rate of ~ 63% relative to career-average after-tax
 income at `z = 0`, and a much smaller cross-sectional dispersion than an
 uncapped `exp(z)`-based scheme would produce.
 
-**Timing.** The last `z` transition occurs between `retire_age − 1` and
-`retire_age` (age 66 → 67); the realized `z` at 67 determines the pension
+**Timing.** The last `z` transition occurs between `retire_age - 1` and
+`retire_age` (age 66 -> 67); the realized `z` at 67 determines the pension
 for all subsequent periods. The working-age solver handles age 66 (last
 labor income at 67), and the retirement solver handles ages 67+ (first
 pension payment at 68).
 
 **Implementation:**
-- `compute_pension_after_tax(z_grid, avg_det)` in `model.py` — applies the
+- `compute_pension_after_tax(z_grid, avg_det)` in `model.py` -- applies the
   AIME cap, the PIA piecewise formula, and the income-tax schedule.
-- `_precompute_pension(self)` in `precompute.py` — computes `avg_det` from
+- `_precompute_pension(self)` in `precompute.py` -- computes `avg_det` from
   the model's `(b0, b1, b2, b3)` over `[start_age, retire_age)` and tiles
   `compute_pension_after_tax(z_grid, avg_det)` across ages into
   `pension_after_tax` of shape `(n_age, n_z)`.
@@ -305,17 +314,18 @@ pension payment at 68).
 
 ### 2.1 Full VAR(1) Specification
 
-The financial state vector has 5 variables:
+The financial state vector has 6 variables at **annual frequency**:
 
 ```
-z_t = [rtb_t, xr_t, xb_t, y_nom_t, dp_t]
+z_t = [y_1_t, spr_t, cy_t, rtb_t, xr_t, xb_t]
 
 Variable ordering:
-  Index 0: rtb    -- ex-post real bill rate (annual)
-  Index 1: xr     -- log excess real stock return (annual)
-  Index 2: xb     -- log excess nominal bond return (annual)
-  Index 3: y_nom  -- 10-year nominal yield (SVENY10 / 100, annual decimal)
-  Index 4: dp     -- log dividend-price ratio (log level, annual)
+  Index 0: y_1    -- 1-year nominal Treasury yield (annual decimal)
+  Index 1: spr    -- yield spread: AAA 20yr - y_1 (annual decimal)
+  Index 2: cy     -- log earnings yield: -log(CAPE)
+  Index 3: rtb    -- real bill return: log(1+y_1) - pi (annual log)
+  Index 4: xr     -- excess nominal stock return (annual log)
+  Index 5: xb     -- excess nominal bond return (annual log)
 ```
 
 Dynamics:
@@ -323,32 +333,54 @@ Dynamics:
 z_{t+1} = c + Phi @ z_t + eps_{t+1}
 
 where:
-  c = (I - Phi) @ z_bar     intercept (5,)
-  Phi                        transition matrix (5,5)
-  eps_{t+1} ~ N(0, Omega)   innovation covariance (5,5)
-  z_bar                      unconditional means (5,)
+  c = (I - Phi) @ z_bar     intercept (6,)
+  Phi                        transition matrix (6,6)
+  eps_{t+1} ~ N(0, Omega)   innovation covariance (6,6)
+  z_bar                      unconditional means (6,)
 ```
 
-**Estimation:** The VAR is estimated by restricted OLS directly at **annual frequency**
-(T=63 observations, 1962--2025) from `var_dataset.csv`. The restriction is that lagged
-return columns are excluded from all equations (Phi_12 = 0, Phi_22 = 0). The residual
-covariance Omega comes from the unrestricted residuals.
+**Estimation:** The VAR is estimated using the CCV (2003) constrained estimator
+directly at **annual frequency** (T=63 observations, 1963--2025) from
+`data/var_dataset.csv`. The restriction is that only lagged state variables enter
+each equation -- lagged return columns of Phi are zero by construction.
 
-**z_bar convention (CCV):** The unconditional mean z_bar is set to the sample mean of
-the data, not (I - Phi)^{-1} @ const_OLS. The intercept is then backed out as
-c = (I - Phi) @ z_bar. This follows Campbell, Chan & Viceira (2003) and ensures the
-discretization grid is centered on data moments.
+**CCV constrained estimator:**
+1. Pin z_bar = sample mean of the full dataset.
+2. Demean: z_tilde_t = z_t - z_bar.
+3. Regress z_tilde_{t+1} on z_tilde_t **without intercept**, using only
+   state columns as regressors.
+4. Recover const = (I - Phi) @ z_bar.
+
+This guarantees `(I - Phi)^{-1} @ const = z_bar = sample_mean` **exactly**,
+eliminating grid-centering drift.
+
+**Data construction:** Stock returns use Shiller's nominal P and D columns
+directly (CPI-free). Inflation enters only via FRED CPIAUCSL in the rtb
+definition. Bond returns use the CCV loglinear approximation for a 20-year
+AAA par bond. See `data/build_var_dataset.py` and `contextfiles/RETURNS.md`.
 
 Note: ages 22-99 gives 78 annual periods.
 
 ### 2.2 Partition into State Variables and Returns
 
-We partition the 5-variable system into:
+We partition the 6-variable system into:
 
 ```
-State variables: s_t = (rtb_t, y_nom_t, dp_t)   indices [0, 3, 4]
-Returns:         r_t = (xr_t, xb_t)              indices [1, 2]
+State variables: s_t = (y_1_t, spr_t, cy_t)     indices [0, 1, 2]
+Returns:         r_t = (rtb_t, xr_t, xb_t)      indices [3, 4, 5]
 ```
+
+**Key design choices:**
+- **No riskless asset.** `rtb` is a return variable (uncertain because of
+  inflation risk), not a state variable. The nominal bill yield `y_1` is known
+  at decision time, but the real return is uncertain.
+- **All excess returns are nominal minus nominal** (CCV convention): `xr` and `xb`
+  subtract `log(1+y_1)`. Inflation appears in `rtb` only.
+- **`spr = y_20 - y_1`** rather than `y_20` directly: more orthogonal to `y_1`,
+  better-conditioned estimation, more efficient Rouwenhorst grid.
+- **`cy = -log(CAPE)`** rather than `dp`: cyclically-adjusted earnings yield is a
+  stronger long-horizon equity predictor.
+- **20-year Moody's AAA par bond** with CCV loglinear approximation.
 
 **Key restriction:** Lagged returns do not predict anything (imposed by estimation):
 
@@ -356,9 +388,9 @@ Returns:         r_t = (xr_t, xb_t)              indices [1, 2]
 Full Phi partitioned by (state, return) blocks:
 
         | Phi_11  Phi_12 |     Phi_11: (3,3) state -> state
-Phi =   | Phi_21  Phi_22 |     Phi_21: (2,3) state -> returns
-                                Phi_12: (3,2) returns -> state   [= 0 by restriction]
-                                Phi_22: (2,2) returns -> returns  [= 0 by restriction]
+Phi =   | Phi_21  Phi_22 |     Phi_21: (3,3) state -> returns
+                                Phi_12: (3,3) returns -> state   [= 0 by restriction]
+                                Phi_22: (3,3) returns -> returns  [= 0 by restriction]
 ```
 
 With this restriction:
@@ -368,99 +400,98 @@ State dynamics:    s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s_{t+1}
 Return equations:  r_{t+1} = Phi_0_ret   + Phi_21 @ s_t + v^r_{t+1}
 ```
 
-### 2.2.1 Generic Architecture
-
-Although examples use `(rtb, y_nom, dp)` as state variables and `(xr, xb)` as
-returns, the architecture is **generic** and config-driven via `variable_names`,
-`state_indices`, and `return_indices`. No solver logic may hardcode specific
-variable identities. Adding/removing/replacing variables requires only updating
-the partition config.
-
-The indexing is non-contiguous. State indices are [0, 3, 4] and return indices
-are [1, 2] within the full 5-vector. The `partition_var()` function handles
-this using NumPy fancy indexing:
-
-```python
-Phi_11 = Phi_full[np.ix_(state_idx, state_idx)]   # (3,3)
-Phi_21 = Phi_full[np.ix_(ret_idx,   state_idx)]   # (2,3)
-Phi_12 = Phi_full[np.ix_(state_idx, ret_idx)]     # (3,2) -- should be ~0
-Phi_22 = Phi_full[np.ix_(ret_idx,   ret_idx)]     # (2,2) -- should be ~0
-```
-
 ### 2.3 Innovation Covariance Partition
 
 ```
          | Sigma_ss  Sigma_sr |     Sigma_ss: (3,3)  state-state
-Omega =  | Sigma_rs  Sigma_rr |     Sigma_rr: (2,2)  return-return
-                                    Sigma_rs: (2,3)  return-state cross
+Omega =  | Sigma_rs  Sigma_rr |     Sigma_rr: (3,3)  return-return
+                                    Sigma_rs: (3,3)  return-state cross
 ```
 
 Extracted as:
 ```python
 Sigma_ss = Omega[np.ix_(state_idx, state_idx)]   # (3,3)
-Sigma_rr = Omega[np.ix_(ret_idx,   ret_idx)]     # (2,2)
-Sigma_rs = Omega[np.ix_(ret_idx,   state_idx)]   # (2,3)
+Sigma_rr = Omega[np.ix_(ret_idx,   ret_idx)]     # (3,3)
+Sigma_rs = Omega[np.ix_(ret_idx,   state_idx)]   # (3,3)
 ```
 
 ### 2.4 Conditional Return Distribution
 
-For a state transition s_i -> s_j, the state innovation is:
-```
-v^s_{ij} = s_j - Phi_0_state - Phi_11 @ s_i
-```
+The return innovation decomposes as:
 
-The conditional mean return given this transition:
 ```
-E[r_{t+1} | s_t=i, s_{t+1}=j] = Phi_0_ret + Phi_21 @ s_i + M @ v^s_{ij}
+v^r = M @ v^s + eps,     eps ~ N(0, Sigma_r_cond) independent of v^s
 
 where:
-  M = Sigma_rs @ inv(Sigma_ss)     (2,3) conditioning matrix
+  M = Sigma_rs @ inv(Sigma_ss)                    (3,3) conditioning matrix
+  Sigma_r_cond = Sigma_rr - M @ Sigma_sr          (3,3) residual covariance
 ```
 
-Rearranged for efficient vectorized computation:
+**Conditioning on the state innovation v^s** (used by the solver):
+
 ```
+E[r_{t+1} | s_t, v^s_{t+1}] = Phi_0_ret + Phi_21 @ s_t + M @ v^s_{t+1}
+                              = const_r  + A_r @ s_t    + M @ v^s_{t+1}
+Var[r_{t+1} | s_t, v^s_{t+1}] = Sigma_r_cond   (constant)
+```
+
+where `const_r = Phi_0_ret` and `A_r = Phi_21`.
+
+**Equivalently, conditioning on the next state s_{t+1}** (used for precomputed mu_r):
+
+```
+E[r_{t+1} | s_t=i, s_{t+1}=j] = Phi_0_ret + Phi_21 @ s_i + M @ (s_j - Phi_0_state - Phi_11 @ s_i)
+
+Rearranged:
 mu_r[i,j] = (Phi_0_ret - M @ Phi_0_state) + (Phi_21 - M @ Phi_11) @ s_i + M @ s_j
            = const + A @ s_i + M @ s_j
 ```
 
-**Consistency check:** Averaging over j gives the regression prediction:
+**Consistency check:** Averaging over v^s gives the regression prediction:
 ```
-sum_j Pi_state[i,j] * mu_r[i,j]  ==  Phi_0_ret + Phi_21 @ s_i     for each i
-```
-
-**Key values (annual parameters):** M[xb, y_nom] ≈ -10.2 (directly estimated
-at annual frequency). This is the bond duration mechanism: a 1pp (0.01) rise in
-y_nom at t+1 reduces the annual bond return by ~10.2pp, matching the ~9.75
-modified duration of a 10-year zero-coupon bond.
-
-### 2.5 Residual Return Variance and the K=1 Approximation
-
-The conditional distribution of returns given a state transition is:
-```
-(xr, xb) | (s_t=i, s_{t+1}=j) ~ N(mu_r[i,j], Sigma_r_cond)
-
-Sigma_r_cond = Sigma_rr - M @ Sigma_rs'     (2,2) constant matrix
+E_{v^s}[mu_r] = Phi_0_ret + Phi_21 @ s_i     for each i
 ```
 
-The solver supports configurable return quadrature. Let `K` denote the
-Gauss-Hermite order **per return dimension**. With `n_ret` return variables,
-the tensor-product rule has `K_eff = K^n_ret` joint residual-return nodes.
-The baseline `K=1` case is the old point-mass approximation at `mu_r[i,j]`.
+**Key values (annual parameters):**
+```
+M[xb, y_1]  = -8.72    (100bp rise in y_1 -> -8.7pp xb; bond duration)
+M[xb, spr]  = -8.51    (100bp rise in spr -> -8.5pp xb)
+M[xr, cy]   = -0.93    (mechanical CAPE/price relationship)
+M[rtb, y_1] = -0.94    (Fisher effect)
 
-**Why K=1 is accurate:**
-- Conditioning on `s_{t+1}` (especially y_nom via `M[xb,y_nom]=-10.2`) explains
-  ~97.8% of bond return variance. The xb residual is near-degenerate.
-- Stock residual variance is larger but the portfolio FOC effect is second-order:
-  the Jensen's inequality bias scales as `gamma*(gamma+1)*sigma_resid^2`, which
-  is small when `sigma_resid` is already modest after conditioning.
+Variance explained by state conditioning:
+  rtb: 39.1%   xr: 96.2%   xb: 91.2%
+```
 
-For `K>1`, draw tensor-product Gauss-Hermite nodes from
-`N(0, Sigma_r_cond)` and evaluate the FOC at `mu_r[i,j] + node_k` for each joint
-node `k`. Since `Sigma_r_cond` is constant across `(i,j)`, the residual nodes
-and weights are precomputed once and reused for every state transition.
-This multiplies the inner loop cost by `K_eff` (e.g. `K=3` in the 2-return
-model implies `K_eff = 9` joint nodes).
-Expected improvement: basis-point-level changes in portfolio shares.
+### 2.5 Residual Return Variance and 3D Return Quadrature
+
+The conditional distribution of returns given a state innovation is:
+
+```
+(rtb, xr, xb) | (s_t, v^s) ~ N(mu_r, Sigma_r_cond)
+
+Sigma_r_cond = Sigma_rr - M @ Sigma_rs'     (3,3) constant matrix
+```
+
+The solver integrates over return residuals using tensor-product Gauss-Hermite
+quadrature on `Sigma_r_cond` (3x3). With K nodes per dimension, this produces
+K^3 joint residual-return nodes. At K=2, that's 8 nodes.
+
+Gross real returns at each return quadrature node k_r:
+
+```
+R_bill[k_r]  = exp(mu_rtb  + ret_nodes[k_r, 0])
+R_stock[k_r] = R_bill * exp(mu_xr + ret_nodes[k_r, 1])
+R_bond[k_r]  = R_bill * exp(mu_xb + ret_nodes[k_r, 2])
+```
+
+**Critical invariant:** all three returns for a single period use the SAME
+return quadrature node k_r -- they are components of one joint draw.
+
+**Residual return std (after conditioning):**
+```
+rtb: 1.54%   xr: 3.10%   xb: 2.26%
+```
 
 `Sigma_r_cond` is stored on the model object and used directly by the
 return-quadrature constructor.
@@ -474,11 +505,11 @@ def partition_var(Phi_full, Omega_full, z_bar, state_idx, ret_idx,
     Partition a full VAR(1) into state sub-VAR and return equations.
 
     Parameters:
-        Phi_full:        (n, n) full transition matrix (annual)
-        Omega_full:      (n, n) full innovation covariance (annual)
-        z_bar:           (n,) unconditional means (sample means, CCV convention)
-        state_idx:       list of indices for state variables, e.g. [0, 3, 4]
-        ret_idx:         list of indices for returns, e.g. [1, 2]
+        Phi_full:        (6, 6) full transition matrix (annual)
+        Omega_full:      (6, 6) full innovation covariance (annual)
+        z_bar:           (6,) unconditional means (sample means, CCV convention)
+        state_idx:       [0, 1, 2]  (y_1, spr, cy)
+        ret_idx:         [3, 4, 5]  (rtb, xr, xb)
         variable_names:  optional list of names for diagnostics
 
     Returns: dict with keys:
@@ -513,55 +544,47 @@ class LifecyclePortfolioModel(NamedTuple):
     gamma: float              # CRRA risk aversion (3.0)
 
     # === BEQUEST (Catherine 2025) ===
-    b_bar: int                # Bequest horizon in years = bond maturity (10)
-                              # b(W,s) = b_bar*(W/A(y_nom_s))^(1-gamma)/(1-gamma)
+    b_bar: int                # Bequest horizon in years (10)
 
     # === LIFECYCLE ===
     start_age: int            # 22
     retire_age: int           # 67
     terminal_age: int         # 99
-    # survival_probs: moved to Precompute as survival_probs_2d (n_age, n_z)
 
     # === LABOR INCOME (Guvenen 2022 / Catherine 2025) ===
-    b0: float                 # Age-earnings intercept (-6.142)
-    b1: float                 # Age-earnings linear (0.3040)
-    b2: float                 # Age-earnings quadratic /10 (-0.051)
-    b3: float                 # Age-earnings cubic /100 (0.002586)
+    b0, b1, b2, b3: float    # Age-earnings polynomial coefficients
     rho: float                # Persistent income AR(1) coefficient (0.991)
     pz: float                 # Mixture prob for persistent shock (0.176)
-    mu_eta1: float
-    sigma_eta1: float
-    mu_eta2: float
-    sigma_eta2: float
-    pe: float                 # Mixture prob for transitory shock (0.05)
-    mu_eps1: float
-    sigma_eps1: float
-    mu_eps2: float            # NOTE: overridden to enforce zero mean in quadrature
-    sigma_eps2: float
+    mu_eta1, sigma_eta1: float
+    mu_eta2, sigma_eta2: float   # mu_eta2 DERIVED: -(pz/(1-pz))*mu_eta1
+    pe: float                 # Mixture prob for transitory shock (0.044)
+    mu_eps1, sigma_eps1: float
+    mu_eps2, sigma_eps2: float   # mu_eps2 DERIVED: -(pe/(1-pe))*mu_eps1
 
     # === PARTITIONED VAR STRUCTURE (annual parameters) ===
     n_state: int              # Number of state variables (3)
-    n_ret: int                # Number of return variables (2)
-    state_names: tuple        # ('rtb', 'y_nom', 'dp')
-    ret_names: tuple          # ('xr', 'xb')
+    n_ret: int                # Number of return variables (3)
+    state_names: tuple        # ('y_1', 'spr', 'cy')
+    ret_names: tuple          # ('rtb', 'xr', 'xb')
 
-    z_bar_state: np.ndarray   # (n_state,) state unconditional means
-    z_bar_ret: np.ndarray     # (n_ret,) return unconditional means
+    z_bar_state: np.ndarray   # (3,) state unconditional means
+    z_bar_ret: np.ndarray     # (3,) return unconditional means
 
-    Phi_0_state: np.ndarray   # (n_state,) state intercepts = C_{h-1} @ c_s (annual)
-    Phi_11: np.ndarray        # (n_state, n_state) state persistence (annual = Phi_11_q^4)
-    Phi_0_ret: np.ndarray     # (n_ret,) return intercepts (annual)
-    Phi_21: np.ndarray        # (n_ret, n_state) state -> return loading (annual)
+    Phi_0_state: np.ndarray   # (3,) state intercepts
+    Phi_11: np.ndarray        # (3, 3) state persistence
+    Phi_0_ret: np.ndarray     # (3,) return intercepts
+    Phi_21: np.ndarray        # (3, 3) state -> return loading
 
-    Sigma_ss: np.ndarray      # (n_state, n_state) state innovation covariance (annual)
-    Sigma_rr: np.ndarray      # (n_ret, n_ret) return innovation covariance (annual)
-    Sigma_rs: np.ndarray      # (n_ret, n_state) return-state cross-covariance (annual)
-    M: np.ndarray             # (n_ret, n_state) conditioning matrix = Sigma_rs @ Sigma_ss^{-1}
-    Sigma_r_cond: np.ndarray  # (n_ret, n_ret) residual return covariance
+    Sigma_ss: np.ndarray      # (3, 3) state innovation covariance
+    Sigma_rr: np.ndarray      # (3, 3) return innovation covariance
+    Sigma_rs: np.ndarray      # (3, 3) return-state cross-covariance
+    M: np.ndarray             # (3, 3) conditioning matrix = Sigma_rs @ Sigma_ss^{-1}
+    Sigma_r_cond: np.ndarray  # (3, 3) residual return covariance
 
-    bill_rate_index_in_state: int   # Index of rtb within state vector (0)
-    annuity_yield_index_in_state: int   # Index of y_nom within state vector (1)
-    constrained: bool            # True = no short-selling/leverage, False = unconstrained
+    y_1_index_in_state: int       # Index of y_1 within state vector (= 0)
+    spr_index_in_state: int       # Index of spr within state vector (= 1)
+
+    constrained: bool             # True = no short-selling/leverage
 ```
 
 The refactor cleanly separates the **economic model** from the **numerical tuning**.
@@ -573,7 +596,8 @@ disc_config = DiscretizationConfig(
     state_grid_sizes=(5, 5, 5),
     n_z=11,
     n_eps_nodes=5,
-    n_ret_nodes_1d=1,   # K = GH order per return dimension; total joint nodes = K^n_ret
+    n_ret_nodes_1d=2,   # K = GH order per return dimension; total joint nodes = K^3
+    n_state_quad_nodes=3,  # GH order per state dimension for state innovation quadrature
 )
 
 solver_config = SolverConfig(
@@ -585,34 +609,31 @@ solver_config = SolverConfig(
 ```
 
 `DiscretizationConfig` owns wealth/savings grids, state-grid sizes, income-grid sizes,
-and conditional-return validation tolerances. `SolverConfig` owns Newton tolerances,
+and quadrature node counts. `SolverConfig` owns Newton tolerances,
 iteration caps, initial guesses, dampening rules, feasibility floors, and EGM safety
-constants. This is a major structural change from the old notebook, where these choices
-were implicit in cell-local variables.
+constants.
 
 ### 3.2 model.py -- Bequest Utility Functions
 
 ```python
-def annuity_factor(y_ann, b_bar):
+def annuity_factor(y_1, spr, b_bar):
     """
-    A(y) = (1 - (1+y)^{-b_bar}) / y
+    Annuity factor with linearly interpolated term structure.
 
-    y_ann: annual nominal yield (y_nom, already in annual decimal)
-    b_bar: bequest horizon in years (= bond maturity = 10)
+    A = sum_{k=1}^{b_bar} (1 + y(k))^{-k}
+    where y(k) = y_1 + spr * min(k-1, 19) / 19
+
+    Uses discrete compounding (1+y)^{-k}.
     """
-    return (1 - (1 + y_ann)**(-b_bar)) / y_ann
 
 def bequest_utility(W, A, gamma, b_bar):
     """b(W) = b_bar * (W/A)^(1-gamma) / (1-gamma)"""
-    return b_bar * (W / A)**(1 - gamma) / (1 - gamma)
 
 def bequest_marginal(W, A, gamma, b_bar):
     """db/dW = b_bar * (W/A)^(-gamma) / A"""
-    return b_bar * (W / A)**(-gamma) / A
 
 def bequest_marginal_inv(mu, A, gamma, b_bar):
     """Inverse of bequest_marginal: W = A * (mu*A/b_bar)^(-1/gamma)"""
-    return A * (mu * A / b_bar)**(-1.0 / gamma)
 ```
 
 ### 3.3 model.py and discretization.py -- Helper Functions
@@ -620,9 +641,8 @@ def bequest_marginal_inv(mu, A, gamma, b_bar):
 ```python
 create_utility_functions(gamma)          # Returns u, u_prime, u_prime_inv
 mixture_cdf(x, p, mu1, sigma1, mu2, sigma2)
-mixture_quantile(q, p, mu1, sigma1, mu2, sigma2)
 disposable_income_working(y_gross)       # Progressive tax on labor income (vectorized)
-scalar_disposable_income(y_gross)        # Same schedule, scalar float — Numba-callable from solver hot loop
+scalar_disposable_income(y_gross)        # Same schedule, scalar float -- Numba-callable
 compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_det, 2.5)
 ```
 
@@ -631,14 +651,13 @@ compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_d
 The workflow from raw data to model:
 
 ```python
-# Step 1: Estimate annual VAR from CSV (restricted OLS, CCV z_bar convention)
-var_config = estimate_restricted_var1_from_csv(
-    csv_path="var_dataset.csv",
-    # columns = ['rtb', 'xr', 'xb', 'y_nom', 'dp']
-    # state_indices = [0, 3, 4]    (rtb, y_nom, dp)
-    # return_indices = [1, 2]      (xr, xb)
-    # restriction: Phi_12=0, Phi_22=0
+# Step 1: Estimate annual VAR from CSV (CCV constrained, restricted)
+var_config, fit_details, data = build_nominal_system1_var_config(
+    csv_path="data/var_dataset.csv"
 )
+# columns = ['y_1', 'spr', 'cy', 'rtb', 'xr', 'xb']
+# state_indices = [0, 1, 2]    (y_1, spr, cy)
+# return_indices = [3, 4, 5]   (rtb, xr, xb)
 
 # Step 2: Build model
 base_config = build_base_config_legacy_defaults()
@@ -664,22 +683,27 @@ C_mat, S_mat, B_mat, diagnostics = run_lifecycle_solver(
 ```
 
 **Fallback hardcoded parameters** live in `var.py` as module-level arrays
-(`_Z_BAR`, `_PHI`, `_OMEGA`). These are annual estimates directly.
+(`_Z_BAR`, `_PHI`, `_OMEGA`). These are annual estimates from the 1963-2025 dataset.
 
 **Key annual parameter values:**
 
 ```
-z_bar = [+0.00697, +0.05492, +0.01945, +0.05777, -3.670]
-        [ rtb,      xr,       xb,       y_nom,     dp  ]
+z_bar = [+0.04849, +0.01992, -2.99287, +0.00913, +0.05547, +0.01427]
+        [ y_1,      spr,      cy,       rtb,      xr,       xb      ]
 
-Annual means: rtb=+0.70%  xr=+5.49%  xb=+1.95%  y_nom=5.78%
+Annual means: y_1=4.85%  spr=1.99%  cy=-2.99  rtb=0.91%  xr=5.55%  xb=1.43%
 
 Annual Phi_11 diagonal (state persistence):
-  rtb:   0.432
-  y_nom: 0.871
-  dp:    0.874
+  y_1: 0.670   spr: 0.872   cy: 0.919
 
-M[xb, y_nom] = -10.23   (bond duration; 1 unit rise in y_nom -> -10.2 in xb)
+Phi_21 (return equations, 3x3):
+         L.y_1       L.spr       L.cy
+  rtb   +1.079      +0.857      -0.034
+  xr    -1.801      -0.523      +0.107
+  xb    +1.462      +4.492      -0.055
+
+M[xb, y_1] = -8.72   (bond duration; 100bp rise in y_1 -> -8.7pp xb)
+M[xb, spr] = -8.51   (100bp rise in spr -> -8.5pp xb)
 ```
 
 ### 3.5 discretization.py -- Discretization Functions
@@ -707,7 +731,7 @@ def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma, method='independent'):
     """
 ```
 
-Called on the 3D state sub-VAR (not the full 5D system):
+Called on the 3D state sub-VAR (not the full 6D system):
 
 ```python
 state_grids, Pi_state, state_indices = rouwenhorst_multivariate(
@@ -718,12 +742,11 @@ state_grids, Pi_state, state_indices = rouwenhorst_multivariate(
 )
 ```
 
-**Approximation error:** The independence method uses only `diag(Phi_11)` per
-marginal, ignoring off-diagonal cross-persistence. The structural error is
-`M @ Phi_11_off @ s_i` where `Phi_11_off = Phi_11 - diag(diag(Phi_11))`.
-This is reported at runtime. Finer grids do not reduce this error.
-
-Grid coverage: ±2 sigma of the stationary distribution with N=5 points.
+**Note:** The independence method uses only `diag(Phi_11)` per marginal grid,
+ignoring off-diagonal cross-persistence. This only affects grid coverage, not
+transition accuracy -- the solver uses Gauss-Hermite quadrature for state
+transitions, which handles the full covariance structure exactly. The Rouwenhorst
+grid is retained for policy function storage and interpolation.
 
 #### 3.5.3 Income Process Discretization
 
@@ -765,42 +788,49 @@ s_grid:           (n_s,)          savings grid for EGM endogenous gridpoints
 ages:             (n_age,)        integer ages from start_age to terminal_age
 
 # === FINANCIAL STATE DISCRETIZATION ===
-state_grid:       (N_state, 3)    joint state grid; row i = [rtb, y_nom, dp]
-Pi_state:         (N_state, N_state)  transition matrix; Pi_state[i,j] = P(s'=j|s=i)
+state_grid:       (N_state, 3)    joint state grid; row i = [y_1, spr, cy]
+Pi_state:         (N_state, N_state)  transition matrix (retained, not used by solver)
 state_grids:      list[3]         marginal 1-D grids for each state variable
 state_indices:    (N_state, 3)    multi-index into marginal grids
 N_state:          int             total joint states = prod(state_grid_sizes)
 
-# Backward-compatibility aliases:
-slow_grid, Pi_slow, slow_grids, slow_state_indices, N_s
+# === STATE INNOVATION QUADRATURE ===
+v_nodes:          (K_s^3, 3)      state innovation Gauss-Hermite nodes
+v_weights:        (K_s^3,)        tensor-product weights, sum to 1
+n_state_quad:     int             total state quadrature nodes
 
 # === CONDITIONAL RETURNS ===
-mu_r:             (N_state, N_state, 2)
-                  mu_r[i, j, 0] = E[xr | s_t=i, s_{t+1}=j]   log excess stock return
-                  mu_r[i, j, 1] = E[xb | s_t=i, s_{t+1}=j]   log excess bond return
-ret_nodes:        (n_ret_quad, 2)   residual log-return shocks around mu_r
-ret_weights:      (n_ret_quad,)     tensor-product quadrature weights; sum=1
-r_bill_grid:      (N_state,)      log real bill rate at each state (rtb component)
+mu_r:             (N_state, N_state, 3)
+                  mu_r[i, j, 0] = E[rtb | s_t=i, s_{t+1}=j]
+                  mu_r[i, j, 1] = E[xr  | s_t=i, s_{t+1}=j]
+                  mu_r[i, j, 2] = E[xb  | s_t=i, s_{t+1}=j]
+const_r:          (3,)            Phi_0_ret
+A_r:              (3, 3)          Phi_21
+M_v_nodes:        (K_s^3, 3)     v_nodes @ M.T (precomputed)
+ret_nodes:        (K_r^3, 3)     residual log-return shocks around mu_r
+ret_weights:      (K_r^3,)       joint return quadrature weights; sum=1
+exp_ret_bill:     (K_r^3,)       exp(ret_nodes[:, 0])
+exp_ret_stock:    (K_r^3,)       exp(ret_nodes[:, 1])
+exp_ret_bond:     (K_r^3,)       exp(ret_nodes[:, 2])
 
 # === BEQUEST ===
-annuity_factors:  (N_state,)      A(y_nom_s, b_bar) for each financial state
-                  Computed as: annuity_factor(state_grid[:, y_nom_idx], b_bar)
-                  Used by bequest_utility / bequest_marginal / bequest_marginal_inv
+annuity_factors:  (N_state,)      A(y_1, spr, b_bar) for each financial state
+                  Computed from state_grid[:, 0] (y_1) and state_grid[:, 1] (spr)
 
 # === INCOME PROCESS ===
 z_grid:           (n_z,)          persistent income states (log, mean-zero)
-Pi_z:             (n_z, n_z)      income transition matrix (retained, not used by solver/simulation)
+Pi_z:             (n_z, n_z)      income transition matrix (retained, not used by solver)
 eps_nodes:        (n_eps,)        Gauss-Hermite nodes for transitory shock
 eps_weights:      (n_eps,)        quadrature weights; sum=1, mean=0 enforced
 eta_nodes:        (n_eta,)        Gauss-Hermite nodes for persistent innovation eta
 eta_weights:      (n_eta,)        quadrature weights; sum=1, mean=0 enforced
-dz:               float           uniform z_grid spacing (z_grid[1] - z_grid[0])
-log_det_profile:  (n_age,)        deterministic age-earnings profile f(age) for each period
-avg_det:          float           mean(exp(f(age))) over working ages; used for pension AIME
+dz:               float           uniform z_grid spacing
+log_det_profile:  (n_age,)        deterministic age-earnings profile f(age)
+avg_det:          float           mean(exp(f(age))) over working ages
 
 # === LOOKUP TABLES ===
-working_income:   (n_age, n_z, n_eps)  after-tax labor income table (simulation warmup + diagnostics; solver computes income on the fly — §4.5)
-pension_after_tax:(n_age, n_z)         after-tax Social Security benefit (solver grid lookup)
+working_income:   (n_age, n_z, n_eps)  after-tax labor income table (simulation; solver computes on the fly)
+pension_after_tax:(n_age, n_z)         after-tax Social Security benefit
 survival_probs_2d:(n_age, n_z)         age- and earnings-dependent survival probabilities
 
 # === DIMENSIONS ===
@@ -819,36 +849,35 @@ def _precompute_conditional_returns(self):
       where  const = Phi_0_ret - M @ Phi_0_state
              A     = Phi_21    - M @ Phi_11
     """
-    const  = model.Phi_0_ret - model.M @ model.Phi_0_state  # (2,)
-    A      = model.Phi_21    - model.M @ model.Phi_11        # (2,3)
-    term_i = state_grid @ A.T        # (N_state, 2)
-    term_j = state_grid @ model.M.T  # (N_state, 2)
+    const  = model.Phi_0_ret - model.M @ model.Phi_0_state  # (3,)
+    A      = model.Phi_21    - model.M @ model.Phi_11        # (3,3)
+    term_i = state_grid @ A.T        # (N_state, 3)
+    term_j = state_grid @ model.M.T  # (N_state, 3)
     mu_r = const[None,None,:] + term_i[:,None,:] + term_j[None,:,:]
-    # Shape: (N_state, N_state, 2)
+    # Shape: (N_state, N_state, 3)
 ```
 
-Memory: N_state=125 -> 0.25 MB. N_state=343 -> 1.9 MB.
+Memory: N_state=125 -> 0.37 MB. N_state=343 -> 2.8 MB.
 
 #### 3.6.3 Bequest Annuity Factor Precomputation
 
 ```python
-# y_nom is the 2nd state variable (index 1 in state_names = ('rtb','y_nom','dp'))
-# y_nom stored in annual decimal (SVENY10/100); use directly
-_y_nom_idx = list(model.state_names).index('y_nom')
-_y_ann = state_grid[:, _y_nom_idx]
-self.annuity_factors = annuity_factor(_y_ann, model.b_bar)
+# y_1 is the 1st state variable (index 0 in state_names = ('y_1','spr','cy'))
+# spr is the 2nd state variable (index 1)
+_y_1 = state_grid[:, model.y_1_index_in_state]
+_spr = state_grid[:, model.spr_index_in_state]
+self.annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
 # (N_state,) -- one annuity factor per financial state
 ```
 
 #### 3.6.4 Consistency Validation
 
 ```python
-def _validate_conditional_returns(self):
+def _validate_state_quadrature(self):
     """
-    Verify: sum_j Pi_state[i,j] * mu_r[i,j] == Phi_0_ret + Phi_21 @ s_i
+    Verify: sum_k w_k * (const_r + A_r @ s_i + M @ v_k) == Phi_0_ret + Phi_21 @ s_i
 
-    Error = M @ Phi_11_off @ s_i  where Phi_11_off = Phi_11 - diag(diag(Phi_11))
-    Printed at runtime; finer grids do not reduce this error.
+    Uses the property that sum_k w_k * v_k = 0 (zero-mean quadrature).
     """
 ```
 
@@ -907,26 +936,29 @@ Shape: `(n_age, n_z, N_state, n_w)`
 
 ```
 V(W, i_s, i_z, t) = max_{c, alpha_s, alpha_b}  u(c)
-                     + beta * psi_{t,i_z}     * E[V(W', i_s', i_z', t+1)]
+                     + beta * psi_{t,i_z}     * E[V(W', s', z', t+1)]
                      + beta * (1-psi_{t,i_z}) * b(a*R_port, annuity_factors[i_s])
 
 where:
   a       = W - c                                    savings
-  R_bill  = exp(r_bill_grid[i_s])                    known at decision time
-  R_s     = R_bill * exp(mu_r[i_s, j_s, 0])          stock return for transition i_s->j_s
-  R_b     = R_bill * exp(mu_r[i_s, j_s, 1])          bond return for transition i_s->j_s
+  R_bill  = exp(mu_rtb + eps_rtb)                    real bill return (uncertain)
+  R_s     = R_bill * exp(mu_xr + eps_xr)             real stock return
+  R_b     = R_bill * exp(mu_xb + eps_xb)             real bond return
   R_port  = alpha_s*R_s + alpha_b*R_b + alpha_bill*R_bill
   W'      = a * R_port + Y'                          next-period cash-on-hand
   b(W, A) = b_bar * (W/A)^(1-gamma) / (1-gamma)     bequest utility
 ```
 
 The expectation integrates over:
-1. Next financial state `j_s`: weighted by `Pi_state[i_s, j_s]`
-2. Persistent innovation `eta`: Gauss-Hermite quadrature with `eta_weights[k_eta]`.
+1. State innovation `v^s_k`: Gauss-Hermite quadrature with `v_weights[k_v]`.
+   Next state `s_{t+1} = Phi_0_state + Phi_11 @ s_t + v_k` is generally off-grid;
+   policies are trilinearly interpolated on the 3D state grid.
+2. Return residual `eps_k`: Gauss-Hermite quadrature with `ret_weights[k_r]`.
+   Joint draw from `N(0, Sigma_r_cond)`.
+3. Persistent innovation `eta`: Gauss-Hermite quadrature with `eta_weights[k_eta]`.
    `z_next = rho * z_grid[i_z] + eta_nodes[k_eta]` is generally off-grid;
    policies are linearly interpolated between bracketing z-grid points.
-3. Transitory shock `eps`: weighted by `eps_weights[i_eps]` (working age only)
-4. Residual return shock `k_r`: weighted by `ret_weights[k_r]`
+4. Transitory shock `eps`: weighted by `eps_weights[i_eps]` (working age only)
 
 ### 4.3 Interpolation and Helper Functions
 
@@ -942,6 +974,11 @@ def fast_interp_slope_1d(x, x_grid, y_grid):
     Returns nearest interior slope at extrapolation boundaries."""
 
 @njit
+def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
+    """Bracket (s0,s1,s2) in the 3D state grid for trilinear interpolation.
+    Returns (lo0, lo1, lo2, f0, f1, f2) with clamping to valid range."""
+
+@njit
 def project_to_triangle(alpha_s, alpha_b):
     """Project (alpha_stock, alpha_bond) onto feasible region: >=0, sum<=1."""
 ```
@@ -951,40 +988,28 @@ def project_to_triangle(alpha_s, alpha_b):
 For a given savings level, current state, and candidate portfolio weights,
 compute the FOC and Jacobian for the 2D Newton step.
 
-```python
-@njit(fastmath=True)
-def compute_foc_jac_retirement(alpha_s, alpha_b, s_val, z_idx, i_s,
-                                wealth_grid, c_next_full, pension_next_scalar,
-                                annuity_factor_is,
-                                Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
-                                gamma, psi, beta, b_bar):
-    """
-    Parameters:
-        alpha_s, alpha_b:     candidate portfolio weights
-        s_val:                savings (a = W - c)
-        z_idx:                persistent income state index (unused, passed through)
-        i_s:                  current financial state index
-        c_next_full:          (N_state, n_w) consumption policy at t+1 for this z
-        pension_next_scalar:  pension income for this z
-        annuity_factor_is:    A(y_nom, b_bar) at current state i_s  [scalar]
-        Pi_state:             (N_state, N_state)
-        Rx_stock_next:        (N_state, n_ret_quad) precomputed exp(mu_r[i_s, :, 0] + ret_node[:,0])
-        Rx_bond_next:         (N_state, n_ret_quad) precomputed exp(mu_r[i_s, :, 1] + ret_node[:,1])
-        ret_weights:          (n_ret_quad,) joint return quadrature weights
-        R_bill:               scalar, exp(r_bill_grid[i_s])
+The solver integrates over state innovations (outer loop) and return residuals
+(inner loop). For each state innovation v_k:
 
-    Returns:
-        foc_s, foc_b:         FOC for stock and bond weights
-        J_ss, J_bb, J_sb:     Jacobian entries
-        euler_sum:            expected marginal utility * R_port (for EGM)
-    """
+```
+s_next = Phi_0_state + Phi_11 @ s_i + v_k    (trilinearly interpolated)
+mu_r   = const_r + A_r @ s_i + M_v_nodes[k_v]  (conditional return mean)
+```
+
+For each return residual node k_r:
+
+```
+R_bill = exp(mu_rtb + ret_nodes[k_r, 0])
+R_s    = R_bill * exp(mu_xr + ret_nodes[k_r, 1])
+R_b    = R_bill * exp(mu_xb + ret_nodes[k_r, 2])
+R_port = alpha_s * R_s + alpha_b * R_b + alpha_bill * R_bill
 ```
 
 **Annuity factor pricing:** The bequest annuity factor uses the **current** state's
-nominal yield (`annuity_factors[i_s]`), consistent with Catherine (2025, eq. 21-22)
-where the annuity is priced at the time-t risk-free rate `r_ft`. The invested wealth
-`a * R_port` varies by next state `j_s` through portfolio returns, but the annuity
-pricing is fixed at the current yield.
+yields (`annuity_factors[i_s]`), consistent with Catherine (2025, eq. 21-22)
+where the annuity is priced at the time-t yield curve. The invested wealth
+`a * R_port` varies by scenario through portfolio returns, but the annuity
+pricing is fixed at the current state.
 
 ### 4.5 FOC and Jacobian -- Working Age
 
@@ -1001,107 +1026,63 @@ two bracketing grid points `iz_lo` and `iz_lo + 1`; income is **not** interpolat
 **Income computed on the fly (no table interpolation):** Next-period gross income
 
 ```
-y_gross = exp( f(t+1) + ρ·z_grid[z_idx] + η_k + ε_j )
+y_gross = exp( f(t+1) + rho*z_grid[z_idx] + eta_k + eps_j )
 ```
 
 is evaluated directly via `scalar_disposable_income(y_gross)` (the scalar,
 Numba-JIT'd companion to the vectorized `disposable_income_working`). This
 replaces the earlier scheme of interpolating the precomputed `working_income`
-table in `z`, which introduced a chord-overshoot bias of ~14–17% between grid
-points because the tax schedule is nonlinear. The solver now uses the exact same
-gross-to-net mapping as the simulation.
+table in `z`, which introduced a chord-overshoot bias of ~14-17% between grid
+points because the tax schedule is nonlinear.
 
 To keep the hot loop free of transcendentals, the exponential is factored once
 per FOC call:
 
 ```
-base_det_z = exp( f(t+1) + ρ·z_grid[z_idx] )          # 1 exp (hoisted)
-exp_eta[k] = exp( η_k )      for k in 0..n_eta-1      # n_eta exps (hoisted)
-exp_eps[j] = exp( ε_j )      for j in 0..n_eps-1      # n_eps exps (hoisted)
+base_det_z = exp( f(t+1) + rho*z_grid[z_idx] )          # 1 exp (hoisted)
+exp_eta[k] = exp( eta_k )      for k in 0..n_eta-1      # n_eta exps (hoisted)
+exp_eps[j] = exp( eps_j )      for j in 0..n_eps-1      # n_eps exps (hoisted)
 
-y_gross    = base_det_z · exp_eta[k_eta] · exp_eps[i_e]   # inside hot loop: 2 muls
+y_gross    = base_det_z * exp_eta[k_eta] * exp_eps[i_e]   # inside hot loop: 2 muls
 ```
 
-Total transcendentals per FOC call: `n_eta + n_eps + 1` (typically ~8), versus
-`N_state · n_ret_quad · n_eta · n_eps` (typically ~4,500) if `exp()` were left
-inline. The two small `exp_eta` / `exp_eps` buffers are allocated inside the
-`@njit` function and fit comfortably in L1 cache.
-
 **Bequest hoist optimization:** The bequest marginal utility (`mu_bequest`, `mup_bequest`)
-depends only on `j_s` (through `w_inv = s_val * R_p`), not on `(k_eta, i_e)`. Its
-contribution to all 6 accumulators (foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum) is
-accumulated once at the `j_s` level, while the inner `(k_eta, i_e)` loops handle only the
-alive (`psi * mu_alive`) part. This is valid because `sum(eta_weights) = sum(eps_weights) = 1`,
-so `sum(weight) = p_var` for each `j_s`.
+depends only on the scenario `(k_v, k_r)` (through `w_inv = s_val * R_p`), not on
+`(k_eta, i_e)`. Its contribution to all 6 accumulators (foc_s, foc_b, J_ss, J_bb, J_sb,
+euler_sum) is accumulated once at the outer loop level, while the inner `(k_eta, i_e)`
+loops handle only the alive (`psi * mu_alive`) part.
 
-**Note on earnings-dependent mortality:** The FOC functions receive scalar `psi` (already
-indexed by the current `z_i` in the calling step function). Therefore `prob_death = 1 - psi`
-is constant within a single FOC call, and the bequest hoist remains valid: the bequest
-weight `p_var * prob_death` is still independent of `(k_eta, i_e)` within the inner loops.
-
-**Note on `z_next` clamping:** The z-bracketing for consumption-policy interpolation
-clamps `iz_lo` and `frac_z` to `[0, n_z-2]` and `[0, 1]`. The income computation uses
-the raw `z_next = ρ·z + η_k` without clamping — the tax function is well-defined at
-every real `z`, so tail realizations get more accurate income than they would under a
-clamped table lookup.
-
-```python
-@njit(fastmath=True)
-def compute_foc_jac_working(alpha_s, alpha_b, s_val, z_idx, i_s,
-                             wealth_grid, c_next_full, log_det_next,
-                             annuity_factor_is,
-                             z_grid, rho, eta_nodes, eta_weights, dz,
-                             Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
-                             eps_nodes, eps_weights,
-                             gamma, psi, beta, b_bar):
-    """
-    Working-age FOC/Jacobian. Integrates over:
-      - Next financial state j_s (weighted by Pi_state)
-      - Joint return node k_r (weighted by ret_weights)
-      - Persistent innovation eta (Gauss-Hermite quadrature: eta_weights)
-      - Transitory shock eps (weighted by eps_weights)
-
-    z_next = rho * z_grid[z_idx] + eta_nodes[k_eta] is generally off-grid;
-    consumption is linearly interpolated in z. Income is evaluated exactly
-    via scalar_disposable_income(exp(log_det_next + rho*z + eta + eps))
-    with the exp() factored into precomputed per-node tables.
-
-    log_det_next: scalar float = f(age_{t+1}), the deterministic age-earnings
-                  profile evaluated at next period's age.
-    c_next_full shape: (n_z, N_state, n_w)
-
-    Loop structure (after bequest hoist):
-      precompute exp_eta[k], exp_eps[j], base_det_z    # outside all loops
-      for j_s:                              # future macro state
-          for k_r:                          # joint return node
-              bequest accumulators += ...   # once per (j_s, k_r)
-              for k_eta:                    # persistent innovation (GH quadrature)
-                  z_next = rho * z + eta_nodes[k_eta]
-                  iz_lo, frac_z = bracket(z_next)       # for consumption policy only
-                  det_z_eta = base_det_z * exp_eta[k_eta]
-                  for i_e:                  # transitory shock
-                      y_gross     = det_z_eta * exp_eps[i_e]
-                      income_next = scalar_disposable_income(y_gross)
-                      interpolate consumption at (iz_lo, frac_z)
-                      alive accumulators += ...
-    """
+**Loop structure (after bequest hoist):**
+```
+precompute exp_eta[k], exp_eps[j], base_det_z    # outside all loops
+for k_v:                              # state innovation quadrature node
+    compute s_next, bracket on 3D grid
+    compute mu_r = base_mu_r + M_v_nodes[k_v]
+    for k_r:                          # return residual quadrature node
+        compute R_bill, R_s, R_b, R_port
+        bequest accumulators += ...   # once per (k_v, k_r)
+        for k_eta:                    # persistent innovation (GH quadrature)
+            z_next = rho * z + eta_nodes[k_eta]
+            iz_lo, frac_z = bracket(z_next)       # for consumption policy only
+            det_z_eta = base_det_z * exp_eta[k_eta]
+            for i_e:                  # transitory shock
+                y_gross     = det_z_eta * exp_eps[i_e]
+                income_next = scalar_disposable_income(y_gross)
+                interpolate consumption at (iz_lo, frac_z)
+                alive accumulators += ...
 ```
 
 ### 4.6 Newton Portfolio Solver
 
 2D Newton-Raphson for optimal `(alpha_stock, alpha_bond)`. Checks corners (all bills,
 all stocks, all bonds), then edges (two-asset combinations), then interior Newton.
-`Rx_stock_next` and `Rx_bond_next` are precomputed per `i_s` in the step functions
-to avoid redundant `exp()` calls across Newton iterations and savings grid points.
-They now have shape `(N_state, n_ret_quad)` rather than `(N_state,)`.
 
 ```python
 @njit(fastmath=True)
 def solve_portfolio_2d_retirement(s_val, z_idx, i_s,
                                   wealth_grid, c_next_full, pension_next_scalar,
                                   annuity_factor_is,
-                                  Pi_state, Rx_stock_next, Rx_bond_next, ret_weights, R_bill,
-                                  gamma, psi, beta, b_bar,
+                                  ...
                                   init_s=0.1, init_b=0.4, tol=1e-7, max_iter=20):
     """Returns: (opt_alpha_s, opt_alpha_b, euler_sum)"""
 ```
@@ -1109,62 +1090,91 @@ def solve_portfolio_2d_retirement(s_val, z_idx, i_s,
 #### 4.6.1 Relative Tolerance Scaling
 
 All tolerance checks in the Newton solvers use **relative** rather than absolute
-tolerances. The FOCs `foc_s`, `foc_b` are sums of `c^{-gamma} * Rex_k` terms,
-so their natural magnitude scales with marginal utility `c^{-gamma}`. With
-`gamma=3` and small consumption, absolute FOC values can reach ~1e+9, making a
-fixed absolute tolerance of 1e-7 impossible to achieve.
+tolerances. The FOCs are sums of `c^{-gamma} * Rex_k` terms, so their natural
+magnitude scales with marginal utility `c^{-gamma}`. With `gamma=3` and small
+consumption, absolute FOC values can reach ~1e+9, making a fixed absolute
+tolerance of 1e-7 impossible to achieve.
 
 **Scale computation.** After the first FOC evaluation (all-bills corner), the
-Euler equation level `e0 = sum_j pi_j * MU_j * R_bill` provides the natural
-FOC magnitude. Each solver computes:
-
-- Retirement/working: `scale = max(abs(e0), 1.0)`
-- Terminal: `scale = R_bill ** (-gamma)` (since terminal FOC has no euler_sum)
-
+Euler equation level `e0 = sum * MU * R_bill` provides the natural FOC magnitude.
 The floor of 1.0 ensures the tolerance never becomes tighter than the absolute
 `tol` when FOC values happen to be small.
 
-**Where scale is applied:**
-
-| Check | Old (absolute) | New (relative) |
-|-------|---------------|----------------|
-| Corner KKT | `fs0 <= 1e-8` | `fs0 <= 1e-8 * scale` |
-| Edge Newton convergence | `abs(fs) < tol` | `abs(fs) < tol * scale` |
-| Edge acceptance | `abs(fs) < tol*10 and fb <= tol` | `abs(fs) < tol*scale*10 and fb <= tol*scale` |
-| Interior Newton convergence | `err < tol` | `err < tol * scale` |
-| Returned `foc_resid` | `abs(fs)` or `err` | `abs(fs)/scale` or `err/scale` |
-
-The returned `foc_resid` is now a **relative** Euler equation error. Values
-< `tol` indicate convergence; the post-solve diagnostic "Worst FOC" and "RMS FOC"
-report these relative residuals directly.
-
 ### 4.7 Terminal Condition
 
-At the final age T, the agent consumes optimally given that savings generate
-bequest utility. The portfolio FOC decouples from consumption due to the CRRA
-bequest structure (homogeneous of degree 1-gamma in wealth). The portfolio is
-solved once per financial state `i_s` via `solve_portfolio_2d_terminal`, then
-consumption follows in closed form.
+At the final age T (99), the agent consumes `c` and saves `a = W - c`.
+Savings generate bequest utility only (no continuation value). The problem is:
 
-```python
-@njit
-def solve_terminal_age(wealth_grid, annuity_factors, r_bill_grid, Pi_state, mu_r,
-                        ret_nodes, ret_weights,
-                        gamma, beta, b_bar, N_state, n_z):
-    """
-    Terminal period: jointly solve for c* and optimal (alpha_s*, alpha_b*).
-
-    Portfolio FOC (independent of c and W due to CRRA bequest):
-        sum_j sum_k pi(j|i) * ret_weights[k] * R_port*(j,k)^{-gamma} * (R_k(j,k) - R_bill) = 0
-
-    Consumption closed-form:
-        Omega = b_bar * A^{gamma-1} * sum_j sum_k pi(j|i) * ret_weights[k] * R_port*(j,k)^{1-gamma}
-        ratio = (beta * Omega)^{-1/gamma}
-        c*    = W * ratio / (1 + ratio)
-
-    Output shape: (n_z, N_state, n_w) -- identical across z (bequest independent of income).
-    """
 ```
+V_T(W, s) = max_{c, alpha}  u(c) + beta * E[b(a * R_port, A(s))]
+```
+
+**Portfolio-consumption separation.** Because the bequest is CRRA in
+terminal wealth `a * R_port`:
+
+  b(a*R_port, A) = b_bar * (a*R_port/A)^{1-gamma} / (1-gamma)
+                 = b_bar * A^{gamma-1} * a^{1-gamma} * R_port^{1-gamma} / (1-gamma)
+
+the portfolio problem `min_{alpha} E[R_port^{1-gamma}]` (for gamma > 1)
+is independent of savings `a` and consumption `c`. The portfolio is solved
+once per financial state `i_s`, then consumption follows in closed form.
+
+**Return construction.** For each financial state `i_s`, returns are built
+using the same two-layer Gauss-Hermite quadrature as the retirement solver:
+
+```
+base_mu_r = const_r + A_r @ state_grid[i_s]       (3,) unconditional return mean
+mu_r_k    = base_mu_r + M_v_nodes[k_v]             + M @ v^s innovation effect
+R_bill    = exp(mu_r_k[0] + ret_nodes[k_r, 0])     gross real bill return
+R_stock   = R_bill * exp(mu_r_k[1] + ret_nodes[k_r, 1])
+R_bond    = R_bill * exp(mu_r_k[2] + ret_nodes[k_r, 2])
+```
+
+where `M_v_nodes = v_nodes @ M'` and `M = Sigma_rs @ inv(Sigma_ss)`.
+This factored quadrature correctly reproduces: (i) the unconditional return
+mean `Phi_0_ret + Phi_21 @ s_i`, (ii) the full return covariance `Omega_rr`,
+and (iii) the state-return cross-covariance `Sigma_sr`.
+
+**Terminal FOC (dropping constant `(1-gamma)` factor):**
+
+```
+FOC_k = sum_{k_v,k_r} w_v * w_r * R_port^{-gamma} * (R_k - R_bill) = 0
+J_kl  = sum_{k_v,k_r} w_v * w_r * (-gamma) * R_port^{-gamma-1} * Rex_k * Rex_l
+```
+
+The Jacobian is negative definite for gamma > 1 (guaranteed by CRRA concavity
+and R_port > 0 on the simplex), so Newton converges to the unique optimum.
+No scipy dependency; the terminal solver uses the same `@njit` 2D Newton with
+corner/edge/interior pattern as the retirement solver.
+
+**Euler sum.** The FOC loop also accumulates
+`euler_sum = sum w * R_port^{1-gamma} = E[R_port^{1-gamma}]`, used in the
+consumption formula below.
+
+**Consumption formula.** Given the optimal portfolio with
+`moment = E[R_port^{1-gamma}]`, the FOC for consumption gives:
+
+```
+c^{-gamma} = beta * b_bar * A^{gamma-1} * (W-c)^{-gamma} * moment
+
+omega = b_bar * A^{gamma-1} * moment
+ratio = (beta * omega)^{-1/gamma}
+c     = W * ratio / (ratio + 1)
+```
+
+This is constant in `c/W` across wealth (CRRA homogeneity) and independent
+of income state `z` (bequest depends only on financial state via `A(y_1, spr)`
+and conditional return distribution).
+
+**Implementation:**
+
+| Function | Role |
+|----------|------|
+| `_build_terminal_quad_returns` | Builds `(Rx_bill, Rx_stock_mult, Rx_bond_mult)` scenario arrays from state quadrature |
+| `compute_terminal_portfolio_foc_jac` | `@njit` FOC + Jacobian + euler_sum, returns 6 values |
+| `solve_portfolio_2d_terminal_constrained_njit` | `@njit` constrained Newton (corner/edge/interior) |
+| `solve_portfolio_unconstrained_terminal_njit` | `@njit` unconstrained Newton with backtracking |
+| `solve_terminal_age` | Loops over `i_s`, calls Newton, applies consumption formula |
 
 ### 4.8 Period Solvers
 
@@ -1175,14 +1185,12 @@ def solve_terminal_age(wealth_grid, annuity_factors, r_bill_grid, Pi_state, mu_r
 def solve_retirement_step(wealth_grid, savings_grid, z_grid, N_state,
                           c_next_full, pension_1d,
                           annuity_factors,
-                          Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
+                          ...
                           gamma, psi_vec, beta, b_bar):
     """
     Solve one retirement period using EGM + 2D Newton.
     Parallelized: prange over i_s (financial state index).
     psi_vec: (n_z,) survival probs for this age, indexed by z.
-    Inside the z_i loop: psi = psi_vec[z_i] (scalar) passed to Newton solver.
-    Output shapes: (n_z, N_state, n_w) for policy_c, policy_alpha_s, policy_alpha_b
     """
 ```
 
@@ -1193,22 +1201,12 @@ def solve_retirement_step(wealth_grid, savings_grid, z_grid, N_state,
 def solve_working_age_step(wealth_grid, savings_grid, z_grid, N_state,
                            c_next_full, log_det_next,
                            annuity_factors,
-                           rho, eta_nodes, eta_weights, dz,
-                           Pi_state, mu_r, ret_nodes, ret_weights, r_bill_grid,
-                           eps_nodes, eps_weights,
+                           ...
                            gamma, psi_vec, beta, b_bar):
     """
     Solve one working-age period using EGM + 2D Newton.
-    Same EGM structure as retirement but with income integration via
-    Gauss-Hermite quadrature over persistent innovations (eta_nodes/weights)
-    and linear z-interpolation of the consumption policy at off-grid z'
-    values. Income at each quadrature node is computed on the fly from
-    log_det_next, z_grid[z_i], eta_nodes[k_eta], eps_nodes[i_e] via
-    scalar_disposable_income — no table interpolation (§4.5).
-
-    log_det_next: scalar = f(age_{t+1}). Master solver passes
-                  pc.log_det_profile[t+1].
-    psi_vec:      (n_z,) survival probs for this age, indexed by z.
+    log_det_next: scalar = f(age_{t+1}).
+    psi_vec: (n_z,) survival probs for this age, indexed by z.
     """
 ```
 
@@ -1235,8 +1233,7 @@ own row in the diagnostic arrays -- no race conditions.
 
 #### 4.10.1 Newton Solver Return Values
 
-All Newton solvers (`solve_portfolio_2d_retirement`, `_working`, `_terminal`)
-return `(alpha_s, alpha_b, euler_sum, exit_code, foc_resid)` where:
+All Newton solvers return `(alpha_s, alpha_b, euler_sum, exit_code, foc_resid)` where:
 
 | Exit code | Constant | Meaning |
 |-----------|----------|---------|
@@ -1252,36 +1249,16 @@ return `(alpha_s, alpha_b, euler_sum, exit_code, foc_resid)` where:
 
 `foc_resid` is the final FOC norm at exit (0.0 for corners).
 
-#### 4.10.2 Diagnostic Arrays
-
-Step functions return `diag_int` (N_state, 13) and `diag_float` (N_state, 9)
-instead of the old `mono_violations` and `mono_worst` arrays.
-
-**Integer counters** (`diag_int[i_s, idx]`):
-Corner/edge/interior counts, Newton failures, negative euler events,
-monotonicity violations, total calls.
-
-**Float counters** (`diag_float[i_s, idx]`):
-Worst monotonicity drop, max/RMS FOC residual, portfolio share min/max/sum.
-
-#### 4.10.3 Output Layers
+#### 4.10.2 Output Layers
 
 **Per-age table** (printed as each age completes):
 ```
  Age  Phase  Time  Newton%  alpha_s  alpha_b  a_bill  c/W    %int  %edge  %corn  mono
   79  RETIRE  2.1s  100.0%    0.115    0.528   0.357  0.189   53%    34%    13%     0
 ```
-Portfolio shares and c/W are at the median income/financial/wealth state.
 
-**Post-solve report** (5 sections):
-1. Newton convergence: total/failed calls, worst/RMS FOC residual
-2. Portfolio regime breakdown: 7-category split by retirement vs working
-3. Portfolio share ranges: global min/max/mean
-4. EGM monotonicity: violations by age
-5. Policy sanity: NaN/inf/negative checks on C_mat, S_mat, B_mat
-
-**Verbosity:** `verbose=0` silent, `verbose=1` per-age progress table plus the
-post-solve diagnostic report.
+**Post-solve report:** Newton convergence, portfolio regime breakdown,
+share ranges, EGM monotonicity, and policy sanity checks.
 
 ---
 
@@ -1291,19 +1268,26 @@ post-solve diagnostic report.
 
 | Array | Shape | Description |
 |-------|-------|-------------|
-| `state_grid` | (N_state, 3) | Joint state grid; row i = [rtb, y_nom, dp] |
-| `Pi_state` | (N_state, N_state) | State transition matrix |
-| `mu_r` | (N_state, N_state, 2) | Conditional return means (xr, xb) |
-| `r_bill_grid` | (N_state,) | Log real bill rate at each state |
-| `annuity_factors` | (N_state,) | A(y_nom, b_bar) annuity factor per state |
+| `state_grid` | (N_state, 3) | Joint state grid; row i = [y_1, spr, cy] |
+| `v_nodes` | (K_s^3, 3) | State innovation quadrature nodes |
+| `v_weights` | (K_s^3,) | State quadrature weights |
+| `mu_r` | (N_state, N_state, 3) | Conditional return means (rtb, xr, xb) |
+| `M_v_nodes` | (K_s^3, 3) | v_nodes @ M.T (precomputed) |
+| `const_r` | (3,) | Phi_0_ret |
+| `A_r` | (3, 3) | Phi_21 |
+| `ret_nodes` | (K_r^3, 3) | Return residual quadrature nodes |
+| `ret_weights` | (K_r^3,) | Return quadrature weights |
+| `exp_ret_bill` | (K_r^3,) | exp(ret_nodes[:, 0]) |
+| `exp_ret_stock` | (K_r^3,) | exp(ret_nodes[:, 1]) |
+| `exp_ret_bond` | (K_r^3,) | exp(ret_nodes[:, 2]) |
+| `annuity_factors` | (N_state,) | A(y_1, spr, b_bar) annuity factor per state |
 | `z_grid` | (n_z,) | Persistent income states |
-| `Pi_z` | (n_z, n_z) | Income transition matrix (retained, not used by solver/simulation) |
-| `eps_nodes/weights` | (n_eps,) | Gauss-Hermite quadrature for transitory shocks |
-| `eta_nodes/weights` | (n_eta,) | Gauss-Hermite quadrature for persistent innovation eta |
-| `log_det_profile` | (n_age,) | Deterministic age-earnings profile f(age) per period |
-| `avg_det` | scalar | Mean of exp(f(age)) over working ages; for pension AIME |
-| `working_income` | (n_age, n_z, n_eps) | After-tax labor income table (retained for simulation warmup and diagnostics; solver now computes income on the fly — §4.5) |
-| `pension_after_tax` | (n_age, n_z) | After-tax pension table (solver grid lookup) |
+| `eps_nodes/weights` | (n_eps,) | Gauss-Hermite for transitory shocks |
+| `eta_nodes/weights` | (n_eta,) | Gauss-Hermite for persistent innovation eta |
+| `log_det_profile` | (n_age,) | Deterministic age-earnings profile f(age) |
+| `working_income` | (n_age, n_z, n_eps) | After-tax labor income (simulation; solver on-the-fly) |
+| `pension_after_tax` | (n_age, n_z) | After-tax pension table |
+| `survival_probs_2d` | (n_age, n_z) | Earnings-dependent survival probs |
 
 ### 5.2 Policy Function Shapes
 
@@ -1317,11 +1301,12 @@ post-solve diagnostic report.
 
 | Variable | Description | Units | Sample mean |
 |----------|-------------|-------|-------------|
-| `rtb` | Ex-post real bill rate | annual decimal | +0.70% |
-| `xr` | Log excess real stock return | annual decimal | +5.49% |
-| `xb` | Log excess nominal bond return | annual decimal | +1.95% |
-| `y_nom` | 10-year nominal yield (SVENY10/100) | annual decimal | 5.78% |
-| `dp` | Log dividend-price ratio | log level | -3.670 |
+| `y_1` | 1-year nominal Treasury yield | annual decimal | 4.85% |
+| `spr` | Yield spread (AAA 20yr - y_1) | annual decimal | 1.99% |
+| `cy` | Log earnings yield: -log(CAPE) | log level | -2.99 |
+| `rtb` | Real bill return | annual log | +0.91% |
+| `xr` | Excess nominal stock return | annual log | +5.55% |
+| `xb` | Excess nominal bond return | annual log | +1.43% |
 
 ---
 
@@ -1330,40 +1315,37 @@ post-solve diagnostic report.
 ### 6.1 Inner Loop Cost
 
 Per Newton evaluation, the inner loop iterates over:
-- N_state financial state transitions (125 or 343)
-- Working age: x n_eta persistent innovation nodes (10) x n_eps transitory nodes (10)
+- K_s^3 state innovation nodes (27 at K_s=3) x K_r^3 return residual nodes (8 at K_r=2)
+- Working age: additionally x n_eta persistent innovation nodes (10) x n_eps transitory nodes (10)
 
 | Config | Retirement | Working |
 |--------|-----------|---------|
-| N_state=125 | 125 iters | 12,500 iters |
-| N_state=343 | 343 iters | 34,300 iters |
+| K_s=3, K_r=2 | 216 iters | 21,600 iters |
 
 ### 6.2 Bequest Hoist Optimization
 
 In `compute_foc_jac_working`, the bequest contribution to the FOC and Jacobian
-depends only on the future macro state `j_s` (through `w_inv = s_val * R_p`),
-not on the income dimensions `(j_z, i_e)`. The bequest terms are accumulated
-once per `j_s` at the outer loop level, while the inner `(j_z, i_e)` loops
-handle only the alive contribution (`psi * mu_alive`). This avoids
-`(n_z * n_eps - 1)` redundant multiply-accumulates per active `j_s` across
-6 accumulators, reducing inner-loop work by ~30%.
+depends only on the scenario `(k_v, k_r)` (through `w_inv = s_val * R_p`),
+not on the income dimensions `(k_eta, i_e)`. The bequest terms are accumulated
+once at the `(k_v, k_r)` level, while the inner `(k_eta, i_e)` loops handle only the
+alive contribution (`psi * mu_alive`). This avoids redundant multiply-accumulates,
+reducing inner-loop work by ~30%.
 
 ### 6.3 Parallelization
 
 `prange` over `i_s` (financial state index) in both period solvers.
-`mu_r` and `annuity_factors` are read-only shared arrays.
+All quadrature arrays are read-only shared.
 
 ### 6.4 Memory
 
 | Array | N_state=125 | N_state=343 |
 |-------|-------------|-------------|
-| `mu_r` (N_state^2 x 2) | 0.24 MB | 1.8 MB |
-| `Pi_state` (N_state^2) | 0.12 MB | 0.9 MB |
+| `mu_r` (N_state^2 x 3) | 0.37 MB | 2.8 MB |
 | `C_mat` (78 x n_z x N_state x 150) | ~20 MB (n_z=11) | ~55 MB |
 | Total policy (x3) | ~60 MB | ~165 MB |
 
 ### 6.5 Numba Compatibility
 
 All `@njit` functions receive plain NumPy arrays. The Precompute object unpacks
-everything before passing to compiled functions. `mu_r` and `annuity_factors` are
-standard float64 arrays, fully Numba-compatible.
+everything before passing to compiled functions. All arrays are standard float64
+and fully Numba-compatible.

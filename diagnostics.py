@@ -27,9 +27,11 @@ from math import exp
 
 from model import SolverConfig, disposable_income_working, compute_pension_after_tax
 from solver import (
-    build_gross_return_arrays, compute_terminal_portfolio_foc_jac,
-    solve_portfolio_unconstrained_terminal_exact, solve_portfolio_2d_terminal_exact,
-    _terminal_prepare_scenarios, _terminal_portfolio_moment,
+    compute_terminal_portfolio_foc_jac,
+    solve_portfolio_2d_terminal_constrained_njit,
+    solve_portfolio_unconstrained_terminal_njit,
+    _terminal_prepare_scenarios,
+    _build_terminal_quad_returns,
     EC_NEWTON_FAIL, EC_INTERIOR,
     EC_CORNER_BILLS, EC_CORNER_STOCKS, EC_CORNER_BONDS,
     EC_EDGE_SB, EC_EDGE_BB, EC_EDGE_STOCKBOND,
@@ -1238,9 +1240,12 @@ def _probe_terminal_directions(alpha_s, alpha_b, base_moment,
         for step in probe_steps:
             test_s = alpha_s + step * direction[0]
             test_b = alpha_b + step * direction[1]
-            test_moment = _terminal_portfolio_moment(
-                test_s, test_b, R_bill, scenario_weights, R_stock, R_bond, gamma
-            )
+            alpha_bill = 1.0 - test_s - test_b
+            R_port_test = test_s * R_stock + test_b * R_bond + alpha_bill * R_bill
+            if np.any((scenario_weights > 0.0) & (R_port_test <= 0.0)):
+                test_moment = np.inf
+            else:
+                test_moment = float(np.sum(scenario_weights * np.power(R_port_test, 1.0 - gamma)))
             if not np.isfinite(test_moment):
                 continue
             delta = float(test_moment - base_moment)
@@ -1272,34 +1277,34 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
     rows = []
 
     for i_s in range(pc.N_state):
-        Rx_bill_next, Rx_stock_next, Rx_bond_next = build_gross_return_arrays(pc.mu_r[i_s, :, :], pc.ret_nodes)
+        Rx_bill, Rx_stock_mult, Rx_bond_mult = _build_terminal_quad_returns(
+            i_s, pc.state_grid, pc.const_r, pc.A_r, pc.M_v_nodes, pc.ret_nodes
+        )
 
         if model.constrained:
-            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_2d_terminal_exact(
-                i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights, model.gamma,
+            opt_s, opt_b, euler_sum, exit_code, foc_resid = solve_portfolio_2d_terminal_constrained_njit(
+                pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
-                max_iter=max(100, 20 * solver_config.max_iter),
+                max_iter=solver_config.max_iter,
             )
         else:
-            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_exact(
-                i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights, model.gamma,
+            opt_s, opt_b, euler_sum, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_njit(
+                pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
-                max_iter=max(100, 20 * solver_config.max_iter),
+                max_iter=solver_config.max_iter,
             )
 
         scenario_weights, R_bill_arr, R_stock, R_bond, _, _ = _terminal_prepare_scenarios(
-            pc.Pi_state[i_s, :], Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights
+            pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights
         )
-        moment = _terminal_portfolio_moment(
-            opt_s, opt_b, R_bill_arr, scenario_weights, R_stock, R_bond, model.gamma
-        )
+        moment = float(euler_sum)
 
-        foc_s, foc_b, J_ss, J_bb, J_sb = compute_terminal_portfolio_foc_jac(
-            opt_s, opt_b, i_s, pc.Pi_state, Rx_bill_next, Rx_stock_next, Rx_bond_next, pc.ret_weights,
+        foc_s, foc_b, J_ss, J_bb, J_sb, _ = compute_terminal_portfolio_foc_jac(
+            opt_s, opt_b, pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights,
             model.gamma, solver_config.min_return_power, solver_config.prob_skip_threshold
         )
         foc_norm = float(np.hypot(foc_s, foc_b))
@@ -1311,14 +1316,14 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
         det_jac = float(J_ss * J_bb - J_sb * J_sb)
 
         a_bill = 1.0 - opt_s - opt_b
-        R_port = opt_s * R_stock + opt_b * R_bond + a_bill * R_bill
+        R_port = opt_s * R_stock + opt_b * R_bond + a_bill * R_bill_arr
         positive_mask = scenario_weights > 0.0
         min_r_port = float(np.min(R_port[positive_mask])) if np.any(positive_mask) else float("nan")
         max_r_port = float(np.max(R_port[positive_mask])) if np.any(positive_mask) else float("nan")
 
         push_hint, push_score = _terminal_push_hint(foc_s, foc_b, tol=solver_config.tol)
         probe_label, probe_step, probe_delta, probe_rel = _probe_terminal_directions(
-            opt_s, opt_b, moment, R_bill, scenario_weights, R_stock, R_bond, model.gamma, probe_steps
+            opt_s, opt_b, moment, R_bill_arr, scenario_weights, R_stock, R_bond, model.gamma, probe_steps
         )
 
         row = {

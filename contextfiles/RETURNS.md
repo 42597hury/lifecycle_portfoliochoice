@@ -238,10 +238,10 @@ quarterly-to-annual compounding step is needed.
 ### 4.1 Annual (estimated on 1963–2025, T=63, CCV constrained)
 
 ```
-z_bar = [+0.04849, +0.01992, -2.99287, +0.00913, +0.05558, +0.01427]
+z_bar = [+0.04849, +0.01992, -2.99287, +0.00913, +0.05547, +0.01427]
          [ y_1      spr       cy        rtb       xr        xb      ]
 
-Annual means: y_1=4.85%  spr=1.99%  cy=-2.99  rtb=0.91%  xr=5.56%  xb=1.43%
+Annual means: y_1=4.85%  spr=1.99%  cy=-2.99  rtb=0.91%  xr=5.55%  xb=1.43%
 
 Phi_11 diagonal (state persistence, annual):
   y_1: 0.670   spr: 0.872   cy: 0.919
@@ -249,11 +249,11 @@ Phi_11 diagonal (state persistence, annual):
 Phi_21 (return equations, 3×3):
          L.y_1       L.spr       L.cy
   rtb   +1.079      +0.857      -0.034
-  xr    -1.801      -0.512      +0.107
+  xr    -1.801      -0.523      +0.107
   xb    +1.462      +4.492      -0.055
 
 Innovation std devs (annual):
-  y_1: 1.57%   spr: 1.12%   cy: 16.69%   rtb: 1.98%   xr: 15.91%   xb: 7.63%
+  y_1: 1.57%   spr: 1.12%   cy: 16.69%   rtb: 1.98%   xr: 15.89%   xb: 7.63%
 
 Equation R²:
   y_1: 0.784   spr: 0.521   cy: 0.873   rtb: 0.518   xr: 0.059   xb: 0.322
@@ -385,8 +385,8 @@ Return residuals are drawn from N(0, Sigma_r_cond) via its Cholesky factor.
 - [x] **cy range sanity** — mean -2.99, min -3.79 (2025), max -2.06 (1974).
       Consistent with CAPE range ~8 to ~44.
 - [x] **rtb range sanity** — mean +0.91%, min -6.83%, max +8.78%.
-- [x] **xr range sanity** — mean +5.56% (equity premium), std 16.1%.
-      Min -53.2% (2008), max +26.0%.
+- [x] **xr range sanity** — mean +5.55% (equity premium), std 16.0%.
+      Min -53.1% (2008), max +25.9%.
 - [x] **xb range sanity** — mean +1.43%, std 9.0%. Min -23.2%, max +17.2%.
 - [x] **AAA bond duration** — mean 11.76 years for 20-year par bond at mean
       AAA yield of 6.84%. Duration rises as yields fall (currently ~14 at 5%).
@@ -405,7 +405,7 @@ cross-validation against the old 5-variable quarterly dataset is not meaningful.
 - [x] **Restriction correctly imposed** — `||Phi[:, 3:6]|| = 0.0` exactly.
       Return-lag columns zero by construction.
 - [x] **Annual magnitudes sensible** — z_bar: y_1=4.85%, spr=1.99%, cy=-2.99,
-      rtb=0.91%, xr=5.56%, xb=1.43%. All economically reasonable.
+      rtb=0.91%, xr=5.55%, xb=1.43%. All economically reasonable.
 - [x] **Bond duration mechanism intact** — M[xb, y_1] = -8.72, M[xb, spr] = -8.51.
       A 100bp rise in y_1 reduces xb by ~8.7pp; a 100bp rise in spr reduces xb
       by ~8.5pp. Both channels reflect the ~12-year duration of the 20-year AAA
@@ -460,7 +460,22 @@ cross-validation against the old 5-variable quarterly dataset is not meaningful.
 
 ### 6.6 Solver integration checks
 
-- [ ] **Terminal condition** — finite, positive consumption; stock share in [0,1].
+- [x] **Terminal condition** — VERIFIED. Terminal solver replaced with `@njit`
+      2D Newton (no scipy dependency). Uses state quadrature consistent with
+      rest of solver. Verified by 12 automated tests (`test_terminal_correctness.py`):
+      - CRRA homogeneity: c/W constant across wealth (CV = 3e-16)
+      - z-independence: policy identical across income states (spread = 0)
+      - KKT conditions at solution (violation = 6e-13)
+      - Newton matches 201x201 brute-force grid search (moment err < 1e-6)
+      - Moment E[R^{1-gamma}] finite and positive for all states
+      - Consumption in (0, W) with c/W in [0.08, 0.20]
+      - Analytic FOC matches finite-difference gradient (rel err = 5e-8)
+      - Terminal return construction bit-identical to retirement (err = 6e-16)
+      - Quadrature mean reproduces Phi_0_ret + Phi_21 @ s_i (err = 8e-17)
+      - Quadrature covariance reproduces full Omega_rr (err = 1e-17)
+      - Return correlation structure exact (bill-stock-bond correlations match)
+      - State-return cross-covariance Cov(v^s, e_r) = Sigma_sr (err = 9e-16)
+      - Two-layer vs single-layer quadrature agree (rel err = 2e-4)
 - [ ] **Full lifecycle solve** — no NaN/Inf. (Skipped — too slow for validation.)
 
 ### 6.7 Quadrature convergence (K) and cross-validation
@@ -496,8 +511,14 @@ mean that affected the old unconstrained estimator.
 
 - [ ] **Determinism test** — 2 full solves with bit-exact comparison.
 - [ ] **Grid convergence** — policies at 5^3 vs 7^3 vs 9^3.
-- [ ] **Terminal age uses Pi_state, not quadrature** — asymmetry with
-      rest of solver. Low impact (terminal age has minimal horizon).
+- [x] **Terminal age uses Pi_state, not quadrature** — FIXED. Terminal
+      solver now uses v_nodes/v_weights state quadrature, consistent with
+      retirement and working-age solvers.
+- [x] **Terminal solver uses scipy** — FIXED. Replaced `solve_portfolio_2d_terminal_exact`
+      (scipy trust-constr + SLSQP) and `solve_portfolio_unconstrained_terminal_exact`
+      (scipy trust-ncg + BFGS) with `@njit` Newton solvers. Removed scipy.optimize
+      import from solver.py. CRRA concavity guarantees Newton convergence without
+      multi-start or trust regions.
 
 ### 6.13 Bugs found and fixed
 

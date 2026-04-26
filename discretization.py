@@ -56,15 +56,14 @@ def rouwenhorst_univariate(N, mu, rho, sigma):
 
 
 
-def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma, method="independent",
-                             grid_scale=1.0):
+def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma):
     """
     Multivariate Markov chain approximation for a Gaussian VAR(1).
 
     Uses independence Rouwenhorst: Kronecker product of marginal chains.
-    The resulting Pi_state is retained for backward compatibility (simulation
-    fallback) but the solver uses Gauss-Hermite quadrature for state
-    transitions, which handles cross-correlations exactly.
+    The resulting Pi_state is retained for simulation fallback but the
+    solver uses Gauss-Hermite quadrature for state transitions, which
+    handles cross-correlations exactly.
 
     Parameters
     ----------
@@ -76,8 +75,6 @@ def rouwenhorst_multivariate(N_vec, mu, Phi, Sigma, method="independent",
         Persistence matrix.
     Sigma : ndarray, shape (d, d)
         Cholesky factor of innovation covariance (Sigma @ Sigma.T = Omega).
-    grid_scale : float, optional
-        Unused (kept for API compatibility).
 
     Returns
     -------

@@ -631,6 +631,83 @@ def test_single_layer_vs_two_layer_quadrature(model, pc, n_test=5):
     return max_moment_err < 0.02
 
 
+def test_monte_carlo_cross_validation(model, pc, n_mc=500_000, n_test=8, seed=42):
+    """Test 13: Monte Carlo cross-validation of the quadrature moment.
+
+    For each test state i_s, draw n_mc samples from the FULL return innovation
+    distribution N(0, Omega_rr) (using the Cholesky of the 3x3 return covariance),
+    compute E[R_port^{1-gamma}] by sample average, and compare to the quadrature
+    result.
+
+    This tests whether the low-order Gauss-Hermite quadrature (27 state nodes x
+    8 return nodes = 216 scenarios) accurately integrates the highly nonlinear
+    integrand R_port^{1-gamma} over the true joint return distribution. The
+    quadrature exactly reproduces the first few polynomial moments of the
+    distribution, but R^{1-gamma} for gamma=5 is R^{-4} — a steep, convex
+    function that amplifies the tails. If the quadrature is too coarse for this
+    integrand, the MC estimate will diverge.
+
+    Uses a fixed seed for reproducibility.
+    """
+    print(f"\n=== Test 13: Monte Carlo cross-validation (n_mc={n_mc:,d}) ===")
+
+    rng = np.random.default_rng(seed)
+
+    # Cholesky of full Omega_rr for sampling
+    Omega_rr = np.array(model.Sigma_rr, dtype=float)
+    Omega_rr = 0.5 * (Omega_rr + Omega_rr.T)
+    L_full = np.linalg.cholesky(Omega_rr)
+
+    # Draw all MC samples at once: eps ~ N(0, Omega_rr)
+    z_samples = rng.standard_normal((n_mc, model.n_ret))
+    eps_samples = z_samples @ L_full.T  # (n_mc, 3) — [rtb, xr, xb] innovations
+
+    max_rel_err = 0.0
+    test_states = np.linspace(0, pc.N_state - 1, min(n_test, pc.N_state), dtype=int)
+
+    for i_s in test_states:
+        s_i = pc.state_grid[i_s]
+        mu_r = model.Phi_0_ret + model.Phi_21 @ s_i  # (3,) conditional return mean
+
+        # --- Quadrature moment at optimal portfolio ---
+        Rx_bill, Rx_stock_mult, Rx_bond_mult = _build_terminal_quad_returns(
+            i_s, pc.state_grid, pc.const_r, pc.A_r, pc.M_v_nodes, pc.ret_nodes)
+        opt_s, opt_b, moment_quad, ec, resid = solve_portfolio_2d_terminal_constrained_njit(
+            pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma)
+
+        # --- Monte Carlo moment at the same portfolio ---
+        log_rtb = mu_r[0] + eps_samples[:, 0]  # (n_mc,)
+        log_xr  = mu_r[1] + eps_samples[:, 1]
+        log_xb  = mu_r[2] + eps_samples[:, 2]
+
+        R_bill_mc = np.exp(log_rtb)
+        R_stock_mc = R_bill_mc * np.exp(log_xr)
+        R_bond_mc = R_bill_mc * np.exp(log_xb)
+
+        a_bill = 1.0 - opt_s - opt_b
+        R_port_mc = opt_s * R_stock_mc + opt_b * R_bond_mc + a_bill * R_bill_mc
+        moment_mc = float(np.mean(R_port_mc ** (1.0 - model.gamma)))
+
+        # MC standard error for reference
+        mc_samples = R_port_mc ** (1.0 - model.gamma)
+        mc_se = float(np.std(mc_samples) / np.sqrt(n_mc))
+
+        rel_err = abs(moment_quad - moment_mc) / max(abs(moment_mc), 1e-15)
+        # How many MC standard errors apart?
+        n_se = abs(moment_quad - moment_mc) / max(mc_se, 1e-15)
+        max_rel_err = max(max_rel_err, rel_err)
+
+        print(f"  i_s={i_s:3d}  quad={moment_quad:.8f}  MC={moment_mc:.8f}"
+              f"  rel_err={rel_err:.2e}  ({n_se:.1f} SE)")
+
+    # Tolerance: quadrature is an approximation with finite nodes. For gamma=5,
+    # R^{-4} amplifies tails, so some discrepancy is expected. But it should be
+    # small — within a few percent.
+    status = "PASS" if max_rel_err < 0.05 else "FAIL"
+    print(f"  Max relative error (quad vs MC): {max_rel_err:.2e}  [{status}]")
+    return max_rel_err < 0.05
+
+
 if __name__ == "__main__":
     print("Building model and precomputed arrays...")
     model, pc = build_test_pc(state_grid_sizes=(7, 7, 7), n_z=7, gamma=5.0)
@@ -649,6 +726,7 @@ if __name__ == "__main__":
     results.append(("Return correlation structure",   test_return_correlation_structure(model, pc, n_test=5)))
     results.append(("State-return cross-covariance", test_state_return_cross_covariance(model, pc)))
     results.append(("Single vs two-layer quadrature", test_single_layer_vs_two_layer_quadrature(model, pc, n_test=8)))
+    results.append(("Monte Carlo cross-validation",  test_monte_carlo_cross_validation(model, pc, n_mc=500_000, n_test=8)))
 
     print("\n" + "=" * 60)
     print("SUMMARY")

@@ -103,7 +103,6 @@ class DiscretizationConfig(NamedTuple):
 
     # Financial state VAR discretization
     state_grid_sizes: tuple = (5, 5, 5)
-    state_grid_scale: float = 1.0                      # grid coverage scaling; ~0.85 for N=5 debug
 
     # Income process
     n_z: int = 7                        # persistent income grid points

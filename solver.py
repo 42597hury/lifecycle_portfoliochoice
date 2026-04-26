@@ -1703,7 +1703,8 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                      Phi_0_state, Phi_11,
                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                      gamma, psi_vec, beta, b_bar,
-                                     constrained, solver_config):
+                                     constrained, solver_config,
+                                     policy_c, policy_alpha_s, policy_alpha_b):
     """Solve one retirement period using quadrature over state innovations."""
 
     sc = solver_config
@@ -1713,9 +1714,6 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     N1 = len(grids_1)
     N2 = len(grids_2)
 
-    policy_c = np.empty((n_z, N_state, n_wealth))
-    policy_alpha_s = np.empty((n_z, N_state, n_wealth))
-    policy_alpha_b = np.empty((n_z, N_state, n_wealth))
     diag_int = np.zeros((N_state, 13), dtype=np.int64)
     diag_float = np.zeros((N_state, 9))
 
@@ -1838,7 +1836,7 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 policy_alpha_s[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_s)
                 policy_alpha_b[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_b)
 
-    return policy_c, policy_alpha_s, policy_alpha_b, diag_int, diag_float
+    return diag_int, diag_float
 
 
 def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
@@ -1849,10 +1847,19 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                Phi_0_state, Phi_11,
                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                gamma, psi_vec, beta, b_bar,
-                               constrained=True, solver_config=None):
+                               constrained=True, solver_config=None,
+                               out_c=None, out_s=None, out_b=None):
     if solver_config is None:
         solver_config = SolverConfig()
-    return _solve_retirement_step_quad_jit(
+    n_z = len(z_grid)
+    n_w = len(wealth_grid)
+    if out_c is None:
+        out_c = np.empty((n_z, N_state, n_w))
+    if out_s is None:
+        out_s = np.empty((n_z, N_state, n_w))
+    if out_b is None:
+        out_b = np.empty((n_z, N_state, n_w))
+    _di, _df = _solve_retirement_step_quad_jit(
         wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, pension_1d,
         annuity_factors,
@@ -1861,7 +1868,9 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         Phi_0_state, Phi_11,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         gamma, psi_vec, beta, b_bar,
-        constrained, solver_config)
+        constrained, solver_config,
+        out_c, out_s, out_b)
+    return out_c, out_s, out_b, _di, _df
 
 
 # =============================================================================
@@ -1878,7 +1887,8 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                       exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                       eps_nodes, eps_weights,
                                       gamma, psi_vec, beta, b_bar,
-                                      constrained, solver_config):
+                                      constrained, solver_config,
+                                      policy_c, policy_alpha_s, policy_alpha_b):
     """Solve one working-age period using quadrature over state innovations."""
 
     sc = solver_config
@@ -1888,9 +1898,6 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     N1 = len(grids_1)
     N2 = len(grids_2)
 
-    policy_c = np.empty((n_z, N_state, n_wealth))
-    policy_alpha_s = np.empty((n_z, N_state, n_wealth))
-    policy_alpha_b = np.empty((n_z, N_state, n_wealth))
     diag_int = np.zeros((N_state, 13), dtype=np.int64)
     diag_float = np.zeros((N_state, 9))
 
@@ -2015,7 +2022,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 policy_alpha_s[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_s)
                 policy_alpha_b[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_b)
 
-    return policy_c, policy_alpha_s, policy_alpha_b, diag_int, diag_float
+    return diag_int, diag_float
 
 
 def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
@@ -2027,10 +2034,19 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                 eps_nodes, eps_weights,
                                 gamma, psi_vec, beta, b_bar,
-                                constrained=True, solver_config=None):
+                                constrained=True, solver_config=None,
+                                out_c=None, out_s=None, out_b=None):
     if solver_config is None:
         solver_config = SolverConfig()
-    return _solve_working_age_step_quad_jit(
+    n_z = len(z_grid)
+    n_w = len(wealth_grid)
+    if out_c is None:
+        out_c = np.empty((n_z, N_state, n_w))
+    if out_s is None:
+        out_s = np.empty((n_z, N_state, n_w))
+    if out_b is None:
+        out_b = np.empty((n_z, N_state, n_w))
+    _di, _df = _solve_working_age_step_quad_jit(
         wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, log_det_next,
         annuity_factors, rho, eta_nodes, eta_weights, dz,
@@ -2040,7 +2056,9 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi_vec, beta, b_bar,
-        constrained, solver_config)
+        constrained, solver_config,
+        out_c, out_s, out_b)
+    return out_c, out_s, out_b, _di, _df
 
 
 # =============================================================================
@@ -2101,12 +2119,10 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     n_age   = pc.n_age
 
     # ---- Transitions and returns ----
-    Pi_state        = pc.Pi_state
     rho             = model.rho
     eta_nodes       = pc.eta_nodes
     eta_weights     = pc.eta_weights
     dz              = pc.dz
-    mu_r            = pc.mu_r
     ret_nodes       = pc.ret_nodes
     ret_weights     = pc.ret_weights
     annuity_factors = pc.annuity_factors
@@ -2204,8 +2220,13 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         psi    = survival_probs[t, :]      # (n_z,) -- z-dependent survival
         c_next = C_mat[t + 1]
 
+        # Output buffers — JIT writes directly into C_mat/S_mat/B_mat slices
+        out_c = C_mat[t]
+        out_s = S_mat[t]
+        out_b = B_mat[t]
+
         if age >= retire_age:
-            c, a_s, a_b, _di, _df = solve_retirement_step_quad(
+            _, _, _, _di, _df = solve_retirement_step_quad(
                 w_grid, s_grid, z_grid, N_state,
                 c_next, pension_table[t + 1, :],
                 annuity_factors,
@@ -2213,10 +2234,11 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                 Phi_0_state, Phi_11,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config)
+                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
+                out_c=out_c, out_s=out_s, out_b=out_b)
             label = "RETIRE"
         else:
-            c, a_s, a_b, _di, _df = solve_working_age_step_quad(
+            _, _, _, _di, _df = solve_working_age_step_quad(
                 w_grid, s_grid, z_grid, N_state,
                 c_next, log_det_profile[t + 1],
                 annuity_factors, rho, eta_nodes, eta_weights, dz,
@@ -2225,12 +2247,11 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 Phi_0_state, Phi_11,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config)
+                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
+                out_c=out_c, out_s=out_s, out_b=out_b)
             label = "WORK  "
 
-        C_mat[t] = c
-        S_mat[t] = a_s
-        B_mat[t] = a_b
+        # No copy needed — JIT wrote directly into C_mat[t], S_mat[t], B_mat[t]
 
         # Reduce diagnostics for this age
         ti, tf_sum, tf_max, tf_min = _reduce_diag(_di, _df)
@@ -2253,10 +2274,10 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             mono_v = int(ti[DI_MONO_VIOLATIONS])
 
             # Median-state policy values
-            med_as = float(a_s[i_z_med, i_s_med, i_w_med])
-            med_ab = float(a_b[i_z_med, i_s_med, i_w_med])
+            med_as = float(out_s[i_z_med, i_s_med, i_w_med])
+            med_ab = float(out_b[i_z_med, i_s_med, i_w_med])
             med_bill = 1.0 - med_as - med_ab
-            med_c = float(c[i_z_med, i_s_med, i_w_med])
+            med_c = float(out_c[i_z_med, i_s_med, i_w_med])
             med_w = float(w_grid[i_w_med])
             c_over_w = med_c / med_w if med_w > 0 else 0.0
 

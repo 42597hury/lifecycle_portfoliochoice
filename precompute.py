@@ -42,7 +42,7 @@ class Precompute:
     the trade-off between accuracy and computation time:
       - [5, 5, 5]   = 125 states, fast, coarser approximation
       - [7, 7, 7]   = 343 states, good default for production runs
-      - [9, 9, 9]   = 729 states, finer, check memory (Pi_state: N_s^2 floats)
+      - [9, 9, 9]   = 729 states, finer
     Different sizes per dimension are allowed, e.g. [9, 7, 7] if one
     state variable has higher persistence and needs more resolution.
     The consistency check below reports the approximation error so you
@@ -85,7 +85,6 @@ class Precompute:
                                         benefit; constant across ages, indexed by career z
 
     Dimension counters: n_w, n_s, n_z, n_eps, n_ret_quad, n_age, N_state
-    Backward-compat aliases: slow_grid, Pi_slow, slow_grids, slow_state_indices, N_s
     -------------------------------------------------------
     """
 
@@ -122,8 +121,6 @@ class Precompute:
             mu=model.Phi_0_state,
             Phi=model.Phi_11,
             Sigma=Sigma_state_chol,
-            method="independent",
-            grid_scale=disc_config.state_grid_scale,
         )
         # state_grids:   list[n_state] of 1-D marginal grids, state_grids[d] has shape (state_grid_sizes[d],)
         # Pi_state:      (N_state, N_state) float64 - joint transition matrix; Pi_state[i,j] = P(s_{t+1}=j|s_t=i)

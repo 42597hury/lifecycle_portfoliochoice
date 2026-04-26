@@ -436,10 +436,8 @@ def build_nominal_system1_var_config(
 # All levels are end-of-year values; all returns are calendar-year.
 # These parameters are ready for the annual DP solver — no compounding needed.
 #
-# NOTE: These are PLACEHOLDER values that must be re-estimated from the
-# new 6-variable dataset once data_construction.ipynb is updated.
-# The structure (6x6 Phi, 6x6 Omega, etc.) is correct; the numerical
-# values below are illustrative estimates to allow the code to run.
+# Estimated from data/var_dataset.csv (1963–2025, T=63) using
+# build_nominal_system1_var_config(). Values are final — not placeholders.
 # =============================================================================
 
 # Variable order: [y_1, spr, cy, rtb, xr, xb]
@@ -447,46 +445,41 @@ _NOM_COLS   = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
 _STATE_IDX  = [0, 1, 2]   # y_1, spr, cy
 _RET_IDX    = [3, 4, 5]   # rtb, xr, xb
 
-# --- Unconditional means (sample means, CCV convention) ---
-# z_bar = sample mean of each variable (pinned by constrained estimator).
+# --- Unconditional means (= sample means, pinned by CCV constrained estimator) ---
 _Z_BAR = np.array([
-     +5.200000000000e-02,   # y_1   = 5.20% 1-year Treasury yield
-     +1.300000000000e-02,   # spr   = 1.30% yield spread (AAA - y_1)
-     -3.300000000000e+00,   # cy    = -3.30  log earnings yield (-log CAPE)
-     +7.000000000000e-03,   # rtb   = +0.70% real bill return
-     +5.500000000000e-02,   # xr    = +5.50% excess stock return
-     +2.000000000000e-02,   # xb    = +2.00% excess bond return
+     +4.849047619047617e-02,   # y_1   = 4.85% 1-year Treasury yield
+     +1.992222222222219e-02,   # spr   = 1.99% yield spread (AAA - y_1)
+     -2.992866096159315e+00,   # cy    = -2.99  log earnings yield (-log CAPE)
+     +9.131332050837982e-03,   # rtb   = +0.91% real bill return
+     +5.547089589883376e-02,   # xr    = +5.55% excess stock return
+     +1.426793925807303e-02,   # xb    = +1.43% excess bond return
 ])
-
-# --- Intercept vector c = (I - Phi) @ z_bar  (annual) ---
-_CONST = (np.eye(6) - np.zeros((6, 6))) @ _Z_BAR  # placeholder, recomputed below
 
 # --- AR(1) coefficient matrix Phi  (annual, restricted: return-lag columns = 0) ---
 # Phi[i, j] = coefficient on lagged z_j in equation for z_i
 # Return columns (3=rtb, 4=xr, 5=xb) are zero by restriction.
 #
-#          L.y_1        L.spr       L.cy        L.rtb  L.xr   L.xb
+#            L.y_1                    L.spr                    L.cy                     L.rtb  L.xr   L.xb
 _PHI = np.array([
-    [ +8.700000e-01,  +5.000000e-02,  +1.000000e-02,  0.0,  0.0,  0.0],  # y_1
-    [ -5.000000e-02,  +8.000000e-01,  +5.000000e-03,  0.0,  0.0,  0.0],  # spr
-    [ +1.000000e-01,  -5.000000e-02,  +9.500000e-01,  0.0,  0.0,  0.0],  # cy
-    [ +5.000000e-01,  +1.000000e-01,  -2.000000e-02,  0.0,  0.0,  0.0],  # rtb
-    [ -1.500000e+00,  +5.000000e-01,  +1.500000e-01,  0.0,  0.0,  0.0],  # xr
-    [ +8.000000e-01,  -3.000000e+00,  -5.000000e-02,  0.0,  0.0,  0.0],  # xb
+    [+6.702462738632788e-01, -2.772634868583639e-01, +1.363201720683440e-02,  0.0,  0.0,  0.0],  # y_1
+    [+1.531357294701692e-01, +8.716178770527138e-01, -6.764732512558174e-03,  0.0,  0.0,  0.0],  # spr
+    [+5.130156081976586e-01, -1.290491627329386e+00, +9.187333699835324e-01,  0.0,  0.0,  0.0],  # cy
+    [+1.078616245849965e+00, +8.569464429861950e-01, -3.415319093708467e-02,  0.0,  0.0,  0.0],  # rtb
+    [-1.800969180871340e+00, -5.232972665970130e-01, +1.065093539573744e-01,  0.0,  0.0,  0.0],  # xr
+    [+1.462300839390819e+00, +4.491691224680785e+00, -5.509242762249906e-02,  0.0,  0.0,  0.0],  # xb
 ])
 
-# Recompute const from constrained formula
+# --- Intercept vector c = (I - Phi) @ z_bar  (annual) ---
 _CONST = (np.eye(6) - _PHI) @ _Z_BAR
 
-# --- Residual covariance matrix Omega  (annual, 6x6) ---
-# Placeholder — diagonal approximation with reasonable annual std devs
-_OMEGA = np.diag([
-    1.0e-04,   # y_1   ~ 1.0% std
-    4.0e-05,   # spr   ~ 0.63% std
-    2.5e-02,   # cy    ~ 15.8% std (log CAPE is noisy)
-    2.7e-04,   # rtb   ~ 1.65% std
-    2.5e-02,   # xr    ~ 15.8% std
-    1.1e-02,   # xb    ~ 10.5% std
+# --- Residual covariance matrix Omega  (annual, 6x6, full matrix) ---
+_OMEGA = np.array([
+    [+2.470627990056877e-04, -1.526712590195692e-04, +4.368690016444582e-04, -1.521376476533990e-04, -2.401901226227324e-04, -8.564291757894816e-04],  # y_1
+    [-1.526712590195692e-04, +1.262233324893276e-04, +9.795851825998807e-06, +6.423467650083652e-05, -1.424102066635836e-04, +2.562880611608877e-04],  # spr
+    [+4.368690016444582e-04, +9.795851825998807e-06, +2.783938815517296e-02, -1.408231590804927e-03, -2.592393426002024e-02, -4.042172107764783e-03],  # cy
+    [-1.521376476533990e-04, +6.423467650083652e-05, -1.408231590804927e-03, +3.913428245730285e-04, +9.569535302672091e-04, +7.574536961223423e-04],  # rtb
+    [-2.401901226227324e-04, -1.424102066635836e-04, -2.592393426002024e-02, +9.569535302672091e-04, +2.523837825303790e-02, +3.517415310010160e-03],  # xr
+    [-8.564291757894816e-04, +2.562880611608877e-04, -4.042172107764783e-03, +7.574536961223423e-04, +3.517415310010160e-03, +5.817512498246198e-03],  # xb
 ])
 
 
@@ -502,7 +495,7 @@ def build_nominal_system1_var_config_hardcoded():
     using for production runs.
     """
     print("Using HARDCODED VAR parameters (nominal System 1, annual, 6-var).")
-    print("  WARNING: placeholder values — re-estimate from data!")
+    print("  Estimated from data/var_dataset.csv (1963-2025, T=63).")
     return {
         "z_bar":                  _Z_BAR.copy(),
         "Phi":                    _PHI.copy(),

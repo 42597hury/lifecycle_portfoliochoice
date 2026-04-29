@@ -121,7 +121,8 @@ Washes out period-to-period. Does not affect pension.
 ## 2. Tax Schedule
 
 Applied identically to working income and pension benefits.
-Implementation: `disposable_income_working()` in model.py:268.
+Implementation: `disposable_income_working()` at
+[model.py:285](model.py#L285).
 
 ### 2.1 Payroll tax
 
@@ -178,7 +179,8 @@ Verified against real 2019 brackets to within 1-2% (see TODO.md item 7).
 PIA formula (bend points, replacement rates): Catherine (2025, Section 3.4, eqs. 17-20).
 AIME computation: **our approximation**, deviating from Catherine who tracks
 cumulative career earnings as an explicit state variable.
-Implementation: `compute_pension_after_tax()` in model.py:294.
+Implementation: `compute_pension_after_tax()` at
+[model.py:349](model.py#L349).
 
 ### 3.1 AIME approximation
 
@@ -246,7 +248,8 @@ a separate partial-taxation rule -- but maintains consistency.
 
 ### 4.1 z-grid
 
-`discretize_income_ar1_mixture()` in discretization.py:128.
+`discretize_income_ar1_mixture()` at
+[discretization.py:283](discretization.py#L283).
 
 ```
 std_z = sqrt(var_eta / (1 - rho^2))
@@ -260,30 +263,54 @@ Uniform spacing: `dz = z_grid[1] - z_grid[0]`.
 Also produces `Pi_Nz` (Tauchen transition matrix) but this is **not used**
 by the solver or simulation -- retained for diagnostics only.
 
-### 4.2 Gauss-Hermite quadrature for eta (persistent innovation)
+### 4.2 Judd-mixture quadrature for eta (persistent innovation)
 
-`get_eta_quadrature_mixture()` in discretization.py:188.
+`get_eta_quadrature_mixture()` at
+[discretization.py:421](discretization.py#L421); private helper
+`_judd_mixture_quadrature()` at
+[discretization.py:338](discretization.py#L338).
 
-Instead of Pi_z, the solver integrates over z' using GH quadrature on eta.
-Two sets of nodes (one per mixture component), concatenated:
+Instead of `Pi_z`, the solver integrates over `z'` via a Judd (1998)
+quadrature built directly on the mixture density. Three steps:
+
+1. Build the `(2n+1)`-vector of raw moments `m_k = E[X^k]` of the mixture
+   (`_normal_raw_moment` × `_mixture_raw_moments`).
+2. Solve the `n × n` Hankel system `H_oo a = -h` for the monic orthogonal
+   polynomial of degree `n`. Its `n` real roots are the quadrature nodes.
+3. Solve the `n × n` Vandermonde system `Σ_i ω_i x_i^k = m_k` (`k = 0..n-1`)
+   for the weights.
 
 ```
-eta_nodes   = concat(GH_nodes*sigma_eta1 + mu_eta1,  GH_nodes*sigma_eta2 + mu_eta2_eff)
-eta_weights = concat(GH_weights*pz,                   GH_weights*(1-pz))
+eta_nodes   ∈ ℝ^n   (sorted ascending, all real, distinct)
+eta_weights ∈ ℝ^n   (all strictly positive; sum to 1)
 ```
 
-Total nodes: `2 * n_eta_nodes` (default n_eta_nodes=5, so 10 nodes).
-Zero-mean enforced by construction.
+`n` is the **total** node count — `disc_config.n_eta_nodes` (no longer
+"per-component K, doubled internally"). Zero-mean is enforced by setting
+`mu_eta2_eff = -(pz/(1-pz))·mu_eta1` before constructing the mixture moments.
 
-### 4.3 Gauss-Hermite quadrature for eps (transitory shock)
+**Polynomial exactness against the mixture.** The Judd `n`-point rule
+integrates monomials of degree ≤ `2n - 1` exactly against the mixture
+density (Theorem 1 of Judd 1998 §7). Same polynomial-exactness order
+as a `K`-per-component stratified Gauss-Hermite rule when `n = K`, but
+half the nodes for the marginal and a quarter for the joint
+`η × ε` integral.
 
-`get_eps_quadrature_corrected()` in discretization.py:159.
+### 4.3 Judd-mixture quadrature for eps (transitory shock)
 
-Same structure. Total nodes: `2 * n_eps_nodes` (default n_eps_nodes=3, so 6 nodes).
+`get_eps_quadrature_corrected()` at
+[discretization.py:395](discretization.py#L395). Identical construction
+to §4.2, applied to the eps mixture. `n_eps = disc_config.n_eps_nodes`
+total nodes; polynomial exactness `2n_eps - 1` against the eps mixture.
+
+The eps mixture has excess kurtosis +52, so polynomial exactness alone
+does **not** imply integrand accuracy on `E[exp(-γ·ε)]` for γ ≥ 5; see
+§4.8 for the production node-selection guidance and the high-γ wall.
 
 ### 4.4 Precomputed income table
 
-`_precompute_working_income()` in precompute.py:366.
+`_precompute_working_income()` at
+[precompute.py:320](precompute.py#L320).
 
 ```python
 y_gross = exp(log_det_profile[t] + z_grid[iz] + eps_nodes[ie])
@@ -294,7 +321,8 @@ Shape: `(n_age, n_z, n_eps)`. Evaluated at grid points only.
 
 ### 4.5 Precomputed pension table
 
-`_precompute_pension()` in precompute.py:387.
+`_precompute_pension()` at
+[precompute.py:341](precompute.py#L341).
 
 ```python
 base_pension = compute_pension_after_tax(z_grid, avg_det)    # (n_z,)
@@ -327,7 +355,7 @@ income_next  = scalar_disposable_income(y_gross_next)
 
 The progressive tax schedule is then evaluated pointwise — no
 interpolation in `z`. Because `scalar_disposable_income` is the *same*
-function used in simulation (see [model.py:295](model.py#L295)), income
+function used in simulation (see [model.py:312](model.py#L312)), income
 in the solver and income in the simulation are bit-exact equal.
 
 **exp() factoring.** Computing `exp(A+B+C+D)` inside a triple loop
@@ -390,7 +418,7 @@ shock enters retirement).
 ### 4.7 Simulation vs solver
 
 Both the solver and the simulation now use the **same** scalar income
-function, `scalar_disposable_income` in [model.py:295](model.py#L295):
+function, `scalar_disposable_income` in [model.py:312](model.py#L312):
 
 ```python
 # Working (both solver and simulation):
@@ -409,72 +437,85 @@ is on the consumption policy (Section 4.6).
 
 ### 4.8 Quadrature node selection for production
 
-The GH rule is exact for polynomial integrands of degree `2K-1` per
-component, so each process has a hard floor set by its kurtosis:
+Two distinct accuracy questions:
 
-- **eps:** theoretical excess kurtosis = +52.2 (driven by rare
-  component 1 with sigma_eps1 = 0.762). Needs `k >= 4` raw moment
-  captured, so **K_eps >= 3** (2K-1 = 5). K=2 misses 66% of the
-  kurtosis and gives ~10% CRRA integrand error at gamma = 8.
-- **eta:** theoretical excess kurtosis = +1.42 (mild, because
-  sigma_eta1 = 0.113 is narrow). **K_eta >= 2** is sufficient for
-  gamma <= 4 (mean/variance/skewness reproduced exactly; only kurtosis
-  picks up ~1% error). Bump to K_eta >= 3 if gamma >= 6. K_eta = 1 is
-  invalid — collapses each component to its mean and loses 6.4% of
-  Var(eta).
+(i) **polynomial exactness against the mixture density** — the formal
+property of the rule. Judd `n`-point: exact to degree `2n - 1`. So
+`n = 2` reproduces mean+variance+skewness; `n = 3` adds the 4th and
+5th raw moment (so kurtosis is exact); `n = 5` extends through the 9th
+moment.
 
-**Full combo table** (CRRA gamma=4 relative integrand error vs K=30
-truth; cost normalized to (2, 3) = 1.00x):
+(ii) **accuracy on the actual FOC integrand `E[exp(-γ·X)]`** — what an
+economist cares about. Polynomial exactness is a necessary but not
+sufficient guarantee here: when the integrand has heavy weight in the
+heavy-tail region, low-order rules under-resolve the tail even while
+matching low-order moments.
 
-```
-K_eta K_eps  nodes   cost    err_eta   err_eps   per-component exactness
-------------------------------------------------------------------------
-  2    3      24    1.00x   1.6e-5    1.4e-4    eta k3, eps k5
-  2    4      32    1.33x   1.6e-5    1.1e-4    eta k3, eps k7
-  2    5      40    1.67x   1.6e-5    3.9e-5    eta k3, eps k9
-  3    3      36    1.50x   8.3e-8    1.4e-4    eta k5, eps k5
-  3    4      48    2.00x   8.3e-8    1.1e-4    eta k5, eps k7
-  3    5      60    2.50x   8.3e-8    3.9e-5    eta k5, eps k9
-  4    3      48    2.00x   5.6e-10   1.4e-4    eta k7, eps k5
-  4    4      64    2.67x   5.6e-10   1.1e-4    eta k7, eps k7
-  4    5      80    3.33x   5.6e-10   3.9e-5    eta k7, eps k9
-  5    3      60    2.50x   4.5e-12   1.4e-4    eta k9, eps k5
-  5    4      80    3.33x   4.5e-12   1.1e-4    eta k9, eps k7
-  5    5     100    4.17x   4.5e-12   3.9e-5    eta k9, eps k9
-```
+The audit script
+[tests/audit_judd_economist.py](tests/audit_judd_economist.py) and the
+notebook section §C.4–C.5 of
+[verify_discretization.ipynb](verify_discretization.ipynb) measure (ii)
+directly against a 400-point reference. Production guidance reads off
+those numbers.
 
-Moment-capture reading: "eta kN" means per-component polynomial
-integrals are reproduced exactly up to order N. Practical meaning: k3
-covers mean, variance, skewness; k5 also covers kurtosis; k7 and
-higher give deep-tail accuracy of the rare component with diminishing
-returns.
-
-**Reading of the table.** In every row `err_eps >> err_eta` by 3-10
-orders of magnitude — eps is the only dimension that moves total
-error. K_eps = 4 is strictly dominated (same error as K_eps = 3, more
-cost); only K_eps = 5 gives a real step down. On eta, K_eta = 4 gains
-nothing observable. The effective production choices collapse to four
-tiers:
+**FOC-integrand error** (CRRA `E[exp((1-γ)·X)]`, rel err vs analytic
+mixture-MGF):
 
 ```
-tier       combo       cost    dominant err   use case
+                  η rel err                       ε rel err
+n   γ=3      γ=5      γ=8      γ=10     γ=3      γ=5      γ=8
+---------------------------------------------------------------
+2   1.6e-3   2.1e-2   1.5e-1   2.8e-1   3.1e-2   ~70%     ~100%
+3   2.6e-5   5.5e-3   4.9e-2   1.1e-1   6.4e-3   ~55%     ~99%
+4   1.0e-7   1.5e-4   1.5e-3   7.3e-3   1.1e-3   ~37%     ~99%
+5   4.6e-10  4.2e-6   8.4e-5   6.7e-4   1.4e-4   ~17%     ~97%
+6   1.7e-12  9.9e-8   3.9e-6   5.1e-5   1.4e-5   ~7%      ~92%
+8   ~4e-16   2.0e-11  3.1e-9   1.1e-7   1e-7     ~0.1%    ~69%
+```
+
+**Reading.**
+
+- **η is easy.** At the production γ=3 default, `n_eta = 3` already
+  gives rel err 2.6e-5. `n_eta = 5` is overkill except at γ ≥ 8.
+- **ε is the binding dial, and the wall starts early.** At γ = 5, even
+  `n_eps = 8` leaves ~17% rel err on `E[exp(-4·ε)]`. At γ = 8, the
+  rule is essentially uninformative for any reasonable `n` — the
+  excess kurtosis +52 means the integral is dominated by deep-tail
+  realizations no low-order quadrature can capture.
+- **Recommendation by γ regime:**
+
+```
+γ regime     n_eta    n_eps    income joint    use case
 -----------------------------------------------------------------------
-budget     (2, 3)      1.00x   1.4e-4         sweeps, gamma <= 4
-standard   (3, 3)      1.50x   1.4e-4         main runs, gamma <= 4
-safe       (3, 5)      2.50x   3.9e-5         reported results, gamma <= 6
-gold       (5, 5)      4.17x   3.9e-5         robustness appendix
+γ ≤ 3         3        5             15        production default ✓
+γ ∈ {4, 5}    3        6             18        slight margin on ε
+γ ∈ {6, 7}    4        8             32        ε tail still ~10%, accept
+γ ≥ 8         5       ≥8           ≥40        ε bias > 50%; reduce γ or
+                                              redesign the integrand
 ```
+
+The current production setting is `n_eta_nodes = 3, n_eps_nodes = 5`
+(15 income nodes, joint `27 × 27 × 15 = 10,935` nodes per FOC including
+the 27-node state and 27-node return quadratures).
+
+**How this compares to the previous concatenated-GH method.** At the
+same polynomial-exactness order, the older "K-per-component"
+stratified rule was ~10× more accurate on `E[exp(-γ·η)]` than Judd at
+the same `n`, because GH stratification puts more nodes inside each
+component's tail. Going to Judd `n_eta = 5` (5 nodes) recovers and
+exceeds the old K=3 (6 nodes) accuracy — same polynomial order
+(9 vs 5), one fewer node, materially smaller error at high γ. So the
+migration's real win is **at `n = 5`, not at `n = 3`**: better
+accuracy at fewer nodes once the user opts into the higher tier.
 
 **Context for "does this error matter."** Quadrature error feeds into
 the Euler FOC right-hand side; CRRA marginal-utility inversion scales
-the consumption-policy error by `1/gamma`. So at gamma = 4, a 1.4e-4
-integrand error translates to ~3.5e-5 relative error in the policy.
-This sits below the dominant numerical error from z-grid linear
-interpolation of the **consumption policy** (~1e-3 to 1e-2 at n_z =
-11). Income is no longer interpolated in `z` (Section 4.6), so that
-source of error has been eliminated. Quadrature is never the binding
-accuracy constraint once the hard floors (K_eps >= 3, K_eta >= 2) are
-respected.
+the consumption-policy error by `1/γ`. At γ = 3 with `n_eps = 5`, a
+~1e-4 ε integrand error implies ~3e-5 relative consumption-policy
+error — well below the dominant numerical error from `z`-grid linear
+interpolation of the consumption policy (~1e-3 to 1e-2 at `n_z = 11`).
+At γ ≥ 5 the ε quadrature error becomes the binding constraint and no
+longer sits below the policy-interpolation floor.
 
 ---
 
@@ -524,7 +565,7 @@ Checked items, with a short note where relevant.
       over time. Standard in lifecycle literature.
 - [x] **z-grid is Tauchen (mixture-generalized), correctly implemented** —
       `discretize_income_ar1_mixture()` in
-      [discretization.py:128](discretization.py#L128) is mathematically
+      [discretization.py:283](discretization.py#L283) is mathematically
       Tauchen (1986) with the single generalization that the conditional CDF
       used for bin integration is the mixture CDF rather than `Φ`. Checks:
       (i) grid layout `linspace(-n_stds·σ_z, +n_stds·σ_z, N)` with
@@ -535,7 +576,7 @@ Checked items, with a short note where relevant.
       `upper/lower = z_j ± dz/2 - ρ·z_i` follow directly from
       `P(ρz_i + η ∈ bin_j) = F_η(upper) - F_η(lower)`;
       (iv) tail bins absorb residual mass so rows sum to 1 (defensive
-      normalization at [discretization.py:152](discretization.py#L152)).
+      normalization at [discretization.py:309](discretization.py#L309)).
       Rouwenhorst and Tauchen–Hussey were considered and rejected:
       Rouwenhorst matches only the first two moments and would discard the
       mixture's skewness/kurtosis; TH concentrates nodes where a Gaussian has
@@ -556,7 +597,7 @@ Checked items, with a short note where relevant.
       asymmetric grid.
 - [x] **Boundary clipping checked and not visibly distorting policies** —
       when `z_next = ρ·z_i + η_k` lands outside the grid, the solver
-      interpolation at [solver.py:842-845](solver.py#L842-L845) clips
+      interpolation at [solver.py:627](solver.py#L627) clips
       `iz_lo` and `frac_z` — effectively evaluating `V` at the grid
       boundary. Mechanically this under-weights the upside: at `z_i = z_top`,
       ~75% of GH-weighted mass pushes `z_next` above the grid (common
@@ -573,55 +614,77 @@ Checked items, with a short note where relevant.
       would not. If higher confidence is needed before a production run,
       Tier-2 (widen `n_stds` at constant `dz`) would give a quantitative
       bound; not performed now.
-- [x] **GH quadrature for η reproduces mixture moments** — the mixture-GH
-      rule in [discretization.py:188-213](discretization.py#L188-L213)
-      (per-component GH on each Gaussian, concatenated with mixture weights)
-      was tested against the closed-form mixture moments at the calibrated
+- [x] **Judd-mixture quadrature for η reproduces mixture moments** —
+      the rule in [discretization.py:421](discretization.py#L421) (Judd
+      1998 construction directly on the mixture density) was tested
+      against the closed-form mixture moments at the calibrated
       parameters (`pz=0.176, μ_1=-0.524, σ_1=0.113, μ_2=0.11192, σ_2=0.046`).
-      Weight sums exact: `Σ_j W_j = 1` (bit-exact at K=3, 1 ulp at K=5);
-      component weights `Σ w1 = pz`, `Σ w2 = 1-pz` exact.
+      Weight sum exact: `Σ_j W_j = 1` to machine precision; all weights
+      strictly positive (Theorem 3 of Judd §7).
       Discrete moments vs theoretical:
       `mean = 0` to machine precision;
       `Var = 0.0626382290` (exact match);
-      `Skew = -1.72960` (err 2e-16 at K=3, 0 at K=5);
-      `Ex.kurt = +1.41664` (err 9e-16 at K=3, 0 at K=5).
-      Per-component polynomial integrals `∫ x^k φ(x;μ,σ) dx` match
-      exactly (rel err ≤ 2e-15) up to and including order `2K-1` — the
-      GH exactness bound — for both K=3 (orders 0..5) and K=5 (orders
-      0..9); stressing at order `2K` produces visible error (e.g. ~1e-5
-      at K=3, k=6 for component 1), confirming the exactness boundary is
-      tight. On the `μ_2` parameter: Catherine (2025) Table E.1 and
-      Guvenen et al. (2021) Table IV treat only `(p, μ_1, σ_1, σ_2)` as
-      free; `μ_2` is pinned by `E[η] = 0` via
-      `μ_2 = -(p/(1-p))·μ_1 = 0.11192233`. The quadrature recomputes this
-      from the formula; the config slot `model.mu_eta2` stores the same
-      derived value and is not used. Documented in
-      [model.py:52](model.py#L52). Note: this validates the
-      discretization of the *innovation* η; the stationary `z`
-      distribution differs (AR(1) with ρ=0.991 smooths η toward
-      Gaussian — see prior item).
-- [x] **GH quadrature for ε reproduces mixture moments** — analogous
-      check to the η entry for the transitory shock at
-      [discretization.py:159](discretization.py#L159). Calibrated
+      `Skew = -1.72960` (err < 2e-15 at n=3 and n=5);
+      `Ex.kurt = +1.41664` (err < 1e-14 at n=3 and n=5).
+      Polynomial integrals against the mixture density match exactly
+      (rel err ≤ 4e-15) up to order `2n - 1` — the Judd exactness
+      bound — for both n=3 (orders 0..5) and n=5 (orders 0..9);
+      stressing at order `2n` produces visible error (3.16% at n=3,
+      k=6; 7.99e-4 at n=5, k=10), confirming the exactness boundary is
+      tight. Cross-checked against an independent Golub–Welsch
+      Jacobi-eigendecomposition reference: nodes and weights agree to
+      ≤ 1e-10 max-abs. On the `μ_2` parameter: Catherine (2025) Table
+      E.1 and Guvenen et al. (2021) Table IV treat only
+      `(p, μ_1, σ_1, σ_2)` as free; `μ_2` is pinned by `E[η] = 0` via
+      `μ_2 = -(p/(1-p))·μ_1 = 0.11192233`. The quadrature recomputes
+      this from the formula; the config slot `model.mu_eta2` stores
+      the same derived value and is not used. Documented in
+      [model.py:52](model.py#L52). Test battery:
+      [tests/test_judd_quadrature.py](tests/test_judd_quadrature.py)
+      (Tier 1–6). Note: this validates the discretization of the
+      *innovation* η; the stationary `z` distribution differs (AR(1)
+      with ρ=0.991 smooths η toward Gaussian — see prior item).
+- [x] **Judd-mixture quadrature for ε reproduces mixture moments** —
+      analogous check to the η entry for the transitory shock at
+      [discretization.py:395](discretization.py#L395). Calibrated
       parameters: `pe=0.044, μ_1=0.134, σ_1=0.762, σ_2=0.055`, with
       `μ_2` derived from the zero-mean constraint as
       `μ_2 = -(pe/(1-pe))·μ_1 = -0.006167` (the config slot
-      `model.mu_eps2 = 0.0` is a stale placeholder and is ignored by the
-      quadrature — see [model.py:57](model.py#L57)). Discretization
+      `model.mu_eps2 = 0.0` is a stale placeholder and is ignored by
+      the quadrature — see [model.py:57](model.py#L57)). Discretization
       reproduces the theoretical mixture moments exactly:
-      `Σ_j W_j = 1` (bit-exact at K=3, 1 ulp at K=5);
+      `Σ_j W_j = 1` to machine precision; weights strictly positive;
       `mean = 0` to ~1e-18;
       `Var = 0.02926666` (err 1e-17);
       `Skew = +2.0617` (err ~1e-15);
-      `Ex.kurt = +52.219` (err ~2e-14 — note the *size* of the
-      excess kurtosis, ~37× larger than η's, driven by the rare
-      `σ_1 = 0.762` component). Per-component polynomial integrals
-      exact up to order `2K-1` (rel err ≤ 4e-15); stress at order
-      `2K` produces visible error (~37% at K=3, k=6; ~11% at K=5, k=10),
-      confirming the exactness bound is tight. The extreme kurtosis is
-      what makes `K_eps ≥ 3` the hard floor — K=2 would miss 66% of the
-      kurtosis and produce ~10% CRRA integrand error at γ=8. See
-      Section 4.8 for the production node-selection table.
+      `Ex.kurt = +52.219` (err ~5e-15 — note the *size* of the excess
+      kurtosis, ~37× larger than η's, driven by the rare `σ_1 = 0.762`
+      component). Polynomial integrals against the mixture exact up to
+      order `2n - 1` (rel err ≤ 5e-15 at n ≤ 6); stress at order `2n`
+      produces visible error, confirming the exactness bound is tight.
+      The extreme kurtosis means polynomial exactness alone is *not*
+      sufficient for FOC accuracy at high γ — see §4.8 for the
+      production node-selection guidance and the heavy-tail wall at
+      γ ≥ 5.
+- [x] **Judd quadrature is API- and orchestration-compatible** —
+      under the migration from concatenated-GH-per-component to
+      Judd-on-the-mixture, `disc_config.n_eta_nodes` and
+      `disc_config.n_eps_nodes` now mean the **total** node count (no
+      longer per-component K, doubled internally). The codebase
+      consumes node arrays via `len(...)` everywhere (solver, simulation,
+      diagnostics, working-income table) — there is no hardcoded
+      doubling factor anywhere. Verified by grep across the repo:
+      [solver.py:523-524](solver.py#L523),
+      [solver.py:2294-2295](solver.py#L2294),
+      [precompute.py:339](precompute.py#L339),
+      [simulation.py:907-908](simulation.py#L907) all read array
+      lengths dynamically. Cached helper field
+      `pc.n_eps = len(self.eps_nodes)` at
+      [precompute.py:248](precompute.py#L248) is derived from the
+      array, not from the config integer. Caveat: saved
+      `metadata.json` integers from pre-migration runs refer to
+      *half* the node count under the new convention; reload preserves
+      polynomial-exactness order but not the original node count.
 - [x] **Precomputed working-income table is wired correctly** —
       `_precompute_working_income()` at
       [precompute.py:366](precompute.py#L366) builds a shape
@@ -629,7 +692,9 @@ Checked items, with a short note where relevant.
       `y_gross = exp(log_det_profile[:,None,None] + z_grid[None,:,None] + eps_nodes[None,None,:])`,
       then passes the whole array through
       `disposable_income_working()`. Spot-checked on the calibrated
-      config (77 ages × 11 z × 10 ε = 8,470 cells) at 8 representative
+      config (77 ages × 11 z × 10 ε = 8,470 cells under the previous
+      per-component-K convention; under Judd-mixture at `n_eps = 5`
+      this becomes 77 × 11 × 5 = 4,235 cells) at 8 representative
       probes covering: young / peak-earnings / last-working-age × low /
       middle / high z × rare-component / common-component ε, with
       `y_gross` spanning 0.0008 to 530 model units (all 7 tax brackets
@@ -649,7 +714,7 @@ Checked items, with a short note where relevant.
       each `(k_eta, i_e)` the solver evaluates
       `y_gross_next = base_det_z · exp_eta[k_eta] · exp_eps[i_e]` and
       passes it through `scalar_disposable_income` (the same njit
-      function used by the simulation — [model.py:295](model.py#L295)).
+      function used by the simulation — [model.py:312](model.py#L312)).
       Three-part numerical validation (script:
       `_validate_income_ontheflyp.py`):
       **(a) Scalar ≡ vectorized.** `scalar_disposable_income` matches

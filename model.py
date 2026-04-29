@@ -15,7 +15,7 @@ Dependencies: numpy, scipy (no project imports)
 import numpy as np
 from numba import njit
 from scipy.stats import norm
-from typing import NamedTuple, Callable
+from typing import NamedTuple, Callable, Any
 
 
 # =============================================================================
@@ -103,13 +103,15 @@ class DiscretizationConfig(NamedTuple):
 
     # Financial state VAR discretization
     state_grid_sizes: tuple = (5, 5, 5)
+    state_grid_mode: str = "naive"      # "naive" | "lyapunov-axis" | "principal"
+    state_n_stds: float = 3.0           # half-width in standardized state-grid units
 
     # Income process
     n_z: int = 7                        # persistent income grid points
     n_stds: float = 3.0                 # z-grid covers ±n_stds unconditional std devs
-    n_eps_nodes: int = 3                # Gauss-Hermite nodes per component (doubled internally)
-    n_eta_nodes: int = 3                # Gauss-Hermite nodes per component for persistent innovation (doubled internally)
-    n_ret_nodes_1d: int = 2             # Gauss-Hermite order per return dimension
+    n_eps_nodes: int = 3                # total Judd-mixture nodes for transitory shock (poly. exactness 2n-1)
+    n_eta_nodes: int = 3                # total Judd-mixture nodes for persistent innovation (poly. exactness 2n-1)
+    n_ret_nodes_1d: Any = 2             # Gauss-Hermite order per return dim; int (uniform) OR tuple of length n_ret
     n_state_quad_nodes: int = 3         # GH order per state dimension for state innovation quadrature
 
 

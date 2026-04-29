@@ -667,6 +667,7 @@ def diagnose_var_pre(model, pc):
 
     N_per_dim = pc.state_grid_sizes
     print(f"  Grid sizes: {N_per_dim}   N_state = {pc.N_state} joint states")
+    print(f"  Grid mode: {getattr(pc, 'state_grid_mode', 'naive')}")
     print()
     print(f"  {'Var':>8}  {'N':>3}  {'Coverage':>9}  {'Grid min':>10}  {'Grid max':>10}  "
           f"{'Uncond. mu':>11}  {'Uncond. sigma':>13}")
@@ -674,16 +675,21 @@ def diagnose_var_pre(model, pc):
 
     _grid_coverage = []
     for d, name in enumerate(sv):
-        g = pc.state_grids[d]
-        Nd = len(g)
-        mu_d = model.z_bar_state[d]
-        rho_d = model.Phi_11[d, d]
-        sig_inn = np.sqrt(max(1e-14, model.Sigma_ss[d, d]))
-        sig_y = sig_inn / np.sqrt(max(1e-14, 1.0 - rho_d**2))
-        cover = (g.max() - mu_d) / sig_y if sig_y > 0 else float("nan")
-        print(f"  {name:>8}  {Nd:>3}  {cover:>+9.2f}  {g.min():>10.5f}  {g.max():>10.5f}  "
+        Nd = int(N_per_dim[d])
+        mu_d = float(getattr(pc, "state_grid_mu_s", model.z_bar_state)[d])
+        sig_y = float(getattr(pc, "state_grid_sigma_z", np.sqrt(np.diag(model.Sigma_ss)))[d])
+        g_vals = pc.state_grid[:, d]
+        cover = (g_vals.max() - mu_d) / sig_y if sig_y > 0 else float("nan")
+        print(f"  {name:>8}  {Nd:>3}  {cover:>+9.2f}  {g_vals.min():>10.5f}  {g_vals.max():>10.5f}  "
               f"{mu_d:>11.5f}  {sig_y:>13.5f}")
         _grid_coverage.append((name, cover))
+
+    if getattr(pc, "state_grid_mode", "naive") == "principal":
+        print()
+        print("  Principal-mode bracketing axes (u-coordinates):")
+        for d in range(len(pc.state_bracket_grids)):
+            g = pc.state_bracket_grids[d]
+            print(f"    u[{d}] range = [{g.min():+.2f}, {g.max():+.2f}]")
 
     print()
     # Tests 2-4: State grid coverage >= 2.5 sigma (per dimension)
@@ -699,16 +705,19 @@ def diagnose_var_pre(model, pc):
     # ── Return Distribution Quality ────────────────────────────────────
     _sub("Return Distribution Quality")
 
-    print(f"  Return quadrature: {pc.disc_config.n_ret_nodes_1d} nodes/dim -> {pc.n_ret_quad} joint nodes")
+    K_str = "x".join(str(k) for k in pc.n_ret_nodes_1d)
+    print(f"  Return quadrature: ({K_str}) nodes/dim -> {pc.n_ret_quad} joint nodes")
 
     # Stationary distribution of Pi_state
-    try:
-        evals, evecs = np.linalg.eig(pc.Pi_state.T)
-        idx = int(np.argmin(np.abs(evals - 1.0)))
-        stat = np.real(evecs[:, idx])
-        stat = np.abs(stat) / np.abs(stat).sum()
-    except Exception:
-        stat = np.ones(pc.N_state) / pc.N_state
+    stat = getattr(pc, "state_stationary_probs", None)
+    if stat is None:
+        try:
+            evals, evecs = np.linalg.eig(pc.Pi_state.T)
+            idx = int(np.argmin(np.abs(evals - 1.0)))
+            stat = np.real(evecs[:, idx])
+            stat = np.abs(stat) / np.abs(stat).sum()
+        except Exception:
+            stat = np.ones(pc.N_state) / pc.N_state
 
     E_ret_by_state = np.einsum("ij,ijk->ik", pc.Pi_state, pc.mu_r)  # (N_state, n_ret)
     print()
@@ -811,14 +820,14 @@ def diagnose_grids_pre(model, pc):
         ("n_w",     pc.n_w,     "wealth grid points"),
         ("n_s",     pc.n_s,     "savings grid points (EGM)"),
         ("n_z",     pc.n_z,     "persistent income states"),
-        ("n_eps",   pc.n_eps,   f"transitory shock nodes  (= 2 x {pc.n_eps // 2} GH nodes)"),
+        ("n_eps",   pc.n_eps,   f"transitory shock nodes  (Judd-mixture, total = {pc.n_eps})"),
         ("n_age",   pc.n_age,   f"age periods  ({model.start_age}-{model.terminal_age})"),
         ("N_state", pc.N_state, f"joint VAR states  ({'x'.join(str(n) for n in pc.state_grid_sizes)})"),
         ("n_state", model.n_state, "slow-state variables"),
         ("n_ret",   model.n_ret,   "return variables (integrated)"),
-        ("n_eta",   len(pc.eta_nodes), f"persistent innovation nodes  (= 2 x {len(pc.eta_nodes) // 2} GH nodes)"),
+        ("n_eta",   len(pc.eta_nodes), f"persistent innovation nodes  (Judd-mixture, total = {len(pc.eta_nodes)})"),
         ("n_ret_quad", pc.n_ret_quad,
-         f"joint return quadrature nodes  (= {pc.disc_config.n_ret_nodes_1d}^{model.n_ret})"),
+         f"joint return quadrature nodes  (= prod({'x'.join(str(k) for k in pc.n_ret_nodes_1d)}) = {pc.n_ret_quad})"),
     ]
     for name, val, desc in dims:
         print(f"  {name:>10} = {val:>6}   {desc}")
@@ -1290,7 +1299,8 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
                 max_iter=solver_config.max_iter,
             )
         else:
-            opt_s, opt_b, euler_sum, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_njit(
+            # Unconstrained returns 6-tuple now (last element is n_newton_iter); discarded.
+            opt_s, opt_b, euler_sum, exit_code, foc_resid, _ = solve_portfolio_unconstrained_terminal_njit(
                 pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
@@ -1425,4 +1435,3 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
 # =============================================================================
 # NEWTON FAILURE DIAGNOSTICS (unchanged, njit)
 # =============================================================================
-

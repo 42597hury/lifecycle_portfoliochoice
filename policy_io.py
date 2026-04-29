@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -166,8 +167,14 @@ def load_policy_bundle(
 
     diagnostics = None
     if diag_path.exists():
-        with diag_path.open("rb") as f:
-            diagnostics = pickle.load(f)
+        try:
+            with diag_path.open("rb") as f:
+                diagnostics = pickle.load(f)
+        except Exception as exc:
+            warnings.warn(
+                f"Could not load diagnostics from {diag_path.name}: {exc}. "
+                "Continuing with arrays + metadata only."
+            )
 
     metadata: dict[str, Any] = {}
     if meta_path.exists():

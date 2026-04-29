@@ -72,6 +72,10 @@ if "const" in var_config and not isinstance(var_config["const"], np.ndarray):
 
 model = build_model(base_config, var_config, verbose=False)
 
+_n_ret_nodes_1d = disc_meta["n_ret_nodes_1d"]
+if isinstance(_n_ret_nodes_1d, list):
+    _n_ret_nodes_1d = tuple(_n_ret_nodes_1d)
+
 disc_config = DiscretizationConfig(
     n_wealth=disc_meta["n_wealth"],
     n_savings=disc_meta["n_savings"],
@@ -80,7 +84,7 @@ disc_config = DiscretizationConfig(
     n_stds=disc_meta["n_stds"],
     n_eps_nodes=disc_meta["n_eps_nodes"],
     n_eta_nodes=disc_meta.get("n_eta_nodes", 3),
-    n_ret_nodes_1d=disc_meta["n_ret_nodes_1d"],
+    n_ret_nodes_1d=_n_ret_nodes_1d,
 )
 
 pc = Precompute(model, disc_config, verbose=False)

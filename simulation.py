@@ -8,7 +8,8 @@ simulation follows the same timing as the Bellman problem:
 1. Enter period t alive with state (x_t, z_t, s_t).
 2. Look up policies c_t, alpha_s_t, alpha_b_t on the solved grids.
 3. Savings a_t = x_t - c_t.
-4. Draw next financial state s_{t+1} from Pi_state[s_t, :].
+4. Propagate the next financial state continuously and map it back to the
+   nearest policy-grid index for next period's lookup.
 5. Realize end-of-period wealth a_t * R_port via one of two modes:
    - "monte_carlo": residual return drawn from N(0, Sigma_r_cond) via a
      precomputed factor matrix F such that F @ F' = Sigma_r_cond.
@@ -121,6 +122,21 @@ def initialize_states(n_simulations: int,
             f"Initial state array has length {arr.shape[0]}, expected {n_simulations}."
         )
     return arr
+
+
+def _resolve_initial_state_indices(n_simulations: int,
+                                   pc,
+                                   initial_state: Union[str, np.ndarray],
+                                   rng: np.random.Generator) -> np.ndarray:
+    """Mode-aware initialization for the financial state."""
+    if isinstance(initial_state, str) and initial_state == "stationary":
+        probs = getattr(pc, "state_stationary_probs", None)
+        if probs is not None:
+            probs = np.asarray(probs, dtype=float)
+            probs = np.clip(probs, 0.0, None)
+            probs = probs / np.maximum(probs.sum(), 1e-300)
+            return rng.choice(pc.N_state, size=n_simulations, p=probs).astype(np.int32)
+    return initialize_states(n_simulations, pc.N_state, pc.Pi_state, initial_state, rng)
 
 
 def _draw_discrete_vectorized(weights: np.ndarray, uniforms: np.ndarray) -> np.ndarray:
@@ -382,6 +398,8 @@ def simulate_lifecycle_core(
     state_grids_0: np.ndarray,
     state_grids_1: np.ndarray,
     state_grids_2: np.ndarray,
+    state_bracket_shift: np.ndarray,
+    state_bracket_L_inv: np.ndarray,
     L_ss: np.ndarray,
     Phi_0_state: np.ndarray,
     Phi_11: np.ndarray,
@@ -400,7 +418,7 @@ def simulate_lifecycle_core(
     uniform_draws[:, t, :] slots:
       [0] survival draw
       [1] mixture component draw (u < pz -> component 1)
-      [2] financial state transition draw (unused when use_continuous_state=True)
+      [2] financial state transition draw (legacy discrete branch only)
       [3] return-node draw (quadrature mode only)
       [4] transitory income shock draw
 
@@ -508,22 +526,28 @@ def simulate_lifecycle_core(
                 mu_xr  = const_r[1] + A_r[1, 0] * s_cur[0] + A_r[1, 1] * s_cur[1] + A_r[1, 2] * s_cur[2] + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
                 mu_xb  = const_r[2] + A_r[2, 0] * s_cur[0] + A_r[2, 1] * s_cur[1] + A_r[2, 2] * s_cur[2] + M_matrix[2, 0] * v_s_0 + M_matrix[2, 1] * v_s_1 + M_matrix[2, 2] * v_s_2
 
+                ds0 = s_next_0 - state_bracket_shift[0]
+                ds1 = s_next_1 - state_bracket_shift[1]
+                ds2 = s_next_2 - state_bracket_shift[2]
+                b_next_0 = state_bracket_L_inv[0, 0] * ds0 + state_bracket_L_inv[0, 1] * ds1 + state_bracket_L_inv[0, 2] * ds2
+                b_next_1 = state_bracket_L_inv[1, 0] * ds0 + state_bracket_L_inv[1, 1] * ds1 + state_bracket_L_inv[1, 2] * ds2
+                b_next_2 = state_bracket_L_inv[2, 0] * ds0 + state_bracket_L_inv[2, 1] * ds1 + state_bracket_L_inv[2, 2] * ds2
+
                 # Find nearest grid point for next period's policy lookup
                 N1_s = len(state_grids_1); N2_s = len(state_grids_2)
-                # Clamp and find nearest index per dimension
-                best_d0 = 0; best_dist = abs(s_next_0 - state_grids_0[0])
+                best_d0 = 0; best_dist = abs(b_next_0 - state_grids_0[0])
                 for dd in range(1, len(state_grids_0)):
-                    d = abs(s_next_0 - state_grids_0[dd])
+                    d = abs(b_next_0 - state_grids_0[dd])
                     if d < best_dist:
                         best_dist = d; best_d0 = dd
-                best_d1 = 0; best_dist = abs(s_next_1 - state_grids_1[0])
+                best_d1 = 0; best_dist = abs(b_next_1 - state_grids_1[0])
                 for dd in range(1, N1_s):
-                    d = abs(s_next_1 - state_grids_1[dd])
+                    d = abs(b_next_1 - state_grids_1[dd])
                     if d < best_dist:
                         best_dist = d; best_d1 = dd
-                best_d2 = 0; best_dist = abs(s_next_2 - state_grids_2[0])
+                best_d2 = 0; best_dist = abs(b_next_2 - state_grids_2[0])
                 for dd in range(1, N2_s):
-                    d = abs(s_next_2 - state_grids_2[dd])
+                    d = abs(b_next_2 - state_grids_2[dd])
                     if d < best_dist:
                         best_dist = d; best_d2 = dd
                 next_state_idx = best_d0 * N1_s * N2_s + best_d1 * N2_s + best_d2
@@ -713,9 +737,9 @@ def simulate_lifecycle(C_mat: np.ndarray,
         print(f"  Ages:                {model.start_age} to {model.terminal_age} ({n_age} periods)")
         print(f"  Retirement age:      {model.retire_age} (index {retire_age_idx})")
         print(f"  Income x fin state:  {pc.n_z} z x {pc.N_state} s = {pc.n_z * pc.N_state:,} combined states")
-        print(f"  Eta quad nodes:      {len(pc.eta_nodes)} (K={pc.disc_config.n_eta_nodes} per component)")
-        print(f"  Eps quad nodes:      {len(pc.eps_nodes)} (K={pc.disc_config.n_eps_nodes} per component)")
-        print(f"  Return quad nodes:   {pc.n_ret_quad} (K={pc.disc_config.n_ret_nodes_1d} per dim)")
+        print(f"  Eta quad nodes:      {len(pc.eta_nodes)} (Judd-mixture, total = n_eta_nodes={pc.disc_config.n_eta_nodes})")
+        print(f"  Eps quad nodes:      {len(pc.eps_nodes)} (Judd-mixture, total = n_eps_nodes={pc.disc_config.n_eps_nodes})")
+        print(f"  Return quad nodes:   {pc.n_ret_quad} (K=({'x'.join(str(k) for k in pc.n_ret_nodes_1d)}) per dim)")
         print(f"  Return draw mode:    {return_draw_mode}")
         if return_draw_mode == "monte_carlo":
             diag = np.sqrt(np.clip(np.diag(model.Sigma_r_cond), 0.0, None))
@@ -739,7 +763,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
     # Convert grid indices to continuous z values
     init_z_val = pc.z_grid[init_z_idx].astype(np.float64)
 
-    init_state_idx = initialize_states(n_simulations, pc.N_state, pc.Pi_state, initial_state, rng)
+    init_state_idx = _resolve_initial_state_indices(n_simulations, pc, initial_state, rng)
 
     # --- Initial income: compute directly from continuous z ---
     # Use the vectorized model functions (outside the Numba core loop)
@@ -843,9 +867,11 @@ def simulate_lifecycle(C_mat: np.ndarray,
         L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
             0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)))
         state_grid_arr = np.ascontiguousarray(pc.state_grid)
-        sg0 = np.ascontiguousarray(pc.state_grids[0])
-        sg1 = np.ascontiguousarray(pc.state_grids[1])
-        sg2 = np.ascontiguousarray(pc.state_grids[2])
+        sg0 = np.ascontiguousarray(pc.state_bracket_grids[0])
+        sg1 = np.ascontiguousarray(pc.state_bracket_grids[1])
+        sg2 = np.ascontiguousarray(pc.state_bracket_grids[2])
+        state_bracket_shift_arr = np.ascontiguousarray(pc.state_bracket_shift)
+        state_bracket_L_inv_arr = np.ascontiguousarray(pc.state_bracket_L_inv)
         Phi_0_state_arr = np.ascontiguousarray(model.Phi_0_state)
         Phi_11_arr = np.ascontiguousarray(model.Phi_11)
         const_r_arr = np.ascontiguousarray(pc.const_r)
@@ -857,6 +883,8 @@ def simulate_lifecycle(C_mat: np.ndarray,
         sg0 = np.empty(0, dtype=float)
         sg1 = np.empty(0, dtype=float)
         sg2 = np.empty(0, dtype=float)
+        state_bracket_shift_arr = np.empty(0, dtype=float)
+        state_bracket_L_inv_arr = np.empty((0, 0), dtype=float)
         Phi_0_state_arr = np.empty(0, dtype=float)
         Phi_11_arr = np.empty((0, 0), dtype=float)
         const_r_arr = np.empty(0, dtype=float)
@@ -900,6 +928,8 @@ def simulate_lifecycle(C_mat: np.ndarray,
         state_grids_0=sg0,
         state_grids_1=sg1,
         state_grids_2=sg2,
+        state_bracket_shift=state_bracket_shift_arr,
+        state_bracket_L_inv=state_bracket_L_inv_arr,
         L_ss=L_ss_arr,
         Phi_0_state=Phi_0_state_arr,
         Phi_11=Phi_11_arr,

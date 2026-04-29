@@ -17,9 +17,9 @@ from model import (
 )
 from var import partition_var
 from discretization import (
-    rouwenhorst_multivariate, discretize_income_ar1_mixture,
+    build_state_grid, discretize_income_ar1_mixture,
     get_eps_quadrature_corrected, get_eta_quadrature_mixture, get_return_quadrature,
-    get_state_quadrature,
+    get_state_quadrature, _normalize_ret_nodes,
 )
 from mortality import calibrate_earnings_dependent_mortality
 
@@ -101,8 +101,10 @@ class Precompute:
         self.model = model
         self.verbose = verbose
 
-        if disc_config.n_ret_nodes_1d < 1:
-            raise ValueError("disc_config.n_ret_nodes_1d must be >= 1")
+        K_ret_per_dim = _normalize_ret_nodes(disc_config.n_ret_nodes_1d, model.n_ret)
+        if any(k < 1 for k in K_ret_per_dim):
+            raise ValueError("All entries of disc_config.n_ret_nodes_1d must be >= 1")
+        self.n_ret_nodes_1d = K_ret_per_dim   # tuple of ints, length n_ret (always normalized)
 
         # --- Grids ---
         self.wealth_grid = np.geomspace(disc_config.wealth_min, disc_config.wealth_max, disc_config.n_wealth)
@@ -115,21 +117,26 @@ class Precompute:
             raise ValueError("state_grid_sizes length must equal model.n_state")
         self.state_grid_sizes = list(state_grid_sizes)
 
-        Sigma_state_chol = np.linalg.cholesky(model.Sigma_ss)
-        self.state_grids, self.Pi_state, self.state_indices = rouwenhorst_multivariate(
+        grid_info = build_state_grid(
             N_vec=state_grid_sizes,
-            mu=model.Phi_0_state,
+            mu_intercept=model.Phi_0_state,
             Phi=model.Phi_11,
-            Sigma=Sigma_state_chol,
+            Sigma_innov=model.Sigma_ss,
+            n_stds=disc_config.state_n_stds,
+            mode=disc_config.state_grid_mode,
         )
-        # state_grids:   list[n_state] of 1-D marginal grids, state_grids[d] has shape (state_grid_sizes[d],)
-        # Pi_state:      (N_state, N_state) float64 - joint transition matrix; Pi_state[i,j] = P(s_{t+1}=j|s_t=i)
-        # state_indices: (N_state, n_state) int64  - multi-index into marginal grids; row i maps to state_grids
-
-        self.state_grid = self._build_state_grid(self.state_grids, self.state_indices)
-        # (N_state, n_state) float64 - flat Cartesian grid of slow-state vectors
-        # row i = [y_1, spr, cy] values at joint state i
-
+        self.state_grid_mode = grid_info["mode"]
+        self.state_grid_mu_s = grid_info["mu_s"]
+        self.state_grid_sigma_z = grid_info["sigma_z"]
+        self.state_bracket_shift = grid_info["bracket_shift"]
+        self.state_bracket_L_inv = grid_info["bracket_L_inv"]
+        self.state_bracket_grids = grid_info["state_bracket_grids"]
+        self.state_indices = grid_info["state_indices"]
+        self.state_grid = grid_info["state_grid"]
+        self.Pi_state = grid_info["Pi_state"]
+        self.state_stationary_probs = grid_info["stationary_probs"]
+        # state_bracket_grids: interpolation axes; in principal mode these live in transformed coordinates.
+        # state_grid: economic slow-state vectors at the flat lattice points.
         self.N_state = self.state_grid.shape[0]  # int — total joint states = prod(state_grid_sizes)
 
 
@@ -145,7 +152,7 @@ class Precompute:
         )
         # ret_nodes:   (n_ret_quad, n_ret) float64 - residual log-return shocks around mu_r
         # ret_weights: (n_ret_quad,) float64       - tensor-product weights, sum(ret_weights)=1
-        # Total joint return nodes = n_ret_nodes_1d ** model.n_ret.  K=1 yields one zero residual node.
+        # Total joint return nodes = prod(n_ret_nodes_1d).  All-K=1 yields one zero residual node.
 
         # --- State innovation quadrature ---
         self.v_nodes, self.v_weights = get_state_quadrature(
@@ -199,11 +206,11 @@ class Precompute:
         # Pi_z:   (n_z, n_z) float64 - Pi_z[iz, jz] = P(z_{t+1}=jz | z_t=iz)
 
         self.eps_nodes, self.eps_weights = get_eps_quadrature_corrected(model, n_nodes=disc_config.n_eps_nodes)
-        # eps_nodes:   (n_eps,) float64 - Gauss-Hermite quadrature nodes for transitory income shock eps
+        # eps_nodes:   (n_eps,) float64 - Judd-mixture quadrature nodes for transitory income shock eps
         # eps_weights: (n_eps,) float64 - quadrature weights; sum(eps_weights) = 1,  E[eps] = 0 enforced
 
         self.eta_nodes, self.eta_weights = get_eta_quadrature_mixture(model, n_nodes=disc_config.n_eta_nodes)
-        # eta_nodes:   (n_eta,) float64 - Gauss-Hermite quadrature nodes for persistent innovation eta
+        # eta_nodes:   (n_eta,) float64 - Judd-mixture quadrature nodes for persistent innovation eta
         # eta_weights: (n_eta,) float64 - quadrature weights; sum(eta_weights) = 1,  E[eta] = 0 enforced
 
         self.dz = self.z_grid[1] - self.z_grid[0]  # uniform grid spacing, used for z-interpolation in solver
@@ -240,8 +247,8 @@ class Precompute:
         self.n_w   = len(self.wealth_grid)  # int — wealth grid points
         self.n_s   = len(self.s_grid)       # int — savings grid points
         self.n_z   = len(self.z_grid)       # int — persistent income states
-        self.n_eps = len(self.eps_nodes)    # int — transitory shock quadrature nodes (= 2 * n_eps_nodes)
-        self.n_ret_quad = len(self.ret_weights)  # int — joint return quadrature nodes (= n_ret_nodes_1d ** n_ret)
+        self.n_eps = len(self.eps_nodes)    # int — transitory shock quadrature nodes (= n_eps_nodes total)
+        self.n_ret_quad = len(self.ret_weights)  # int — joint return quadrature nodes (= prod(n_ret_nodes_1d))
         self.n_age = len(self.ages)         # int — number of age periods
 
         # --- Earnings-dependent mortality (Catherine 2025, eq. 35) ---
@@ -264,15 +271,6 @@ class Precompute:
         self._validate_state_quadrature()
         if self.verbose:
             self._print_summary()
-
-    @staticmethod
-    def _build_state_grid(state_grids, state_indices):
-        n_total, n_dim = state_indices.shape
-        out = np.empty((n_total, n_dim), dtype=float)
-        for i in range(n_total):
-            for d in range(n_dim):
-                out[i, d] = state_grids[d][state_indices[i, d]]
-        return out
 
     def _precompute_conditional_returns(self):
         """
@@ -376,11 +374,13 @@ class Precompute:
               f"  ({self.n_age} periods,"
               f" retire at {self.model.retire_age})")
         print(f"State grid   : {sizes_str} = {self.N_state} joint states")
+        print(f"  mode       : {self.state_grid_mode}  |  half-width = {self.disc_config.state_n_stds:.2f}")
         print(f"  state vars : {list(self.model.state_names)}")
         print(f"  return vars: {list(self.model.ret_names)}")
         print(f"Income grid  : {self.n_z} persistent states"
               f"  x  {self.n_eps} transitory nodes")
-        print(f"Return quad  : {self.disc_config.n_ret_nodes_1d} nodes/dim"
+        K_str = "x".join(str(k) for k in self.n_ret_nodes_1d)
+        print(f"Return quad  : ({K_str}) nodes/dim"
               f"  ->  {self.n_ret_quad} joint nodes")
         print(f"State quad   : {self.disc_config.n_state_quad_nodes} nodes/dim"
               f"  ->  {self.n_state_quad} joint nodes")
@@ -470,5 +470,3 @@ def build_model(base_config, var_config, verbose=True):
         spr_index_in_state=spr_index_in_state,
         constrained=bool(base_config.get("constrained", True)),
     )
-
-

@@ -46,7 +46,9 @@ DI_TINY_SAVINGS    = 9   # s_val < threshold, trivial all-bills
 DI_TOTAL_CALLS     = 10  # total Newton calls
 DI_NEG_CONSUMPTION = 11  # negative euler (before clamping)
 DI_MONO_VIOLATIONS = 12  # EGM monotonicity violations
-N_DIAG_INT = 13
+DI_SUM_ITER        = 13  # total Newton outer-iterations summed over unconstrained calls
+DI_WARM_RESET      = 14  # times warm-start was reset to cold init after EC_NEWTON_FAIL
+N_DIAG_INT = 15
 
 # Float counter indices -- diag_float[i_s, idx], shape (N_state, N_DIAG_FLOAT)
 DF_WORST_MONO_DROP  = 0  # largest endogenous grid inversion
@@ -58,7 +60,8 @@ DF_MIN_ALPHA_B      = 5  # min bond share
 DF_MAX_ALPHA_B      = 6  # max bond share
 DF_SUM_ALPHA_S      = 7  # sum of stock shares (for mean)
 DF_SUM_ALPHA_B      = 8  # sum of bond shares (for mean)
-N_DIAG_FLOAT = 9
+DF_MAX_NEWTON_ITER  = 9  # max outer iters in any single unconstrained Newton call
+N_DIAG_FLOAT = 10
 
 # Exit codes from Newton solvers
 EC_TINY_SAVINGS = 0
@@ -276,6 +279,19 @@ def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
 
 
 @njit(fastmath=True)
+def transform_state_for_bracketing_3d(s0, s1, s2, bracket_shift, bracket_L_inv):
+    """Map an economic state into the coordinates used by state-grid bracketing."""
+    ds0 = s0 - bracket_shift[0]
+    ds1 = s1 - bracket_shift[1]
+    ds2 = s2 - bracket_shift[2]
+
+    u0 = bracket_L_inv[0, 0] * ds0 + bracket_L_inv[0, 1] * ds1 + bracket_L_inv[0, 2] * ds2
+    u1 = bracket_L_inv[1, 0] * ds0 + bracket_L_inv[1, 1] * ds1 + bracket_L_inv[1, 2] * ds2
+    u2 = bracket_L_inv[2, 0] * ds0 + bracket_L_inv[2, 1] * ds1 + bracket_L_inv[2, 2] * ds2
+    return u0, u1, u2
+
+
+@njit(fastmath=True)
 def _interp_z_wealth(c_next_full, j_s, iz_lo, frac_z, iw, frac_w, inv_dw, n_z, use_cubic, min_c):
     """Interpolate c_next and mpc at a single state-grid corner j_s.
 
@@ -332,6 +348,7 @@ def compute_foc_jac_retirement_quad(
     v_nodes, v_weights, M_v_nodes,
     base_mu_r_i,          # const_r + A_r @ s_i, precomputed per i_s
     Phi_0_state, Phi_11, state_grid_i,  # for computing s_next
+    state_bracket_shift, state_bracket_L_inv,
     grids_0, grids_1, grids_2,          # marginal grids for bracketing
     N1, N2,                              # grid sizes dim 1, dim 2
     # --- Return quadrature ---
@@ -365,9 +382,13 @@ def compute_foc_jac_retirement_quad(
         s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_grid_i[0] + Phi_11[1, 1] * state_grid_i[1] + Phi_11[1, 2] * state_grid_i[2] + v_nodes[k_v, 1]
         s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_grid_i[0] + Phi_11[2, 1] * state_grid_i[1] + Phi_11[2, 2] * state_grid_i[2] + v_nodes[k_v, 2]
 
-        # --- Bracket s_next in 3D grid ---
+        b_next_0, b_next_1, b_next_2 = transform_state_for_bracketing_3d(
+            s_next_0, s_next_1, s_next_2, state_bracket_shift, state_bracket_L_inv
+        )
+
+        # --- Bracket transformed next state in 3D grid ---
         lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
-            s_next_0, s_next_1, s_next_2, grids_0, grids_1, grids_2
+            b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
         )
 
         # 8 trilinear weights
@@ -473,6 +494,7 @@ def compute_foc_jac_working_quad(
     v_nodes, v_weights, M_v_nodes,
     base_mu_r_i,
     Phi_0_state, Phi_11, state_grid_i,
+    state_bracket_shift, state_bracket_L_inv,
     grids_0, grids_1, grids_2,
     N1, N2,
     # --- Return quadrature ---
@@ -523,9 +545,13 @@ def compute_foc_jac_working_quad(
         s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_grid_i[0] + Phi_11[1, 1] * state_grid_i[1] + Phi_11[1, 2] * state_grid_i[2] + v_nodes[k_v, 1]
         s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_grid_i[0] + Phi_11[2, 1] * state_grid_i[1] + Phi_11[2, 2] * state_grid_i[2] + v_nodes[k_v, 2]
 
-        # --- Bracket s_next in 3D grid ---
+        b_next_0, b_next_1, b_next_2 = transform_state_for_bracketing_3d(
+            s_next_0, s_next_1, s_next_2, state_bracket_shift, state_bracket_L_inv
+        )
+
+        # --- Bracket transformed next state in 3D grid ---
         lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
-            s_next_0, s_next_1, s_next_2, grids_0, grids_1, grids_2
+            b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
         )
 
         # 8 trilinear weights
@@ -945,9 +971,11 @@ def solve_portfolio_unconstrained_terminal_njit(
     fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
     err = (fs * fs + fb * fb) ** 0.5
 
-    for _ in range(max_iter):
+    # n_iter = number of outer Newton iterations actually entered
+    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
+    for k in range(max_iter):
         if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
+            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
 
         det = Jss * Jbb - Jsb * Jsb
         if abs(det) < singular_det:
@@ -966,6 +994,7 @@ def solve_portfolio_unconstrained_terminal_njit(
                 step_b *= cap
 
             alpha = 1.0
+            found = False
             for _bt in range(max_backtrack_iter):
                 a_s_t = a_s + alpha * step_s
                 a_b_t = a_b + alpha * step_b
@@ -975,8 +1004,11 @@ def solve_portfolio_unconstrained_terminal_njit(
                     fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
                     e_last = e_t; err = err_t
                     a_s = a_s_t; a_b = a_b_t
+                    found = True
                     break
                 alpha *= 0.5
+            if not found:
+                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
         else:
             slen = (step_s * step_s + step_b * step_b) ** 0.5
             if slen > step_damp:
@@ -988,7 +1020,7 @@ def solve_portfolio_unconstrained_terminal_njit(
             fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
             err = (fs * fs + fb * fb) ** 0.5
 
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
+    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
 
 
 def solve_terminal_age(wealth_grid, annuity_factors,
@@ -1027,12 +1059,24 @@ def solve_terminal_age(wealth_grid, annuity_factors,
                 max_iter=solver_config.max_iter,
             )
         else:
-            opt_s, opt_b, moment, exit_code, foc_resid = solve_portfolio_unconstrained_terminal_njit(
+            # Unconstrained returns 6-tuple including n_newton_iter; discarded here
+            # because the terminal step is N_state calls — diagnostic value is in
+            # the period (working/retirement) solvers which run ~566k calls each.
+            opt_s, opt_b, moment, exit_code, foc_resid, _ = solve_portfolio_unconstrained_terminal_njit(
                 v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights, gamma,
                 init_s=solver_config.init_alpha_s,
                 init_b=solver_config.init_alpha_b,
                 tol=solver_config.tol,
-                max_iter=solver_config.max_iter,
+                max_iter=solver_config.max_iter_unconstrained,
+                singular_det=solver_config.singular_det,
+                grad_step_size=solver_config.grad_step_size,
+                step_damp=solver_config.step_damp_unconstrained,
+                grad_denom_eps=solver_config.grad_denom_eps,
+                min_return_power=solver_config.min_return_power,
+                prob_skip=solver_config.prob_skip_threshold,
+                use_line_search=solver_config.use_line_search,
+                max_backtrack_iter=solver_config.max_backtrack_iter,
+                line_search_max_step=solver_config.line_search_max_step,
             )
 
         terminal_diag_int[i_s] = exit_code
@@ -1062,6 +1106,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                                        v_nodes, v_weights, M_v_nodes,
                                        base_mu_r_i,
                                        Phi_0_state, Phi_11, state_grid_i,
+                                       state_bracket_shift, state_bracket_L_inv,
                                        grids_0, grids_1, grids_2, N1, N2,
                                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                        gamma, psi, beta, b_bar,
@@ -1081,22 +1126,24 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
         _, _, _, _, _, e = compute_foc_jac_retirement_quad(
             0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
 
     # Corner: all bills
     fs0, fb0, _, _, _, e0 = compute_foc_jac_retirement_quad(
         0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
     if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
         return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
@@ -1105,11 +1152,12 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
     fs1, fb1, _, _, _, e1 = compute_foc_jac_retirement_quad(
         1.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
         return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
 
@@ -1117,11 +1165,12 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
     fs2, fb2, _, _, _, e2 = compute_foc_jac_retirement_quad(
         0.0, 1.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
         return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
 
@@ -1134,6 +1183,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 a_s, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
@@ -1155,6 +1205,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 0.0, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
@@ -1179,6 +1230,7 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
                 a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
@@ -1203,11 +1255,12 @@ def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
         fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_retirement_quad(
             a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
         e_last = e_sum
 
         err = (fs * fs + fb * fb) ** 0.5
@@ -1245,6 +1298,7 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                                                    v_nodes, v_weights, M_v_nodes,
                                                    base_mu_r_i,
                                                    Phi_0_state, Phi_11, state_grid_i,
+                                                   state_bracket_shift, state_bracket_L_inv,
                                                    grids_0, grids_1, grids_2, N1, N2,
                                                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                                    gamma, psi, beta, b_bar,
@@ -1265,21 +1319,23 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
         _, _, _, _, _, e = compute_foc_jac_retirement_quad(
             0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
+        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0, 0
 
     _, _, _, _, _, e0 = compute_foc_jac_retirement_quad(
         0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
 
     a_s = init_s
@@ -1288,16 +1344,19 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
     fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement_quad(
         a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     err = (fs * fs + fb * fb) ** 0.5
 
-    for _ in range(max_iter):
+    # n_iter = number of outer Newton iterations actually entered
+    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
+    for k in range(max_iter):
         if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
+            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
 
         det = Jss * Jbb - Jsb * Jsb
         if abs(det) < singular_det:
@@ -1323,11 +1382,12 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                 fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_retirement_quad(
                     a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                     v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+                    Phi_0_state, Phi_11, state_grid_i,
+                    state_bracket_shift, state_bracket_L_inv,
+                    grids_0, grids_1, grids_2, N1, N2,
+                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+                    gamma, psi, beta, b_bar,
+                    min_wealth_inv, min_consumption, prob_skip)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
                 if err_t < err:
                     fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
@@ -1336,6 +1396,8 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                     found = True
                     break
                 alpha *= 0.5
+            if not found:
+                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
         else:
             slen = (step_s * step_s + step_b * step_b) ** 0.5
             if slen > step_damp:
@@ -1348,13 +1410,14 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                 a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 gamma, psi, beta, b_bar,
                 min_wealth_inv, min_consumption, prob_skip)
             err = (fs * fs + fb * fb) ** 0.5
 
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
+    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
 
 
 # =============================================================================
@@ -1369,6 +1432,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                                      v_nodes, v_weights, M_v_nodes,
                                      base_mu_r_i,
                                      Phi_0_state, Phi_11, state_grid_i,
+                                     state_bracket_shift, state_bracket_L_inv,
                                      grids_0, grids_1, grids_2, N1, N2,
                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                      eps_nodes, eps_weights,
@@ -1390,24 +1454,26 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
             z_grid, rho, eta_nodes, eta_weights, dz,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            eps_nodes, eps_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
 
     fs0, fb0, _, _, _, e0 = compute_foc_jac_working_quad(
         0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
         z_grid, rho, eta_nodes, eta_weights, dz,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        eps_nodes, eps_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
     if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
         return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
@@ -1416,12 +1482,13 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         1.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
         z_grid, rho, eta_nodes, eta_weights, dz,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        eps_nodes, eps_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
         return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
 
@@ -1429,12 +1496,13 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         0.0, 1.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
         z_grid, rho, eta_nodes, eta_weights, dz,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        eps_nodes, eps_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
         return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
 
@@ -1448,6 +1516,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 z_grid, rho, eta_nodes, eta_weights, dz,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
@@ -1471,6 +1540,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 z_grid, rho, eta_nodes, eta_weights, dz,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
@@ -1497,6 +1567,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 z_grid, rho, eta_nodes, eta_weights, dz,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
@@ -1523,12 +1594,13 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
             z_grid, rho, eta_nodes, eta_weights, dz,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            eps_nodes, eps_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
         e_last = e_sum
 
         err = (fs * fs + fb * fb) ** 0.5
@@ -1567,6 +1639,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                                                 v_nodes, v_weights, M_v_nodes,
                                                 base_mu_r_i,
                                                 Phi_0_state, Phi_11, state_grid_i,
+                                                state_bracket_shift, state_bracket_L_inv,
                                                 grids_0, grids_1, grids_2, N1, N2,
                                                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                                 eps_nodes, eps_weights,
@@ -1589,24 +1662,26 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
             0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
             z_grid, rho, eta_nodes, eta_weights, dz,
             v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
+            Phi_0_state, Phi_11, state_grid_i,
+            state_bracket_shift, state_bracket_L_inv,
+            grids_0, grids_1, grids_2, N1, N2,
+            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+            eps_nodes, eps_weights,
+            gamma, psi, beta, b_bar,
+            min_wealth_inv, min_consumption, prob_skip)
+        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0, 0
 
     _, _, _, _, _, e0 = compute_foc_jac_working_quad(
         0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
         z_grid, rho, eta_nodes, eta_weights, dz,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        eps_nodes, eps_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
 
     a_s = init_s
@@ -1616,17 +1691,20 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
         a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
         z_grid, rho, eta_nodes, eta_weights, dz,
         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+        Phi_0_state, Phi_11, state_grid_i,
+        state_bracket_shift, state_bracket_L_inv,
+        grids_0, grids_1, grids_2, N1, N2,
+        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+        eps_nodes, eps_weights,
+        gamma, psi, beta, b_bar,
+        min_wealth_inv, min_consumption, prob_skip)
     err = (fs * fs + fb * fb) ** 0.5
 
-    for _ in range(max_iter):
+    # n_iter = number of outer Newton iterations actually entered
+    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
+    for k in range(max_iter):
         if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
+            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
 
         det = Jss * Jbb - Jsb * Jsb
         if abs(det) < singular_det:
@@ -1653,12 +1731,13 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                     a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
                     z_grid, rho, eta_nodes, eta_weights, dz,
                     v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip)
+                    Phi_0_state, Phi_11, state_grid_i,
+                    state_bracket_shift, state_bracket_L_inv,
+                    grids_0, grids_1, grids_2, N1, N2,
+                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+                    eps_nodes, eps_weights,
+                    gamma, psi, beta, b_bar,
+                    min_wealth_inv, min_consumption, prob_skip)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
                 if err_t < err:
                     fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
@@ -1667,6 +1746,8 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                     found = True
                     break
                 alpha *= 0.5
+            if not found:
+                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
         else:
             slen = (step_s * step_s + step_b * step_b) ** 0.5
             if slen > step_damp:
@@ -1680,6 +1761,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                 z_grid, rho, eta_nodes, eta_weights, dz,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                 Phi_0_state, Phi_11, state_grid_i,
+                state_bracket_shift, state_bracket_L_inv,
                 grids_0, grids_1, grids_2, N1, N2,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
@@ -1687,7 +1769,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                 min_wealth_inv, min_consumption, prob_skip)
             err = (fs * fs + fb * fb) ** 0.5
 
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
+    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
 
 
 # =============================================================================
@@ -1699,6 +1781,7 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                      c_next_full, pension_1d,
                                      annuity_factors,
                                      state_grid, grids_0, grids_1, grids_2,
+                                     state_bracket_shift, state_bracket_L_inv,
                                      v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                      Phi_0_state, Phi_11,
                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -1714,8 +1797,11 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     N1 = len(grids_1)
     N2 = len(grids_2)
 
-    diag_int = np.zeros((N_state, 13), dtype=np.int64)
-    diag_float = np.zeros((N_state, 9))
+    # Slot conventions: see DI_*/DF_* constants at top of solver.py.
+    # Sizes are 14 (DI) and 10 (DF); slot 13 (DI_SUM_ITER) and slot 9 (DF_MAX_NEWTON_ITER)
+    # are populated only on the unconstrained branch.
+    diag_int = np.zeros((N_state, 15), dtype=np.int64)
+    diag_float = np.zeros((N_state, 10))
 
     for i_s in prange(N_state):
         annuity_factor_is = annuity_factors[i_s]
@@ -1756,6 +1842,7 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         annuity_factor_is,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
+                        state_bracket_shift, state_bracket_L_inv,
                         grids_0, grids_1, grids_2, N1, N2,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         gamma, psi, beta, b_bar,
@@ -1767,13 +1854,15 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         step_damp=sc.step_damp_constrained, grad_denom_eps=sc.grad_denom_eps,
                         min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
                         prob_skip=sc.prob_skip_threshold)
+                    n_newton_iter = 0  # not tracked for constrained
                 else:
-                    opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_unconstrained_retirement_quad(
+                    opt_s, opt_b, euler, exit_code, foc_resid, n_newton_iter = solve_portfolio_unconstrained_retirement_quad(
                         s_val, z_i, i_s,
                         wealth_grid, c_next_slice, pension_next,
                         annuity_factor_is,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
+                        state_bracket_shift, state_bracket_L_inv,
                         grids_0, grids_1, grids_2, N1, N2,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         gamma, psi, beta, b_bar,
@@ -1800,6 +1889,11 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 elif exit_code == 7:  diag_int[i_s, 6] += 1
                 elif exit_code == 8:  diag_int[i_s, 7] += 1
 
+                # Newton iter accounting (unconstrained only; constrained → 0)
+                diag_int[i_s, 13] += n_newton_iter
+                if n_newton_iter > diag_float[i_s, 9]:
+                    diag_float[i_s, 9] = float(n_newton_iter)
+
                 if foc_resid > diag_float[i_s, 1]:
                     diag_float[i_s, 1] = foc_resid
                 diag_float[i_s, 2] += foc_resid * foc_resid
@@ -1820,8 +1914,19 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 temp_s[s_i_idx + 1] = opt_s
                 temp_b[s_i_idx + 1] = opt_b
 
-                last_a_s = opt_s
-                last_a_b = opt_b
+                # Warm-start update: on unconstrained Newton failure, the returned
+                # (opt_s, opt_b) is the last interior iterate before max_iter or
+                # stagnation — can be wildly off (e.g. (1.5, -2.0)) and poisons
+                # subsequent solves in the s_val/z_i chain. Reset to cold init.
+                # Constrained failures keep the simplex-projected iterate which
+                # is bounded to [0,1]^2 and remains usable.
+                if (not constrained) and exit_code == EC_NEWTON_FAIL:
+                    last_a_s = sc.init_alpha_s
+                    last_a_b = sc.init_alpha_b
+                    diag_int[i_s, 14] += 1   # DI_WARM_RESET
+                else:
+                    last_a_s = opt_s
+                    last_a_b = opt_b
 
             for s_i_idx in range(n_savings):
                 if temp_x[s_i_idx + 1] <= temp_x[s_i_idx]:
@@ -1843,6 +1948,7 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                c_next_full, pension_1d,
                                annuity_factors,
                                state_grid, grids_0, grids_1, grids_2,
+                               state_bracket_shift, state_bracket_L_inv,
                                v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                Phi_0_state, Phi_11,
                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -1864,6 +1970,7 @@ def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, pension_1d,
         annuity_factors,
         state_grid, grids_0, grids_1, grids_2,
+        state_bracket_shift, state_bracket_L_inv,
         v_nodes, v_weights, M_v_nodes, const_r, A_r,
         Phi_0_state, Phi_11,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -1882,6 +1989,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                       c_next_full, log_det_next,
                                       annuity_factors, rho, eta_nodes, eta_weights, dz,
                                       state_grid, grids_0, grids_1, grids_2,
+                                      state_bracket_shift, state_bracket_L_inv,
                                       v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                       Phi_0_state, Phi_11,
                                       exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -1898,8 +2006,11 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
     N1 = len(grids_1)
     N2 = len(grids_2)
 
-    diag_int = np.zeros((N_state, 13), dtype=np.int64)
-    diag_float = np.zeros((N_state, 9))
+    # Slot conventions: see DI_*/DF_* constants at top of solver.py.
+    # Sizes are 14 (DI) and 10 (DF); slot 13 (DI_SUM_ITER) and slot 9 (DF_MAX_NEWTON_ITER)
+    # are populated only on the unconstrained branch.
+    diag_int = np.zeros((N_state, 15), dtype=np.int64)
+    diag_float = np.zeros((N_state, 10))
 
     for i_s in prange(N_state):
         annuity_factor_is = annuity_factors[i_s]
@@ -1939,6 +2050,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         z_grid, rho, eta_nodes, eta_weights, dz,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
+                        state_bracket_shift, state_bracket_L_inv,
                         grids_0, grids_1, grids_2, N1, N2,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
@@ -1951,14 +2063,16 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         step_damp=sc.step_damp_constrained, grad_denom_eps=sc.grad_denom_eps,
                         min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
                         prob_skip=sc.prob_skip_threshold)
+                    n_newton_iter = 0  # not tracked for constrained
                 else:
-                    opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_unconstrained_working_quad(
+                    opt_s, opt_b, euler, exit_code, foc_resid, n_newton_iter = solve_portfolio_unconstrained_working_quad(
                         s_val, z_i, i_s,
                         wealth_grid, c_next_full, log_det_next,
                         annuity_factor_is,
                         z_grid, rho, eta_nodes, eta_weights, dz,
                         v_nodes, v_weights, M_v_nodes, base_mu_r_i,
                         Phi_0_state, Phi_11, s_i,
+                        state_bracket_shift, state_bracket_L_inv,
                         grids_0, grids_1, grids_2, N1, N2,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
@@ -1985,6 +2099,11 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 elif exit_code == 7:  diag_int[i_s, 6] += 1
                 elif exit_code == 8:  diag_int[i_s, 7] += 1
 
+                # Newton iter accounting (unconstrained only; constrained → 0)
+                diag_int[i_s, 13] += n_newton_iter
+                if n_newton_iter > diag_float[i_s, 9]:
+                    diag_float[i_s, 9] = float(n_newton_iter)
+
                 if foc_resid > diag_float[i_s, 1]:
                     diag_float[i_s, 1] = foc_resid
                 diag_float[i_s, 2] += foc_resid * foc_resid
@@ -2006,8 +2125,19 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                 temp_s[s_i_idx + 1] = opt_s
                 temp_b[s_i_idx + 1] = opt_b
 
-                last_a_s = opt_s
-                last_a_b = opt_b
+                # Warm-start update: on unconstrained Newton failure, the returned
+                # (opt_s, opt_b) is the last interior iterate before max_iter or
+                # stagnation — can be wildly off (e.g. (1.5, -2.0)) and poisons
+                # subsequent solves in the s_val/z_i chain. Reset to cold init.
+                # Constrained failures keep the simplex-projected iterate which
+                # is bounded to [0,1]^2 and remains usable.
+                if (not constrained) and exit_code == EC_NEWTON_FAIL:
+                    last_a_s = sc.init_alpha_s
+                    last_a_b = sc.init_alpha_b
+                    diag_int[i_s, 14] += 1   # DI_WARM_RESET
+                else:
+                    last_a_s = opt_s
+                    last_a_b = opt_b
 
             for s_i_idx in range(n_savings):
                 if temp_x[s_i_idx + 1] <= temp_x[s_i_idx]:
@@ -2029,6 +2159,7 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                 c_next_full, log_det_next,
                                 annuity_factors, rho, eta_nodes, eta_weights, dz,
                                 state_grid, grids_0, grids_1, grids_2,
+                                state_bracket_shift, state_bracket_L_inv,
                                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                                 Phi_0_state, Phi_11,
                                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -2051,6 +2182,7 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         c_next_full, log_det_next,
         annuity_factors, rho, eta_nodes, eta_weights, dz,
         state_grid, grids_0, grids_1, grids_2,
+        state_bracket_shift, state_bracket_L_inv,
         v_nodes, v_weights, M_v_nodes, const_r, A_r,
         Phi_0_state, Phi_11,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -2134,9 +2266,11 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     const_r         = pc.const_r
     A_r             = pc.A_r
     state_grid      = pc.state_grid
-    grids_0         = pc.state_grids[0]
-    grids_1         = pc.state_grids[1]
-    grids_2         = pc.state_grids[2]
+    grids_0         = pc.state_bracket_grids[0]
+    grids_1         = pc.state_bracket_grids[1]
+    grids_2         = pc.state_bracket_grids[2]
+    state_bracket_shift = pc.state_bracket_shift
+    state_bracket_L_inv = pc.state_bracket_L_inv
     exp_ret_bill    = pc.exp_ret_bill
     exp_ret_stock   = pc.exp_ret_stock
     exp_ret_bond    = pc.exp_ret_bond
@@ -2164,10 +2298,17 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         solver_config = SolverConfig()
 
     if verbose >= 1:
+        n_v_q = len(v_weights)
+        n_r_q = len(ret_weights)
+        n_eta_q = len(eta_nodes)
+        n_eps_q = len(eps_nodes)
         print(f"  Ages {start_age}\u2013{terminal_age}  ({n_age} periods)")
         print(f"  Grids: n_w={n_w}, n_s={len(s_grid)}, n_z={n_z}, N_state={N_state}")
         print(f"  gamma={gamma}, beta={beta}, b_bar={b_bar}")
         print(f"  States per period: {n_z} \u00d7 {N_state} = {n_z * N_state:,}")
+        print(f"  Quadrature nodes: state-innov={n_v_q}, return-resid={n_r_q}, "
+              f"labor eta={n_eta_q}, labor eps={n_eps_q}  "
+              f"(FOC evals/call: retire={n_v_q*n_r_q:,}, work={n_v_q*n_r_q*(1+n_eta_q*n_eps_q):,})")
 
     # ---- Median indices for per-age summary ----
     i_z_med = n_z // 2
@@ -2207,9 +2348,13 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     # ---- Backward induction ----
     if verbose >= 1:
         print(f"\n{'='*120}")
+        # avg_it / max_it columns are only meaningful for unconstrained
+        # (constrained Newton iter counts are not tracked → always 0).
+        iter_hdr = f"  {'avg_it':>6} {'max_it':>6}" if not constrained else ""
         hdr = (f" {'Age':>3}  {'Phase':<6} {'Time':>5}  {'Newt%':>5} {'Fail':>6}"
                f"  {'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'c/W':>5}"
-               f"  {'%int':>4}  {'%edge':>5}  {'%corn':>5}  {'mono':>4}")
+               f"  {'%int':>4}  {'%edge':>5}  {'%corn':>5}  {'mono':>4}"
+               f"{iter_hdr}")
         print(hdr)
         print(f"{'='*120}")
 
@@ -2231,6 +2376,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 c_next, pension_table[t + 1, :],
                 annuity_factors,
                 state_grid, grids_0, grids_1, grids_2,
+                state_bracket_shift, state_bracket_L_inv,
                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                 Phi_0_state, Phi_11,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -2243,6 +2389,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 c_next, log_det_profile[t + 1],
                 annuity_factors, rho, eta_nodes, eta_weights, dz,
                 state_grid, grids_0, grids_1, grids_2,
+                state_bracket_shift, state_bracket_L_inv,
                 v_nodes, v_weights, M_v_nodes, const_r, A_r,
                 Phi_0_state, Phi_11,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
@@ -2283,12 +2430,21 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
 
             mono_str = f"{mono_v:4d}" if mono_v == 0 else f"\033[91m{mono_v:4d}\033[0m"
 
+            # Iter columns: only printed when unconstrained
+            if not constrained:
+                sum_it = int(ti[DI_SUM_ITER])
+                max_it = int(tf_max[DF_MAX_NEWTON_ITER])
+                avg_it = sum_it / max(total_calls, 1)
+                iter_str = f"  {avg_it:6.1f} {max_it:6d}"
+            else:
+                iter_str = ""
+
             print(f" {age:3d}  {label:<6} {elapsed:5.1f}s  {newton_pct:5.1f}% {n_fail:>6}"
                   f"  {med_as:7.3f}  {med_ab:7.3f}  {med_bill:7.3f}  {c_over_w:5.3f}"
                   f"  {_format_pct(n_interior, total_calls)}"
                   f"  {_format_pct(n_edge, total_calls)}"
                   f"  {_format_pct(n_corner, total_calls)}"
-                  f"  {mono_str}", flush=True)
+                  f"  {mono_str}{iter_str}", flush=True)
 
     total = time.time() - t_start
 
@@ -2309,6 +2465,12 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     worst_foc = float(all_fmax[DF_MAX_FOC_RESID])
     rms_foc = (all_fsum[DF_SUM_FOC_RESID_SQ] / max(total_calls, 1)) ** 0.5
 
+    # Newton iter aggregates (unconstrained only; zero for constrained)
+    total_iter = int(all_int[DI_SUM_ITER])
+    max_iter_used = int(all_fmax[DF_MAX_NEWTON_ITER])
+    avg_iter = total_iter / max(total_calls, 1)
+    total_warm_reset = int(all_int[DI_WARM_RESET])
+
     # Build diagnostics dict
     diagnostics = {
         'age_diag_int': age_diag_int,
@@ -2320,6 +2482,10 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         'total_newton_failures': total_fail,
         'worst_foc_resid': worst_foc,
         'total_calls': total_calls,
+        'total_newton_iter': total_iter,
+        'avg_newton_iter': avg_iter,
+        'max_newton_iter': max_iter_used,
+        'total_warm_reset': total_warm_reset,
         'constrained': constrained,
         'solver_config': solver_config,
         'disc_config': pc.disc_config,
@@ -2350,6 +2516,38 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                     lbl = "RETIRE" if age >= retire_age else "WORK"
                     mfoc = float(age_diag_fmax[t, DF_MAX_FOC_RESID])
                     print(f"       Age {age:3d} {lbl:>6}: {nf:4d} failures  (max resid {mfoc:.2e})")
+
+        # --- Section 1b: Newton iteration counts (unconstrained only) ---
+        if not constrained and total_calls > 0:
+            print(f"\n  1b. NEWTON ITERATIONS  (unconstrained Newton only)")
+            print(f"     Total iters:  {total_iter:>12,}  (across {total_calls:,} calls)")
+            print(f"     Avg iters:    {avg_iter:>12.2f}  per call")
+            print(f"     Max iters:    {max_iter_used:>12,}  in any single call"
+                  f"  (max_iter_unconstrained={solver_config.max_iter_unconstrained})")
+            print(f"     Warm resets:  {total_warm_reset:>12,}  "
+                  f"(times init_alpha_* fell back after EC_NEWTON_FAIL)")
+            n_at_cap = int(np.sum(age_diag_fmax[:-1, DF_MAX_NEWTON_ITER]
+                                  >= solver_config.max_iter_unconstrained))
+            if max_iter_used >= solver_config.max_iter_unconstrained:
+                print(f"     WARNING: at least one call hit max_iter_unconstrained "
+                      f"({n_at_cap}/{n_age-1} ages saw the cap reached)")
+            # Per-age top offenders by avg iter
+            age_avg = []
+            for t in range(n_age - 1):
+                tc = int(age_diag_int[t, DI_TOTAL_CALLS])
+                if tc == 0:
+                    continue
+                ai = age_diag_int[t, DI_SUM_ITER] / tc
+                mi = int(age_diag_fmax[t, DF_MAX_NEWTON_ITER])
+                age_avg.append((ages[t], ai, mi, tc))
+            age_avg.sort(key=lambda r: -r[1])
+            top_k = age_avg[:5]
+            if top_k:
+                print(f"\n     Top 5 ages by avg iters:")
+                print(f"       {'Age':>3}  {'Phase':<6}  {'avg_iter':>8}  {'max_iter':>8}  {'calls':>8}")
+                for age_t, ai, mi, tc in top_k:
+                    lbl = "RETIRE" if age_t >= retire_age else "WORK"
+                    print(f"       {age_t:3d}  {lbl:<6}  {ai:>8.2f}  {mi:>8}  {tc:>8,}")
 
         # --- Section 2: Portfolio Regime Breakdown ---
         print(f"\n  2. PORTFOLIO REGIME BREAKDOWN")

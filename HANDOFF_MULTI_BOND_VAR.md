@@ -215,7 +215,7 @@ the bequest horizon (b_bar=10) without discounting at a mismatched yield.
 
 ---
 
-## Empirical Results (from `bond20_var_comparison.ipynb`)
+## Empirical Results (from `return_estimation/bond20_var_comparison.ipynb`)
 
 Key differences found between the two systems (same 1962-2025 sample):
 
@@ -256,6 +256,6 @@ After implementation, verify by running:
 1. `build_var_dataset("treasury_10y")` produces output matching existing
    `var_dataset.csv` to machine precision
 2. `build_var_dataset("aaa_20y")` produces output matching the alternative
-   dataset constructed in `bond20_var_comparison.ipynb`
+   dataset constructed in `return_estimation/bond20_var_comparison.ipynb`
 3. Both `var_config` dicts can be passed to `build_model()` without error
 4. `diagnose_var_pre(model, pc)` passes for both systems

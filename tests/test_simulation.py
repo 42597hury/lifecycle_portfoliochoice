@@ -41,6 +41,10 @@ def setup():
     vc = rc["var_config"]
     dc_raw = rc["discretization_config"]
 
+    n_ret_nodes_1d = dc_raw["n_ret_nodes_1d"]
+    if isinstance(n_ret_nodes_1d, list):
+        n_ret_nodes_1d = tuple(n_ret_nodes_1d)
+
     disc = DiscretizationConfig(
         n_wealth=dc_raw["n_wealth"],
         wealth_min=dc_raw["wealth_min"],
@@ -50,7 +54,7 @@ def setup():
         state_grid_sizes=tuple(dc_raw["state_grid_sizes"]),
         n_z=dc_raw["n_z"],
         n_eps_nodes=dc_raw["n_eps_nodes"],
-        n_ret_nodes_1d=dc_raw["n_ret_nodes_1d"],
+        n_ret_nodes_1d=n_ret_nodes_1d,
     )
 
     for key in ("Phi", "Omega"):

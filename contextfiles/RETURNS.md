@@ -511,6 +511,40 @@ mean that affected the old unconstrained estimator.
 
 - [ ] **Determinism test** — 2 full solves with bit-exact comparison.
 - [ ] **Grid convergence** — policies at 5^3 vs 7^3 vs 9^3.
+- [ ] **Discretization-arbitrage origin of terminal Newton failures** — Terminal
+      EC_NEWTON_FAIL exits at unconstrained γ=3 are not numerical: they are
+      states where the discrete return quadrature contains an arbitrage. The
+      convex hull of the joint excess-return cloud
+      `{(R_s^(n) - R_bill^(n), R_b^(n) - R_bill^(n))}_n` over the K_state·K_ret
+      quadrature nodes does not contain the origin, so a separating direction
+      (d_s, d_b) makes `d·X^(n) ≥ 0` at every node — guaranteed positive return
+      per unit leverage in the discrete model. Unconstrained CRRA then has no
+      interior optimum and Newton runs to budget. Add a `convex_hull_arb_gap`
+      diagnostic that flags any i_s with gap > 0 (current smoke-test config:
+      state_grid=5×5×5 principal/3.0σ, K_state=2, K_ret=3 → 24/125 states
+      arbitrage). Note one such state passes EC_INTERIOR by phantom convergence
+      at huge α.
+- [ ] **Per-dimension K_ret with stock-axis priority** — The arbitrage is
+      eliminated most cheaply by refining the stock residual (xr) axis, not
+      the bond axis. With the eigendecomposition Cholesky, K_xr controls the
+      principal eigenvector direction (largest residual variance), and joint
+      stock+bond crash scenarios are what's missing from the convex hull.
+      Empirical (smoke-test config, see above): bond-only refinement
+      (3,3,21)=189 nodes leaves 18 arbitrages; stock-only (3,15,3)=135 nodes
+      eliminates all 24; uniform (9,9,9)=729 nodes leaves 1. Highest ROI:
+      change `n_ret_nodes_1d: int` to a 3-tuple `(K_rtb, K_xr, K_xb)` in
+      `DiscretizationConfig` and update `get_return_quadrature` to accept
+      per-dimension counts. Target a config that eliminates arbitrage at
+      acceptable solver runtime — actual full-solve timings to be measured
+      before fixing a value.
+- [ ] **State-grid pruning of arbitrage points** — Complement to the above.
+      During grid construction, after building the principal-axis lattice,
+      compute the arbitrage gap at every candidate state and drop those with
+      gap > 0 (or refine quadrature locally for them). Verify the dropped
+      states are economically implausible by checking the simulated
+      stationary distribution rarely visits them — if simulation paths
+      regularly land in dropped regions, the model needs a structural fix
+      (constrained portfolios, leverage cap) rather than grid pruning.
 - [x] **Terminal age uses Pi_state, not quadrature** — FIXED. Terminal
       solver now uses v_nodes/v_weights state quadrature, consistent with
       retirement and working-age solvers.

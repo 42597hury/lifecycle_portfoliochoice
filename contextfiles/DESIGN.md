@@ -81,7 +81,7 @@ k > 20, y(k) = y_20 (capped, no extrapolation). With b_bar=10, only yields
 up to k=10 matter. Uses discrete compounding (1+y)^{-k} to match the codebase
 convention.
 
-**Calibration:** `gamma = 3`, `beta = 0.96`, `b_bar = 10`.
+**Calibration:** `gamma = 5`, `beta = 0.96`, `b_bar = 10`.
 
 ### 1.1b Earnings-Dependent Mortality
 
@@ -197,7 +197,8 @@ Income timing at the working-retirement boundary:
 
   Treatment of z differs between solver and simulation:
   - Solver: z is discrete (n_z grid points). E[V(z')] is computed via
-    Gauss-Hermite quadrature over mixture-normal eta innovations, with
+    a Judd (1998) quadrature built directly on the mixture-normal eta
+    density (n_eta total nodes, polynomial exactness 2*n_eta - 1), with
     linear interpolation of policies at off-grid z' values.
   - Simulation: z is continuous (float64). Each period draws a continuous
     eta from the mixture, computes z' = rho*z + eta (clamped to grid
@@ -508,7 +509,7 @@ def partition_var(Phi_full, Omega_full, z_bar, state_idx, ret_idx,
         Phi_full:        (6, 6) full transition matrix (annual)
         Omega_full:      (6, 6) full innovation covariance (annual)
         z_bar:           (6,) unconditional means (sample means, CCV convention)
-        state_idx:       [0, 1, 2]  (y_1, spr, cy)
+        state_idx:       [2, 1, 0]  (cy, spr, y_1) default since 2026-04-30; was [0,1,2]
         ret_idx:         [3, 4, 5]  (rtb, xr, xb)
         variable_names:  optional list of names for diagnostics
 
@@ -541,7 +542,7 @@ class LifecyclePortfolioModel(NamedTuple):
     u_prime: Callable         # Marginal utility
     u_prime_inv: Callable     # Inverse marginal utility
     beta: float               # Discount factor (0.96 annual)
-    gamma: float              # CRRA risk aversion (3.0)
+    gamma: float              # CRRA risk aversion (5.0)
 
     # === BEQUEST (Catherine 2025) ===
     b_bar: int                # Bequest horizon in years (10)
@@ -564,7 +565,7 @@ class LifecyclePortfolioModel(NamedTuple):
     # === PARTITIONED VAR STRUCTURE (annual parameters) ===
     n_state: int              # Number of state variables (3)
     n_ret: int                # Number of return variables (3)
-    state_names: tuple        # ('y_1', 'spr', 'cy')
+    state_names: tuple        # default ('cy', 'spr', 'y_1') since 2026-04-30; legacy ('y_1', 'spr', 'cy')
     ret_names: tuple          # ('rtb', 'xr', 'xb')
 
     z_bar_state: np.ndarray   # (3,) state unconditional means
@@ -594,9 +595,16 @@ and Newton tuning are carried by separate configuration objects in `model.py`:
 ```python
 disc_config = DiscretizationConfig(
     state_grid_sizes=(5, 5, 5),
+    state_grid_mode="principal",   # "naive" | "lyapunov-axis" | "principal"
+    state_n_stds=2.0,              # scalar (broadcast) OR length-3 sequence for
+                                   # per-axis half-width in standardized u-coords
+                                   # (principal mode) or physical sigma_stat units
+                                   # (lyapunov-axis mode). Per-axis added 2026-04-30.
     n_z=11,
     n_eps_nodes=5,
-    n_ret_nodes_1d=2,   # K = GH order per return dimension; total joint nodes = K^3
+    n_ret_nodes_1d=2,   # int K -> uniform K^n_ret nodes (legacy); also accepts a
+                        # tuple (K_rtb, K_xr, K_xb) for per-dimension refinement,
+                        # giving prod(K_i) joint nodes (e.g. (3,9,3) -> 81)
     n_state_quad_nodes=3,  # GH order per state dimension for state innovation quadrature
 )
 
@@ -655,8 +663,9 @@ The workflow from raw data to model:
 var_config, fit_details, data = build_nominal_system1_var_config(
     csv_path="data/var_dataset.csv"
 )
-# columns = ['y_1', 'spr', 'cy', 'rtb', 'xr', 'xb']
-# state_indices = [0, 1, 2]    (y_1, spr, cy)
+# columns = ['y_1', 'spr', 'cy', 'rtb', 'xr', 'xb']    # CSV column order, fixed
+# state_indices = [2, 1, 0]    (cy, spr, y_1) default since 2026-04-30
+#                              (legacy [0, 1, 2] = (y_1, spr, cy) was the pre-reorder default)
 # return_indices = [3, 4, 5]   (rtb, xr, xb)
 
 # Step 2: Build model
@@ -748,6 +757,40 @@ transition accuracy -- the solver uses Gauss-Hermite quadrature for state
 transitions, which handles the full covariance structure exactly. The Rouwenhorst
 grid is retained for policy function storage and interpolation.
 
+#### 3.5.2a build_state_grid (production entry point)
+
+```python
+build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="principal")
+    # Mode-aware financial-state interpolation grid. Returns a dict with
+    # state_grid (joint physical-state lattice), state_bracket_grids
+    # (per-axis interpolation grids in standardized u-coords for principal
+    # mode, or physical coords for lyapunov-axis), state_indices (multi-index
+    # into marginals), bracket_shift (mu_s in principal, zero elsewhere),
+    # bracket_L_inv (Cholesky inverse in principal, identity elsewhere),
+    # Pi_state, stationary_probs.
+    #
+    # n_stds accepts a scalar (broadcast across axes) OR a length-3 sequence
+    # for per-axis half-widths.
+    # - principal mode: n_stds[d] is the half-width of Cholesky direction d
+    #   in standardized u-coords. Cholesky directions mix physical state
+    #   variables; under the default ordering (cy, spr, y_1) -- 2026-04-30:
+    #     L[:, 0] = (+0.530,  0,       0)        # PURE cy (100%)
+    #     L[:, 1] = (-0.054, +0.0158,  0)        # mostly spr (~99%) + tiny cy leakage
+    #     L[:, 2] = (+0.378, -0.0187, +0.0165)   # y_1 with residual cy/spr coupling
+    #   So n_stds[0] is the clean cy knob, n_stds[1] is the clean spr knob;
+    #   n_stds[2] only controls the leftover y_1 variance.  Variable order
+    #   matters: the variable listed first gets the "pure" Cholesky column.
+    # - lyapunov-axis mode: n_stds[d] is the half-width of physical axis d in
+    #   stationary-sigma units (mu_s[d] +/- n_stds[d] * sigma_stat[d]).
+    #   Per-axis n_stds maps directly to per-physical-variable control.
+    # - naive mode: ignores n_stds (Rouwenhorst per-marginal).
+```
+
+This is the production entry point used by `Precompute`. The legacy
+`rouwenhorst_multivariate` block above describes the `mode="naive"` fallback;
+production runs use `mode="principal"` for joint covariance shape and
+`state_bracket_*` artefacts that the solver and simulator consume directly.
+
 #### 3.5.3 Income Process Discretization
 
 ```python
@@ -755,14 +798,18 @@ discretize_income_ar1_mixture(rho, p, mu1, sigma1, mu2, sigma2, N)
     # Tauchen-style Markov chain for persistent income z. Produces z_grid
     # and Pi_z. NOTE: Pi_z is retained for backward compatibility but is
     # NOT used by the solver or simulation for z-transitions. The solver
-    # uses Gauss-Hermite quadrature (eta_nodes/weights); the simulation
+    # uses Judd-mixture quadrature (eta_nodes/weights); the simulation
     # draws continuous eta from the mixture distribution.
 
-get_eps_quadrature_corrected(model, n_nodes)   # Gauss-Hermite, zero-mean enforced
-get_eta_quadrature_mixture(model, n_nodes)     # Gauss-Hermite for persistent innovation eta
-    # Both quadratures use the physicist's convention: nodes scaled by sqrt(2),
-    # weights divided by sqrt(pi). Component 2's mean is computed internally
-    # to enforce E[eta] = 0: mu_eta2_eff = -(pz/(1-pz)) * mu_eta1.
+get_eps_quadrature_corrected(model, n_nodes)   # Judd 1998 mixture quadrature, zero-mean enforced
+get_eta_quadrature_mixture(model, n_nodes)     # Judd 1998 mixture quadrature for eta
+    # Both build an n-point Gauss rule directly on the mixture density
+    # (Hankel-system orthogonal polynomial -> roots = nodes; Vandermonde
+    # solve for weights). n_nodes is the TOTAL node count; polynomial
+    # exactness against the mixture is 2*n_nodes - 1. Component 2's mean
+    # is computed internally to enforce E[eta] = 0: mu_eta2_eff =
+    # -(pz/(1-pz)) * mu_eta1. Helper _judd_mixture_quadrature() in
+    # discretization.py:338.
 ```
 
 ### 3.6 precompute.py -- Precompute Class
@@ -788,7 +835,8 @@ s_grid:           (n_s,)          savings grid for EGM endogenous gridpoints
 ages:             (n_age,)        integer ages from start_age to terminal_age
 
 # === FINANCIAL STATE DISCRETIZATION ===
-state_grid:       (N_state, 3)    joint state grid; row i = [y_1, spr, cy]
+state_grid:       (N_state, 3)    joint state grid; row i = state vector in MODEL ordering
+                                  (default [cy, spr, y_1] since 2026-04-30; legacy [y_1, spr, cy])
 Pi_state:         (N_state, N_state)  transition matrix (retained, not used by solver)
 state_grids:      list[3]         marginal 1-D grids for each state variable
 state_indices:    (N_state, 3)    multi-index into marginal grids
@@ -807,11 +855,13 @@ mu_r:             (N_state, N_state, 3)
 const_r:          (3,)            Phi_0_ret
 A_r:              (3, 3)          Phi_21
 M_v_nodes:        (K_s^3, 3)     v_nodes @ M.T (precomputed)
-ret_nodes:        (K_r^3, 3)     residual log-return shocks around mu_r
-ret_weights:      (K_r^3,)       joint return quadrature weights; sum=1
-exp_ret_bill:     (K_r^3,)       exp(ret_nodes[:, 0])
-exp_ret_stock:    (K_r^3,)       exp(ret_nodes[:, 1])
-exp_ret_bond:     (K_r^3,)       exp(ret_nodes[:, 2])
+ret_nodes:        (n_ret_quad, 3) residual log-return shocks around mu_r
+ret_weights:      (n_ret_quad,)   joint return quadrature weights; sum=1
+exp_ret_bill:     (n_ret_quad,)   exp(ret_nodes[:, 0])
+exp_ret_stock:    (n_ret_quad,)   exp(ret_nodes[:, 1])
+exp_ret_bond:     (n_ret_quad,)   exp(ret_nodes[:, 2])
+                  n_ret_quad = prod(n_ret_nodes_1d).
+                  Scalar K_r -> K_r^3.  Tuple (K_rtb, K_xr, K_xb) -> K_rtb*K_xr*K_xb.
 
 # === BEQUEST ===
 annuity_factors:  (N_state,)      A(y_1, spr, b_bar) for each financial state
@@ -820,10 +870,10 @@ annuity_factors:  (N_state,)      A(y_1, spr, b_bar) for each financial state
 # === INCOME PROCESS ===
 z_grid:           (n_z,)          persistent income states (log, mean-zero)
 Pi_z:             (n_z, n_z)      income transition matrix (retained, not used by solver)
-eps_nodes:        (n_eps,)        Gauss-Hermite nodes for transitory shock
-eps_weights:      (n_eps,)        quadrature weights; sum=1, mean=0 enforced
-eta_nodes:        (n_eta,)        Gauss-Hermite nodes for persistent innovation eta
-eta_weights:      (n_eta,)        quadrature weights; sum=1, mean=0 enforced
+eps_nodes:        (n_eps,)        Judd-mixture nodes for transitory shock (n_eps = n_eps_nodes total)
+eps_weights:      (n_eps,)        quadrature weights; sum=1, mean=0 enforced, all > 0
+eta_nodes:        (n_eta,)        Judd-mixture nodes for persistent innovation eta (n_eta = n_eta_nodes total)
+eta_weights:      (n_eta,)        quadrature weights; sum=1, mean=0 enforced, all > 0
 dz:               float           uniform z_grid spacing
 log_det_profile:  (n_age,)        deterministic age-earnings profile f(age)
 avg_det:          float           mean(exp(f(age))) over working ages
@@ -955,10 +1005,11 @@ The expectation integrates over:
    policies are trilinearly interpolated on the 3D state grid.
 2. Return residual `eps_k`: Gauss-Hermite quadrature with `ret_weights[k_r]`.
    Joint draw from `N(0, Sigma_r_cond)`.
-3. Persistent innovation `eta`: Gauss-Hermite quadrature with `eta_weights[k_eta]`.
+3. Persistent innovation `eta`: Judd-mixture quadrature with `eta_weights[k_eta]`.
    `z_next = rho * z_grid[i_z] + eta_nodes[k_eta]` is generally off-grid;
    policies are linearly interpolated between bracketing z-grid points.
-4. Transitory shock `eps`: weighted by `eps_weights[i_eps]` (working age only)
+4. Transitory shock `eps`: Judd-mixture quadrature, weighted by
+   `eps_weights[i_eps]` (working age only)
 
 ### 4.3 Interpolation and Helper Functions
 
@@ -1015,13 +1066,19 @@ pricing is fixed at the current state.
 
 Same structure as retirement, with additional integration over income innovations.
 
-**Gauss-Hermite quadrature over persistent innovations:** Instead of iterating
+**Judd-mixture quadrature over persistent innovations:** Instead of iterating
 over discrete grid points weighted by `Pi_z[i_z, j_z]`, the inner loop iterates
-over Gauss-Hermite quadrature nodes `eta_nodes[k_eta]` with weights `eta_weights[k_eta]`.
+over Judd-mixture quadrature nodes `eta_nodes[k_eta]` with weights `eta_weights[k_eta]`.
 For each node, `z_next = rho * z_grid[z_idx] + eta_nodes[k_eta]` is computed and
-bracketed on the z-grid. Consumption policy is linearly interpolated between the
-two bracketing grid points `iz_lo` and `iz_lo + 1`; income is **not** interpolated
-(see below).
+bracketed on the z-grid. Consumption policy is interpolated in z by **PCHIP**
+(Fritsch-Carlson, monotonicity-preserving cubic Hermite) on interior intervals
+where the 4-point stencil `[iz_lo-1, iz_lo, iz_lo+1, iz_lo+2]` fits
+(`iz_lo >= 1` and `iz_lo + 2 < n_z`); the first and last z intervals fall back
+to linear. Wealth interpolation is linear on `[iw, iw+1]`; the FOC Jacobian's
+`mpc` is computed as the analytical wealth derivative of the PCHIP interpolant
+(PCHIP evaluated at iw and iw+1, finite-differenced across `dw`), which keeps
+`mpc` exactly consistent with `c_val` even when the slope limiter activates
+asymmetrically. Income is **not** interpolated (see below).
 
 **Income computed on the fly (no table interpolation):** Next-period gross income
 
@@ -1091,7 +1148,7 @@ def solve_portfolio_2d_retirement(s_val, z_idx, i_s,
 
 All tolerance checks in the Newton solvers use **relative** rather than absolute
 tolerances. The FOCs are sums of `c^{-gamma} * Rex_k` terms, so their natural
-magnitude scales with marginal utility `c^{-gamma}`. With `gamma=3` and small
+magnitude scales with marginal utility `c^{-gamma}`. With `gamma=5` and small
 consumption, absolute FOC values can reach ~1e+9, making a fixed absolute
 tolerance of 1e-7 impossible to achieve.
 
@@ -1268,22 +1325,23 @@ share ranges, EGM monotonicity, and policy sanity checks.
 
 | Array | Shape | Description |
 |-------|-------|-------------|
-| `state_grid` | (N_state, 3) | Joint state grid; row i = [y_1, spr, cy] |
+| `state_grid` | (N_state, 3) | Joint state grid; row i = state vector in MODEL ordering (default [cy, spr, y_1] since 2026-04-30) |
 | `v_nodes` | (K_s^3, 3) | State innovation quadrature nodes |
 | `v_weights` | (K_s^3,) | State quadrature weights |
 | `mu_r` | (N_state, N_state, 3) | Conditional return means (rtb, xr, xb) |
 | `M_v_nodes` | (K_s^3, 3) | v_nodes @ M.T (precomputed) |
 | `const_r` | (3,) | Phi_0_ret |
 | `A_r` | (3, 3) | Phi_21 |
-| `ret_nodes` | (K_r^3, 3) | Return residual quadrature nodes |
-| `ret_weights` | (K_r^3,) | Return quadrature weights |
-| `exp_ret_bill` | (K_r^3,) | exp(ret_nodes[:, 0]) |
-| `exp_ret_stock` | (K_r^3,) | exp(ret_nodes[:, 1]) |
-| `exp_ret_bond` | (K_r^3,) | exp(ret_nodes[:, 2]) |
+| `ret_nodes` | (n_ret_quad, 3) | Return residual quadrature nodes |
+| `ret_weights` | (n_ret_quad,) | Return quadrature weights; sum=1 |
+| `exp_ret_bill` | (n_ret_quad,) | exp(ret_nodes[:, 0]) |
+| `exp_ret_stock` | (n_ret_quad,) | exp(ret_nodes[:, 1]) |
+| `exp_ret_bond` | (n_ret_quad,) | exp(ret_nodes[:, 2]) |
+| `n_ret_quad` | scalar int | `prod(n_ret_nodes_1d)`; e.g. scalar K -> K^3, tuple (3,9,3) -> 81 |
 | `annuity_factors` | (N_state,) | A(y_1, spr, b_bar) annuity factor per state |
 | `z_grid` | (n_z,) | Persistent income states |
-| `eps_nodes/weights` | (n_eps,) | Gauss-Hermite for transitory shocks |
-| `eta_nodes/weights` | (n_eta,) | Gauss-Hermite for persistent innovation eta |
+| `eps_nodes/weights` | (n_eps,) | Judd-mixture for transitory shocks (n_eps = n_eps_nodes total) |
+| `eta_nodes/weights` | (n_eta,) | Judd-mixture for persistent innovation eta (n_eta = n_eta_nodes total) |
 | `log_det_profile` | (n_age,) | Deterministic age-earnings profile f(age) |
 | `working_income` | (n_age, n_z, n_eps) | After-tax labor income (simulation; solver on-the-fly) |
 | `pension_after_tax` | (n_age, n_z) | After-tax pension table |
@@ -1315,12 +1373,20 @@ share ranges, EGM monotonicity, and policy sanity checks.
 ### 6.1 Inner Loop Cost
 
 Per Newton evaluation, the inner loop iterates over:
-- K_s^3 state innovation nodes (27 at K_s=3) x K_r^3 return residual nodes (8 at K_r=2)
-- Working age: additionally x n_eta persistent innovation nodes (10) x n_eps transitory nodes (10)
+- `n_state_quad` state innovation nodes (e.g. K_s=3 → 27) × `n_ret_quad` return
+  residual nodes (`prod(n_ret_nodes_1d)`; e.g. uniform K_r=2 → 8, asymmetric
+  (3,9,3) → 81)
+- Working age: additionally × n_eta persistent innovation nodes × n_eps transitory nodes
 
 | Config | Retirement | Working |
 |--------|-----------|---------|
-| K_s=3, K_r=2 | 216 iters | 21,600 iters |
+| K_s=3, K_r=2, n_eta=3, n_eps=5 (uniform) | 216 iters | 3,240 iters |
+| K_s=3, K_r=3, n_eta=3, n_eps=5 (production) | 729 iters | 10,935 iters |
+| K_s=3, K_r=(3,9,3), n_eta=5, n_eps=5 | 2,187 iters | 54,675 iters |
+
+(Income joint count under Judd-mixture is `n_eta_nodes × n_eps_nodes`
+total — half the marginal and a quarter the joint of the previous
+concatenated-GH rule at the same `n_*_nodes` settings.)
 
 ### 6.2 Bequest Hoist Optimization
 

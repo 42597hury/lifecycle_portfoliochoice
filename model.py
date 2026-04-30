@@ -5,6 +5,7 @@ Contains:
   - LifecyclePortfolioModel(NamedTuple) — full model specification
   - DiscretizationConfig(NamedTuple) — grid/quadrature choices
   - SolverConfig(NamedTuple) — Newton solver tuning knobs
+  - SolveControl(NamedTuple) — optional non-numerical solver controls
   - CRRA utility constructors
   - Bequest utility functions (Catherine 2025)
   - Tax and income helper functions
@@ -78,7 +79,7 @@ class LifecyclePortfolioModel(NamedTuple):
     M: np.ndarray
     Sigma_r_cond: np.ndarray
 
-    y_1_index_in_state: int       # Index of y_1 (1-year nominal yield) in state vector (= 0)
+    y_1_index_in_state: int       # Index of y_1 (1-year nominal yield) in state vector (= 2 under default cy-first ordering; = 0 under legacy y_1-first ordering)
     spr_index_in_state: int       # Index of spr (yield spread) in state vector (= 1)
 
     # Portfolio constraints
@@ -100,11 +101,12 @@ class DiscretizationConfig(NamedTuple):
     # Savings grid (EGM)
     n_savings: int = 150
     savings_min: float = 1e-8
+    savings_max: float | None = None   # None => use wealth_max (backward compatible)
 
     # Financial state VAR discretization
     state_grid_sizes: tuple = (5, 5, 5)
     state_grid_mode: str = "naive"      # "naive" | "lyapunov-axis" | "principal"
-    state_n_stds: float = 3.0           # half-width in standardized state-grid units
+    state_n_stds: Any = 3.0             # half-width in standardized state-grid units; scalar (broadcast) or length-3 sequence (per-axis bounds in pre-transform u-coords)
 
     # Income process
     n_z: int = 7                        # persistent income grid points
@@ -112,7 +114,7 @@ class DiscretizationConfig(NamedTuple):
     n_eps_nodes: int = 3                # total Judd-mixture nodes for transitory shock (poly. exactness 2n-1)
     n_eta_nodes: int = 3                # total Judd-mixture nodes for persistent innovation (poly. exactness 2n-1)
     n_ret_nodes_1d: Any = 2             # Gauss-Hermite order per return dim; int (uniform) OR tuple of length n_ret
-    n_state_quad_nodes: int = 3         # GH order per state dimension for state innovation quadrature
+    n_state_quad_nodes: Any = 3         # GH order per state dim; int (uniform) OR tuple of length n_state for per-axis (e.g. (2,2,5) refines axis 2 only)
 
 
 # =============================================================================
@@ -158,6 +160,20 @@ class SolverConfig(NamedTuple):
     prob_skip_threshold: float = 1e-12         # skip states with prob below this
     euler_inv_floor: float = 1e-20             # floor for beta*euler before inversion
     egm_anchor: float = 1e-10                  # anchor value for EGM grid at zero savings
+
+
+# =============================================================================
+# SOLVE CONTROL
+# =============================================================================
+
+class SolveControl(NamedTuple):
+    """Optional non-numerical controls for partial solves and checkpoints."""
+
+    youngest_age_to_solve: int | None = None
+    checkpoint_path: str | None = None
+    checkpoint_every_n_ages: int | None = None
+    save_on_interrupt: bool = False
+    return_partial_on_interrupt: bool = False
 
 
 # =============================================================================

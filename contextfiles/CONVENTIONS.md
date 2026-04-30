@@ -43,7 +43,8 @@ START OF PERIOD t
 │
 │  Agent OBSERVES state:
 │    x_t  = cash-on-hand (wealth + income already received)
-│    s_t  = (y_1, spr, cy) financial state (known at end of prior year)
+│    s_t  = (cy, spr, y_1) financial state under default ordering (2026-04-30+);
+│                          legacy bundles use (y_1, spr, cy)
 │    z_t  = persistent income state (log, mean-zero)
 │
 │  Agent CHOOSES:
@@ -276,7 +277,7 @@ There is no sub-annual time step anywhere in the model.
 | Aspect | Solver | Simulation |
 |--------|--------|------------|
 | z representation | Discrete grid `z_grid[i_z]` | Continuous float64 |
-| z transitions | GH quadrature over η, interpolate policies at off-grid z' | Draw continuous η from mixture, clamp z' to grid bounds |
+| z transitions | Judd-mixture quadrature over η, interpolate policies at off-grid z' | Draw continuous η from mixture, clamp z' to grid bounds |
 | Income computation | On-the-fly `scalar_disposable_income(exp(f + ρz + η + ε))` | Same: direct from continuous z |
 | Pension computation | Table lookup `pension_table[t, i_z]` | Direct from continuous z: `_scalar_pension_after_tax(z, avg_det)` |
 | Policy lookup | Direct indexing by `i_z` | Linear interpolation between bracketing z-grid points |

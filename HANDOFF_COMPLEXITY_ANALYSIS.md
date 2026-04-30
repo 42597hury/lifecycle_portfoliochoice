@@ -30,11 +30,12 @@ the cost increase and identify the binding bottleneck.
 - Returns: `[rtb, xr, xb]` (3 returns, ALL uncertain including bill rate)
 - **State transitions:** Gauss-Hermite quadrature over `v^s ~ N(0, Sigma_ss)`.
   Inner loop: `for k_v in range(n_state_quad)` where `n_state_quad = K_s^3`.
-- **Return quadrature:** 3D, K_r^3 nodes
-- **Per-FOC cost (retirement):** `K_s^3 * K_r^3` iterations, each with
-  trilinear interpolation (8 corner lookups + weights)
-- **Per-FOC cost (working):** `K_s^3 * K_r^3 * n_eta * n_eps`, each with
-  trilinear interpolation
+- **Return quadrature:** 3D, `n_ret_quad = prod(n_ret_nodes_1d)` nodes
+  (uniform `K_r → K_r^3`; per-dim tuple `(K_rtb, K_xr, K_xb) → K_rtb·K_xr·K_xb`)
+- **Per-FOC cost (retirement):** `n_state_quad * n_ret_quad` iterations, each
+  with trilinear interpolation (8 corner lookups + weights)
+- **Per-FOC cost (working):** `n_state_quad * n_ret_quad * n_eta * n_eps`,
+  each with trilinear interpolation
 - Policy lookup at next state: **trilinear interpolation** via
   `bracket_state_3d` + 8 weighted lookups (replaces direct index)
 
@@ -51,7 +52,7 @@ From `model.py` `DiscretizationConfig`:
 | `n_savings` | 150 | EGM savings grid |
 | `n_wealth` | 150 | Cash-on-hand interpolation grid |
 | `n_state_quad_nodes` | 3 | GH order per state dim. Total = 3^3 = 27 nodes |
-| `n_ret_nodes_1d` | 2 | GH order per return dim. Total = 2^3 = 8 nodes |
+| `n_ret_nodes_1d` | 2 | int K → uniform K^n_ret nodes (default 2 → 8); also accepts a tuple `(K_rtb, K_xr, K_xb)` for per-dimension refinement, giving `prod(K_i)` nodes (e.g. `(3,9,3) → 81`) |
 | `n_eps_nodes` | 3 | GH per mixture component for transitory shock |
 | `n_eta_nodes` | 3 | GH per mixture component for persistent shock |
 

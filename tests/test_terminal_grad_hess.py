@@ -58,6 +58,7 @@ if isinstance(_n_ret_nodes_1d, list):
 disc_config = DiscretizationConfig(
     n_wealth=disc_meta["n_wealth"],
     n_savings=disc_meta["n_savings"],
+    savings_max=disc_meta.get("savings_max"),
     state_grid_sizes=tuple(disc_meta["state_grid_sizes"]),
     n_z=disc_meta["n_z"],
     n_stds=disc_meta["n_stds"],

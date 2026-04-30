@@ -342,11 +342,15 @@ return quadrature node k_r — they are components of one joint draw.
 | `M_v_nodes` | (K_s^3, 3) | `v_nodes @ M.T` — return contribution per state node |
 | `const_r` | (3,) | `Phi_0_ret` |
 | `A_r` | (3, 3) | `Phi_21` |
-| `exp_ret_bill` | (K_r^3,) | `exp(ret_nodes[:, 0])` |
-| `exp_ret_stock` | (K_r^3,) | `exp(ret_nodes[:, 1])` |
-| `exp_ret_bond` | (K_r^3,) | `exp(ret_nodes[:, 2])` |
-| `ret_nodes` | (K_r^3, 3) | Return residual nodes |
-| `ret_weights` | (K_r^3,) | Return tensor-product weights |
+| `exp_ret_bill` | (n_ret_quad,) | `exp(ret_nodes[:, 0])` |
+| `exp_ret_stock` | (n_ret_quad,) | `exp(ret_nodes[:, 1])` |
+| `exp_ret_bond` | (n_ret_quad,) | `exp(ret_nodes[:, 2])` |
+| `ret_nodes` | (n_ret_quad, 3) | Return residual nodes |
+| `ret_weights` | (n_ret_quad,) | Return tensor-product weights |
+
+`n_ret_quad = prod(n_ret_nodes_1d)`. With the legacy scalar form
+`n_ret_nodes_1d = K`, this is `K^3`. With the per-dimension form
+`n_ret_nodes_1d = (K_rtb, K_xr, K_xb)`, this is `K_rtb · K_xr · K_xb`.
 
 ### 5.5 Simulation
 
@@ -360,6 +364,274 @@ mu_r = const_r + A_r @ s_t + M @ v^s      # 3-vector [rtb, xr, xb]
 ```
 
 Return residuals are drawn from N(0, Sigma_r_cond) via its Cholesky factor.
+
+### 5.6 Sensitivity of the conditional-return cloud to discretization knobs
+
+Four knobs in `DiscretizationConfig` shape the joint state×return cloud the
+solver integrates over:
+
+| knob | type | what it controls |
+|------|------|------------------|
+| `state_n_stds` | float OR length-3 sequence | half-width of the state grid in standardized state-stationary units; scalar broadcasts to all axes, sequence applies a per-axis bound. In `principal` mode the axes are Cholesky directions (mixed across physical state vars); in `lyapunov-axis` mode the axes are physical state vars. |
+| `state_grid_sizes` | tuple `(N_y_1, N_spr, N_cy)` | number of grid points per state dimension |
+| `n_state_quad_nodes` (K_state) | int | Gauss-Hermite order per state-innovation dim |
+| `n_ret_nodes_1d` | tuple `(K_rtb, K_xr, K_xb)` | per-dimension GH order for return residuals |
+
+**Per-axis `state_n_stds` (added 2026-04-30; production ordering changed
+2026-04-30 evening).** The default state ordering is now `(cy, spr, y_1)`
+(`state_indices=(2, 1, 0)` in `var.py`). With that ordering, the Cholesky
+`L` columns project to physical axes as:
+`L[:, 0] = (+0.530, 0, 0)` — pure cy,
+`L[:, 1] = (-0.054, +0.0158, 0)` — mostly spr with mild cy leakage,
+`L[:, 2] = (+0.378, -0.0187, +0.0165)` — y_1 absorbing the residual coupling.
+Reading off the dominant physical contribution of each Cholesky direction
+in `principal` mode under the default ordering:
+
+- `state_n_stds[0]` ↓ shrinks Cholesky axis 0 → **pure cy**, 100% of cy variance (clean)
+- `state_n_stds[1]` ↓ shrinks Cholesky axis 1 → primarily reduces spr (~99%) and a small share of y_1
+- `state_n_stds[2]` ↓ shrinks Cholesky axis 2 → reduces residual y_1 only
+
+So `state_n_stds[0]` is the cheapest, cleanest knob for the cy corner;
+`state_n_stds[1]` for spr (which drives `α_b` via `Φ_21[xb, spr] = +4.49`);
+`state_n_stds[2]` is rarely material because it only carries the y_1 residual
+that's left after cy and spr have been orthogonalized away.
+
+For the legacy ordering `(y_1, spr, cy)` (used by `saved_runs/*` prior to
+2026-04-30), the mapping was: `state_n_stds[0]` → y_1 + cy mix,
+`state_n_stds[1]` → spr-dominant + 40% of cy, `state_n_stds[2]` → cy-only
+but only 58% of cy variance. The reorder gave us a clean cy knob that the
+legacy ordering geometrically could not provide.
+
+For exact per-physical-axis control regardless of ordering, use
+`state_grid_mode="lyapunov-axis"` where each `state_n_stds[d]` directly
+sets `±n_stds[d] · σ_stat[d]` on the physical axis. See
+`tests/test_state_grid_modes.py::run_per_axis_n_stds_checks` for
+verification (scalar↔tuple bit-equivalence, asymmetric extents, and
+trilinear exact-on-linear preservation).
+
+The structural metrics that move with these knobs (no solver run needed —
+all computed from `(model, pc)` plus the joint cloud at each state):
+
+| metric | meaning |
+|--------|---------|
+| `max ‖α_merton(s)‖∞` | per-period Merton optimum on the cloud at the most-extreme state — upper bound on what the per-period FOC will demand |
+| `p_α>τ` | cumulative `state_stationary_probs` mass of states where `‖α_merton‖∞ > τ` |
+| `max joint Sharpe` | max over states of `√(μ_e^⊤ Σ_e^{-1} μ_e)` from the empirical cloud |
+| `max E[xr|s]`, `max E[xb|s]` | conditional log excess returns at the worst grid point |
+| `grad` | max `‖α_merton(s) − α_merton(s')‖∞` between adjacent grid states (interpolation gradient) |
+| `R²_xr`, `R²_xb` | effective predictability `Var(E[r|s])_stat / Var(r)` weighted by stationary mass |
+
+#### Mapping knob → metric
+
+```
+                     M1: less probability   M2: smaller Sharpe   M3: less return    M4: smaller
+                     of extreme states      at extreme states    predictability    interp. bleed
+                     (p_α>5, p_α>10)        (max Sharpe)         (R²_xr, R²_xb)    (grad)
+─────────────────────────────────────────────────────────────────────────────────────────────────
+state_n_stds ↓       ✓ (linear in |s|)      ✓ (linear in |s|)    ✓ (Var(s) ↓)      ✓ (per-state α ↓)
+state_grid_sizes ↑   — (corners unchanged)  —                    —                  ✓ (smaller jumps)
+K_state ↑            —                      —                    —                  —
+K_ret ↑              —                      —                    —                  —
+```
+
+The conditional mean `E[r | s] = const_r + Phi_21·s` is determined by the
+formula at any state, independent of how many quadrature nodes integrate
+over `(v^s, ε_r)`. With both `v^s` and `ε_r` mean-zero by construction (the
+joint moments are exact at low K — see §6.5), refining `K_state` or `K_ret`
+does not move M1, M2, M3, or M4. Refinement of those knobs only sharpens
+higher-order moment integration on the cloud at any *fixed* state.
+
+#### Empirical sweep at the production calibration
+
+`_diag_grid_quad_sweep.py` builds a Precompute for each cell and computes
+the metrics above. Selected rows from a sweep at the production VAR
+parameters and `γ=3, n_z=5, n_eps_nodes=3, n_eta_nodes=3`:
+
+```
+config                              N_s   max_α  p_α>2  p_α>5  p_α>10  maxSh  max_xr  max_xb   grad   R²_xr  R²_xb
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+baseline    (5,5,5)/2.0/K2/(3,5,3)  125  10.70  51.96%  8.69%  0.03%   2.09  0.217   0.181    3.95   0.063  0.304
+
+— tighten state_n_stds, fixed grid (5,5,5) and quadrature ((3,5,3)/K2) —
+nstds=1.75                          125   8.99  52.21%  7.84%  0.00%   1.81  0.199   0.159    3.28   0.059  0.288
+nstds=1.5                           125   7.38  48.68%  5.06%  0.00%   1.56  0.180   0.138    2.67   0.053  0.265
+nstds=1.0                           125   4.43  42.54%  0.00%  0.00%   1.14  0.144   0.097    1.60   0.035  0.189
+
+— refine state_grid_sizes, fixed n_stds=2.0 and quadrature ((3,5,3)/K2) —
+grid=(5,7,7)                        245  10.70  51.25%  7.98%  0.02%   2.09  0.217   0.181    2.70   0.061  0.294
+grid=(7,7,7)                        343  10.70  52.15%  8.24%  0.04%   2.09  0.217   0.181    2.70   0.060  0.293
+grid=(9,9,9)                        729  10.70  50.36%  7.87%  0.02%   2.09  0.217   0.181    2.05   0.059  0.289
+
+— combined ((5,7,7) grid + tighter n_stds) —
+combo (5,7,7)/1.5                   245   7.38  48.58%  4.91%  0.00%   1.56  0.180   0.138    1.81   0.051  0.257
+combo (7,7,7)/1.5                   343   7.38  49.48%  4.52%  0.00%   1.56  0.180   0.138    1.81   0.051  0.257
+
+— quadrature refinement only, fixed grid (5,5,5)/2.0 —
+K_state=3                           125  10.62  51.96%  8.69%  0.03%   2.08  0.217   0.181    3.93   0.063  0.304
+K_state=4                           125  10.62  51.96%  8.69%  0.03%   2.08  0.217   0.181    3.93   0.063  0.304
+K_ret=(3,9,3)                       125  10.70  51.96%  8.69%  0.03%   2.09  0.217   0.181    3.95   0.063  0.304
+K_ret=(5,9,5)                       125  10.70  51.96%  8.69%  0.03%   2.09  0.217   0.181    3.95   0.063  0.304
+```
+
+Reading the rows:
+
+- **`state_n_stds` only.** Each metric in M1, M2, M3 column moves
+  monotonically. `max_α` falls 10.70 → 7.38 (n_stds=1.5) → 4.43 (n_stds=1.0).
+  `max_xb` falls 0.181 → 0.138 → 0.097. `R²_xb` falls 30.4% → 26.5% → 18.9%.
+  The interpolation gradient also drops because per-state `α_merton`
+  magnitudes shrink at all grid points.
+
+- **`state_grid_sizes` only.** `max_α`, `max_xr`, `max_xb`, `Sharpe`, and the
+  high-leverage probability mass are essentially unchanged across (5,5,5),
+  (5,7,7), (7,7,7), (9,9,9) at fixed `n_stds=2.0`. The corner state's
+  economic vector and conditional return mean are identical because the
+  bracket grid endpoints `±n_stds` don't move. `grad` does drop monotonically
+  (3.95 → 2.70 → 2.05) — this is the interpolation-density effect: with more
+  intermediate grid points the maximum jump in `α_merton` between neighbours
+  gets smaller.
+
+- **`K_state` and `K_ret`.** Across `K_state ∈ {2, 3, 4}` and
+  `K_ret ∈ {(3,5,3), (3,9,3), (5,9,5)}` at fixed grid, every metric is
+  identical to ≤ 1% (`max_α` moves 10.70 → 10.62 with K_state=3, well
+  inside numerical noise; everything else exact). The conditional means
+  and covariances of the cloud are exact at K_state=2 / K_ret=(3,5,3)
+  (T-Q7 verified the rule integrates these moments to 1e-16); higher orders
+  do not enter `α_merton` or Sharpe at first order.
+
+#### What the cloud-level conditional return looks like under each knob
+
+The grid-corner conditional excess return `E[xr|s]` and `E[xb|s]` track
+`Phi_21 · s` linearly:
+
+```
+E[xr | s] = const_xr + Phi_21[xr,:] · s
+        = 0.472  + (-1.801)·y_1 + (-0.523)·spr + (+0.107)·cy
+
+E[xb | s] = const_xb + Phi_21[xb,:] · s
+        = -0.311 + (+1.462)·y_1 + (+4.492)·spr + (-0.055)·cy
+```
+
+The bond loading on `spr` (+4.49) and the stock loading on `y_1` (-1.80)
+dominate the corner extremes. At `state_n_stds=2.0` in principal mode the
+grid corner combinations push these into the 0.18–0.22 log-return range
+(18–22% conditional excess), which exceeds the in-sample VAR equation R²
+ranges (xr R²=5.9%, xb R²=32.2%) — i.e., the corners sit outside the
+data hull where the linear projection is an extrapolation rather than an
+in-sample prediction. Tightening `n_stds` shrinks this extrapolation
+margin proportionally; refining the grid does not.
+
+The corner *probabilities* under principal mode go in the opposite
+direction: in `_normal_bin_probs`, the corner bin spans `(-∞, midpoint)`
+in standardized coordinates, so tightening `n_stds` makes the corner bin
+*larger* in stationary mass (its tail share grows) even though the corner
+state is *less extreme* economically. The full sweep table shows this as
+roughly stable `p_α>2` across n_stds (e.g. 51.96% → 48.68% at
+n_stds=1.5) — the high-leverage demand at moderate states doesn't go
+away, only the deepest tail (`p_α>5`, `p_α>10`) thins out.
+
+#### Pointer
+
+Reproduce the table with `python _diag_grid_quad_sweep.py`. The cell-level
+metrics for the saved bundle are produced by `_diag_quadrature_cloud.py`
+(per-state Merton, Sharpe, arbitrage gap, moment recovery — T-Q1 through
+T-Q7 in `HANDOFF_UNCONSTRAINED_LEVERAGE.md`).
+
+#### Choosing `state_n_stds` — what the knob solves and how to pick a value
+
+`state_n_stds` is the **coverage knob**. It does not affect the VAR's
+covariance structure (`Σ_z`, `L`, `M`, `Σ_r_cond`, `Σ_rr` are all
+unchanged); it only sets where the lattice corners land. The trade-off is
+between *tail coverage* (high values) and *corner discipline* (low values).
+
+**Recommended baseline (production):** `state_n_stds=2.0` scalar. Verified
+arbitrage-free at K_ret=(3,5,3), K_state=2 across γ ∈ {3, 5}, with ≥99%
+historical hull coverage in principal mode at this setting.
+
+**Per-axis tightening when the unconstrained solver shows extreme tail leverage**
+(under the default cy-first ordering, `state_indices=(2, 1, 0)` since 2026-04-30):
+
+```
+state_n_stds = (0.3-0.5, 1.0-1.25, 2.0)   # tighten cy and spr; keep y_1 wide  (typical fix)
+state_n_stds = (2.0,     1.0-1.25, 2.0)   # spr-driven leverage problem (axis 1)
+state_n_stds = (0.3-0.5, 2.0,      2.0)   # cy-only tightening (axis 0)
+state_n_stds = (2.0,     2.0,      1.5)   # rare; only if residual y_1 corner misbehaves
+```
+
+The Cholesky-axis-to-physical-variable map under the default ordering
+(`cy, spr, y_1`) is documented in §5.6 above — index 0 is pure cy
+(100 % of cy variance), index 1 is the spr-dominant axis (~99 %),
+index 2 is residual y_1.
+
+**Dialing DOWN — what it solves**
+
+| symptom | cause | knob |
+|---|---|---|
+| Unconstrained α_b > 30 at corner states | μ_xb hits +0.16 at `(spr=+0.064)` corner = `+4σ_innov spr` | `state_n_stds[1]` ↓ (spr axis) |
+| Unconstrained α_s > 5 at corner states | μ_xr/y_1 corner is large (Phi_21[xr, y_1] = −1.80) | `state_n_stds[2]` ↓ (residual y_1 axis); under legacy ordering, was axis 0 |
+| Discrete-cloud arbitrage at extreme states | μ_e at corners exceeds residual support of K_ret quadrature | `state_n_stds` ↓ uniformly OR refine `K_ret` |
+| EGM interpolation bleed (high `grad`) | adjacent corner states have very different α_merton | `state_n_stds` ↓ shrinks per-state α range |
+| max joint Sharpe > 2 | μ_e/σ_e blowing up at corners (extrapolation outside data hull) | `state_n_stds` ↓ |
+
+Empirical sweep at the (5,5,5) production grid:
+
+```
+n_stds   max_α   max_xb   max joint Sharpe   p_α>5   p_α>10
+2.0      10.70   0.181    2.09               8.69%   0.03%
+1.75      8.99   0.159    1.81               7.84%   0.00%
+1.5       7.38   0.138    1.56               5.06%   0.00%
+1.0       4.43   0.097    1.14               0.00%   0.00%
+```
+
+`max_α` falls roughly linearly in `n_stds` (corner state's μ_e is linear
+in `s`, and α_merton is linear in μ_e at fixed Σ).
+
+**Dialing UP — what it costs**
+
+| symptom | cause | knob |
+|---|---|---|
+| Conditional return cloud unrealistically large at corners | corner physical state outside data hull (e.g. spr ≈ +4σ_innov) | `state_n_stds` ↓ |
+| Unconstrained policy on the no-bankruptcy boundary (H1b) | corner conditional mean too aggressive vs. residual support | `state_n_stds` ↓ |
+| α_merton ≫ Markowitz at corners | predictability extrapolated past in-sample R² ranges | `state_n_stds` ↓ |
+| Higher solver compute time | `max_iter_unconstrained` triggered more often at corners | `state_n_stds` ↓ |
+
+Dialing up only "buys" you tail-state coverage. Two reasons it's rarely worth
+the cost:
+
+1. **The corners are not in-sample.** Our VAR was estimated on T=63 annual
+   observations. `n_stds=3` in principal mode pushes corner physical-axis
+   values out to roughly `±10σ_innov` on cy and `±6σ_innov` on spr — these
+   are extrapolations past anything historically observed, and the linear
+   `Phi_21·s` projection there has no empirical anchor.
+
+2. **The simulator handles tail draws via flat extrapolation already.** A
+   tightly-bounded grid that excludes 1% of simulated states still produces
+   well-behaved policies on the 99% interior; the simulator's
+   `state_bracket_grids` clamping puts off-grid paths on the boundary policy
+   without crashing. The off-grid diagnostic in `simulation.py` will warn
+   when this exceeds 5%.
+
+**Diagnostic workflow for choosing the value**
+
+1. Solve at the current default (`state_n_stds=2.0` scalar).
+2. Inspect `_diag_quadrature_cloud.py` output for the saved bundle — look at
+   `max_α`, `max joint Sharpe`, and per-state arbitrage gap.
+3. If `max_α > 5` or `max Sharpe > 1.5` and you don't believe the
+   corner-state economics, identify the worst axis (look at which
+   `Phi_21[ret_var, state_var]` term is dominant at the worst corner) and
+   tighten the corresponding `state_n_stds[d]`. Under the default cy-first
+   ordering this almost always points to axis 1 (spr) or axis 0 (cy).
+4. Re-solve and re-simulate. Confirm with the simulator's off-grid warning
+   that the tighter grid still covers the simulated wealth distribution.
+5. If simulated z or s drift outside the grid by more than ~5% of household-years,
+   you've gone too far — widen the relevant axis back.
+
+The right `state_n_stds` is the smallest value at which the simulator
+doesn't materially leak off-grid AND the corner-state α_merton is within
+~2× of the unconditional Markowitz allocation. For our calibration that's
+empirically `state_n_stds=2.0` scalar or, under the default cy-first
+ordering, `(0.3–0.5, 1.0–1.25, 2.0)` per-axis (tighten cy and spr, keep y_1
+wide). Under the legacy y_1-first ordering, the equivalent recommendation
+was `(2.0, 1.0–1.5, 1.0–1.5)`.
 
 ---
 
@@ -515,8 +787,9 @@ mean that affected the old unconstrained estimator.
       EC_NEWTON_FAIL exits at unconstrained γ=3 are not numerical: they are
       states where the discrete return quadrature contains an arbitrage. The
       convex hull of the joint excess-return cloud
-      `{(R_s^(n) - R_bill^(n), R_b^(n) - R_bill^(n))}_n` over the K_state·K_ret
-      quadrature nodes does not contain the origin, so a separating direction
+      `{(R_s^(n) - R_bill^(n), R_b^(n) - R_bill^(n))}_n` over the
+      `n_state_quad · n_ret_quad` quadrature nodes does not contain the origin,
+      so a separating direction
       (d_s, d_b) makes `d·X^(n) ≥ 0` at every node — guaranteed positive return
       per unit leverage in the discrete model. Unconstrained CRRA then has no
       interior optimum and Newton runs to budget. Add a `convex_hull_arb_gap`
@@ -524,19 +797,21 @@ mean that affected the old unconstrained estimator.
       state_grid=5×5×5 principal/3.0σ, K_state=2, K_ret=3 → 24/125 states
       arbitrage). Note one such state passes EC_INTERIOR by phantom convergence
       at huge α.
-- [ ] **Per-dimension K_ret with stock-axis priority** — The arbitrage is
-      eliminated most cheaply by refining the stock residual (xr) axis, not
-      the bond axis. With the eigendecomposition Cholesky, K_xr controls the
-      principal eigenvector direction (largest residual variance), and joint
-      stock+bond crash scenarios are what's missing from the convex hull.
-      Empirical (smoke-test config, see above): bond-only refinement
-      (3,3,21)=189 nodes leaves 18 arbitrages; stock-only (3,15,3)=135 nodes
-      eliminates all 24; uniform (9,9,9)=729 nodes leaves 1. Highest ROI:
-      change `n_ret_nodes_1d: int` to a 3-tuple `(K_rtb, K_xr, K_xb)` in
-      `DiscretizationConfig` and update `get_return_quadrature` to accept
-      per-dimension counts. Target a config that eliminates arbitrage at
-      acceptable solver runtime — actual full-solve timings to be measured
-      before fixing a value.
+- [x] **Per-dimension K_ret with stock-axis priority** — IMPLEMENTED.
+      `n_ret_nodes_1d` in `DiscretizationConfig` accepts either a scalar `int`
+      (uniform across all return dimensions, legacy default) or a length-3
+      tuple `(K_rtb, K_xr, K_xb)`. The arbitrage is eliminated most cheaply
+      by refining the stock residual (xr) axis: with the eigendecomposition
+      transform, K_xr controls the principal eigenvector direction (largest
+      residual variance), which is where the missing joint stock+bond crash
+      scenarios live. Empirical (smoke-test config above): bond-only
+      refinement `(3,3,21)`=189 nodes leaves 18 arbitrages; stock-only
+      `(3,15,3)`=135 nodes eliminates all 24; uniform `(9,9,9)`=729 nodes
+      leaves 1. The user picks the production tuple after measuring full-solve
+      runtime; default stays at scalar `2` for backward compatibility.
+      `get_return_quadrature` and `Precompute` normalize either form via
+      `discretization._normalize_ret_nodes` before building the asymmetric
+      Hermite tensor product.
 - [ ] **State-grid pruning of arbitrage points** — Complement to the above.
       During grid construction, after building the principal-axis lattice,
       compute the arbitrage gap at every candidate state and drop those with

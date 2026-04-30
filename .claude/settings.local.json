@@ -5,7 +5,8 @@
       "Bash(python -c \":*)",
       "WebFetch(domain:sylvaincatherine.net)",
       "WebFetch(domain:www.federalreserve.gov)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=. python _diag_quadrature_cloud.py)"
     ]
   }
 }

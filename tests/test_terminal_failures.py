@@ -8,7 +8,7 @@ we do a brute-force grid scan of (alpha_s, alpha_b) ∈ [-3, 3]² to find the
 true minimum of ||F||. Then we compare:
   - Newton's returned (alpha_s, alpha_b) vs the brute-force optimum
   - Newton's residual vs the brute-force minimum residual
-  - State values (y_1, spr, cy) at the failing states
+  - State values at the failing states (in MODEL state-name order)
   - Whether R_p ever goes near min_return_power in the FOC scenarios
 
 Hypothesis being tested: for unconstrained portfolios at certain financial
@@ -175,7 +175,8 @@ def main():
     # Brute-force scan for the first 5 failing states
     # ------------------------------------------------------------------
     print(f"\nBrute-force scan of first 5 failing states:")
-    print(f"  {'i_s':>4}  {'state (y_1,spr,cy)':<24}  "
+    _state_hdr = "state " + ",".join(model.state_names)
+    print(f"  {'i_s':>4}  {_state_hdr:<24}  "
           f"{'Newton (a,b)':<18} {'N_resid':>9}  "
           f"{'BruteOpt (a,b)':<18} {'BF_resid':>9}  "
           f"{'min R_p @ BF':>12}  {'iters':>5}")

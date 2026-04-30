@@ -156,6 +156,24 @@ def _independence_rouwenhorst_pi(N_vec, Phi, Sigma_innov):
     return Pi_joint, state_indices
 
 
+def _normalize_n_stds(n_stds, k):
+    """Broadcast scalar to length-k float array; validate length and positivity.
+
+    Accepts a scalar (int/float) or a length-k sequence. Returns a length-k
+    float ndarray. Raises on length mismatch or non-positive entries.
+    """
+    arr = np.asarray(n_stds, dtype=float)
+    if arr.ndim == 0:
+        arr = np.full(int(k), float(arr))
+    if arr.shape != (int(k),):
+        raise ValueError(
+            f"n_stds must be scalar or length-{int(k)} sequence; got shape {arr.shape}"
+        )
+    if np.any(arr <= 0):
+        raise ValueError(f"all n_stds entries must be > 0; got {arr.tolist()}")
+    return arr
+
+
 def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="principal"):
     """Build the financial-state interpolation grid.
 
@@ -169,8 +187,12 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
         State persistence matrix.
     Sigma_innov : ndarray, shape (k, k)
         Innovation covariance matrix.
-    n_stds : float
-        Half-width of each interpolation axis in standardized units.
+    n_stds : float or sequence of length k
+        Half-width of each interpolation axis in standardized units. A scalar
+        broadcasts to all axes. A length-k sequence applies a per-axis bound.
+        In `principal` mode, axes are Cholesky directions (not physical state
+        variables); in `lyapunov-axis` mode, axes correspond to the physical
+        state variables.
     mode : {"naive", "lyapunov-axis", "principal"}
         Grid construction mode.
 
@@ -201,6 +223,8 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     if mode not in {"naive", "lyapunov-axis", "principal"}:
         raise ValueError(f"Unknown state grid mode: {mode!r}")
 
+    n_stds_arr = _normalize_n_stds(n_stds, k)
+
     mu_s = np.linalg.solve(np.eye(k) - Phi, mu_intercept)
     Sigma_z = stationary_covariance(Phi, Sigma_innov)
     sigma_z = np.sqrt(np.maximum(np.diag(Sigma_z), 0.0))
@@ -212,7 +236,7 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
 
     if mode == "principal":
         state_bracket_grids = [
-            np.linspace(-float(n_stds), float(n_stds), int(N_vec[d]), dtype=float)
+            np.linspace(-n_stds_arr[d], n_stds_arr[d], int(N_vec[d]), dtype=float)
             for d in range(k)
         ]
         state_grid = np.empty((n_total, k), dtype=float)
@@ -236,8 +260,8 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     else:
         if mode == "lyapunov-axis":
             state_bracket_grids = [
-                np.linspace(mu_s[d] - float(n_stds) * sigma_z[d],
-                            mu_s[d] + float(n_stds) * sigma_z[d],
+                np.linspace(mu_s[d] - n_stds_arr[d] * sigma_z[d],
+                            mu_s[d] + n_stds_arr[d] * sigma_z[d],
                             int(N_vec[d]), dtype=float)
                 for d in range(k)
             ]
@@ -528,19 +552,60 @@ def get_return_quadrature(model, n_nodes=1):
     return ret_nodes, ret_weights
 
 
+def _normalize_state_nodes(value, n_state):
+    """Normalize n_state_quad_nodes to a length-n_state tuple of ints.
+
+    Accepts a scalar (broadcast to every axis) or a length-`n_state`
+    sequence. Mirrors `_normalize_ret_nodes` for the return quadrature.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("n_state_quad_nodes must be int or sequence of ints, got bool")
+    try:
+        scalar = int(value)
+        if scalar != value:
+            raise TypeError
+        return (scalar,) * int(n_state)
+    except TypeError:
+        pass
+    try:
+        t = tuple(int(v) for v in value)
+    except TypeError as exc:
+        raise TypeError(
+            f"n_state_quad_nodes must be int or sequence of ints, "
+            f"got {type(value).__name__}"
+        ) from exc
+    if len(t) != int(n_state):
+        raise ValueError(
+            f"n_state_quad_nodes tuple length {len(t)} does not match "
+            f"n_state={int(n_state)}"
+        )
+    return t
+
+
 def get_state_quadrature(model, n_nodes=3):
     """State innovation quadrature for N(0, Sigma_ss).
 
-    Constructs K^n_state tensor-product Gauss-Hermite nodes for integrating
-    over the state innovation v^s ~ N(0, Sigma_ss). Used by the solver to
-    replace the discrete Markov chain Pi_state.
+    Constructs tensor-product Gauss-Hermite nodes for integrating over the
+    state innovation v^s ~ N(0, Sigma_ss). Used by the solver to replace
+    the discrete Markov chain Pi_state.
+
+    The Cholesky transform `v = L u` (lower-triangular) makes the per-axis
+    K_per_dim[d] interpretable: under Cholesky factorization of Σ_ss with
+    state ordering (cy, spr, y_1) (default since 2026-04-30), axis 0 is
+    pure cy innovation, axis 1 is mostly spr innovation, axis 2 is
+    residual y_1 innovation. Refining K[2] is the targeted lever for
+    bond-return integration accuracy at high γ × |α| because
+    `M[xb, y_1] = -8.7` is the dominant v-channel for bond returns.
 
     Parameters
     ----------
     model : LifecyclePortfolioModel
         Supplies `n_state` and `Sigma_ss`.
-    n_nodes : int
-        Gauss-Hermite order per state dimension. Total nodes = n_nodes ** n_state.
+    n_nodes : int OR sequence of ints of length `model.n_state`
+        Gauss-Hermite order per state-innovation dimension. A scalar `K`
+        is equivalent to the uniform tuple `(K,) * n_state`. With per-
+        dimension orders `(K_0, ..., K_{n_state-1})`, the tensor-product
+        rule has `prod(K_d)` joint nodes.
 
     Returns
     -------
@@ -549,23 +614,32 @@ def get_state_quadrature(model, n_nodes=3):
     v_weights : ndarray, shape (K_total,)
         Tensor-product quadrature weights summing to one.
     """
-    if n_nodes < 1:
-        raise ValueError("n_nodes must be >= 1 for state quadrature")
-
     n_state = int(model.n_state)
+    K_per_dim = _normalize_state_nodes(n_nodes, n_state)
+    if any(k < 1 for k in K_per_dim):
+        raise ValueError("All entries of n_state_quad_nodes must be >= 1")
 
-    nodes_1d, weights_1d = roots_hermite(n_nodes)
-    weights_1d = weights_1d / np.sqrt(np.pi)
-    nodes_1d = nodes_1d * np.sqrt(2.0)
+    grids_z, grids_w = [], []
+    for K in K_per_dim:
+        if K == 1:
+            grids_z.append(np.zeros(1, dtype=float))
+            grids_w.append(np.ones(1, dtype=float))
+        else:
+            z, w = roots_hermite(K)
+            grids_z.append(z * np.sqrt(2.0))
+            grids_w.append(w / np.sqrt(np.pi))
 
-    # Tensor product in standard-normal space
-    grid_1d = np.meshgrid(*([nodes_1d] * n_state), indexing="ij")
-    weight_1d = np.meshgrid(*([weights_1d] * n_state), indexing="ij")
+    # Tensor product in standard-normal space (per-axis K)
+    grid_1d = np.meshgrid(*grids_z, indexing="ij")
+    weight_1d = np.meshgrid(*grids_w, indexing="ij")
 
-    z_nodes = np.stack([g.ravel() for g in grid_1d], axis=1)     # (K_total, n_state)
-    v_weights = np.prod(np.stack(weight_1d, axis=0), axis=0).ravel()  # (K_total,)
+    z_nodes = np.stack([g.ravel() for g in grid_1d], axis=1)            # (K_total, n_state)
+    v_weights = np.prod(np.stack(weight_1d, axis=0), axis=0).ravel()    # (K_total,)
 
-    # Transform from standard normal to N(0, Sigma_ss) via Cholesky
+    # Transform from standard normal to N(0, Sigma_ss) via Cholesky.
+    # Lower-triangular L makes axis d in u-space correspond to the d-th
+    # variable's residual contribution after the previous variables have
+    # been orthogonalized away (Gram-Schmidt order = state ordering).
     Sigma = 0.5 * (np.asarray(model.Sigma_ss, dtype=float)
                     + np.asarray(model.Sigma_ss, dtype=float).T)
     L = np.linalg.cholesky(Sigma)

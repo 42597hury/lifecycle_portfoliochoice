@@ -107,8 +107,15 @@ class Precompute:
         self.n_ret_nodes_1d = K_ret_per_dim   # tuple of ints, length n_ret (always normalized)
 
         # --- Grids ---
+        effective_savings_max = disc_config.wealth_max if disc_config.savings_max is None else float(disc_config.savings_max)
+        if effective_savings_max <= disc_config.savings_min:
+            raise ValueError("savings_max must be strictly greater than savings_min")
+        if effective_savings_max > disc_config.wealth_max:
+            raise ValueError("savings_max cannot exceed wealth_max; widen wealth_max instead")
+
         self.wealth_grid = np.geomspace(disc_config.wealth_min, disc_config.wealth_max, disc_config.n_wealth)
-        self.s_grid      = np.geomspace(disc_config.savings_min, disc_config.wealth_max, disc_config.n_savings)
+        self.savings_max = effective_savings_max
+        self.s_grid      = np.geomspace(disc_config.savings_min, self.savings_max, disc_config.n_savings)
         self.ages        = np.arange(model.start_age, model.terminal_age + 1)
 
         # --- Financial state VAR discretization ---
@@ -363,7 +370,7 @@ class Precompute:
 
     def regenerate_savings_grid(self, n_s_points):
         """Utility for sensitivity runs in Part 2."""
-        return np.geomspace(self.disc_config.savings_min, self.wealth_grid[-1], int(n_s_points))
+        return np.geomspace(self.disc_config.savings_min, self.savings_max, int(n_s_points))
 
     def _print_summary(self):
         print("=" * 64)
@@ -374,7 +381,13 @@ class Precompute:
               f"  ({self.n_age} periods,"
               f" retire at {self.model.retire_age})")
         print(f"State grid   : {sizes_str} = {self.N_state} joint states")
-        print(f"  mode       : {self.state_grid_mode}  |  half-width = {self.disc_config.state_n_stds:.2f}")
+        ns = self.disc_config.state_n_stds
+        ns_arr = np.atleast_1d(np.asarray(ns, dtype=float))
+        if ns_arr.size == 1:
+            ns_str = f"{float(ns_arr[0]):.2f}"
+        else:
+            ns_str = "(" + ", ".join(f"{x:.2f}" for x in ns_arr) + ")"
+        print(f"  mode       : {self.state_grid_mode}  |  half-width = {ns_str}")
         print(f"  state vars : {list(self.model.state_names)}")
         print(f"  return vars: {list(self.model.ret_names)}")
         print(f"Income grid  : {self.n_z} persistent states"
@@ -382,8 +395,15 @@ class Precompute:
         K_str = "x".join(str(k) for k in self.n_ret_nodes_1d)
         print(f"Return quad  : ({K_str}) nodes/dim"
               f"  ->  {self.n_ret_quad} joint nodes")
-        print(f"State quad   : {self.disc_config.n_state_quad_nodes} nodes/dim"
+        K_state_disp = self.disc_config.n_state_quad_nodes
+        if hasattr(K_state_disp, "__len__"):
+            K_state_str = "(" + "x".join(str(k) for k in K_state_disp) + ")"
+        else:
+            K_state_str = str(K_state_disp)
+        print(f"State quad   : {K_state_str} nodes/dim"
               f"  ->  {self.n_state_quad} joint nodes")
+        print(f"Wealth grid  : {self.n_w} points  [{self.wealth_grid[0]:.3e}, {self.wealth_grid[-1]:.3e}]")
+        print(f"Savings grid : {self.n_s} points  [{self.s_grid[0]:.3e}, {self.s_grid[-1]:.3e}]")
         print(f"mu_r         : {self.mu_r.shape}"
               f"  ({self.N_state * self.N_state * self.model.n_ret:,} values)")
         print(f"ret_nodes    : {self.ret_nodes.shape}")

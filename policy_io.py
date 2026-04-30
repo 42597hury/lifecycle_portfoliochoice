@@ -181,6 +181,35 @@ def load_policy_bundle(
         with meta_path.open("r", encoding="utf-8") as f:
             metadata = json.load(f)
 
+    # State-ordering guard: warn if the bundle was produced under a different
+    # state_indices than the current var.py default.  Prevents silent column
+    # mislabelling when an old (y_1, spr, cy) bundle is loaded after the
+    # 2026-04-30 reorder default to (cy, spr, y_1).
+    try:
+        from var import build_nominal_system1_var_config as _bn
+        import inspect as _inspect
+        _default_state_indices = list(
+            _inspect.signature(_bn).parameters["state_indices"].default
+        )
+        _bundle_var_cfg = (
+            metadata.get("run_config", {}).get("var_config", {}) if metadata else {}
+        )
+        _bundle_state_indices = _bundle_var_cfg.get("state_indices")
+        if (
+            _bundle_state_indices is not None
+            and list(_bundle_state_indices) != _default_state_indices
+        ):
+            warnings.warn(
+                f"Bundle '{bundle.name}' was solved with state_indices="
+                f"{list(_bundle_state_indices)}, but the current var.py default is "
+                f"{_default_state_indices}. The bundle's state_grid columns are in "
+                f"the OLD order; do not mix with arrays from a freshly-built "
+                f"Precompute under the current default. Re-solve to migrate."
+            )
+    except Exception:
+        # Guard is advisory; never block a load on an inspection failure.
+        pass
+
     return C_mat, S_mat, B_mat, diagnostics, metadata
 
 

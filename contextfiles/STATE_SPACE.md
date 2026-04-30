@@ -69,9 +69,14 @@ z_grid : (n_z,) float64
 
 **Solver treatment:** The z dimension is indexed discretely (`i_z`), but
 within the FOC, next-period z values `z' = ρ·z[i_z] + η_k` land off-grid.
-Policies are **linearly interpolated** between the two bracketing z-grid points.
-Catmull-Rom cubic interpolation is used for consumption when the stencil fits
-(i.e., `iz_lo ≥ 1` and `iz_lo + 2 < n_z`); otherwise falls back to linear.
+Consumption is interpolated by **PCHIP** (Fritsch-Carlson, monotonicity-preserving
+cubic Hermite) on interior intervals where the 4-point stencil fits
+(`iz_lo ≥ 1` and `iz_lo + 2 < n_z`); the first and last z intervals fall back
+to linear. Wealth interpolation is linear on `[iw, iw+1]`. The Jacobian's
+`mpc` is the analytical wealth derivative of the interpolant -- PCHIP
+evaluated at iw and iw+1 then finite-differenced -- which keeps mpc exactly
+consistent with c_val even when the PCHIP slope limiter activates
+asymmetrically across the two wealth corners.
 
 **Simulation treatment:** z is tracked as a continuous float. Policies are
 linearly interpolated between bracketing z-grid points. Income and pension
@@ -83,13 +88,15 @@ are computed directly from continuous z (no table interpolation).
 | `z_grid` | (n_z,) | Persistent income grid points |
 | `Pi_z` | (n_z, n_z) | Transition matrix (retained; NOT used by solver) |
 | `dz` | scalar | Uniform grid spacing |
-| `eta_nodes` | (n_eta,) | GH quadrature nodes for persistent innovation |
+| `eta_nodes` | (n_eta,) | Judd-mixture quadrature nodes for persistent innovation |
 | `eta_weights` | (n_eta,) | Corresponding weights (sum = 1, mean = 0) |
-| `eps_nodes` | (n_eps,) | GH quadrature nodes for transitory shock |
+| `eps_nodes` | (n_eps,) | Judd-mixture quadrature nodes for transitory shock |
 | `eps_weights` | (n_eps,) | Corresponding weights (sum = 1, mean = 0) |
 
-Quadrature node counts: `n_eta = 2 × n_eta_nodes` and `n_eps = 2 × n_eps_nodes`
-(doubled because each mixture component gets its own set of GH nodes).
+Quadrature node counts: `n_eta = disc_config.n_eta_nodes` and
+`n_eps = disc_config.n_eps_nodes` (total node count — Judd 1998
+construction directly on the mixture density; polynomial exactness
+`2n − 1` against the mixture).
 
 ---
 
@@ -97,15 +104,23 @@ Quadrature node counts: `n_eta = 2 × n_eta_nodes` and `n_eps = 2 × n_eps_nodes
 
 ### 3.1 The 3D State Vector
 
-The financial state `s_t` has three components:
+The financial state `s_t` has three components.  The default ordering
+(production, since 2026-04-30) puts cy first so Cholesky `L[:, 0]` is a
+pure-cy column, which makes per-axis `state_n_stds[0]` a clean cy knob:
 
 ```
-s_t = (y_1, spr, cy)
+s_t = (cy, spr, y_1)
 
-state_names = ('y_1', 'spr', 'cy')
-y_1_index_in_state = 0
-spr_index_in_state = 1
+state_names = ('cy', 'spr', 'y_1')
+y_1_index_in_state = 2     # was 0 under the legacy (y_1, spr, cy) ordering
+spr_index_in_state = 1     # spr stays in the middle column
 ```
+
+Saved bundles produced before the reorder use the legacy ordering
+`('y_1', 'spr', 'cy')` with `y_1_index_in_state = 0`.  Pass
+`state_indices=(0, 1, 2)` and `y_1_index_in_state=0` to
+`build_nominal_system1_var_config()` to reproduce the legacy ordering.
+See `contextfiles/RETURNS.md` §5.6 for why the reorder matters.
 
 ### 3.2 Marginal Grids and Cartesian Product
 
@@ -124,7 +139,8 @@ N_state = N_0 × N_1 × N_2             e.g. 125 or 343
 The joint state grid is the Cartesian product of these marginals:
 
 ```
-state_grid   : (N_state, 3) float64 — row i = [y_1, spr, cy] at joint state i
+state_grid   : (N_state, 3) float64 — row i = state vector in MODEL ordering
+                                       (default: [cy, spr, y_1]; legacy: [y_1, spr, cy])
 state_indices: (N_state, 3) int64   — row i = [idx_0, idx_1, idx_2] into marginals
 ```
 
@@ -251,41 +267,63 @@ computes:
 ### 5.2 Return Residual Quadrature
 
 ```
-ret_nodes   : (K_r^n_ret, n_ret) = (K_r^3, 3)   residual return nodes
-ret_weights : (K_r^n_ret,)       = (K_r^3,)      weights (sum = 1)
+ret_nodes   : (n_ret_quad, n_ret) = (n_ret_quad, 3)   residual return nodes
+ret_weights : (n_ret_quad,)                            weights (sum = 1)
 ```
 
-Default `K_r = n_ret_nodes_1d = 2`, giving `2^3 = 8` joint nodes.
+`n_ret_nodes_1d` in `DiscretizationConfig` accepts:
+- a scalar `int K` — uniform Gauss-Hermite order across all `n_ret`
+  dimensions, giving `n_ret_quad = K^n_ret` joint nodes (e.g. `K=2 → 8`,
+  `K=3 → 27`); this is the legacy default,
+- a length-`n_ret` tuple `(K_rtb, K_xr, K_xb)` — per-dimension order,
+  giving `n_ret_quad = prod(K_i)` joint nodes (e.g. `(3,9,3) → 81`).
+
+Use the tuple form to refine the dimensions that matter most for the
+problem: under the eigendecomposition transform in
+`get_return_quadrature`, increasing `K_xr` adds resolution along the
+principal eigenvector direction (largest residual variance), which is
+the cheapest way to kill discretization-arbitrage in the joint
+excess-return cloud at unconstrained CRRA. Default stays `2`.
 
 These are Gauss-Hermite nodes on `N(0, Σ_r_cond)`. Precomputed exponentials
 avoid recomputation in the hot loop:
 ```
-exp_ret_bill  : (K_r^3,)    exp(ret_nodes[:, 0])  — rtb residuals
-exp_ret_stock : (K_r^3,)    exp(ret_nodes[:, 1])  — xr residuals
-exp_ret_bond  : (K_r^3,)    exp(ret_nodes[:, 2])  — xb residuals
+exp_ret_bill  : (n_ret_quad,)    exp(ret_nodes[:, 0])  — rtb residuals
+exp_ret_stock : (n_ret_quad,)    exp(ret_nodes[:, 1])  — xr residuals
+exp_ret_bond  : (n_ret_quad,)    exp(ret_nodes[:, 2])  — xb residuals
 ```
 
 ### 5.3 Income Quadrature (Working Age Only)
 
 ```
-eta_nodes   : (n_eta,) float64    persistent innovation GH nodes
-eta_weights : (n_eta,) float64    weights (sum = 1, mean = 0)
-eps_nodes   : (n_eps,) float64    transitory shock GH nodes
-eps_weights : (n_eps,) float64    weights (sum = 1, mean = 0)
+eta_nodes   : (n_eta,) float64    persistent innovation Judd-mixture nodes
+eta_weights : (n_eta,) float64    weights (sum = 1, mean = 0, all > 0)
+eps_nodes   : (n_eps,) float64    transitory shock Judd-mixture nodes
+eps_weights : (n_eps,) float64    weights (sum = 1, mean = 0, all > 0)
 ```
 
-n_eta = 2 × n_eta_nodes (doubled for two mixture components).
-n_eps = 2 × n_eps_nodes (doubled for two mixture components).
+`n_eta = disc_config.n_eta_nodes` (total node count, no longer
+per-component K). `n_eps` likewise. Polynomial exactness `2n − 1`
+against the mixture density (Judd 1998 §7).
 
 ### 5.4 Total FOC Iterations per Newton Evaluation
 
 | Phase | Outer | × Return | × Persistent | × Transitory | Total |
 |-------|-------|----------|-------------|-------------|-------|
-| Terminal | K_s^3 = 27 | × K_r^3 = 8 | — | — | **216** |
-| Retirement | 27 | × 8 | — | — | **216** |
-| Working | 27 | × 8 | × n_eta = 6 | × n_eps = 6 | **7,776** |
+| Terminal | n_state_quad = 27 | × n_ret_quad = 27 | — | — | **729** |
+| Retirement | 27 | × 27 | — | — | **729** |
+| Working | 27 | × 27 | × n_eta = 3 | × n_eps = 5 | **10,935** |
 
-(Default settings: K_s=3, K_r=2, n_eta_nodes=3, n_eps_nodes=3)
+Counts above use uniform `K_s=3` and uniform `K_r=3`
+(`n_state_quad = 3^3 = 27`, `n_ret_quad = 3^3 = 27`). With per-dimension
+return refinement, `n_ret_quad = prod(n_ret_nodes_1d)` instead — for
+example `(3,9,3) → 81` triples each row's "× Return" factor.
+
+(Default settings: K_s=3, K_r=3, n_eta_nodes=3, n_eps_nodes=5; total
+income nodes 3 × 5 = 15 — for comparison, the previous concatenated-GH
+rule at the same `n_eta_nodes=3, n_eps_nodes=5` produced 6 × 10 = 60
+income nodes, i.e. the Judd migration is a 4× cost reduction on the
+income loop at the same polynomial-exactness order.)
 
 ---
 
@@ -393,9 +431,11 @@ This is a LEVEL return (not log). Estate = savings × R_port.
 | `const_r` | (3,) | = Phi_0_ret |
 | `A_r` | (3, 3) | = Phi_21 |
 | `mu_r` | (N_state, N_state, 3) | Conditional return means |
-| `ret_nodes` | (K_r^3, 3) | Return residual quad nodes |
-| `ret_weights` | (K_r^3,) | Return residual quad weights |
-| `exp_ret_bill/stock/bond` | (K_r^3,) each | Precomputed exp of residuals |
+| `ret_nodes` | (n_ret_quad, 3) | Return residual quad nodes |
+| `ret_weights` | (n_ret_quad,) | Return residual quad weights; sum=1 |
+| `exp_ret_bill/stock/bond` | (n_ret_quad,) each | Precomputed exp of residuals |
+| `n_ret_quad` | scalar int | `prod(n_ret_nodes_1d)`; uniform K → K^3, tuple (K_rtb, K_xr, K_xb) → K_rtb·K_xr·K_xb |
+| `n_ret_nodes_1d` | tuple[int] of length n_ret | Always normalized to a tuple by `Precompute`, even when the user passed a scalar |
 | `annuity_factors` | (N_state,) | Bequest annuity per state |
 | `z_grid` | (n_z,) | Persistent income grid |
 | `Pi_z` | (n_z, n_z) | Income transition (NOT used by solver) |
@@ -430,15 +470,16 @@ Default configurations and their implications:
 | `state_grid_sizes` | (5,5,5) | Marginal state grid → N_state=125 |
 | `n_z` | 7 (code default; 11 in production) | Persistent income grid points |
 | `n_stds` | 3.0 | z-grid covers ±3σ_z |
-| `n_eps_nodes` | 3 | GH nodes per transitory component → n_eps=6 |
-| `n_eta_nodes` | 3 | GH nodes per persistent component → n_eta=6 |
-| `n_ret_nodes_1d` | 2 | GH order per return dim → 2^3=8 return nodes |
+| `n_eps_nodes` | 3 | Total Judd-mixture nodes for transitory shock (= n_eps; exactness 2n−1) |
+| `n_eta_nodes` | 3 | Total Judd-mixture nodes for persistent innovation (= n_eta; exactness 2n−1) |
+| `n_ret_nodes_1d` | 2 | int K → uniform K^n_ret nodes (default 2 → 8); also accepts a tuple `(K_rtb, K_xr, K_xb)` for per-dimension refinement (e.g. `(3,9,3) → 81`) |
 | `n_state_quad_nodes` | 3 | GH order per state dim → 3^3=27 state nodes |
 
 **Scaling rules:**
 - Policy array size scales as `n_age × n_z × N_state × n_w`
-- Solver cost per period scales as `n_z × N_state × (K_s^3 × K_r^3)` for retirement,
-  plus `× n_eta × n_eps` for working age
+- Solver cost per period scales as `n_z × N_state × (n_state_quad × n_ret_quad)`
+  for retirement, plus `× n_eta × n_eps` for working age, where
+  `n_state_quad = K_s^n_state` and `n_ret_quad = prod(n_ret_nodes_1d)`
 - mu_r memory scales as `N_state^2 × 3`
 
 ---
@@ -452,7 +493,7 @@ Default configurations and their implications:
 | α_bill | `1 - alpha_s - alpha_b` | alpha_bill | α^F (bills) |
 | x_t | `x`, cash-on-hand | W_t | W_t |
 | a_t | `savings` | a_t | a_t |
-| s_t | `state_grid[i_s]` | (y_1, spr, cy) | z_t (VAR state) |
+| s_t | `state_grid[i_s]` | (cy, spr, y_1) default; (y_1, spr, cy) legacy | z_t (VAR state) |
 | z_t | `z_grid[i_z]` | z_t (income) | z_t (earnings) |
 | ψ_t | `survival_probs_2d[t, iz]` | psi_{t,z} | ψ_t |
 | R_port | `R_port` | R_port | R_p |

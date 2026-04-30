@@ -26,8 +26,9 @@ import numpy as np
 from numba import njit, prange
 from math import exp
 import time
+from pathlib import Path
 
-from model import SolverConfig, scalar_disposable_income
+from model import SolveControl, SolverConfig, scalar_disposable_income
 
 # =============================================================================
 # DIAGNOSTIC CONSTANTS
@@ -154,18 +155,21 @@ def find_bracket(x, grid):
     """Binary search for interpolation bracket on a sorted grid.
 
     Returns (iw, frac_w, inv_dw) where:
-      grid[iw] <= x < grid[iw+1]
-      frac_w = (x - grid[iw]) / dw
+      iw is clamped to a valid segment index in [0, len(grid)-2]
+      frac_w = (x - grid[iw]) / dw on that segment
       inv_dw = 1.0 / dw
-    Clamps to valid range: iw in [0, len(grid)-2].
+
+    For off-grid x, frac_w is allowed to lie outside [0, 1]. This keeps the
+    returned affine coordinate consistent with the last-segment slope used by
+    the working-age Jacobian.
     """
     n = len(grid)
     if x <= grid[0]:
         dw = grid[1] - grid[0] + 1e-30
-        return 0, 0.0, 1.0 / dw
+        return 0, (x - grid[0]) / dw, 1.0 / dw
     if x >= grid[n - 1]:
         dw = grid[n - 1] - grid[n - 2] + 1e-30
-        return n - 2, 1.0, 1.0 / dw
+        return n - 2, (x - grid[n - 2]) / dw, 1.0 / dw
     lo = 0
     hi = n - 1
     while hi - lo > 1:
@@ -291,34 +295,89 @@ def transform_state_for_bracketing_3d(s0, s1, s2, bracket_shift, bracket_L_inv):
     return u0, u1, u2
 
 
+@njit(fastmath=True, inline='always')
+def _pchip_slope_uniform(d_left, d_right):
+    # Uniform-grid Fritsch-Carlson slope at an interior node. Result is the
+    # derivative per unit of fractional index, matching Hermite eval on [0,1].
+    # Uniform z-spacing required; do not use on non-uniform grids.
+    if d_left == 0.0 or d_right == 0.0:
+        return 0.0
+    if d_left * d_right <= 0.0:
+        return 0.0
+    return 2.0 * d_left * d_right / (d_left + d_right)
+
+
+@njit(fastmath=True, inline='always')
+def _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11):
+    d_l = p1 - p0
+    d_m = p2 - p1
+    d_r = p3 - p2
+    m0 = _pchip_slope_uniform(d_l, d_m)
+    m1 = _pchip_slope_uniform(d_m, d_r)
+    return h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
+
+
 @njit(fastmath=True)
 def _interp_z_wealth(c_next_full, j_s, iz_lo, frac_z, iw, frac_w, inv_dw, n_z, use_cubic, min_c):
     """Interpolate c_next and mpc at a single state-grid corner j_s.
 
-    Combines z-interpolation (Catmull-Rom cubic or linear fallback) with
-    wealth interpolation. Extracted from the working-age FOC inner loop.
+    Uses PCHIP (Fritsch-Carlson, monotonicity-preserving) cubic Hermite in z
+    on interior intervals and linear fallback on the first and last z
+    intervals. Wealth interpolation is linear on [iw, iw+1].
+
+    Interpolation order (cubic branch): wealth-blend the 4-point z stencil
+    FIRST, then apply PCHIP to the blended stencil. This preserves the
+    monotonicity-in-z property at off-grid wealth points -- the
+    "PCHIP-then-blend" alternative violates shape preservation because
+    Fritsch-Carlson is non-linear in stencil values, so it does not
+    commute with linear wealth blending.
+
+    `mpc` is the secant slope of c_val between iw and iw+1, computed as
+    (PCHIP(stencil_iw1) - PCHIP(stencil_iw)) / dw. At frac_w in {0, 1}
+    this matches the corresponding endpoint evaluation exactly. On the
+    interior, c_val under blend-then-PCHIP is non-linear in frac_w, so
+    mpc is the segment secant rather than the pointwise derivative.
+
+    `frac_w` is the affine wealth coordinate on the selected segment and
+    may be outside [0, 1] for linear extrapolation.
     """
     if use_cubic:
-        # 4-point z stencil x 2-point wealth
-        c_zm1 = (1.0 - frac_w) * c_next_full[iz_lo - 1, j_s, iw] + frac_w * c_next_full[iz_lo - 1, j_s, iw + 1]
-        c_z0  = (1.0 - frac_w) * c_next_full[iz_lo,     j_s, iw] + frac_w * c_next_full[iz_lo,     j_s, iw + 1]
-        c_z1  = (1.0 - frac_w) * c_next_full[iz_lo + 1, j_s, iw] + frac_w * c_next_full[iz_lo + 1, j_s, iw + 1]
-        c_z2  = (1.0 - frac_w) * c_next_full[iz_lo + 2, j_s, iw] + frac_w * c_next_full[iz_lo + 2, j_s, iw + 1]
-        f = frac_z; f2 = f * f; f3 = f2 * f
-        c_val = (c_z0
-                 + 0.5 * f * (-c_zm1 + c_z1)
-                 + 0.5 * f2 * (2.0 * c_zm1 - 5.0 * c_z0 + 4.0 * c_z1 - c_z2)
-                 + 0.5 * f3 * (-c_zm1 + 3.0 * c_z0 - 3.0 * c_z1 + c_z2))
+        f2 = frac_z * frac_z
+        f3 = f2 * frac_z
+        h00 = 2.0 * f3 - 3.0 * f2 + 1.0
+        h10 = f3 - 2.0 * f2 + frac_z
+        h01 = -2.0 * f3 + 3.0 * f2
+        h11 = f3 - f2
+
+        # Read 4-point z stencil at both wealth corners.
+        p0 = c_next_full[iz_lo - 1, j_s, iw]
+        p1 = c_next_full[iz_lo,     j_s, iw]
+        p2 = c_next_full[iz_lo + 1, j_s, iw]
+        p3 = c_next_full[iz_lo + 2, j_s, iw]
+
+        q0 = c_next_full[iz_lo - 1, j_s, iw + 1]
+        q1 = c_next_full[iz_lo,     j_s, iw + 1]
+        q2 = c_next_full[iz_lo + 1, j_s, iw + 1]
+        q3 = c_next_full[iz_lo + 2, j_s, iw + 1]
+
+        # Blend-then-PCHIP for c_val: wealth-blend the 4 z stencil values,
+        # then run PCHIP once on the blended stencil. Shape-preserving in z
+        # at the actually-blended wealth slice.
+        one_minus_fw = 1.0 - frac_w
+        b0 = one_minus_fw * p0 + frac_w * q0
+        b1 = one_minus_fw * p1 + frac_w * q1
+        b2 = one_minus_fw * p2 + frac_w * q2
+        b3 = one_minus_fw * p3 + frac_w * q3
+        c_val = _pchip_eval_with_basis(b0, b1, b2, b3, h00, h10, h01, h11)
         c_val = max(c_val, min_c)
 
-        mpc_zm1 = (c_next_full[iz_lo - 1, j_s, iw + 1] - c_next_full[iz_lo - 1, j_s, iw]) * inv_dw
-        mpc_z0  = (c_next_full[iz_lo,     j_s, iw + 1] - c_next_full[iz_lo,     j_s, iw]) * inv_dw
-        mpc_z1  = (c_next_full[iz_lo + 1, j_s, iw + 1] - c_next_full[iz_lo + 1, j_s, iw]) * inv_dw
-        mpc_z2  = (c_next_full[iz_lo + 2, j_s, iw + 1] - c_next_full[iz_lo + 2, j_s, iw]) * inv_dw
-        mpc_val = (mpc_z0
-                   + 0.5 * f * (-mpc_zm1 + mpc_z1)
-                   + 0.5 * f2 * (2.0 * mpc_zm1 - 5.0 * mpc_z0 + 4.0 * mpc_z1 - mpc_z2)
-                   + 0.5 * f3 * (-mpc_zm1 + 3.0 * mpc_z0 - 3.0 * mpc_z1 + mpc_z2))
+        # mpc = secant slope of c_val between fw=0 and fw=1.  At fw=0 the
+        # blended stencil equals the iw stencil, so PCHIP(b at fw=0) =
+        # PCHIP(p..) = c_iw; same logic at fw=1.  The secant slope is the
+        # diagonal Jacobian element of c_val w.r.t. x_next.
+        c_iw = _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11)
+        c_iw1 = _pchip_eval_with_basis(q0, q1, q2, q3, h00, h10, h01, h11)
+        mpc_val = (c_iw1 - c_iw) * inv_dw
         mpc_val = max(0.0, min(1.0, mpc_val))
     else:
         c_lo = (1.0 - frac_w) * c_next_full[iz_lo,     j_s, iw] + frac_w * c_next_full[iz_lo,     j_s, iw + 1]
@@ -502,6 +561,8 @@ def compute_foc_jac_working_quad(
     eps_nodes, eps_weights,
     # --- Model parameters ---
     gamma, psi, beta, b_bar,
+    # --- Work-to-retirement transition (active only when t+1 == retire_age) ---
+    use_pension_next, pension_next_by_z,
     min_wealth_inv=1e-10, min_consumption=1e-10,
     prob_skip=1e-12,
 ):
@@ -510,6 +571,11 @@ def compute_foc_jac_working_quad(
     Same structure as retirement version but adds income quadrature loops
     (eta for persistent, eps for transitory). Z-interpolation uses Catmull-Rom
     cubic wrapped inside trilinear state interpolation.
+
+    At the work-to-retirement transition year (`t = retire_age - 1`), set
+    `use_pension_next=True` and pass `pension_next_by_z = pension_table[t+1, :]`.
+    The eps loop is preserved (eps_weights sum to 1) but next-period income is
+    replaced by linear z-interpolation of the next-period pension table.
     """
     a_bill = 1.0 - alpha_s - alpha_b
     prob_death = 1.0 - psi
@@ -633,11 +699,22 @@ def compute_foc_jac_working_quad(
                 p_out_base = p_state_ret * w_eta
                 det_z_eta = base_det_z * exp_eta[k_eta]
 
+                # At work->retirement boundary, next-period income = pension(z_next).
+                # Linear interpolation in z reuses iz_lo / frac_z above; result is
+                # constant across i_e (retirement has no transitory shock).
+                if use_pension_next:
+                    income_next_const = (1.0 - frac_z) * pension_next_by_z[iz_lo] + frac_z * pension_next_by_z[iz_lo + 1]
+                else:
+                    income_next_const = 0.0
+
                 for i_e in range(n_eps):
                     weight = p_out_base * eps_weights[i_e]
 
-                    y_gross_next = det_z_eta * exp_eps[i_e]
-                    income_next = scalar_disposable_income(y_gross_next)
+                    if use_pension_next:
+                        income_next = income_next_const
+                    else:
+                        y_gross_next = det_z_eta * exp_eps[i_e]
+                        income_next = scalar_disposable_income(y_gross_next)
                     x_next = w_inv + income_next
 
                     iw, frac_w, inv_dw = find_bracket(x_next, wealth_grid)
@@ -1437,6 +1514,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                      eps_nodes, eps_weights,
                                      gamma, psi, beta, b_bar,
+                                     use_pension_next, pension_next_by_z,
                                      init_s=0.1, init_b=0.4,
                                      tol=1e-7, max_iter=20,
                                      tiny_savings=1e-6, corner_tol=1e-8,
@@ -1460,6 +1538,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
             eps_nodes, eps_weights,
             gamma, psi, beta, b_bar,
+            use_pension_next, pension_next_by_z,
             min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
 
@@ -1473,6 +1552,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
     if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
@@ -1488,6 +1568,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         min_wealth_inv, min_consumption, prob_skip)
     if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
         return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
@@ -1502,6 +1583,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         min_wealth_inv, min_consumption, prob_skip)
     if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
         return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
@@ -1521,6 +1603,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
+                use_pension_next, pension_next_by_z,
                 min_wealth_inv, min_consumption, prob_skip)
             if abs(fs) < tol * scale:
                 break
@@ -1545,6 +1628,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
+                use_pension_next, pension_next_by_z,
                 min_wealth_inv, min_consumption, prob_skip)
             if abs(fb) < tol * scale:
                 break
@@ -1572,6 +1656,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
+                use_pension_next, pension_next_by_z,
                 min_wealth_inv, min_consumption, prob_skip)
             g = fs - fb
             if abs(g) < tol * scale:
@@ -1600,6 +1685,7 @@ def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
             exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
             eps_nodes, eps_weights,
             gamma, psi, beta, b_bar,
+            use_pension_next, pension_next_by_z,
             min_wealth_inv, min_consumption, prob_skip)
         e_last = e_sum
 
@@ -1644,6 +1730,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                                                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                                 eps_nodes, eps_weights,
                                                 gamma, psi, beta, b_bar,
+                                                use_pension_next, pension_next_by_z,
                                                 init_s=0.1, init_b=0.4,
                                                 tol=1e-7, max_iter=30,
                                                 tiny_savings=1e-6,
@@ -1655,7 +1742,10 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                                                 line_search_max_step=2.0):
     """Unconstrained Newton for working-age portfolio using state quadrature."""
 
-
+    # Line search is the global default — it prevents Newton overshoots and now
+    # also applies cleanly at the work->retirement boundary because off-grid
+    # wealth lookups use a value/slope-consistent affine extrapolation.
+    eff_line_search = use_line_search
 
     if s_val < tiny_savings:
         _, _, _, _, _, e = compute_foc_jac_working_quad(
@@ -1668,6 +1758,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
             exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
             eps_nodes, eps_weights,
             gamma, psi, beta, b_bar,
+            use_pension_next, pension_next_by_z,
             min_wealth_inv, min_consumption, prob_skip)
         return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0, 0
 
@@ -1681,6 +1772,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         min_wealth_inv, min_consumption, prob_skip)
     scale = max(abs(e0), 1.0)
 
@@ -1697,6 +1789,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         min_wealth_inv, min_consumption, prob_skip)
     err = (fs * fs + fb * fb) ** 0.5
 
@@ -1715,7 +1808,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
             step_s = -(Jbb * fs - Jsb * fb) * inv_d
             step_b = -(-Jsb * fs + Jss * fb) * inv_d
 
-        if use_line_search:
+        if eff_line_search:
             slen = (step_s * step_s + step_b * step_b) ** 0.5
             if slen > line_search_max_step:
                 cap = line_search_max_step / slen
@@ -1737,6 +1830,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                     eps_nodes, eps_weights,
                     gamma, psi, beta, b_bar,
+                    use_pension_next, pension_next_by_z,
                     min_wealth_inv, min_consumption, prob_skip)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
                 if err_t < err:
@@ -1766,6 +1860,7 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                 eps_nodes, eps_weights,
                 gamma, psi, beta, b_bar,
+                use_pension_next, pension_next_by_z,
                 min_wealth_inv, min_consumption, prob_skip)
             err = (fs * fs + fb * fb) ** 0.5
 
@@ -1995,6 +2090,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                                       exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                       eps_nodes, eps_weights,
                                       gamma, psi_vec, beta, b_bar,
+                                      use_pension_next, pension_next_by_z,
                                       constrained, solver_config,
                                       policy_c, policy_alpha_s, policy_alpha_b):
     """Solve one working-age period using quadrature over state innovations."""
@@ -2055,6 +2151,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
                         gamma, psi, beta, b_bar,
+                        use_pension_next, pension_next_by_z,
                         init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter,
                         tiny_savings=sc.tiny_savings, corner_tol=sc.corner_tol,
@@ -2077,6 +2174,7 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                         eps_nodes, eps_weights,
                         gamma, psi, beta, b_bar,
+                        use_pension_next, pension_next_by_z,
                         init_s=last_a_s, init_b=last_a_b,
                         tol=sc.tol, max_iter=sc.max_iter_unconstrained,
                         tiny_savings=sc.tiny_savings,
@@ -2165,6 +2263,7 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
                                 exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
                                 eps_nodes, eps_weights,
                                 gamma, psi_vec, beta, b_bar,
+                                use_pension_next, pension_next_by_z,
                                 constrained=True, solver_config=None,
                                 out_c=None, out_s=None, out_b=None):
     if solver_config is None:
@@ -2188,6 +2287,7 @@ def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
         exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
         eps_nodes, eps_weights,
         gamma, psi_vec, beta, b_bar,
+        use_pension_next, pension_next_by_z,
         constrained, solver_config,
         out_c, out_s, out_b)
     return out_c, out_s, out_b, _di, _df
@@ -2212,7 +2312,192 @@ def _format_pct(count, total):
     return f"{100.0 * count / total:3.0f}%"
 
 
-def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose=1):
+def _default_checkpoint_path(model, disc_config, youngest_age_to_solve):
+    """Build a natural default bundle path for partial-solve checkpoints."""
+    label = "constrained" if model.constrained else "unconstrained"
+    grid_sizes = "x".join(str(v) for v in disc_config.state_grid_sizes)
+    age_suffix = (
+        f"_to_age{int(youngest_age_to_solve)}"
+        if youngest_age_to_solve is not None
+        else "_partial"
+    )
+    name = (
+        f"{label}_{disc_config.state_grid_mode}"
+        f"_grid{grid_sizes}_nz{disc_config.n_z}{age_suffix}"
+    )
+    return str(Path("saved_runs") / "checkpoints" / name)
+
+
+def _normalize_solve_control(model, pc, solve_control):
+    """Validate and normalize SolveControl inputs."""
+    if solve_control is None:
+        return SolveControl(), False
+    if not isinstance(solve_control, SolveControl):
+        raise TypeError("solve_control must be a SolveControl instance or None")
+
+    youngest = solve_control.youngest_age_to_solve
+    if youngest is not None:
+        youngest = int(youngest)
+        if youngest < model.start_age or youngest > model.terminal_age:
+            raise ValueError(
+                "youngest_age_to_solve must lie within "
+                f"[{model.start_age}, {model.terminal_age}], got {youngest}"
+            )
+
+    every = solve_control.checkpoint_every_n_ages
+    if every is not None:
+        every = int(every)
+        if every <= 0:
+            raise ValueError("checkpoint_every_n_ages must be positive")
+
+    checkpoint_path = solve_control.checkpoint_path
+    if checkpoint_path is None and (
+        youngest is not None or every is not None or solve_control.save_on_interrupt
+    ):
+        checkpoint_path = _default_checkpoint_path(model, pc.disc_config, youngest)
+
+    if checkpoint_path is not None:
+        checkpoint_path = str(Path(checkpoint_path))
+
+    return solve_control._replace(
+        youngest_age_to_solve=youngest,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every_n_ages=every,
+    ), True
+
+
+def _build_solver_diagnostics(
+    *,
+    age_diag_int,
+    age_diag_fsum,
+    age_diag_fmax,
+    age_diag_fmin,
+    solved_age_mask,
+    ages,
+    retire_age,
+    solver_config,
+    disc_config,
+    constrained,
+    solve_control,
+    solve_status,
+    wall_time_sec,
+    checkpoint_save_count,
+    checkpoint_path,
+):
+    """Aggregate per-age diagnostics, respecting partially solved outputs."""
+    solved_idx = np.flatnonzero(solved_age_mask)
+    solved_nonterminal_mask = solved_age_mask.copy()
+    if len(solved_nonterminal_mask) > 0:
+        solved_nonterminal_mask[-1] = False
+    solved_nonterminal_idx = np.flatnonzero(solved_nonterminal_mask)
+
+    if solved_nonterminal_idx.size > 0:
+        all_int = age_diag_int[solved_nonterminal_idx].sum(axis=0)
+        all_fsum = age_diag_fsum[solved_nonterminal_idx].sum(axis=0)
+        all_fmax = age_diag_fmax[solved_nonterminal_idx].max(axis=0)
+        all_fmin = age_diag_fmin[solved_nonterminal_idx].min(axis=0)
+    else:
+        all_int = np.zeros(N_DIAG_INT, dtype=np.int64)
+        all_fsum = np.zeros(N_DIAG_FLOAT)
+        all_fmax = np.zeros(N_DIAG_FLOAT)
+        all_fmin = np.zeros(N_DIAG_FLOAT)
+
+    total_calls = int(all_int[DI_TOTAL_CALLS])
+    total_fail = int(all_int[DI_NEWTON_FAIL])
+    total_mono = int(all_int[DI_MONO_VIOLATIONS])
+    worst_mono = float(all_fmax[DF_WORST_MONO_DROP])
+    worst_foc = float(all_fmax[DF_MAX_FOC_RESID])
+    rms_foc = (all_fsum[DF_SUM_FOC_RESID_SQ] / max(total_calls, 1)) ** 0.5
+
+    total_iter = int(all_int[DI_SUM_ITER])
+    max_iter_used = int(all_fmax[DF_MAX_NEWTON_ITER])
+    avg_iter = total_iter / max(total_calls, 1)
+    total_warm_reset = int(all_int[DI_WARM_RESET])
+
+    solved_ages = ages[solved_idx] if solved_idx.size > 0 else np.array([], dtype=np.int64)
+    youngest_solved_age = int(solved_ages.min()) if solved_ages.size > 0 else None
+    oldest_solved_age = int(solved_ages.max()) if solved_ages.size > 0 else None
+    is_partial = solve_status != "complete" or solved_idx.size != len(ages)
+
+    return {
+        "age_diag_int": age_diag_int,
+        "age_diag_fsum": age_diag_fsum,
+        "age_diag_fmax": age_diag_fmax,
+        "age_diag_fmin": age_diag_fmin,
+        "aggregate_int": all_int,
+        "aggregate_fsum": all_fsum,
+        "aggregate_fmax": all_fmax,
+        "aggregate_fmin": all_fmin,
+        "total_mono_violations": total_mono,
+        "worst_mono_drop": worst_mono,
+        "total_newton_failures": total_fail,
+        "worst_foc_resid": worst_foc,
+        "total_calls": total_calls,
+        "total_newton_iter": total_iter,
+        "avg_newton_iter": avg_iter,
+        "max_newton_iter": max_iter_used,
+        "total_warm_reset": total_warm_reset,
+        "constrained": constrained,
+        "solver_config": solver_config,
+        "disc_config": disc_config,
+        "solve_control": solve_control,
+        "solve_status": solve_status,
+        "is_partial": is_partial,
+        "solved_age_mask": solved_age_mask.copy(),
+        "solved_age_indices": solved_idx.copy(),
+        "youngest_solved_age": youngest_solved_age,
+        "oldest_solved_age": oldest_solved_age,
+        "n_ages_solved": int(solved_idx.size),
+        "n_nonterminal_ages_solved": int(solved_nonterminal_idx.size),
+        "wall_time_sec": float(wall_time_sec),
+        "checkpoint_save_count": int(checkpoint_save_count),
+        "checkpoint_path": checkpoint_path,
+    }
+
+
+def _prepare_policy_snapshot(C_mat, S_mat, B_mat, solved_age_mask):
+    """Return arrays suitable for saving, masking unsolved ages with NaN."""
+    if np.all(solved_age_mask):
+        return C_mat, S_mat, B_mat
+
+    unsolved_mask = ~solved_age_mask
+    C_save = C_mat.copy()
+    S_save = S_mat.copy()
+    B_save = B_mat.copy()
+    C_save[unsolved_mask] = np.nan
+    S_save[unsolved_mask] = np.nan
+    B_save[unsolved_mask] = np.nan
+    return C_save, S_save, B_save
+
+
+def _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask):
+    """Mask unsolved age slices before returning partial results."""
+    if np.all(solved_age_mask):
+        return
+    unsolved_mask = ~solved_age_mask
+    C_mat[unsolved_mask] = np.nan
+    S_mat[unsolved_mask] = np.nan
+    B_mat[unsolved_mask] = np.nan
+
+
+def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
+    """Persist a solver checkpoint bundle."""
+    from policy_io import save_policy_bundle
+
+    C_save, S_save, B_save = _prepare_policy_snapshot(
+        C_mat, S_mat, B_mat, diagnostics["solved_age_mask"]
+    )
+    return save_policy_bundle(
+        checkpoint_path,
+        C_save,
+        S_save,
+        B_save,
+        diagnostics=diagnostics,
+        overwrite=True,
+    )
+
+
+def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose=1, solve_control=None):
     """
     Lifecycle backward induction solver.
 
@@ -2222,6 +2507,8 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     pc    : Precompute
     n_s_points : int, optional  -- override savings grid size
     verbose : int  -- 0=silent, 1=per-age table + post-solve report (default)
+    solve_control : SolveControl | None
+        Optional non-numerical controls for partial solves and checkpoints.
 
     Returns
     -------
@@ -2230,6 +2517,10 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     diagnostics : dict
         Diagnostic summary from the solve.
     """
+    if solver_config is None:
+        solver_config = SolverConfig()
+    solve_control, control_active = _normalize_solve_control(model, pc, solve_control)
+
     if verbose >= 1:
         print(f"\n{'='*70}")
         print(f"LIFECYCLE PORTFOLIO SOLVER  (EGM + 2D Newton)")
@@ -2237,6 +2528,8 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         print(f"  Mode: {mode_str} | STATE_QUADRATURE")
         print(f"  Solver: {solver_config}")
         print(f"  Discretization: {pc.disc_config}")
+        if control_active:
+            print(f"  Solve control: {solve_control}")
         print(f"{'='*70}")
 
     # ---- Grids ----
@@ -2294,9 +2587,6 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     terminal_age   = model.terminal_age
     constrained    = model.constrained
 
-    if solver_config is None:
-        solver_config = SolverConfig()
-
     if verbose >= 1:
         n_v_q = len(v_weights)
         n_r_q = len(ret_weights)
@@ -2320,6 +2610,15 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     C_mat = np.zeros(shape)
     S_mat = np.zeros(shape)
     B_mat = np.zeros(shape)
+    solved_age_mask = np.zeros(n_age, dtype=bool)
+
+    checkpoint_path = solve_control.checkpoint_path
+    youngest_age_to_solve = solve_control.youngest_age_to_solve
+    checkpoint_every_n_ages = solve_control.checkpoint_every_n_ages
+    save_on_interrupt = solve_control.save_on_interrupt
+    return_partial_on_interrupt = solve_control.return_partial_on_interrupt
+    checkpoint_save_count = 0
+    last_saved_nonterminal_count = -1
 
     # ---- Per-age diagnostic accumulators ----
     age_diag_int     = np.zeros((n_age, N_DIAG_INT), dtype=np.int64)
@@ -2338,6 +2637,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     C_mat[-1] = c_T
     S_mat[-1] = a_s_T
     B_mat[-1] = a_b_T
+    solved_age_mask[-1] = True
     if verbose >= 1:
         n_term_interior = int(np.sum(term_diag == EC_INTERIOR))
         n_term_fail = int(np.sum(term_diag == EC_NEWTON_FAIL))
@@ -2359,147 +2659,238 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         print(f"{'='*120}")
 
     t_start = time.time()
+    solve_status = "complete"
+    last_saved_bundle_path = None
 
-    for t in reversed(range(n_age - 1)):
-        age    = ages[t]
-        psi    = survival_probs[t, :]      # (n_z,) -- z-dependent survival
-        c_next = C_mat[t + 1]
+    # Dummy pension array for working ages where t+1 is also working (the
+    # working FOC ignores it; numba still needs a real float64[n_z] array).
+    pension_dummy_z = np.zeros(n_z, dtype=np.float64)
 
-        # Output buffers — JIT writes directly into C_mat/S_mat/B_mat slices
-        out_c = C_mat[t]
-        out_s = S_mat[t]
-        out_b = B_mat[t]
+    try:
+        for t in reversed(range(n_age - 1)):
+            age = ages[t]
+            if youngest_age_to_solve is not None and age < youngest_age_to_solve:
+                solve_status = "stopped_early"
+                break
+            psi = survival_probs[t, :]      # (n_z,) -- z-dependent survival
+            c_next = C_mat[t + 1]
 
-        if age >= retire_age:
-            _, _, _, _di, _df = solve_retirement_step_quad(
-                w_grid, s_grid, z_grid, N_state,
-                c_next, pension_table[t + 1, :],
-                annuity_factors,
-                state_grid, grids_0, grids_1, grids_2,
-                state_bracket_shift, state_bracket_L_inv,
-                v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                Phi_0_state, Phi_11,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
-                out_c=out_c, out_s=out_s, out_b=out_b)
-            label = "RETIRE"
-        else:
-            _, _, _, _di, _df = solve_working_age_step_quad(
-                w_grid, s_grid, z_grid, N_state,
-                c_next, log_det_profile[t + 1],
-                annuity_factors, rho, eta_nodes, eta_weights, dz,
-                state_grid, grids_0, grids_1, grids_2,
-                state_bracket_shift, state_bracket_L_inv,
-                v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                Phi_0_state, Phi_11,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
-                out_c=out_c, out_s=out_s, out_b=out_b)
-            label = "WORK  "
+            # Output buffers - JIT writes directly into C_mat/S_mat/B_mat slices
+            out_c = C_mat[t]
+            out_s = S_mat[t]
+            out_b = B_mat[t]
 
-        # No copy needed — JIT wrote directly into C_mat[t], S_mat[t], B_mat[t]
-
-        # Reduce diagnostics for this age
-        ti, tf_sum, tf_max, tf_min = _reduce_diag(_di, _df)
-        age_diag_int[t]  = ti
-        age_diag_fsum[t] = tf_sum
-        age_diag_fmax[t] = tf_max
-        age_diag_fmin[t] = tf_min
-
-        # Per-age one-line summary
-        if verbose >= 1:
-            elapsed = time.time() - t_start
-            total_calls = int(ti[DI_TOTAL_CALLS])
-            n_fail = int(ti[DI_NEWTON_FAIL])
-            newton_pct = 100.0 * (total_calls - n_fail) / max(total_calls, 1)
-
-            n_interior = int(ti[DI_INTERIOR])
-            n_edge = int(ti[DI_EDGE_SB] + ti[DI_EDGE_BB] + ti[DI_EDGE_STOCKBOND])
-            n_corner = int(ti[DI_CORNER_BILLS] + ti[DI_CORNER_STOCKS] + ti[DI_CORNER_BONDS]
-                           + ti[DI_TINY_SAVINGS])
-            mono_v = int(ti[DI_MONO_VIOLATIONS])
-
-            # Median-state policy values
-            med_as = float(out_s[i_z_med, i_s_med, i_w_med])
-            med_ab = float(out_b[i_z_med, i_s_med, i_w_med])
-            med_bill = 1.0 - med_as - med_ab
-            med_c = float(out_c[i_z_med, i_s_med, i_w_med])
-            med_w = float(w_grid[i_w_med])
-            c_over_w = med_c / med_w if med_w > 0 else 0.0
-
-            mono_str = f"{mono_v:4d}" if mono_v == 0 else f"\033[91m{mono_v:4d}\033[0m"
-
-            # Iter columns: only printed when unconstrained
-            if not constrained:
-                sum_it = int(ti[DI_SUM_ITER])
-                max_it = int(tf_max[DF_MAX_NEWTON_ITER])
-                avg_it = sum_it / max(total_calls, 1)
-                iter_str = f"  {avg_it:6.1f} {max_it:6d}"
+            if age >= retire_age:
+                _, _, _, _di, _df = solve_retirement_step_quad(
+                    w_grid, s_grid, z_grid, N_state,
+                    c_next, pension_table[t + 1, :],
+                    annuity_factors,
+                    state_grid, grids_0, grids_1, grids_2,
+                    state_bracket_shift, state_bracket_L_inv,
+                    v_nodes, v_weights, M_v_nodes, const_r, A_r,
+                    Phi_0_state, Phi_11,
+                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+                    gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
+                    out_c=out_c, out_s=out_s, out_b=out_b)
+                label = "RETIRE"
             else:
-                iter_str = ""
+                # Work-to-retirement boundary: at age = retire_age - 1, next-period
+                # income is pension(z_next), not the labor-income polynomial.
+                use_pension_next = (age == retire_age - 1)
+                pension_next_by_z = pension_table[t + 1, :] if use_pension_next else pension_dummy_z
+                _, _, _, _di, _df = solve_working_age_step_quad(
+                    w_grid, s_grid, z_grid, N_state,
+                    c_next, log_det_profile[t + 1],
+                    annuity_factors, rho, eta_nodes, eta_weights, dz,
+                    state_grid, grids_0, grids_1, grids_2,
+                    state_bracket_shift, state_bracket_L_inv,
+                    v_nodes, v_weights, M_v_nodes, const_r, A_r,
+                    Phi_0_state, Phi_11,
+                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
+                    eps_nodes, eps_weights,
+                    gamma, psi, beta, b_bar,
+                    use_pension_next, pension_next_by_z,
+                    constrained=constrained, solver_config=solver_config,
+                    out_c=out_c, out_s=out_s, out_b=out_b)
+                label = "WORK  "
 
-            print(f" {age:3d}  {label:<6} {elapsed:5.1f}s  {newton_pct:5.1f}% {n_fail:>6}"
-                  f"  {med_as:7.3f}  {med_ab:7.3f}  {med_bill:7.3f}  {c_over_w:5.3f}"
-                  f"  {_format_pct(n_interior, total_calls)}"
-                  f"  {_format_pct(n_edge, total_calls)}"
-                  f"  {_format_pct(n_corner, total_calls)}"
-                  f"  {mono_str}{iter_str}", flush=True)
+            # No copy needed - JIT wrote directly into C_mat[t], S_mat[t], B_mat[t]
+
+            # Reduce diagnostics for this age
+            ti, tf_sum, tf_max, tf_min = _reduce_diag(_di, _df)
+            age_diag_int[t] = ti
+            age_diag_fsum[t] = tf_sum
+            age_diag_fmax[t] = tf_max
+            age_diag_fmin[t] = tf_min
+            solved_age_mask[t] = True
+
+            # Per-age one-line summary
+            if verbose >= 1:
+                elapsed = time.time() - t_start
+                total_calls = int(ti[DI_TOTAL_CALLS])
+                n_fail = int(ti[DI_NEWTON_FAIL])
+                newton_pct = 100.0 * (total_calls - n_fail) / max(total_calls, 1)
+
+                n_interior = int(ti[DI_INTERIOR])
+                n_edge = int(ti[DI_EDGE_SB] + ti[DI_EDGE_BB] + ti[DI_EDGE_STOCKBOND])
+                n_corner = int(ti[DI_CORNER_BILLS] + ti[DI_CORNER_STOCKS] + ti[DI_CORNER_BONDS]
+                               + ti[DI_TINY_SAVINGS])
+                mono_v = int(ti[DI_MONO_VIOLATIONS])
+
+                # Median-state policy values
+                med_as = float(out_s[i_z_med, i_s_med, i_w_med])
+                med_ab = float(out_b[i_z_med, i_s_med, i_w_med])
+                med_bill = 1.0 - med_as - med_ab
+                med_c = float(out_c[i_z_med, i_s_med, i_w_med])
+                med_w = float(w_grid[i_w_med])
+                c_over_w = med_c / med_w if med_w > 0 else 0.0
+
+                mono_str = f"{mono_v:4d}" if mono_v == 0 else f"\033[91m{mono_v:4d}\033[0m"
+
+                # Iter columns: only printed when unconstrained
+                if not constrained:
+                    sum_it = int(ti[DI_SUM_ITER])
+                    max_it = int(tf_max[DF_MAX_NEWTON_ITER])
+                    avg_it = sum_it / max(total_calls, 1)
+                    iter_str = f"  {avg_it:6.1f} {max_it:6d}"
+                else:
+                    iter_str = ""
+
+                print(f" {age:3d}  {label:<6} {elapsed:5.1f}s  {newton_pct:5.1f}% {n_fail:>6}"
+                      f"  {med_as:7.3f}  {med_ab:7.3f}  {med_bill:7.3f}  {c_over_w:5.3f}"
+                      f"  {_format_pct(n_interior, total_calls)}"
+                      f"  {_format_pct(n_edge, total_calls)}"
+                      f"  {_format_pct(n_corner, total_calls)}"
+                      f"  {mono_str}{iter_str}", flush=True)
+
+            if checkpoint_every_n_ages is not None and checkpoint_path is not None:
+                solved_nonterminal_count = int(np.sum(solved_age_mask[:-1]))
+                if solved_nonterminal_count - last_saved_nonterminal_count >= checkpoint_every_n_ages:
+                    checkpoint_save_count += 1
+                    checkpoint_diag = _build_solver_diagnostics(
+                        age_diag_int=age_diag_int,
+                        age_diag_fsum=age_diag_fsum,
+                        age_diag_fmax=age_diag_fmax,
+                        age_diag_fmin=age_diag_fmin,
+                        solved_age_mask=solved_age_mask,
+                        ages=ages,
+                        retire_age=retire_age,
+                        solver_config=solver_config,
+                        disc_config=pc.disc_config,
+                        constrained=constrained,
+                        solve_control=solve_control,
+                        solve_status="checkpoint",
+                        wall_time_sec=time.time() - t_start,
+                        checkpoint_save_count=checkpoint_save_count,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    last_saved_bundle_path = str(_save_policy_checkpoint(
+                        checkpoint_path, C_mat, S_mat, B_mat, checkpoint_diag
+                    ))
+                    last_saved_nonterminal_count = solved_nonterminal_count
+                    if verbose >= 1:
+                        print(f"    checkpoint saved -> {last_saved_bundle_path}", flush=True)
+    except KeyboardInterrupt:
+        solve_status = "interrupted"
+        if verbose >= 1:
+            print("\n  Solve interrupted. Finalizing partial output...", flush=True)
 
     total = time.time() - t_start
 
-    # ========================================================================
-    # POST-SOLVE DIAGNOSTICS
-    # ========================================================================
+    solved_nonterminal_count = int(np.sum(solved_age_mask[:-1]))
+    final_save_needed = (
+        checkpoint_path is not None
+        and (
+            solve_status == "stopped_early"
+            or (solve_status == "interrupted" and save_on_interrupt)
+            or (
+                solve_status == "complete"
+                and
+                checkpoint_every_n_ages is not None
+                and solved_nonterminal_count != last_saved_nonterminal_count
+            )
+        )
+    )
 
-    # Aggregate across all ages (exclude terminal t=-1 which has no diag arrays)
-    all_int = age_diag_int[:-1].sum(axis=0)  # sum across ages
-    all_fsum = age_diag_fsum[:-1].sum(axis=0)
-    all_fmax = age_diag_fmax[:-1].max(axis=0)
-    all_fmin = age_diag_fmin[:-1].min(axis=0)
+    if final_save_needed:
+        next_save_count = checkpoint_save_count + 1
+        diagnostics = _build_solver_diagnostics(
+            age_diag_int=age_diag_int,
+            age_diag_fsum=age_diag_fsum,
+            age_diag_fmax=age_diag_fmax,
+            age_diag_fmin=age_diag_fmin,
+            solved_age_mask=solved_age_mask,
+            ages=ages,
+            retire_age=retire_age,
+            solver_config=solver_config,
+            disc_config=pc.disc_config,
+            constrained=constrained,
+            solve_control=solve_control,
+            solve_status=solve_status,
+            wall_time_sec=total,
+            checkpoint_save_count=next_save_count,
+            checkpoint_path=checkpoint_path,
+        )
+        last_saved_bundle_path = str(_save_policy_checkpoint(
+            checkpoint_path, C_mat, S_mat, B_mat, diagnostics
+        ))
+        checkpoint_save_count = next_save_count
+    else:
+        diagnostics = _build_solver_diagnostics(
+            age_diag_int=age_diag_int,
+            age_diag_fsum=age_diag_fsum,
+            age_diag_fmax=age_diag_fmax,
+            age_diag_fmin=age_diag_fmin,
+            solved_age_mask=solved_age_mask,
+            ages=ages,
+            retire_age=retire_age,
+            solver_config=solver_config,
+            disc_config=pc.disc_config,
+            constrained=constrained,
+            solve_control=solve_control,
+            solve_status=solve_status,
+            wall_time_sec=total,
+            checkpoint_save_count=checkpoint_save_count,
+            checkpoint_path=checkpoint_path,
+        )
 
-    total_calls = int(all_int[DI_TOTAL_CALLS])
-    total_fail = int(all_int[DI_NEWTON_FAIL])
-    total_mono = int(all_int[DI_MONO_VIOLATIONS])
-    worst_mono = float(all_fmax[DF_WORST_MONO_DROP])
-    worst_foc = float(all_fmax[DF_MAX_FOC_RESID])
+    diagnostics["checkpoint_save_count"] = checkpoint_save_count
+    diagnostics["last_saved_bundle_path"] = last_saved_bundle_path
+
+    all_int = diagnostics["aggregate_int"]
+    all_fsum = diagnostics["aggregate_fsum"]
+    all_fmax = diagnostics["aggregate_fmax"]
+    all_fmin = diagnostics["aggregate_fmin"]
+    total_calls = diagnostics["total_calls"]
+    total_fail = diagnostics["total_newton_failures"]
+    total_mono = diagnostics["total_mono_violations"]
+    worst_mono = diagnostics["worst_mono_drop"]
+    worst_foc = diagnostics["worst_foc_resid"]
     rms_foc = (all_fsum[DF_SUM_FOC_RESID_SQ] / max(total_calls, 1)) ** 0.5
-
-    # Newton iter aggregates (unconstrained only; zero for constrained)
-    total_iter = int(all_int[DI_SUM_ITER])
-    max_iter_used = int(all_fmax[DF_MAX_NEWTON_ITER])
-    avg_iter = total_iter / max(total_calls, 1)
-    total_warm_reset = int(all_int[DI_WARM_RESET])
-
-    # Build diagnostics dict
-    diagnostics = {
-        'age_diag_int': age_diag_int,
-        'age_diag_fsum': age_diag_fsum,
-        'age_diag_fmax': age_diag_fmax,
-        'age_diag_fmin': age_diag_fmin,
-        'total_mono_violations': total_mono,
-        'worst_mono_drop': worst_mono,
-        'total_newton_failures': total_fail,
-        'worst_foc_resid': worst_foc,
-        'total_calls': total_calls,
-        'total_newton_iter': total_iter,
-        'avg_newton_iter': avg_iter,
-        'max_newton_iter': max_iter_used,
-        'total_warm_reset': total_warm_reset,
-        'constrained': constrained,
-        'solver_config': solver_config,
-        'disc_config': pc.disc_config,
-    }
+    total_iter = diagnostics["total_newton_iter"]
+    max_iter_used = diagnostics["max_newton_iter"]
+    avg_iter = diagnostics["avg_newton_iter"]
+    total_warm_reset = diagnostics["total_warm_reset"]
+    n_nonterminal_ages_solved = diagnostics["n_nonterminal_ages_solved"]
+    is_partial = diagnostics["is_partial"]
 
     if verbose >= 1:
         print(f"\n{'='*120}")
-        print(f"  DONE in {total / 60:.2f} min  (avg {total / max(n_age - 1, 1):.2f}s per age)")
+        print(f"  DONE in {total / 60:.2f} min  (avg {total / max(n_nonterminal_ages_solved, 1):.2f}s per age)")
         print(f"{'='*120}")
 
         # --- Section 1: Newton Convergence ---
         print(f"\n{'='*70}")
         print(f"  POST-SOLVE DIAGNOSTICS")
         print(f"{'='*70}")
+        if is_partial:
+            print(
+                f"\n  Solve status: {diagnostics['solve_status']}  "
+                f"(solved ages {diagnostics['youngest_solved_age']} to "
+                f"{diagnostics['oldest_solved_age']})"
+            )
+            if last_saved_bundle_path is not None:
+                print(f"  Saved partial bundle: {last_saved_bundle_path}")
 
         print(f"\n  1. NEWTON CONVERGENCE")
         print(f"     Total calls:  {total_calls:>12,}")
@@ -2595,7 +2986,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         print(f"\n  4. EGM MONOTONICITY")
         if total_mono > 0:
             n_affected_ages = int(np.sum(age_diag_int[:-1, DI_MONO_VIOLATIONS] > 0))
-            print(f"     WARNING: {total_mono} total violations across {n_affected_ages}/{n_age-1} ages")
+            print(f"     WARNING: {total_mono} total violations across {n_affected_ages}/{max(n_nonterminal_ages_solved, 1)} ages")
             print(f"     Worst drop: {worst_mono:.2e}")
             for t in range(n_age - 1):
                 mv = int(age_diag_int[t, DI_MONO_VIOLATIONS])
@@ -2609,18 +3000,21 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
 
         # --- Section 5: Policy Function Sanity ---
         print(f"\n  5. POLICY FUNCTION SANITY")
-        nan_c = int(np.isnan(C_mat).sum())
-        nan_s = int(np.isnan(S_mat).sum())
-        nan_b = int(np.isnan(B_mat).sum())
-        inf_c = int(np.isinf(C_mat).sum())
-        inf_s = int(np.isinf(S_mat).sum())
-        inf_b = int(np.isinf(B_mat).sum())
-        neg_c = int((C_mat < 0).sum())
+        C_eval = C_mat[solved_age_mask]
+        S_eval = S_mat[solved_age_mask]
+        B_eval = B_mat[solved_age_mask]
+        nan_c = int(np.isnan(C_eval).sum())
+        nan_s = int(np.isnan(S_eval).sum())
+        nan_b = int(np.isnan(B_eval).sum())
+        inf_c = int(np.isinf(C_eval).sum())
+        inf_s = int(np.isinf(S_eval).sum())
+        inf_b = int(np.isinf(B_eval).sum())
+        neg_c = int((C_eval < 0).sum())
         neg_euler = int(all_int[DI_NEG_CONSUMPTION])
-        alpha_s_neg = int((S_mat < -1e-6).sum())
-        alpha_b_neg = int((B_mat < -1e-6).sum())
-        alpha_sum_viol = int(((S_mat + B_mat) > 1.0 + 1e-6).sum())
-        total_el = C_mat.size + S_mat.size + B_mat.size
+        alpha_s_neg = int((S_eval < -1e-6).sum())
+        alpha_b_neg = int((B_eval < -1e-6).sum())
+        alpha_sum_viol = int(((S_eval + B_eval) > 1.0 + 1e-6).sum())
+        total_el = C_eval.size + S_eval.size + B_eval.size
 
         if constrained:
             all_ok = (nan_c + nan_s + nan_b + inf_c + inf_s + inf_b
@@ -2641,5 +3035,11 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             print(f"     alpha_s+b > 1:   {alpha_sum_viol}")
 
         print(f"{'='*70}\n")
+
+    if diagnostics["is_partial"]:
+        _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask)
+
+    if solve_status == "interrupted" and not return_partial_on_interrupt:
+        raise KeyboardInterrupt
 
     return C_mat, S_mat, B_mat, diagnostics

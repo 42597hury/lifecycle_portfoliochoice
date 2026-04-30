@@ -49,6 +49,7 @@ def setup():
         wealth_max=dc_raw["wealth_max"],
         n_savings=dc_raw["n_savings"],
         savings_min=dc_raw["savings_min"],
+        savings_max=dc_raw.get("savings_max"),
         state_grid_sizes=tuple(dc_raw["state_grid_sizes"]),
         n_z=dc_raw["n_z"],
         n_eps_nodes=dc_raw["n_eps_nodes"],

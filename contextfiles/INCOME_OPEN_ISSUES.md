@@ -42,9 +42,16 @@ All issues found during the review session of 8 April 2026, ordered by economic 
 
 **Status:** Diagnosed, low priority.
 
-**The fact:** `working_income` has shape `(n_age, n_z, n_eps)` = (78, 11, 10), covering all ages 22–99. But only ages 22–67 (indices 0–45) are working ages. Rows 46–77 contain valid after-tax income values for hypothetical workers at those ages, but the solver and simulation never read them — retired agents use `pension_after_tax` instead.
+**The fact:** `working_income` has shape `(n_age, n_z, n_eps)` — at the production
+setting `(n_age, n_z, n_eps_nodes) = (78, 11, 5)` under the Judd-mixture
+quadrature (was `(78, 11, 10)` under the previous concatenated-GH rule
+at the same `n_eps_nodes=5`). The array covers all ages 22–99, but only
+ages 22–67 (indices 0–45) are working ages. Rows 46–77 contain valid
+after-tax income values for hypothetical workers at those ages, but the
+solver and simulation never read them — retired agents use
+`pension_after_tax` instead.
 
-**Impact:** No numerical impact. Wastes ~42% of the array's memory. Could cause confusion if someone reads the array without understanding the retirement boundary. At higher n_z (e.g., 51), this dead data grows to ~390 KB — still trivial.
+**Impact:** No numerical impact. Wastes ~42% of the array's memory. Could cause confusion if someone reads the array without understanding the retirement boundary. At higher n_z (e.g., 51), this dead data grows to ~200 KB — still trivial.
 
 **Fix:** Either truncate to working ages only (`n_work = retire_age - start_age + 1`) or document why the full array exists. Low priority.
 
@@ -78,7 +85,21 @@ All parameters (ρ, pz, μ_η1, σ_η1, σ_η2, pe, μ_ε1, σ_ε1, σ_ε2, b₀
 
 ### 10. Transitory shock quadrature
 
-The Gauss-Hermite quadrature for ε matches all moments (mean, variance, skewness) to machine precision, even at the minimum n_nodes = 3 (6 total nodes). The mixture structure is correctly captured because the quadrature is applied separately to each component and then concatenated. No issue here.
+The Judd-mixture quadrature for ε matches all moments through degree
+`2n_nodes − 1` to machine precision against the closed-form mixture.
+At `n_eps_nodes = 3` (3 total nodes), exactness is order 5 — covers
+mean, variance, skewness, and kurtosis (which is the moment of
+interest for ε given its excess kurtosis +52). At `n_eps_nodes = 5`
+(production), exactness extends through order 9. Polynomial integrals
+match the analytic mixture moments to ≤ 5e-15 rel err. Cross-checked
+against an independent Golub–Welsch eigendecomposition reference
+([tests/test_judd_quadrature.py](tests/test_judd_quadrature.py))
+agreeing to ≤ 1e-10. **Caveat for high γ:** polynomial exactness is
+necessary but not sufficient for the FOC integrand `E[exp(-γ·ε)]`.
+The +52 kurtosis means at γ ≥ 5 the integral is dominated by deep-tail
+mass that no low-`n` quadrature can resolve (rel err ~17% at
+`n_eps = 5, γ = 5`). See [LABOUR.md](LABOUR.md) §4.8 for production
+node-selection guidance.
 
 ### 11. Pension formula (post-fix)
 

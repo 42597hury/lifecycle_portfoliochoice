@@ -174,6 +174,10 @@ Status markers: `[ ]` open, `[~]` in progress, `[x]` done
 
 - [ ] **23. Production solve (10×10×10)**
   - `disc_config = DiscretizationConfig(state_grid_sizes=(10,10,10), n_ret_nodes_1d=3, ...)`
+    accepts a scalar (uniform K=3 → 27 return nodes) or a length-3 tuple
+    `(K_rtb, K_xr, K_xb)` for per-dimension refinement, e.g.
+    `n_ret_nodes_1d=(3, 9, 3)` to add resolution along the principal
+    eigenvector direction (xr) without paying for it on the bond/bill axes.
   - Expected runtime: several hours (dominated by working-age periods)
   - Save full policy bundle to disk immediately after solve
 

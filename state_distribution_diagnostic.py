@@ -1,8 +1,10 @@
 """
 State distribution diagnostic.
 
-Two checks of whether the VAR's state dynamics make the observed
-(y_1, spr, cy) history "typical" from the agent's perspective.
+Two checks of whether the VAR's state dynamics make the observed historical
+state history "typical" from the agent's perspective. State variable order
+is read at runtime from the model's partition (default cy/spr/y_1 since
+2026-04-30; legacy y_1/spr/cy under older bundles).
 
   1. Unconditional fit. Stationary distribution implied by the VAR
      (mean (I-Phi_11)^-1 Phi_0, covariance from discrete Lyapunov).
@@ -23,7 +25,9 @@ from scipy.stats import chi2
 from var import build_nominal_system1_var_config, partition_var
 
 CSV_PATH = "data/var_dataset.csv"
-STATE_NAMES = ("y_1", "spr", "cy")
+# State variable names; resolved dynamically below from the partition so this
+# script keeps working under either ordering (legacy (y_1, spr, cy) or default
+# (cy, spr, y_1) after 2026-04-30).  See contextfiles/RETURNS.md sec.5.6.
 N_STATE = 3
 
 
@@ -52,6 +56,11 @@ def main():
     Phi_0_state = parts["Phi_0_state"]
     Phi_11 = parts["Phi_11"]
     Sigma_ss = parts["Sigma_ss"]
+
+    # State variable names IN MODEL ORDER -- read from the partition so that
+    # historical S, model moments, and prediction errors all use the same
+    # column ordering.
+    STATE_NAMES = tuple(parts["state_names"])
 
     # ------------------------------------------------------------------
     # Historical state observations
@@ -115,7 +124,7 @@ def main():
     # Top 5 most surprising years under the unconditional model
     order = np.argsort(d2_uncond)[::-1][:5]
     print("Top 5 most surprising years (unconditional):")
-    print(f"  {'year':>6} {'d^2':>8} {'p_chi2':>10}  state (y_1, spr, cy)")
+    print(f"  {'year':>6} {'d^2':>8} {'p_chi2':>10}  state {STATE_NAMES}")
     for idx in order:
         p = float(chi2.sf(d2_uncond[idx], df=N_STATE))
         s = S[idx]
@@ -153,7 +162,7 @@ def main():
     print()
     order_c = np.argsort(d2_cond)[::-1][:5]
     print("Top 5 most surprising transitions (conditional):")
-    print(f"  {'year':>6} {'d^2':>8} {'p_chi2':>10}  innovation z-scores (y_1, spr, cy)")
+    print(f"  {'year':>6} {'d^2':>8} {'p_chi2':>10}  innovation z-scores {STATE_NAMES}")
     for idx in order_c:
         p = float(chi2.sf(d2_cond[idx], df=N_STATE))
         z = z_cond[idx]

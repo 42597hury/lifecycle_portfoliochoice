@@ -306,7 +306,7 @@ def build_var_config_from_dataset(
     columns,
     state_indices,
     return_indices,
-    y_1_index_in_state=0,
+    y_1_index_in_state=2,
     spr_index_in_state=1,
     trend="c",
     estimation="restricted",
@@ -380,9 +380,9 @@ def build_var_config_from_dataset(
 
 def build_nominal_system1_var_config(
     csv_path="data/var_dataset.csv",
-    state_indices=(0, 1, 2),
+    state_indices=(2, 1, 0),
     return_indices=(3, 4, 5),
-    y_1_index_in_state=0,
+    y_1_index_in_state=2,
     spr_index_in_state=1,
     trend="c",
     estimation="restricted",
@@ -390,7 +390,13 @@ def build_nominal_system1_var_config(
     """
     Nominal bond system with no riskless asset.
     columns = [y_1, spr, cy, rtb, xr, xb]
-    States: y_1(0), spr(1), cy(2)   Returns: rtb(3), xr(4), xb(5)
+    Returns: rtb(3), xr(4), xb(5)
+
+    Default state ordering: state_indices=(2, 1, 0) -> state vector is
+    (cy, spr, y_1).  This ordering puts cy in Cholesky column 0 (pure cy,
+    100% of cy variance) so per-axis state_n_stds[0] is a clean cy knob;
+    spr stays in the middle; y_1 takes the residual leakage in column 2.
+    See contextfiles/RETURNS.md sec.5.6 for why this ordering matters.
 
     Data is at ANNUAL frequency. The VAR is estimated directly at annual
     frequency using the CCV constrained estimator (z_bar pinned to sample mean).
@@ -402,7 +408,9 @@ def build_nominal_system1_var_config(
     xr   = excess nominal stock return over nominal bill
     xb   = excess nominal bond return over nominal bill
 
-    Partition indices: state_indices=[0,1,2], return_indices=[3,4,5].
+    With the default ordering, state_grid[:, 0] = cy, [:, 1] = spr, [:, 2] = y_1.
+    Pass state_indices=(0, 1, 2) and y_1_index_in_state=0 to recover the
+    legacy ordering (y_1, spr, cy) used by saved_runs/* prior to 2026-04-30.
     """
     columns = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
     return build_var_config_from_dataset(
@@ -442,7 +450,7 @@ def build_nominal_system1_var_config(
 
 # Variable order: [y_1, spr, cy, rtb, xr, xb]
 _NOM_COLS   = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
-_STATE_IDX  = [0, 1, 2]   # y_1, spr, cy
+_STATE_IDX  = [2, 1, 0]   # cy, spr, y_1  (cy first => pure-cy Cholesky col 0; see build_nominal_system1_var_config docstring)
 _RET_IDX    = [3, 4, 5]   # rtb, xr, xb
 
 # --- Unconditional means (= sample means, pinned by CCV constrained estimator) ---
@@ -504,12 +512,12 @@ def build_nominal_system1_var_config_hardcoded():
         "variable_names":         list(_NOM_COLS),
         "state_indices":          list(_STATE_IDX),
         "return_indices":         list(_RET_IDX),
-        "y_1_index_in_state":     0,
+        "y_1_index_in_state":     2,
         "spr_index_in_state":     1,
         "max_abs_return_lag_coeff": 0.0,
         "estimation":             "restricted_constrained_hardcoded",
         "trend":                  "c",
-        "state_predictor_columns": ["y_1", "spr", "cy"],
+        "state_predictor_columns": ["cy", "spr", "y_1"],
         "residual_correlation":   None,
         "equation_r2":            None,
     }

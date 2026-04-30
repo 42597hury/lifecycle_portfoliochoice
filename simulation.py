@@ -1,42 +1,53 @@
 """
-simulation.py - Lifecycle simulation for the refactored portfolio model.
+simulation.py - Lifecycle simulation for the partitioned-VAR portfolio model.
 
-This module simulates household paths downstream of the backward solver in
-`solver.py`. Policies are defined on start-of-period cash-on-hand and the
-simulation follows the same timing as the Bellman problem:
+Simulates household paths downstream of the backward solver in `solver.py`.
+Policies are stored on a 4D grid (age, persistent income, joint financial
+state, cash-on-hand) and evaluated continuously in (z, x); the joint financial
+state is propagated continuously via the partitioned VAR and snapped to the
+nearest bracket-grid index for next-period policy lookup.
+
+Per-period sequence (matches CONVENTIONS.md section 1):
 
 1. Enter period t alive with state (x_t, z_t, s_t).
-2. Look up policies c_t, alpha_s_t, alpha_b_t on the solved grids.
+2. Look up policies c_t, alpha_s_t, alpha_b_t (linear interpolation in z and
+   x; nearest-neighbour in s).
 3. Savings a_t = x_t - c_t.
-4. Propagate the next financial state continuously and map it back to the
-   nearest policy-grid index for next period's lookup.
-5. Realize end-of-period wealth a_t * R_port via one of two modes:
-   - "monte_carlo": residual return drawn from N(0, Sigma_r_cond) via a
-     precomputed factor matrix F such that F @ F' = Sigma_r_cond.
-   - "quadrature": residual drawn by sampling a Gauss-Hermite node using
-     ret_weights.
+4. Draw next-period state innovation v^s ~ N(0, Sigma_ss) and propagate
+   s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s. Snap to nearest bracket-grid
+   index for the next-period policy lookup.
+5. Conditional return mean mu_r = const_r + A_r @ s_t + M @ v^s. Realize
+   gross real returns via one of two modes:
+   - "monte_carlo": residual ~ N(0, Sigma_r_cond) drawn via a factor matrix
+     F such that F @ F' = Sigma_r_cond.
+   - "quadrature":  residual drawn by sampling a return-quadrature node by
+     ret_weights (used to verify the solver's Euler integration; the realized
+     return distribution is not Gaussian).
+   R_bill  = exp(mu_rtb + r_resid_0)
+   R_stock = R_bill * exp(mu_xr  + r_resid_1)
+   R_bond  = R_bill * exp(mu_xb  + r_resid_2)
 6. Draw survival from psi[t, z_t].
 7. If alive, draw next-period income and form x_{t+1} = a_t * R_port + Y_{t+1}.
 
-Income timing (MODEL_DESIGN Section 1.3):
-  - Working phase (t < retire_age_idx):
-      z transitions continuously: z' = rho*z + eta, where eta is drawn from
-      the mixture distribution. Income is computed directly from continuous z:
-      Y = disposable_income(exp(f(age) + z + eps)).
-  - Last working period (t = retire_age_idx - 1):
-      z transitions one final time; realized z at age 67 determines pension.
-  - Retirement phase (t >= retire_age_idx, age 67+):
-      z frozen; pension computed directly from continuous z via PIA formula.
+Income process (DESIGN.md section 1.4 / CONVENTIONS.md section 8):
+  - Working phase (t < retire_age_idx): both income innovations are drawn
+    from their continuous mixtures (eta_nodes / eps_nodes are quadrature
+    rules for the SOLVER, not sampling distributions):
+      eta ~ pz N(mu_eta1, sigma_eta1^2) + (1-pz) N(mu_eta2_eff, sigma_eta2^2)
+      eps ~ pe N(mu_eps1, sigma_eps1^2) + (1-pe) N(mu_eps2_eff, sigma_eps2^2)
+    where mu_eta2_eff = -(pz/(1-pz))*mu_eta1 and
+          mu_eps2_eff = -(pe/(1-pe))*mu_eps1 enforce E[eta] = E[eps] = 0.
+    z_{t+1} = rho * z_t + eta;  Y_{t+1} = disposable_income(exp(f + z + eps)).
+  - Retirement phase (t >= retire_age_idx): z frozen; pension is computed
+    directly from continuous z via the PIA formula on AIME = exp(z)*avg_det.
 
-At the terminal age, all remaining households die. Their final estate
+At the terminal age all remaining households die. Their final estate
     estate_T = savings_T * R_port_T
 is recorded as estate_at_death.
 
-Initial income consistency:
-  - If initial_x is None, each household starts at
-      x_0 = initial_wealth_i + Y_{0,i}
-    where initial_wealth_i is pre-labor-income asset wealth at entry and Y_{0,i}
-    is a drawn income realization at age 0.
+Initial cash-on-hand:
+  - If initial_x is None, x_0 = initial_wealth_i + Y_{0,i}, where Y_{0,i}
+    uses the same continuous-mixture eps draw as the per-period income.
   - If initial_x is supplied, sim_income[:, 0] still records a drawn income
     for bookkeeping, but that draw was not used to construct x_0.
 """
@@ -128,22 +139,13 @@ def _resolve_initial_state_indices(n_simulations: int,
                                    pc,
                                    initial_state: Union[str, np.ndarray],
                                    rng: np.random.Generator) -> np.ndarray:
-    """Mode-aware initialization for the financial state."""
+    """Initialize the joint financial state index for each simulated household."""
     if isinstance(initial_state, str) and initial_state == "stationary":
-        probs = getattr(pc, "state_stationary_probs", None)
-        if probs is not None:
-            probs = np.asarray(probs, dtype=float)
-            probs = np.clip(probs, 0.0, None)
-            probs = probs / np.maximum(probs.sum(), 1e-300)
-            return rng.choice(pc.N_state, size=n_simulations, p=probs).astype(np.int32)
+        probs = np.asarray(pc.state_stationary_probs, dtype=float)
+        probs = np.clip(probs, 0.0, None)
+        probs = probs / probs.sum()
+        return rng.choice(pc.N_state, size=n_simulations, p=probs).astype(np.int32)
     return initialize_states(n_simulations, pc.N_state, pc.Pi_state, initial_state, rng)
-
-
-def _draw_discrete_vectorized(weights: np.ndarray, uniforms: np.ndarray) -> np.ndarray:
-    """Vectorized inverse-CDF draw from a fixed discrete distribution."""
-    cumsum = np.cumsum(weights)
-    indices = np.searchsorted(cumsum, uniforms, side="left")
-    return np.clip(indices, 0, len(weights) - 1).astype(np.int32)
 
 
 def _normal_cdf(x: float, mean: float, std: float) -> float:
@@ -218,16 +220,13 @@ def _initialize_initial_wealth(n_simulations: int,
 
     This is interpreted as asset wealth households bring into working life
     before receiving their first labor-income draw. If `initial_x` is not
-    supplied, period-0 cash-on-hand is constructed as:
+    supplied, period-0 cash-on-hand is constructed as
+        x_0 = initial_wealth_i + Y_{0,i}.
 
-        x_0 = initial_wealth_i + Y_{0,i}
-
-    TODO: clarify the mapping between Catherine's "0.1 x national wage index"
-    calibration and the model's internal income units. For now, `0.1` is
-    treated as a direct model-unit placeholder.
-
-    Initial wealth is floored at zero. This is a clipped normal, not a
-    truncated normal, so negative draws pile up at zero.
+    The default 0.1 corresponds to ~0.1 * AWI (~$5,400) in model units
+    (CONVENTIONS.md section 4.1). Initial wealth is floored at zero — this
+    is a clipped normal, not a truncated normal, so negative draws pile up
+    at zero.
     """
     if initial_wealth_distribution is None:
         if initial_wealth is None:
@@ -260,15 +259,22 @@ def _initialize_initial_wealth(n_simulations: int,
 
 @njit(fastmath=True)
 def fast_interp_1d(x: float, x_grid: np.ndarray, y_grid: np.ndarray) -> float:
-    """Linear interpolation on a sorted grid with linear extrapolation."""
+    """Linear interpolation on a sorted grid with FLAT extrapolation.
+
+    Beyond the grid endpoints, returns the boundary y-value. Linear
+    extrapolation of policies (especially unconstrained portfolio shares,
+    which can have steep slopes near the wealth-grid edges) compounds across
+    the lifecycle and produces blow-ups when households drift outside
+    [wealth_min, wealth_max]. Flat extrapolation contains the simulation
+    inside the solved domain; off-grid visits should be diagnosed by
+    widening the wealth grid or capping leverage rather than by extrapolating.
+    """
     n = len(x_grid)
 
     if x <= x_grid[0]:
-        dx = x_grid[1] - x_grid[0] + 1e-30
-        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / dx
+        return y_grid[0]
     if x >= x_grid[n - 1]:
-        dx = x_grid[n - 1] - x_grid[n - 2] + 1e-30
-        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / dx
+        return y_grid[n - 1]
 
     lo, hi = 0, n - 1
     while hi - lo > 1:
@@ -321,6 +327,25 @@ _scalar_disposable_income = scalar_disposable_income
 
 
 @njit(fastmath=True)
+def _interp_policy_zx(arr4d: np.ndarray,
+                      t: int,
+                      iz_lo: int,
+                      frac_z: float,
+                      j_s: int,
+                      x_t: float,
+                      wealth_grid: np.ndarray) -> float:
+    """Interpolate a 4D policy array at one state-grid corner.
+
+    arr4d has shape (n_age, n_z, N_state, n_w). Returns the value at age t,
+    persistent state linearly interpolated between iz_lo/iz_lo+1 by frac_z,
+    joint financial state j_s, and cash-on-hand x_t (linear in wealth_grid).
+    """
+    v_lo = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo, j_s, :])
+    v_hi = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo + 1, j_s, :])
+    return (1.0 - frac_z) * v_lo + frac_z * v_hi
+
+
+@njit(fastmath=True)
 def _scalar_pension_after_tax(z_val: float, avg_det: float) -> float:
     """After-tax pension benefit for a single continuous z value.
 
@@ -366,15 +391,12 @@ def simulate_lifecycle_core(
     B_mat: np.ndarray,
     wealth_grid: np.ndarray,
     z_grid: np.ndarray,
-    Pi_state: np.ndarray,
-    mu_r: np.ndarray,
     ret_nodes: np.ndarray,
     ret_weights: np.ndarray,
     ret_factor: np.ndarray,
     log_det_profile: np.ndarray,
     avg_det: float,
-    eps_nodes: np.ndarray,
-    eps_weights: np.ndarray,
+    pension_at_z_grid: np.ndarray,
     survival_probs_2d: np.ndarray,
     rho: float,
     pz: float,
@@ -382,19 +404,22 @@ def simulate_lifecycle_core(
     sigma_eta1: float,
     sigma_eta2: float,
     mu_eta2_eff: float,
+    pe: float,
+    mu_eps1: float,
+    sigma_eps1: float,
+    sigma_eps2: float,
+    mu_eps2_eff: float,
     start_age: int,
     retire_age_idx: int,
     constrained: bool,
     use_mc_returns: bool,
     initial_z: np.ndarray,
-    initial_state: np.ndarray,
+    initial_s: np.ndarray,
     initial_x: np.ndarray,
     initial_income: np.ndarray,
     uniform_draws: np.ndarray,
     normal_draws: np.ndarray,
     # --- Continuous state transition arrays ---
-    use_continuous_state: bool,
-    state_grid: np.ndarray,
     state_grids_0: np.ndarray,
     state_grids_1: np.ndarray,
     state_grids_2: np.ndarray,
@@ -410,30 +435,41 @@ def simulate_lifecycle_core(
     """
     Numba-parallel core simulation loop over households.
 
-    z is tracked as a continuous float and policies are interpolated in z,
-    consistent with the solver's Gauss-Hermite quadrature treatment.
-    Income and pension are computed directly from continuous z (no table
-    interpolation).
+    z and the joint financial state s are tracked continuously per household.
+    Policies are interpolated trilinearly in s × linearly in z × linearly in x,
+    matching the solver's continuation-value lookup (solver.py:bracket_state_3d).
+    Survival and pension also use linear z-interp on the same iz_lo/frac_z
+    bracket so the simulator stays consistent with the solver's discrete-z
+    evaluation. eta and eps are drawn from their continuous mixtures.
 
-    uniform_draws[:, t, :] slots:
+    `pension_at_z_grid` is `pc.pension_after_tax[retire_age_idx, :]` — the
+    after-tax pension evaluated at every z_grid point. The retirement branch
+    and the work→retirement boundary both linearly interpolate this table
+    (matching solver.py's `pension_next_by_z` and the retirement step's
+    `pension_table[t+1, z_i]`).
+
+    `initial_s` has shape (n_simulations, 3) and seeds each household at an
+    economic state vector — typically the grid point selected by
+    `_resolve_initial_state_indices`. Subsequent s values are continuous.
+
+    uniform_draws[:, t, :] slots (4 columns):
       [0] survival draw
-      [1] mixture component draw (u < pz -> component 1)
-      [2] financial state transition draw (legacy discrete branch only)
+      [1] eta mixture component selector (u < pz -> component 1)
+      [2] eps mixture component selector (u < pe -> component 1)
       [3] return-node draw (quadrature mode only)
-      [4] transitory income shock draw
 
-    normal_draws[:, t, :] slots:
-      [0..n_ret-1] return shocks (monte_carlo mode)
-      [n_ret]      eta standard normal for persistent income innovation
-      [n_ret+1..n_ret+n_state] state innovation standard normals (when use_continuous_state=True)
+    normal_draws[:, t, :] slots (n_ret + 2 + n_state columns):
+      [0..n_ret-1]                          return residuals (monte_carlo mode)
+      [n_ret]                               eta standard normal
+      [n_ret + 1]                           eps standard normal
+      [n_ret + 2 .. n_ret + 1 + n_state]    state-innovation standard normals
     """
     n_simulations = len(initial_x)
     n_age = C_mat.shape[0]
     n_z = len(z_grid)
-    n_ret = mu_r.shape[2]
+    n_ret = ret_nodes.shape[1]
     dz = z_grid[1] - z_grid[0]
     z_lo = z_grid[0]
-    z_hi = z_grid[n_z - 1]
 
     sim_x = np.zeros((n_simulations, n_age))
     sim_c = np.zeros((n_simulations, n_age))
@@ -451,41 +487,137 @@ def simulate_lifecycle_core(
     death_age = np.full(n_simulations, -1, dtype=np.int32)
     estate_at_death = np.zeros(n_simulations)
 
+    N0_s = len(state_grids_0); N1_s = len(state_grids_1); N2_s = len(state_grids_2)
+
     for i in prange(n_simulations):
         z_val = initial_z[i]
-        state_idx = initial_state[i]
+        s0_t = initial_s[i, 0]
+        s1_t = initial_s[i, 1]
+        s2_t = initial_s[i, 2]
         x_t = initial_x[i]
         income_t = initial_income[i]
 
         for t in range(n_age):
             sim_alive[i, t] = True
             sim_z[i, t] = z_val
-            sim_state[i, t] = state_idx
             sim_x[i, t] = x_t
             sim_income[i, t] = income_t
 
-            # --- z interpolation indices for policy lookup ---
+            # --- z bracketing ---
             iz_lo = int((z_val - z_lo) / dz)
             iz_lo = max(0, min(iz_lo, n_z - 2))
             frac_z = (z_val - z_grid[iz_lo]) / dz
             frac_z = max(0.0, min(1.0, frac_z))
-
-            # nearest grid index (for survival lookup and diagnostics)
             z_idx_near = iz_lo if frac_z <= 0.5 else iz_lo + 1
             sim_z_idx[i, t] = z_idx_near
 
-            # --- Policy lookup: interpolate in z, then in wealth ---
-            c_lo = fast_interp_1d(x_t, wealth_grid, C_mat[t, iz_lo, state_idx, :])
-            c_hi = fast_interp_1d(x_t, wealth_grid, C_mat[t, iz_lo + 1, state_idx, :])
-            c_t = (1.0 - frac_z) * c_lo + frac_z * c_hi
+            # --- s bracketing in transformed (bracket) coordinates ---
+            ds0 = s0_t - state_bracket_shift[0]
+            ds1 = s1_t - state_bracket_shift[1]
+            ds2 = s2_t - state_bracket_shift[2]
+            b0 = state_bracket_L_inv[0, 0] * ds0 + state_bracket_L_inv[0, 1] * ds1 + state_bracket_L_inv[0, 2] * ds2
+            b1 = state_bracket_L_inv[1, 0] * ds0 + state_bracket_L_inv[1, 1] * ds1 + state_bracket_L_inv[1, 2] * ds2
+            b2 = state_bracket_L_inv[2, 0] * ds0 + state_bracket_L_inv[2, 1] * ds1 + state_bracket_L_inv[2, 2] * ds2
 
-            as_lo = fast_interp_1d(x_t, wealth_grid, S_mat[t, iz_lo, state_idx, :])
-            as_hi = fast_interp_1d(x_t, wealth_grid, S_mat[t, iz_lo + 1, state_idx, :])
-            alpha_s_t = (1.0 - frac_z) * as_lo + frac_z * as_hi
+            # Bracket b0 in state_grids_0
+            if b0 <= state_grids_0[0]:
+                lo0 = 0; f0 = 0.0
+            elif b0 >= state_grids_0[N0_s - 1]:
+                lo0 = N0_s - 2; f0 = 1.0
+            else:
+                lo0 = 0
+                for ii in range(N0_s - 1):
+                    if state_grids_0[ii + 1] > b0:
+                        lo0 = ii
+                        break
+                dg0 = state_grids_0[lo0 + 1] - state_grids_0[lo0]
+                f0 = (b0 - state_grids_0[lo0]) / dg0 if dg0 > 1e-30 else 0.0
+                f0 = max(0.0, min(1.0, f0))
 
-            ab_lo = fast_interp_1d(x_t, wealth_grid, B_mat[t, iz_lo, state_idx, :])
-            ab_hi = fast_interp_1d(x_t, wealth_grid, B_mat[t, iz_lo + 1, state_idx, :])
-            alpha_b_t = (1.0 - frac_z) * ab_lo + frac_z * ab_hi
+            if b1 <= state_grids_1[0]:
+                lo1 = 0; f1 = 0.0
+            elif b1 >= state_grids_1[N1_s - 1]:
+                lo1 = N1_s - 2; f1 = 1.0
+            else:
+                lo1 = 0
+                for ii in range(N1_s - 1):
+                    if state_grids_1[ii + 1] > b1:
+                        lo1 = ii
+                        break
+                dg1 = state_grids_1[lo1 + 1] - state_grids_1[lo1]
+                f1 = (b1 - state_grids_1[lo1]) / dg1 if dg1 > 1e-30 else 0.0
+                f1 = max(0.0, min(1.0, f1))
+
+            if b2 <= state_grids_2[0]:
+                lo2 = 0; f2 = 0.0
+            elif b2 >= state_grids_2[N2_s - 1]:
+                lo2 = N2_s - 2; f2 = 1.0
+            else:
+                lo2 = 0
+                for ii in range(N2_s - 1):
+                    if state_grids_2[ii + 1] > b2:
+                        lo2 = ii
+                        break
+                dg2 = state_grids_2[lo2 + 1] - state_grids_2[lo2]
+                f2 = (b2 - state_grids_2[lo2]) / dg2 if dg2 > 1e-30 else 0.0
+                f2 = max(0.0, min(1.0, f2))
+
+            # Diagnostic: nearest grid index from current bracket fractions
+            d0 = lo0 if f0 <= 0.5 else lo0 + 1
+            d1 = lo1 if f1 <= 0.5 else lo1 + 1
+            d2 = lo2 if f2 <= 0.5 else lo2 + 1
+            sim_state[i, t] = d0 * N1_s * N2_s + d1 * N2_s + d2
+
+            # 8 trilinear corners — same flat indexing as the solver
+            j000 = lo0 * N1_s * N2_s + lo1 * N2_s + lo2
+            j001 = lo0 * N1_s * N2_s + lo1 * N2_s + (lo2 + 1)
+            j010 = lo0 * N1_s * N2_s + (lo1 + 1) * N2_s + lo2
+            j011 = lo0 * N1_s * N2_s + (lo1 + 1) * N2_s + (lo2 + 1)
+            j100 = (lo0 + 1) * N1_s * N2_s + lo1 * N2_s + lo2
+            j101 = (lo0 + 1) * N1_s * N2_s + lo1 * N2_s + (lo2 + 1)
+            j110 = (lo0 + 1) * N1_s * N2_s + (lo1 + 1) * N2_s + lo2
+            j111 = (lo0 + 1) * N1_s * N2_s + (lo1 + 1) * N2_s + (lo2 + 1)
+
+            w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
+            w001 = (1.0 - f0) * (1.0 - f1) * f2
+            w010 = (1.0 - f0) * f1 * (1.0 - f2)
+            w011 = (1.0 - f0) * f1 * f2
+            w100 = f0 * (1.0 - f1) * (1.0 - f2)
+            w101 = f0 * (1.0 - f1) * f2
+            w110 = f0 * f1 * (1.0 - f2)
+            w111 = f0 * f1 * f2
+
+            # --- Policy lookup: trilinear in s × linear in z × linear in x ---
+            c_t = (
+                w000 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j000, x_t, wealth_grid)
+                + w001 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j001, x_t, wealth_grid)
+                + w010 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j010, x_t, wealth_grid)
+                + w011 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j011, x_t, wealth_grid)
+                + w100 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j100, x_t, wealth_grid)
+                + w101 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j101, x_t, wealth_grid)
+                + w110 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j110, x_t, wealth_grid)
+                + w111 * _interp_policy_zx(C_mat, t, iz_lo, frac_z, j111, x_t, wealth_grid)
+            )
+            alpha_s_t = (
+                w000 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j000, x_t, wealth_grid)
+                + w001 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j001, x_t, wealth_grid)
+                + w010 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j010, x_t, wealth_grid)
+                + w011 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j011, x_t, wealth_grid)
+                + w100 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j100, x_t, wealth_grid)
+                + w101 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j101, x_t, wealth_grid)
+                + w110 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j110, x_t, wealth_grid)
+                + w111 * _interp_policy_zx(S_mat, t, iz_lo, frac_z, j111, x_t, wealth_grid)
+            )
+            alpha_b_t = (
+                w000 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j000, x_t, wealth_grid)
+                + w001 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j001, x_t, wealth_grid)
+                + w010 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j010, x_t, wealth_grid)
+                + w011 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j011, x_t, wealth_grid)
+                + w100 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j100, x_t, wealth_grid)
+                + w101 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j101, x_t, wealth_grid)
+                + w110 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j110, x_t, wealth_grid)
+                + w111 * _interp_policy_zx(B_mat, t, iz_lo, frac_z, j111, x_t, wealth_grid)
+            )
 
             if constrained:
                 alpha_s_t, alpha_b_t = _clean_constrained_shares(alpha_s_t, alpha_b_t)
@@ -505,57 +637,24 @@ def simulate_lifecycle_core(
             sim_alpha_s[i, t] = alpha_s_t
             sim_alpha_b[i, t] = alpha_b_t
 
-            if use_continuous_state:
-                # Draw v^s = L_ss @ z where z ~ N(0, I)
-                n_state = L_ss.shape[0]
-                v_s_0 = 0.0; v_s_1 = 0.0; v_s_2 = 0.0
-                for kk in range(n_state):
-                    zz = normal_draws[i, t, n_ret + 1 + kk]
-                    v_s_0 += L_ss[0, kk] * zz
-                    v_s_1 += L_ss[1, kk] * zz
-                    v_s_2 += L_ss[2, kk] * zz
+            # Draw state innovation v^s = L_ss @ z, z ~ N(0, I)
+            n_state = L_ss.shape[0]
+            v_s_0 = 0.0; v_s_1 = 0.0; v_s_2 = 0.0
+            for kk in range(n_state):
+                zz = normal_draws[i, t, n_ret + 2 + kk]
+                v_s_0 += L_ss[0, kk] * zz
+                v_s_1 += L_ss[1, kk] * zz
+                v_s_2 += L_ss[2, kk] * zz
 
-                # Propagate state
-                s_cur = state_grid[state_idx]
-                s_next_0 = Phi_0_state[0] + Phi_11[0, 0] * s_cur[0] + Phi_11[0, 1] * s_cur[1] + Phi_11[0, 2] * s_cur[2] + v_s_0
-                s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * s_cur[0] + Phi_11[1, 1] * s_cur[1] + Phi_11[1, 2] * s_cur[2] + v_s_1
-                s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * s_cur[0] + Phi_11[2, 1] * s_cur[1] + Phi_11[2, 2] * s_cur[2] + v_s_2
+            # Propagate continuous state s_{t+1} = Phi_0 + Phi_11 @ s_t + v^s
+            s_next_0 = Phi_0_state[0] + Phi_11[0, 0] * s0_t + Phi_11[0, 1] * s1_t + Phi_11[0, 2] * s2_t + v_s_0
+            s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * s0_t + Phi_11[1, 1] * s1_t + Phi_11[1, 2] * s2_t + v_s_1
+            s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * s0_t + Phi_11[2, 1] * s1_t + Phi_11[2, 2] * s2_t + v_s_2
 
-                # Conditional return mean from continuous v^s (3 returns: rtb, xr, xb)
-                mu_rtb = const_r[0] + A_r[0, 0] * s_cur[0] + A_r[0, 1] * s_cur[1] + A_r[0, 2] * s_cur[2] + M_matrix[0, 0] * v_s_0 + M_matrix[0, 1] * v_s_1 + M_matrix[0, 2] * v_s_2
-                mu_xr  = const_r[1] + A_r[1, 0] * s_cur[0] + A_r[1, 1] * s_cur[1] + A_r[1, 2] * s_cur[2] + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
-                mu_xb  = const_r[2] + A_r[2, 0] * s_cur[0] + A_r[2, 1] * s_cur[1] + A_r[2, 2] * s_cur[2] + M_matrix[2, 0] * v_s_0 + M_matrix[2, 1] * v_s_1 + M_matrix[2, 2] * v_s_2
-
-                ds0 = s_next_0 - state_bracket_shift[0]
-                ds1 = s_next_1 - state_bracket_shift[1]
-                ds2 = s_next_2 - state_bracket_shift[2]
-                b_next_0 = state_bracket_L_inv[0, 0] * ds0 + state_bracket_L_inv[0, 1] * ds1 + state_bracket_L_inv[0, 2] * ds2
-                b_next_1 = state_bracket_L_inv[1, 0] * ds0 + state_bracket_L_inv[1, 1] * ds1 + state_bracket_L_inv[1, 2] * ds2
-                b_next_2 = state_bracket_L_inv[2, 0] * ds0 + state_bracket_L_inv[2, 1] * ds1 + state_bracket_L_inv[2, 2] * ds2
-
-                # Find nearest grid point for next period's policy lookup
-                N1_s = len(state_grids_1); N2_s = len(state_grids_2)
-                best_d0 = 0; best_dist = abs(b_next_0 - state_grids_0[0])
-                for dd in range(1, len(state_grids_0)):
-                    d = abs(b_next_0 - state_grids_0[dd])
-                    if d < best_dist:
-                        best_dist = d; best_d0 = dd
-                best_d1 = 0; best_dist = abs(b_next_1 - state_grids_1[0])
-                for dd in range(1, N1_s):
-                    d = abs(b_next_1 - state_grids_1[dd])
-                    if d < best_dist:
-                        best_dist = d; best_d1 = dd
-                best_d2 = 0; best_dist = abs(b_next_2 - state_grids_2[0])
-                for dd in range(1, N2_s):
-                    d = abs(b_next_2 - state_grids_2[dd])
-                    if d < best_dist:
-                        best_dist = d; best_d2 = dd
-                next_state_idx = best_d0 * N1_s * N2_s + best_d1 * N2_s + best_d2
-            else:
-                next_state_idx = draw_discrete(Pi_state[state_idx, :], uniform_draws[i, t, 2])
-                mu_rtb = mu_r[state_idx, next_state_idx, 0]
-                mu_xr  = mu_r[state_idx, next_state_idx, 1]
-                mu_xb  = mu_r[state_idx, next_state_idx, 2]
+            # Conditional return mean given (s_t, v^s) — 3 returns: rtb, xr, xb
+            mu_rtb = const_r[0] + A_r[0, 0] * s0_t + A_r[0, 1] * s1_t + A_r[0, 2] * s2_t + M_matrix[0, 0] * v_s_0 + M_matrix[0, 1] * v_s_1 + M_matrix[0, 2] * v_s_2
+            mu_xr  = const_r[1] + A_r[1, 0] * s0_t + A_r[1, 1] * s1_t + A_r[1, 2] * s2_t + M_matrix[1, 0] * v_s_0 + M_matrix[1, 1] * v_s_1 + M_matrix[1, 2] * v_s_2
+            mu_xb  = const_r[2] + A_r[2, 0] * s0_t + A_r[2, 1] * s1_t + A_r[2, 2] * s2_t + M_matrix[2, 0] * v_s_0 + M_matrix[2, 1] * v_s_1 + M_matrix[2, 2] * v_s_2
 
             if use_mc_returns:
                 rtb_res = 0.0
@@ -589,40 +688,67 @@ def simulate_lifecycle_core(
                 estate_at_death[i] = estate_t
                 break
 
-            # --- Survival (nearest-neighbor z lookup) ---
-            if uniform_draws[i, t, 0] > survival_probs_2d[t, z_idx_near]:
+            # --- Survival (linear z-interp on the same iz_lo/frac_z used
+            # for policy lookup; matches the rest of the continuous-z
+            # treatment and avoids the step-function in nearest-neighbour). ---
+            psi_t = (1.0 - frac_z) * survival_probs_2d[t, iz_lo] + frac_z * survival_probs_2d[t, iz_lo + 1]
+            if uniform_draws[i, t, 0] > psi_t:
                 death_age[i] = age_t
                 estate_at_death[i] = estate_t
                 break
 
             # --- z and income transition ---
             if t < retire_age_idx:
-                # Draw eta from mixture: component selection + normal draw
+                # Draw eta from continuous mixture
                 std_normal_eta = normal_draws[i, t, n_ret]
                 if uniform_draws[i, t, 1] < pz:
                     eta = mu_eta1 + sigma_eta1 * std_normal_eta
                 else:
                     eta = mu_eta2_eff + sigma_eta2 * std_normal_eta
 
+                # z is propagated unclamped; downstream policy/survival lookup
+                # bracket-clamps the policy axis but income uses raw z so tail
+                # earnings (and hence pension) are not artificially truncated.
                 z_next = rho * z_val + eta
-                # Clamp to grid bounds
-                z_next = max(z_lo, min(z_hi, z_next))
 
-                # Transitory shock (discrete quadrature draw)
-                eps_idx = draw_discrete(eps_weights, uniform_draws[i, t, 4])
+                if t == retire_age_idx - 1:
+                    # Work→retirement boundary. The solver replaces next-period
+                    # labor income with linearly z-interpolated pension(z_next)
+                    # at this step (see solver.py work-to-retirement block where
+                    # use_pension_next=True). Match exactly so the simulator's
+                    # x_{retire_age} is the same x_{retire_age} the solver
+                    # optimised c, alpha_s, alpha_b for.
+                    iz_lo_next = int((z_next - z_lo) / dz)
+                    iz_lo_next = max(0, min(iz_lo_next, n_z - 2))
+                    frac_z_next = (z_next - z_grid[iz_lo_next]) / dz
+                    frac_z_next = max(0.0, min(1.0, frac_z_next))
+                    income_next = ((1.0 - frac_z_next) * pension_at_z_grid[iz_lo_next]
+                                   + frac_z_next * pension_at_z_grid[iz_lo_next + 1])
+                else:
+                    # Draw eps from continuous mixture
+                    std_normal_eps = normal_draws[i, t, n_ret + 1]
+                    if uniform_draws[i, t, 2] < pe:
+                        eps_val = mu_eps1 + sigma_eps1 * std_normal_eps
+                    else:
+                        eps_val = mu_eps2_eff + sigma_eps2 * std_normal_eps
 
-                # Direct income computation
-                y_gross = np.exp(log_det_profile[t + 1] + z_next + eps_nodes[eps_idx])
-                income_next = _scalar_disposable_income(y_gross)
+                    y_gross = np.exp(log_det_profile[t + 1] + z_next + eps_val)
+                    income_next = _scalar_disposable_income(y_gross)
             else:
-                # Retirement: z frozen, pension from continuous z
+                # Retirement: z frozen. Pension uses linear z-interp on the
+                # discrete-z pension table (same iz_lo/frac_z bracket used for
+                # policy lookup at the top of the period), matching the solver's
+                # pension_table[t+1, z_i] evaluation at retirement.
                 z_next = z_val
-                income_next = _scalar_pension_after_tax(z_val, avg_det)
+                income_next = ((1.0 - frac_z) * pension_at_z_grid[iz_lo]
+                               + frac_z * pension_at_z_grid[iz_lo + 1])
 
             x_t = estate_t + income_next
             income_t = income_next
             z_val = z_next
-            state_idx = next_state_idx
+            s0_t = s_next_0
+            s1_t = s_next_1
+            s2_t = s_next_2
 
     return (
         sim_x,
@@ -652,6 +778,45 @@ def _validate_policy_shapes(C_mat: np.ndarray,
             raise ValueError(f"{name} has shape {arr.shape}, expected {expected}.")
 
 
+def _wealth_offgrid_diagnostics(sim_x: np.ndarray,
+                                sim_alive: np.ndarray,
+                                wealth_grid: np.ndarray) -> dict:
+    """Per-age fraction of alive households whose cash-on-hand is outside
+    [wealth_min, wealth_max]. Off-grid households fall on the boundary policy
+    via flat extrapolation, so a high off-grid share means the simulator is
+    no longer reporting moments of the solved model. Standard practice in
+    lifecycle simulation: widen the wealth grid until off-grid share is small.
+    """
+    wlo = float(wealth_grid[0])
+    whi = float(wealth_grid[-1])
+    n_age = sim_x.shape[1]
+
+    n_alive = sim_alive.sum(axis=0).astype(float)              # (n_age,)
+    safe = np.maximum(n_alive, 1.0)
+    below_count = ((sim_x < wlo) & sim_alive).sum(axis=0)
+    above_count = ((sim_x > whi) & sim_alive).sum(axis=0)
+    below_frac = below_count / safe
+    above_frac = above_count / safe
+    off_frac = below_frac + above_frac
+
+    # Where no households are alive, set to NaN so callers can mask cleanly.
+    no_alive = n_alive == 0
+    below_frac = np.where(no_alive, np.nan, below_frac)
+    above_frac = np.where(no_alive, np.nan, above_frac)
+    off_frac = np.where(no_alive, np.nan, off_frac)
+
+    return {
+        "wealth_min": wlo,
+        "wealth_max": whi,
+        "below_frac": below_frac,
+        "above_frac": above_frac,
+        "off_frac": off_frac,
+        "max_off_frac": float(np.nanmax(off_frac)) if not np.all(no_alive) else float("nan"),
+        "max_off_age_offset": int(np.nanargmax(off_frac)) if not np.all(no_alive) else -1,
+        "n_age": int(n_age),
+    }
+
+
 def simulate_lifecycle(C_mat: np.ndarray,
                        S_mat: np.ndarray,
                        B_mat: np.ndarray,
@@ -667,6 +832,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
                        initial_state: Union[str, np.ndarray] = "median",
                        seed: int = 42,
                        return_draw_mode: str = "monte_carlo",
+                       wealth_offgrid_warn_threshold: float = 0.05,
                        verbose: bool = True) -> dict:
     """
     Simulate lifecycle paths using the solved consumption and portfolio policies.
@@ -708,6 +874,12 @@ def simulate_lifecycle(C_mat: np.ndarray,
         Master random seed.
     return_draw_mode : {"monte_carlo", "quadrature"}
         How to simulate residual return shocks each period.
+    wealth_offgrid_warn_threshold : float
+        If the maximum (over alive ages) fraction of households whose cash-on-hand
+        leaves [wealth_min, wealth_max] exceeds this, emit a UserWarning. Off-grid
+        households fall on the boundary policy via flat extrapolation, so a high
+        share means simulated moments no longer represent the solved model.
+        Default 0.05 (5%); set to 1.0 to disable.
     verbose : bool
         Print progress and a simulation summary.
 
@@ -739,22 +911,32 @@ def simulate_lifecycle(C_mat: np.ndarray,
         print(f"  Income x fin state:  {pc.n_z} z x {pc.N_state} s = {pc.n_z * pc.N_state:,} combined states")
         print(f"  Eta quad nodes:      {len(pc.eta_nodes)} (Judd-mixture, total = n_eta_nodes={pc.disc_config.n_eta_nodes})")
         print(f"  Eps quad nodes:      {len(pc.eps_nodes)} (Judd-mixture, total = n_eps_nodes={pc.disc_config.n_eps_nodes})")
+        print(f"  State quad nodes:    {pc.n_state_quad} ({pc.disc_config.n_state_quad_nodes} per dim, solver only)")
         print(f"  Return quad nodes:   {pc.n_ret_quad} (K=({'x'.join(str(k) for k in pc.n_ret_nodes_1d)}) per dim)")
         print(f"  Return draw mode:    {return_draw_mode}")
         if return_draw_mode == "monte_carlo":
             diag = np.sqrt(np.clip(np.diag(model.Sigma_r_cond), 0.0, None))
-            print(f"  sigma_resid (xr,xb): {diag[0]:.4f}, {diag[1]:.4f}")
+            print(f"  sigma_resid (rtb,xr,xb): {diag[0]:.4f}, {diag[1]:.4f}, {diag[2]:.4f}")
 
     rng = np.random.default_rng(seed)
+
+    # Mixture component-2 means derived to enforce E[eta] = E[eps] = 0
+    # (model.mu_eta2 and model.mu_eps2 stored on the model object are
+    # informational; quadrature and simulation both recompute these.)
+    mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
+    mu_eps2_eff = -(model.pe / (1.0 - model.pe)) * model.mu_eps1
 
     # --- Initialize z as continuous values ---
     if isinstance(initial_z, str) and initial_z == "normal":
         init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=initial_z_normal_std)
         init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
     elif isinstance(initial_z, str) and initial_z == "stationary":
-        # Unconditional distribution of z: N(0, sigma_z^2) where sigma_z^2 = Var(eta) / (1 - rho^2)
+        # Unconditional distribution of z: N(0, sigma_z^2) with
+        # sigma_z^2 = Var(eta) / (1 - rho^2). With E[eta]=0 enforced via
+        # mu_eta2_eff, Var(eta) = pz*(sigma_eta1^2 + mu_eta1^2)
+        #                       + (1-pz)*(sigma_eta2^2 + mu_eta2_eff^2).
         var_eta = (model.pz * (model.sigma_eta1**2 + model.mu_eta1**2)
-                   + (1 - model.pz) * (model.sigma_eta2**2 + model.mu_eta2**2))
+                   + (1 - model.pz) * (model.sigma_eta2**2 + mu_eta2_eff**2))
         sigma_z = np.sqrt(var_eta / (1.0 - model.rho**2))
         init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=sigma_z)
         init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
@@ -765,14 +947,18 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     init_state_idx = _resolve_initial_state_indices(n_simulations, pc, initial_state, rng)
 
-    # --- Initial income: compute directly from continuous z ---
-    # Use the vectorized model functions (outside the Numba core loop)
+    # --- Initial income: continuous mixture eps draw, direct from continuous z ---
     from model import disposable_income_working as _disp_inc_vec
     from model import compute_pension_after_tax as _pension_vec
-    init_eps_raw = rng.uniform(size=n_simulations)
     if retire_age_idx > 0:
-        init_eps_idx = _draw_discrete_vectorized(pc.eps_weights, init_eps_raw)
-        init_y_gross = np.exp(pc.log_det_profile[0] + init_z_val + pc.eps_nodes[init_eps_idx])
+        init_eps_uniform = rng.uniform(size=n_simulations)
+        init_eps_normal = rng.standard_normal(size=n_simulations)
+        init_eps_val = np.where(
+            init_eps_uniform < model.pe,
+            model.mu_eps1 + model.sigma_eps1 * init_eps_normal,
+            mu_eps2_eff + model.sigma_eps2 * init_eps_normal,
+        )
+        init_y_gross = np.exp(pc.log_det_profile[0] + init_z_val + init_eps_val)
         initial_income_arr = _disp_inc_vec(init_y_gross)
     else:
         initial_income_arr = _pension_vec(init_z_val, pc.avg_det)
@@ -839,57 +1025,42 @@ def simulate_lifecycle(C_mat: np.ndarray,
             print(f"  Initial z sigma:     {initial_z_normal_std:.3f}")
         print(f"  Initial fin state:   {s_label}")
 
-    uniform_draws = rng.uniform(size=(n_simulations, n_age, 5))
+    # uniform_draws columns: [survival, eta-mix, eps-mix, ret-node]
+    uniform_draws = rng.uniform(size=(n_simulations, n_age, 4))
 
-    # normal_draws: n_ret columns for return shocks + 1 column for eta + n_state for state innovations
+    # normal_draws columns: n_ret return residuals + 1 eta + 1 eps + n_state innovations
     n_state = int(model.n_state)
-    use_continuous_state = hasattr(pc, 'v_nodes')  # True if state quadrature was set up
-    n_normal_cols = n_ret + 1 + (n_state if use_continuous_state else 0)
+    n_normal_cols = n_ret + 2 + n_state
+    normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
     if return_draw_mode == "monte_carlo":
         ret_factor_arr = _build_return_factor(model.Sigma_r_cond)
-        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
         use_mc_returns = True
     else:
         ret_factor_arr = np.zeros((n_ret, n_ret), dtype=float)
-        normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
         use_mc_returns = False
 
     if verbose:
         print("\n  Running simulation...", flush=True)
 
-    # Mixture parameters for continuous eta draws
-    mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
-
     t_start = time.perf_counter()
 
-    # Prepare continuous state transition arrays
-    if use_continuous_state:
-        L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
-            0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)))
-        state_grid_arr = np.ascontiguousarray(pc.state_grid)
-        sg0 = np.ascontiguousarray(pc.state_bracket_grids[0])
-        sg1 = np.ascontiguousarray(pc.state_bracket_grids[1])
-        sg2 = np.ascontiguousarray(pc.state_bracket_grids[2])
-        state_bracket_shift_arr = np.ascontiguousarray(pc.state_bracket_shift)
-        state_bracket_L_inv_arr = np.ascontiguousarray(pc.state_bracket_L_inv)
-        Phi_0_state_arr = np.ascontiguousarray(model.Phi_0_state)
-        Phi_11_arr = np.ascontiguousarray(model.Phi_11)
-        const_r_arr = np.ascontiguousarray(pc.const_r)
-        A_r_arr = np.ascontiguousarray(pc.A_r)
-        M_matrix_arr = np.ascontiguousarray(model.M)
-    else:
-        L_ss_arr = np.empty((0, 0), dtype=float)
-        state_grid_arr = np.empty((0, 0), dtype=float)
-        sg0 = np.empty(0, dtype=float)
-        sg1 = np.empty(0, dtype=float)
-        sg2 = np.empty(0, dtype=float)
-        state_bracket_shift_arr = np.empty(0, dtype=float)
-        state_bracket_L_inv_arr = np.empty((0, 0), dtype=float)
-        Phi_0_state_arr = np.empty(0, dtype=float)
-        Phi_11_arr = np.empty((0, 0), dtype=float)
-        const_r_arr = np.empty(0, dtype=float)
-        A_r_arr = np.empty((0, 0), dtype=float)
-        M_matrix_arr = np.empty((0, 0), dtype=float)
+    # Continuous state-transition arrays (always used)
+    L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
+        0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)))
+    sg0 = np.ascontiguousarray(pc.state_bracket_grids[0])
+    sg1 = np.ascontiguousarray(pc.state_bracket_grids[1])
+    sg2 = np.ascontiguousarray(pc.state_bracket_grids[2])
+    state_bracket_shift_arr = np.ascontiguousarray(pc.state_bracket_shift)
+    state_bracket_L_inv_arr = np.ascontiguousarray(pc.state_bracket_L_inv)
+    Phi_0_state_arr = np.ascontiguousarray(model.Phi_0_state)
+    Phi_11_arr = np.ascontiguousarray(model.Phi_11)
+    const_r_arr = np.ascontiguousarray(pc.const_r)
+    A_r_arr = np.ascontiguousarray(pc.A_r)
+    M_matrix_arr = np.ascontiguousarray(model.M)
+
+    # Resolve the integer state index (still used to seed each household at
+    # an on-grid economic state vector) and convert to continuous s coords.
+    init_s_coords = np.ascontiguousarray(pc.state_grid[init_state_idx, :])
 
     results = simulate_lifecycle_core(
         C_mat=np.ascontiguousarray(C_mat),
@@ -897,15 +1068,12 @@ def simulate_lifecycle(C_mat: np.ndarray,
         B_mat=np.ascontiguousarray(B_mat),
         wealth_grid=np.ascontiguousarray(pc.wealth_grid),
         z_grid=np.ascontiguousarray(pc.z_grid),
-        Pi_state=np.ascontiguousarray(pc.Pi_state),
-        mu_r=np.ascontiguousarray(pc.mu_r),
         ret_nodes=np.ascontiguousarray(pc.ret_nodes),
         ret_weights=np.ascontiguousarray(pc.ret_weights),
         ret_factor=np.ascontiguousarray(ret_factor_arr),
         log_det_profile=np.ascontiguousarray(pc.log_det_profile),
         avg_det=float(pc.avg_det),
-        eps_nodes=np.ascontiguousarray(pc.eps_nodes),
-        eps_weights=np.ascontiguousarray(pc.eps_weights),
+        pension_at_z_grid=np.ascontiguousarray(pc.pension_after_tax[retire_age_idx, :]),
         survival_probs_2d=np.ascontiguousarray(pc.survival_probs_2d),
         rho=float(model.rho),
         pz=float(model.pz),
@@ -913,18 +1081,21 @@ def simulate_lifecycle(C_mat: np.ndarray,
         sigma_eta1=float(model.sigma_eta1),
         sigma_eta2=float(model.sigma_eta2),
         mu_eta2_eff=float(mu_eta2_eff),
+        pe=float(model.pe),
+        mu_eps1=float(model.mu_eps1),
+        sigma_eps1=float(model.sigma_eps1),
+        sigma_eps2=float(model.sigma_eps2),
+        mu_eps2_eff=float(mu_eps2_eff),
         start_age=int(model.start_age),
         retire_age_idx=int(retire_age_idx),
         constrained=bool(model.constrained),
         use_mc_returns=use_mc_returns,
         initial_z=np.ascontiguousarray(init_z_val),
-        initial_state=np.ascontiguousarray(init_state_idx),
+        initial_s=init_s_coords,
         initial_x=np.ascontiguousarray(init_x),
         initial_income=np.ascontiguousarray(initial_income_arr),
         uniform_draws=np.ascontiguousarray(uniform_draws),
         normal_draws=np.ascontiguousarray(normal_draws),
-        use_continuous_state=use_continuous_state,
-        state_grid=state_grid_arr,
         state_grids_0=sg0,
         state_grids_1=sg1,
         state_grids_2=sg2,
@@ -959,6 +1130,20 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     sim_alpha_bill = 1.0 - sim_alpha_s - sim_alpha_b
 
+    offgrid = _wealth_offgrid_diagnostics(sim_x, sim_alive, pc.wealth_grid)
+    if offgrid["max_off_frac"] > wealth_offgrid_warn_threshold:
+        peak_age = model.start_age + offgrid["max_off_age_offset"]
+        warnings.warn(
+            f"simulate_lifecycle: {offgrid['max_off_frac']:.1%} of alive households "
+            f"are outside the solved wealth grid [{offgrid['wealth_min']:.2e}, "
+            f"{offgrid['wealth_max']:.2f}] at age {peak_age} (threshold "
+            f"{wealth_offgrid_warn_threshold:.1%}). Off-grid households fall on "
+            "the boundary policy via flat extrapolation, so simulated moments "
+            "no longer represent the solved model. Widen wealth_max (and "
+            "potentially raise n_wealth) before relying on results.",
+            stacklevel=2,
+        )
+
     if verbose:
         _print_simulation_summary(
             model=model,
@@ -992,6 +1177,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
         "alive": sim_alive,
         "death_age": death_age,
         "ages": pc.ages.copy(),
+        "wealth_offgrid": offgrid,
     }
 
 

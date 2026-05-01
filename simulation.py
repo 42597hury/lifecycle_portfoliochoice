@@ -3,19 +3,26 @@ simulation.py - Lifecycle simulation for the partitioned-VAR portfolio model.
 
 Simulates household paths downstream of the backward solver in `solver.py`.
 Policies are stored on a 4D grid (age, persistent income, joint financial
-state, cash-on-hand) and evaluated continuously in (z, x); the joint financial
-state is propagated continuously via the partitioned VAR and snapped to the
-nearest bracket-grid index for next-period policy lookup.
+state, cash-on-hand) and evaluated continuously in (z, s, x). The joint
+financial state is propagated continuously via the partitioned VAR; the
+nearest bracket-grid snap is recorded as the `sim_state` diagnostic only
+and is not used for policy evaluation.
 
 Per-period sequence (matches CONVENTIONS.md section 1):
 
 1. Enter period t alive with state (x_t, z_t, s_t).
-2. Look up policies c_t, alpha_s_t, alpha_b_t (linear interpolation in z and
-   x; nearest-neighbour in s).
+2. Look up policies c_t, alpha_s_t, alpha_b_t. Interpolation order matches
+   the solver's continuation-value lookup
+   (solver.py:_interp_z_wealth + bracket_state_3d):
+       - trilinear in s across the 8 bracket-grid corners,
+       - PCHIP monotone cubic in z on interior intervals (linear fallback
+         on first/last z intervals),
+       - linear in x with flat extrapolation outside [wealth_min, wealth_max].
 3. Savings a_t = x_t - c_t.
 4. Draw next-period state innovation v^s ~ N(0, Sigma_ss) and propagate
-   s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s. Snap to nearest bracket-grid
-   index for the next-period policy lookup.
+   s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s. The continuous s_{t+1} is
+   carried forward; the start-of-next-period bracket lookup re-projects it
+   into the bracket-grid for trilinear interpolation.
 5. Conditional return mean mu_r = const_r + A_r @ s_t + M @ v^s. Realize
    gross real returns via one of two modes:
    - "monte_carlo": residual ~ N(0, Sigma_r_cond) drawn via a factor matrix
@@ -197,17 +204,16 @@ def _build_return_factor(Sigma_r_cond: np.ndarray) -> np.ndarray:
     """
     Build a factor matrix F such that F @ F' = Sigma_r_cond.
 
-    Uses an eigen decomposition instead of Cholesky so the code remains robust
-    if Sigma_r_cond is positive semidefinite but not strictly positive definite.
+    Uses Cholesky to match the rest of the codebase (state grid, state
+    quadrature, return quadrature all use Cholesky as of 2026-04-30).
+    Sigma_r_cond is strictly positive definite for the production
+    calibration; if a PSD-but-not-PD matrix were ever passed in,
+    np.linalg.cholesky would raise, which is the desired behaviour
+    (degenerate Sigma_r_cond is a model-spec problem to surface).
     """
     Sigma = np.asarray(Sigma_r_cond, dtype=float)
     Sigma = 0.5 * (Sigma + Sigma.T)
-
-    eigvals, eigvecs = np.linalg.eigh(Sigma)
-    if np.any(eigvals < -1e-12):
-        raise ValueError("Sigma_r_cond must be positive semidefinite.")
-    eigvals = np.clip(eigvals, 0.0, None)
-    return eigvecs @ np.diag(np.sqrt(eigvals))
+    return np.linalg.cholesky(Sigma)
 
 
 def _initialize_initial_wealth(n_simulations: int,
@@ -326,6 +332,31 @@ def _clean_constrained_shares(alpha_s: float, alpha_b: float) -> tuple:
 _scalar_disposable_income = scalar_disposable_income
 
 
+@njit(fastmath=True, inline='always')
+def _pchip_slope_uniform(d_left: float, d_right: float) -> float:
+    """Uniform-grid Fritsch-Carlson slope at an interior z-node. Mirrors
+    `solver._pchip_slope_uniform` so simulator and solver use the same
+    monotone cubic on identical 4-point z stencils."""
+    if d_left == 0.0 or d_right == 0.0:
+        return 0.0
+    if d_left * d_right <= 0.0:
+        return 0.0
+    return 2.0 * d_left * d_right / (d_left + d_right)
+
+
+@njit(fastmath=True, inline='always')
+def _pchip_eval_with_basis(p0: float, p1: float, p2: float, p3: float,
+                           h00: float, h10: float, h01: float, h11: float) -> float:
+    """Evaluate PCHIP cubic Hermite given pre-computed basis values at
+    `frac_z`. Mirrors `solver._pchip_eval_with_basis`."""
+    d_l = p1 - p0
+    d_m = p2 - p1
+    d_r = p3 - p2
+    m0 = _pchip_slope_uniform(d_l, d_m)
+    m1 = _pchip_slope_uniform(d_m, d_r)
+    return h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
+
+
 @njit(fastmath=True)
 def _interp_policy_zx(arr4d: np.ndarray,
                       t: int,
@@ -337,9 +368,31 @@ def _interp_policy_zx(arr4d: np.ndarray,
     """Interpolate a 4D policy array at one state-grid corner.
 
     arr4d has shape (n_age, n_z, N_state, n_w). Returns the value at age t,
-    persistent state linearly interpolated between iz_lo/iz_lo+1 by frac_z,
-    joint financial state j_s, and cash-on-hand x_t (linear in wealth_grid).
+    persistent income state interpolated between iz_lo and iz_lo+1 by frac_z,
+    joint financial state j_s, and cash-on-hand x_t.
+
+    z-interpolation order matches solver.py:_interp_z_wealth: PCHIP
+    (Fritsch-Carlson monotone cubic Hermite) on interior intervals
+    (`iz_lo >= 1 and iz_lo + 2 < n_z`); linear fallback on the first and
+    last z intervals. Wealth-interpolation is linear with flat extrapolation
+    via fast_interp_1d. The cubic branch wealth-blends the 4-point z stencil
+    FIRST and then applies PCHIP — preserves shape because Fritsch-Carlson
+    is non-linear in stencil values and does not commute with linear blends.
     """
+    n_z = arr4d.shape[1]
+    use_cubic = (iz_lo >= 1) and (iz_lo + 2 < n_z)
+    if use_cubic:
+        f2 = frac_z * frac_z
+        f3 = f2 * frac_z
+        h00 = 2.0 * f3 - 3.0 * f2 + 1.0
+        h10 = f3 - 2.0 * f2 + frac_z
+        h01 = -2.0 * f3 + 3.0 * f2
+        h11 = f3 - f2
+        b0 = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo - 1, j_s, :])
+        b1 = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo,     j_s, :])
+        b2 = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo + 1, j_s, :])
+        b3 = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo + 2, j_s, :])
+        return _pchip_eval_with_basis(b0, b1, b2, b3, h00, h10, h01, h11)
     v_lo = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo, j_s, :])
     v_hi = fast_interp_1d(x_t, wealth_grid, arr4d[t, iz_lo + 1, j_s, :])
     return (1.0 - frac_z) * v_lo + frac_z * v_hi

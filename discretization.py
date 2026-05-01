@@ -495,6 +495,28 @@ def _normalize_ret_nodes(value, n_ret):
 def get_return_quadrature(model, n_nodes=1):
     """Residual return quadrature for N(0, Sigma_r_cond).
 
+    Uses tensor-product Gauss-Hermite in standardized coordinates `z`,
+    transformed to `r ~ N(0, Sigma_r_cond)` via the Cholesky factor:
+    `r = z @ L^T` where `L L^T = Sigma_r_cond` and `L` is lower-triangular.
+    This matches the transform used by `get_state_quadrature`.
+
+    Per-axis K_i interpretation (under input return order `(rtb, xr, xb)`,
+    consistent with the field name `n_ret_nodes_1d = (K_rtb, K_xr, K_xb)`):
+
+    - `K[0] = K_rtb`: refines the `z_0` axis. Because `L` is lower-triangular,
+      `z_0` is the only component of `z` that contributes to the rtb axis
+      of `r`, so this is a clean rtb-axis refinement.
+    - `K[1] = K_xr`: refines the `z_1` axis. `z_1` contributes to xr (and
+      not rtb), giving the xr residual after the rtb correlation has been
+      orthogonalized away.
+    - `K[2] = K_xb`: refines the `z_2` axis. `z_2` is the pure xb residual
+      after rtb and xr have been orthogonalized away (the `L[2,2]` direction).
+
+    These per-axis labels are honest under Cholesky, in contrast to the
+    legacy eigendecomposition transform where `K[i]` referred to the i-th
+    smallest-eigenvalue direction (mislabelled in code/docs as physical
+    asset axes — see `_check_kret_naming.py` for the empirical mismatch).
+
     Parameters
     ----------
     model : LifecyclePortfolioModel
@@ -516,6 +538,10 @@ def get_return_quadrature(model, n_nodes=1):
     -----
     All-ones (`K_i = 1` for every i) is treated as the exact K=1 approximation
     used previously: a single zero residual shock with weight one.
+
+    Sigma_r_cond is required to be positive definite (Cholesky requirement).
+    For our calibration this is always satisfied because the residual return
+    components are not collinear after partitioning.
     """
     n_ret = int(model.n_ret)
     K_per_dim = _normalize_ret_nodes(n_nodes, n_ret)
@@ -541,13 +567,11 @@ def get_return_quadrature(model, n_nodes=1):
     z_nodes = np.stack([g.ravel() for g in grid_1d], axis=1)
     ret_weights = np.prod(np.stack(weight_1d, axis=0), axis=0).ravel()
 
-    Sigma = 0.5 * (np.asarray(model.Sigma_r_cond, dtype=float) + np.asarray(model.Sigma_r_cond, dtype=float).T)
-    eigvals, eigvecs = np.linalg.eigh(Sigma)
-    if np.any(eigvals < -1e-12):
-        raise ValueError("Sigma_r_cond must be positive semidefinite for return quadrature")
-    eigvals = np.clip(eigvals, 0.0, None)
-    transform = eigvecs @ np.diag(np.sqrt(eigvals))
-    ret_nodes = z_nodes @ transform.T
+    # Symmetrize then Cholesky: lower-triangular L, L L^T = Sigma_r_cond.
+    Sigma = 0.5 * (np.asarray(model.Sigma_r_cond, dtype=float)
+                    + np.asarray(model.Sigma_r_cond, dtype=float).T)
+    L = np.linalg.cholesky(Sigma)
+    ret_nodes = z_nodes @ L.T   # (K_total, n_ret)
 
     return ret_nodes, ret_weights
 

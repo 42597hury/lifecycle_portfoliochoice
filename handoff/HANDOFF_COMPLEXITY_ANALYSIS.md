@@ -170,7 +170,7 @@ Retirement total: 32 * 360,150 * 4 * 216 = **~10B** FOC iterations.
 
 ## Measured timing data (2026-04-26, current quadrature implementation)
 
-Benchmark: `time_retirement.py` — terminal age + 5 retirement periods.
+Benchmark: `scripts/benchmarks/time_retirement.py` — terminal age + 5 retirement periods.
 Machine: user's Windows 11 desktop. First period includes Numba JIT compilation.
 
 ### 5x5x5 grid (N_state=125, n_z=7, 27 state quad, 8 return quad)

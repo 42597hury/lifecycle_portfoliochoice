@@ -722,7 +722,9 @@ Things to look for if policy functions look weird, with literature pointers:
 
 This is **the dominant pathology of the `constrained=False` solver in this codebase**.
 Documented during the April 2026 investigation of the age-22 leverage ramp; see
-`_invest_foc.py`, `_invest_kink.py`, `_invest_age_ramp.py` at repo root.
+`scripts/investigation/_invest_foc.py`,
+`scripts/investigation/_invest_kink.py`,
+`scripts/investigation/_invest_age_ramp.py`.
 
 **Mechanism.** The agent integrates over a *finite* set of joint return-quadrature nodes
 (in this codebase: `n_state_quad × n_ret_quad` = 8 × 45 = 360 total nodes per FOC). With

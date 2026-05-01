@@ -475,6 +475,130 @@ def run_per_axis_n_state_quad_checks(model):
             check(f"validation: rejects {bad}", True)
 
 
+def run_per_axis_n_ret_quad_checks(model):
+    print("\n" + "=" * 70)
+    print("PER-AXIS n_ret_nodes_1d (Cholesky transform) CHECKS")
+    print("=" * 70)
+    from discretization import get_return_quadrature
+    Sigma_r_cond = np.asarray(model.Sigma_r_cond, dtype=float)
+    n_ret = int(model.n_ret)
+
+    # T-A: scalar broadcast equals tuple-of-same.  Note: scalar K=1 is the
+    # special "zero residual node" path, exact under both code branches.
+    for K in (2, 3, 5):
+        r_s, w_s = get_return_quadrature(model, n_nodes=K)
+        r_t, w_t = get_return_quadrature(model, n_nodes=(K, K, K))
+        check(
+            f"K={K}: scalar==tuple ret_nodes",
+            np.allclose(r_s, r_t, atol=0.0, rtol=0.0),
+        )
+        check(
+            f"K={K}: scalar==tuple ret_weights",
+            np.allclose(w_s, w_t, atol=0.0, rtol=0.0),
+        )
+        check(
+            f"K={K}: joint node count = K^n_ret = {K**n_ret}",
+            r_s.shape[0] == K ** n_ret,
+            f"got {r_s.shape[0]}",
+        )
+
+    # T-B: per-axis tuple shape — node count = product of per-axis K
+    for K_per_axis in [(3, 5, 3), (2, 2, 5), (5, 2, 2), (1, 5, 5), (3, 3, 1)]:
+        r, w = get_return_quadrature(model, n_nodes=K_per_axis)
+        expected = int(np.prod(K_per_axis))
+        check(
+            f"per-axis K={K_per_axis}: total nodes = prod = {expected}",
+            r.shape[0] == expected,
+            f"got {r.shape[0]}",
+        )
+        check(
+            f"per-axis K={K_per_axis}: weights sum to 1",
+            abs(float(w.sum()) - 1.0) < 1e-14,
+            f"sum = {float(w.sum()):.16f}",
+        )
+
+    # T-C: moment recovery preserved for asymmetric K (zero mean, exact cov)
+    for K_per_axis in [(2, 2, 5), (2, 5, 2), (5, 2, 2), (3, 5, 3), (5, 3, 3)]:
+        r, w = get_return_quadrature(model, n_nodes=K_per_axis)
+        mean_r = w @ r
+        cov_emp = (r.T * w) @ r
+        err_mean = float(np.max(np.abs(mean_r)))
+        err_cov = float(np.max(np.abs(cov_emp - Sigma_r_cond)))
+        check(
+            f"per-axis K={K_per_axis}: E[r] == 0",
+            err_mean < 1e-15,
+            f"|mean| = {err_mean:.2e}",
+        )
+        check(
+            f"per-axis K={K_per_axis}: E[r r^T] == Sigma_r_cond",
+            err_cov < 1e-14,
+            f"|cov err| = {err_cov:.2e}",
+        )
+
+    # T-D: Cholesky-specific structural test.  Under Cholesky with input
+    # order (rtb, xr, xb), L is lower-triangular, so:
+    #   K=(K_high, 1, 1): only z_0 varies. r[0]=L[0,0]*z_0; r[1]=L[1,0]*z_0;
+    #                     r[2]=L[2,0]*z_0.  All three return components vary
+    #                     proportionally to z_0 (their values are along
+    #                     L[:, 0] = first column of L).
+    #   K=(1, K_high, 1): z_0=0, z_2=0; only z_1 varies.  r[0] = 0 (because
+    #                     L[0,1] = 0 by triangularity), r[1] and r[2] vary.
+    #   K=(1, 1, K_high): z_0=z_1=0; only z_2 varies.  r[0] = 0, r[1] = 0,
+    #                     r[2] = L[2,2]*z_2.  Pure xb-axis variance.
+    L = np.linalg.cholesky(0.5 * (Sigma_r_cond + Sigma_r_cond.T))
+
+    # K=(1, 1, K_high): pure xb axis varies, r[0]==0 and r[1]==0
+    r, _ = get_return_quadrature(model, n_nodes=(1, 1, 5))
+    check(
+        "Cholesky K=(1,1,5): r[:,0] all zero (rtb axis collapsed)",
+        np.allclose(r[:, 0], 0.0, atol=1e-15),
+        f"max |r[:,0]| = {float(np.max(np.abs(r[:, 0]))):.2e}",
+    )
+    check(
+        "Cholesky K=(1,1,5): r[:,1] all zero (xr axis collapsed)",
+        np.allclose(r[:, 1], 0.0, atol=1e-15),
+        f"max |r[:,1]| = {float(np.max(np.abs(r[:, 1]))):.2e}",
+    )
+    check(
+        "Cholesky K=(1,1,5): r[:,2] varies (xb axis active)",
+        float(np.std(r[:, 2])) > 1e-6,
+        f"std(r[:,2]) = {float(np.std(r[:, 2])):.4e}",
+    )
+
+    # K=(1, K_high, 1): r[0] still zero (lower-triangular), r[1] and r[2] vary
+    r, _ = get_return_quadrature(model, n_nodes=(1, 5, 1))
+    check(
+        "Cholesky K=(1,5,1): r[:,0] all zero (rtb axis collapsed)",
+        np.allclose(r[:, 0], 0.0, atol=1e-15),
+        f"max |r[:,0]| = {float(np.max(np.abs(r[:, 0]))):.2e}",
+    )
+    check(
+        "Cholesky K=(1,5,1): r[:,1] varies (xr axis active)",
+        float(np.std(r[:, 1])) > 1e-6,
+    )
+
+    # K=(K_high, 1, 1): all three components vary along the L[:, 0] column.
+    # The ratio r[:,1]/r[:,0] should equal L[1,0]/L[0,0] for every node.
+    r, _ = get_return_quadrature(model, n_nodes=(5, 1, 1))
+    nonzero = np.abs(r[:, 0]) > 1e-15
+    if nonzero.any():
+        ratio_emp = r[nonzero, 1] / r[nonzero, 0]
+        ratio_exp = L[1, 0] / L[0, 0]
+        check(
+            "Cholesky K=(5,1,1): r[:,1]/r[:,0] == L[1,0]/L[0,0] for all nodes",
+            np.allclose(ratio_emp, ratio_exp, atol=1e-13),
+            f"max dev = {float(np.max(np.abs(ratio_emp - ratio_exp))):.2e}",
+        )
+
+    # T-E: validation rejects bad inputs
+    for bad in [(2, 2), (2, 2, 2, 2), (2, 0, 2)]:
+        try:
+            get_return_quadrature(model, n_nodes=bad)
+            check(f"validation: rejects {bad}", False, "did not raise")
+        except (ValueError, TypeError):
+            check(f"validation: rejects {bad}", True)
+
+
 def main() -> int:
     model, data = build_reference_model()
     run_geometry_checks(model, data)
@@ -482,6 +606,7 @@ def main() -> int:
     run_solver_simulation_smoke(model)
     run_per_axis_n_stds_checks(model)
     run_per_axis_n_state_quad_checks(model)
+    run_per_axis_n_ret_quad_checks(model)
 
     print("\n" + "=" * 70)
     print(f"RESULTS: {N_PASS} passed, {N_FAIL} failed")

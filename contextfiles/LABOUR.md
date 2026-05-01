@@ -716,7 +716,7 @@ Checked items, with a short note where relevant.
       passes it through `scalar_disposable_income` (the same njit
       function used by the simulation — [model.py:312](model.py#L312)).
       Three-part numerical validation (script:
-      `_validate_income_ontheflyp.py`):
+      `scripts/validation/_validate_income_ontheflyp.py`):
       **(a) Scalar ≡ vectorized.** `scalar_disposable_income` matches
       `disposable_income_working` across 200 random probes spanning
       `y_gross ∈ [4.2e-3, 1.1e+3]` (covers every tax bracket and the

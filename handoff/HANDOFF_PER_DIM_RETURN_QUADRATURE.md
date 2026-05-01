@@ -65,7 +65,7 @@ job here is just to make per-dim K **possible**.
 
 ## Implementation plan
 
-### 1. Schema: `DiscretizationConfig` in [model.py:114](model.py#L114)
+### 1. Schema: `DiscretizationConfig` in [model.py:114](../model.py#L114)
 
 Change the type annotation but keep the default a scalar so existing call sites
 remain valid:
@@ -96,7 +96,7 @@ This normalization is the single source of truth — every consumer calls it.
 **Do not** change the field name. Renaming would break every saved run and
 notebook.
 
-### 2. `discretization.get_return_quadrature` at [discretization.py:447](discretization.py#L447)
+### 2. `discretization.get_return_quadrature` at [discretization.py:447](../discretization.py#L447)
 
 Change signature and body. Keep the `n_nodes=1` "single zero residual" fast
 path. Build an asymmetric Hermite product when any K_i > 1.
@@ -147,9 +147,9 @@ just changes how the standard-normal `z_nodes` lattice is built before being
 mapped through `transform.T`. The contract (returned shapes
 `(n_ret_quad, n_ret)` and `(n_ret_quad,)`) is preserved.
 
-### 3. `Precompute.__init__` in [precompute.py](precompute.py)
+### 3. `Precompute.__init__` in [precompute.py](../precompute.py)
 
-Validation at [precompute.py:104](precompute.py#L104):
+Validation at [precompute.py:104](../precompute.py#L104):
 
 ```python
 # Old:
@@ -169,11 +169,11 @@ consumers:
 self.n_ret_nodes_1d = K_ret_per_dim   # always a tuple of ints, length n_ret
 ```
 
-The call to `get_return_quadrature` at [precompute.py:148](precompute.py#L148)
+The call to `get_return_quadrature` at [precompute.py:148](../precompute.py#L148)
 already passes through the raw config value — leave that line as-is, since
 `get_return_quadrature` now normalizes internally.
 
-Update the print at [precompute.py:380](precompute.py#L380) to handle both
+Update the print at [precompute.py:380](../precompute.py#L380) to handle both
 forms gracefully:
 
 ```python
@@ -181,38 +181,38 @@ K_str = "x".join(str(k) for k in self.n_ret_nodes_1d)
 print(f"Return quad  : ({K_str}) nodes/dim  ->  {self.n_ret_quad} joint nodes")
 ```
 
-Update the comment at [precompute.py:153](precompute.py#L153) and
-[precompute.py:249](precompute.py#L249) to reflect that the joint count is
+Update the comment at [precompute.py:153](../precompute.py#L153) and
+[precompute.py:249](../precompute.py#L249) to reflect that the joint count is
 `prod(n_ret_nodes_1d)` not `n_ret_nodes_1d ** n_ret`.
 
 ### 4. Diagnostics & simulation prints
 
 Same treatment in:
 
-- [diagnostics.py:708](diagnostics.py#L708) — replace `pc.disc_config.n_ret_nodes_1d` formatting with `"x".join(str(k) for k in pc.n_ret_nodes_1d)`.
-- [diagnostics.py:828-829](diagnostics.py#L828-L829) — replace `f"= {pc.disc_config.n_ret_nodes_1d}^{model.n_ret}"` with `f"= prod({K_str}) = {pc.n_ret_quad}"`.
-- [simulation.py:742](simulation.py#L742) — same treatment.
+- [diagnostics.py:708](../diagnostics.py#L708) — replace `pc.disc_config.n_ret_nodes_1d` formatting with `"x".join(str(k) for k in pc.n_ret_nodes_1d)`.
+- [diagnostics.py:828-829](../diagnostics.py#L828-L829) — replace `f"= {pc.disc_config.n_ret_nodes_1d}^{model.n_ret}"` with `f"= prod({K_str}) = {pc.n_ret_quad}"`.
+- [simulation.py:742](../simulation.py#L742) — same treatment.
 
 ### 5. Tests and saved-run loaders
 
 Saved runs at `saved_runs/*/metadata.json` store
 `"n_ret_nodes_1d": <int>` (verified: see
-[saved_runs/constrained_grid5x5x5_nz11/metadata.json:94](saved_runs/constrained_grid5x5x5_nz11/metadata.json#L94),
+[saved_runs/constrained_grid5x5x5_nz11/metadata.json:94](../saved_runs/constrained_grid5x5x5_nz11/metadata.json#L94),
 the `_diag_332_nz11`, `constrained_grid5x5x5_nz7`, `constrained_grid7x7x7_nz11`
 runs all use scalar `int`). The four test files that reload from saved metadata
 read this field directly into the `DiscretizationConfig` constructor:
 
-- [tests/test_simulation.py:53](tests/test_simulation.py#L53)
-- [tests/test_economics.py:51](tests/test_economics.py#L51)
-- [tests/test_terminal_grad_hess.py:62](tests/test_terminal_grad_hess.py#L62)
-- [tests/test_terminal_omega.py:83](tests/test_terminal_omega.py#L83)
+- [tests/test_simulation.py:53](../tests/test_simulation.py#L53)
+- [tests/test_economics.py:51](../tests/test_economics.py#L51)
+- [tests/test_terminal_grad_hess.py:62](../tests/test_terminal_grad_hess.py#L62)
+- [tests/test_terminal_omega.py:83](../tests/test_terminal_omega.py#L83)
 
 These continue to work without modification because the new
 `DiscretizationConfig` accepts `int`. Verify by running each test against
 existing saved runs after the change. **Do not** rewrite saved-run metadata.
 
 For new saves, JSON serialization is handled by `_to_jsonable` in
-[policy_io.py:25](policy_io.py#L25) which already converts tuples to lists.
+[policy_io.py:25](../policy_io.py#L25) which already converts tuples to lists.
 Loaders (e.g. saved-run reload paths) need to round-trip correctly:
 
 - If `dc_raw["n_ret_nodes_1d"]` is `int` (legacy run) → pass through as int.
@@ -225,9 +225,9 @@ Loaders (e.g. saved-run reload paths) need to round-trip correctly:
 
 Three notebooks reference the field literally:
 
-- [main.ipynb](main.ipynb)
-- [main_part2.ipynb:98](main_part2.ipynb#L98)
-- [verify_discretization.ipynb:109](verify_discretization.ipynb#L109) and [:495](verify_discretization.ipynb#L495)
+- [main.ipynb](../main.ipynb)
+- [main_part2.ipynb:98](../main_part2.ipynb#L98)
+- [verify_discretization.ipynb:109](../verify_discretization.ipynb#L109) and [:495](../verify_discretization.ipynb#L495)
 
 All three currently pass an `int`. They keep working — do not modify them as
 part of this PR. After the change, the user can edit them manually to switch
@@ -240,7 +240,7 @@ normalizes its argument. No edit required.
 
 ### 7. Other call sites
 
-- [_run_sim_gap.py:25](_run_sim_gap.py#L25) — uses `int` literal. No change.
+- [scripts/diagnostics/_run_sim_gap.py:25](../scripts/diagnostics/_run_sim_gap.py#L25) — uses `int` literal. No change.
 - Archived tests under `archive/test_state_quadrature*.py` — frozen, do not touch.
 
 ### 8. Documentation files (low priority, do at the end)
@@ -248,9 +248,9 @@ normalizes its argument. No edit required.
 These hold reference text describing the field; update once the code is
 working. None are imports/exec'd:
 
-- [contextfiles/STATE_SPACE.md:258](contextfiles/STATE_SPACE.md#L258) and [:435](contextfiles/STATE_SPACE.md#L435) — change "K_r per dim" wording.
-- [contextfiles/DESIGN.md:599](contextfiles/DESIGN.md#L599) — update example comment.
-- [contextfiles/TODO.md:176](contextfiles/TODO.md#L176) — touch up example.
+- [contextfiles/STATE_SPACE.md:258](../contextfiles/STATE_SPACE.md#L258) and [:435](../contextfiles/STATE_SPACE.md#L435) — change "K_r per dim" wording.
+- [contextfiles/DESIGN.md:599](../contextfiles/DESIGN.md#L599) — update example comment.
+- [contextfiles/TODO.md:176](../contextfiles/TODO.md#L176) — touch up example.
 - [HANDOFF_COMPLEXITY_ANALYSIS.md:54](HANDOFF_COMPLEXITY_ANALYSIS.md#L54) — table row note.
 
 `contextfiles/RETURNS.md §6.12` has an open task referencing this exact

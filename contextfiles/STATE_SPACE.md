@@ -279,11 +279,23 @@ ret_weights : (n_ret_quad,)                            weights (sum = 1)
   giving `n_ret_quad = prod(K_i)` joint nodes (e.g. `(3,9,3) → 81`).
 
 Use the tuple form to refine the dimensions that matter most for the
-problem: under the eigendecomposition transform in
-`get_return_quadrature`, increasing `K_xr` adds resolution along the
-principal eigenvector direction (largest residual variance), which is
-the cheapest way to kill discretization-arbitrage in the joint
-excess-return cloud at unconstrained CRRA. Default stays `2`.
+problem. As of 2026-04-30, `get_return_quadrature` uses a **Cholesky**
+transform `r = z @ L^T` (consistent with `get_state_quadrature`), so the
+per-axis labels `(K_rtb, K_xr, K_xb)` are honest:
+
+- `K_rtb` refines the rtb axis (`L` lower-triangular: `z_0` is the only
+  component that contributes to the rtb component of `r`).
+- `K_xr` refines the xr-residual after the rtb correlation has been
+  orthogonalized away.
+- `K_xb` refines the pure xb residual (`L[2, 2]` direction, after rtb
+  and xr have been orthogonalized away).
+
+Refining the highest-residual-variance axis (xr in our calibration) by
+setting `K_xr` is the cheapest way to suppress discretization-arbitrage
+in the joint excess-return cloud at unconstrained CRRA. The previous
+implementation used eigendecomposition, under which the slot labels did
+not match the physical asset axes; this was a labelling bug, see the
+note in `RETURNS.md` §6.12. Default stays `2`.
 
 These are Gauss-Hermite nodes on `N(0, Σ_r_cond)`. Precomputed exponentials
 avoid recomputation in the hot loop:

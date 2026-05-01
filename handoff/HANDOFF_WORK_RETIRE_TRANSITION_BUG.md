@@ -18,7 +18,7 @@ Unconstrained smoke config (`state_grid=(5,5,5)`, `state_n_stds=2.0`, `n_z=9`, `
 
 ### 1.2 Root cause
 
-Age 66 is the only year where the *working-age* solver is called with `t+1 = retire_age = 67`. The working-age FOC at [solver.py:619-641](solver.py#L619-L641) computes next-period gross income as
+Age 66 is the only year where the *working-age* solver is called with `t+1 = retire_age = 67`. The working-age FOC at [solver.py:619-641](../solver.py#L619-L641) computes next-period gross income as
 
 ```python
 y_gross_next = det_z_eta * exp_eps[i_e]                    # = exp(f(67) + ρz + η + ε)
@@ -28,7 +28,7 @@ x_next       = w_inv + income_next                          # cash-on-hand at ag
 
 `log_det_next = log_det_profile[t+1]` is the deterministic age-earnings polynomial `f(age)` — defined for *every* age, including retirement ages. So at age 66 the FOC is computing the agent's age-67 income as if they will *still be working* at age 67, paying working-age tax on it.
 
-The model's actual retirement income at age 67 is **pension**, computed from frozen z via the AIME → PIA formula in `compute_pension_after_tax` ([model.py:349](model.py#L349)). Pension is **z-only**, capped (because AIME is capped at 2.5), and bounded — for high z it saturates around 0.628 model units.
+The model's actual retirement income at age 67 is **pension**, computed from frozen z via the AIME → PIA formula in `compute_pension_after_tax` ([model.py:349](../model.py#L349)). Pension is **z-only**, capped (because AIME is capped at 2.5), and bounded — for high z it saturates around 0.628 model units.
 
 ### 1.3 Mechanism (why this kills Newton)
 
@@ -51,10 +51,10 @@ Wealth grid maximum is **200 model units**, so the buggy income alone overshoots
 
 ### 1.5 Code references
 
-- Buggy FOC (working age, used at age 66): [solver.py:488-678](solver.py#L488-L678), specifically the inner-loop income computation at lines 636–641.
-- Dispatch boundary: [solver.py:2363-2399](solver.py#L2363-L2399). The `if age >= retire_age:` branch picks the retirement solver from age 67 onward; ages 22–66 go to the working solver. There is no special case for `age == retire_age - 1`.
-- Correct retirement FOC structure (no eps, no eta, uses pension): [solver.py:340-465](solver.py#L340-L465), specifically `x_next = w_inv + pension_next_scalar` at line 437.
-- Pension formula and table: [model.py:349](model.py#L349) (`compute_pension_after_tax`), `pc.pension_after_tax` shape `(n_age, n_z)` precomputed in [precompute.py](precompute.py).
+- Buggy FOC (working age, used at age 66): [solver.py:488-678](../solver.py#L488-L678), specifically the inner-loop income computation at lines 636–641.
+- Dispatch boundary: [solver.py:2363-2399](../solver.py#L2363-L2399). The `if age >= retire_age:` branch picks the retirement solver from age 67 onward; ages 22–66 go to the working solver. There is no special case for `age == retire_age - 1`.
+- Correct retirement FOC structure (no eps, no eta, uses pension): [solver.py:340-465](../solver.py#L340-L465), specifically `x_next = w_inv + pension_next_scalar` at line 437.
+- Pension formula and table: [model.py:349](../model.py#L349) (`compute_pension_after_tax`), `pc.pension_after_tax` shape `(n_age, n_z)` precomputed in [precompute.py](../precompute.py).
 
 ## 2. Goals of the fix
 
@@ -115,7 +115,7 @@ The fix bounds `x_next` for the *transition* year. But for years 22–65, the ex
 
 ### D7. z_next bracketing edge cases
 
-`z_next = ρ z + η` can land outside `z_grid` for extreme combinations. The existing code at [solver.py:626-629](solver.py#L626-L629) already clamps `iz_lo` to `[0, n_z - 2]` and `frac_z` to `[0, 1]`. Reuse this clamping for the pension interpolation; do **not** reinvent it.
+`z_next = ρ z + η` can land outside `z_grid` for extreme combinations. The existing code at [solver.py:626-629](../solver.py#L626-L629) already clamps `iz_lo` to `[0, n_z - 2]` and `frac_z` to `[0, 1]`. Reuse this clamping for the pension interpolation; do **not** reinvent it.
 
 ### D8. Hidden constants in the existing FOC
 
@@ -123,7 +123,7 @@ Look at the constants used in the existing inner loop (e.g. `prob_skip`, `min_co
 
 ## 4. Proposed plan
 
-> **Review this plan against [solver.py:485-678](solver.py#L485-L678) before implementing.** If anything reads as inconsistent with what you find in the code, raise it back to the user instead of patching around it.
+> **Review this plan against [solver.py:485-678](../solver.py#L485-L678) before implementing.** If anything reads as inconsistent with what you find in the code, raise it back to the user instead of patching around it.
 
 ### 4.1 Strategy
 
@@ -149,11 +149,11 @@ Keep the eps loop in place (D2 — safer). At the transition year `income_next` 
 
 Trace the argument plumbing top-down. Likely list (verify against the actual code):
 
-1. **`compute_foc_jac_working_quad`** at [solver.py:488](solver.py#L488).  Add the two new parameters; insert the branch in the eps inner loop.
-2. **`solve_portfolio_2d_working_quad`** at [solver.py:1429](solver.py#L1429) (constrained working-age Newton).  Forward the two new parameters through to every internal call to `compute_foc_jac_working_quad`.
-3. **`solve_portfolio_unconstrained_working_quad`** at [solver.py:1626](solver.py#L1626).  Same — forward the parameters to every internal `compute_foc_jac_working_quad` call. There are several Newton iterates and corner/edge probes inside; **don't miss any**.
+1. **`compute_foc_jac_working_quad`** at [solver.py:488](../solver.py#L488).  Add the two new parameters; insert the branch in the eps inner loop.
+2. **`solve_portfolio_2d_working_quad`** at [solver.py:1429](../solver.py#L1429) (constrained working-age Newton).  Forward the two new parameters through to every internal call to `compute_foc_jac_working_quad`.
+3. **`solve_portfolio_unconstrained_working_quad`** at [solver.py:1626](../solver.py#L1626).  Same — forward the parameters to every internal `compute_foc_jac_working_quad` call. There are several Newton iterates and corner/edge probes inside; **don't miss any**.
 4. **`solve_working_age_step_quad`** (the per-age batch solver). Forward the parameters down from the dispatcher.
-5. **`run_lifecycle_solver`** at [solver.py:2387](solver.py#L2387) (working-age dispatch). Set `use_pension_next = (age == retire_age - 1)`. Set `pension_next_by_z = pension_table[t + 1, :]` when true, else the precomputed dummy zeros. Pass into `solve_working_age_step_quad`.
+5. **`run_lifecycle_solver`** at [solver.py:2387](../solver.py#L2387) (working-age dispatch). Set `use_pension_next = (age == retire_age - 1)`. Set `pension_next_by_z = pension_table[t + 1, :]` when true, else the precomputed dummy zeros. Pass into `solve_working_age_step_quad`.
 
 Also: precompute the dummy `np.zeros(n_z)` once at the top of `run_lifecycle_solver` — don't allocate inside the loop.
 

@@ -6,7 +6,7 @@
 
 ## 1. Executive summary
 
-The current solver does use Catmull-Rom cubic interpolation in the `z` dimension inside the working-age continuation-value lookup, even though some docs still describe the path as linear. The cubic is implemented in the hot helper [`_interp_z_wealth`](solver.py#L299) and is activated for interior `z` intervals only.
+The current solver does use Catmull-Rom cubic interpolation in the `z` dimension inside the working-age continuation-value lookup, even though some docs still describe the path as linear. The cubic is implemented in the hot helper [`_interp_z_wealth`](../solver.py#L299) and is activated for interior `z` intervals only.
 
 The main takeaways from the investigation so far are:
 
@@ -32,7 +32,7 @@ This handoff is designed to guide that comparison.
 
 The active interpolation helper is:
 
-- [`solver.py:_interp_z_wealth`](solver.py#L299)
+- [`solver.py:_interp_z_wealth`](../solver.py#L299)
 
 The cubic branch is:
 
@@ -55,7 +55,7 @@ mpc_z2  = ...
 mpc_val = Catmull-Rom(mpc_zm1, mpc_z0, mpc_z1, mpc_z2, frac_z)
 ```
 
-This matters because Catmull-Rom is linear in the data. That makes the current `mpc` path exactly consistent with the interpolated `c_next` in the sense tested in [`tests/test_cubic_interp.py`](tests/test_cubic_interp.py#L271).
+This matters because Catmull-Rom is linear in the data. That makes the current `mpc` path exactly consistent with the interpolated `c_next` in the sense tested in [`tests/test_cubic_interp.py`](../tests/test_cubic_interp.py#L271).
 
 ### 2.2 Where the branch is chosen
 
@@ -65,7 +65,7 @@ The working-age FOC computes:
 - `frac_z = ...`
 - `use_cubic = (iz_lo >= 1) and (iz_lo + 2 < n_z)`
 
-See [`solver.py`](solver.py#L639-L685).
+See [`solver.py`](../solver.py#L639-L685).
 
 So:
 
@@ -76,7 +76,7 @@ So:
 
 The design doc still says working-age consumption is linearly interpolated in `z`:
 
-- [`contextfiles/DESIGN.md`](contextfiles/DESIGN.md#L1068-L1070)
+- [`contextfiles/DESIGN.md`](../contextfiles/DESIGN.md#L1068-L1070)
 
 That description is currently stale. Do not use it as ground truth for the implementation.
 
@@ -98,7 +98,7 @@ In a CRRA model this matters because marginal utility amplifies negative `c` err
 
 The current code clamps `mpc_val` into `[0,1]` in both the cubic and linear branches:
 
-- [`solver.py`](solver.py#L324-L338)
+- [`solver.py`](../solver.py#L324-L338)
 
 If the raw cubic `mpc` ever leaves `[0,1]`, then the clamp introduces a kink in the Jacobian path because:
 
@@ -136,7 +136,7 @@ That is a coarse stencil, especially near the boundaries.
 
 ### 4.1 Existing synthetic cubic tests pass
 
-Running [`tests/test_cubic_interp.py`](tests/test_cubic_interp.py) gave the following substantive results:
+Running [`tests/test_cubic_interp.py`](../tests/test_cubic_interp.py) gave the following substantive results:
 
 - endpoint interpolation passes
 - Catmull-Rom is exact on linear and quadratic data
@@ -218,7 +218,7 @@ So this is a kink in the `z` axis, not a control-space branch flip.
 
 ## 5. Fast synthetic evidence that Catmull-Rom helps over linear
 
-To anchor the "is it better than linear?" question, a few synthetic monotone functions were tested at the **actual current `dz ~= 1.1218`**, not the finer `[-2,2]` test grid used in [`tests/test_cubic_interp.py`](tests/test_cubic_interp.py#L170).
+To anchor the "is it better than linear?" question, a few synthetic monotone functions were tested at the **actual current `dz ~= 1.1218`**, not the finer `[-2,2]` test grid used in [`tests/test_cubic_interp.py`](../tests/test_cubic_interp.py#L170).
 
 Results:
 
@@ -336,7 +336,7 @@ Also report:
 - monotonicity violations in EGM outputs
 - whether linear interpolation changes policy smoothness or corners
 
-The diagnostic counters already exist in [`solver.py`](solver.py#L2838-L2870).
+The diagnostic counters already exist in [`solver.py`](../solver.py#L2838-L2870).
 
 ### 7.4 Boundary-specific comparison
 
@@ -367,7 +367,7 @@ If the next agent starts exploring monotonicity-preserving Hermite or PCHIP-styl
 
 > The present Catmull-Rom implementation is linear in the node values, so the solver can compute `mpc` by applying the same operator to nodewise wealth slopes.
 
-This is exactly what [`tests/test_cubic_interp.py`](tests/test_cubic_interp.py#L271) checks.
+This is exactly what [`tests/test_cubic_interp.py`](../tests/test_cubic_interp.py#L271) checks.
 
 A slope-limited Hermite scheme is generally **not linear** in the node values. That means:
 

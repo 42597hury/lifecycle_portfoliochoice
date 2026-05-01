@@ -27,7 +27,7 @@ Plus two cross-cutting checks:
     metric: max E[xr|s], max E[xb|s] (and the negatives)
     knob expected to move it: tighten n_stds
 
-Run: PYTHONIOENCODING=utf-8 PYTHONPATH=. python _diag_grid_quad_sweep.py
+Run from repo root: python -m scripts.diagnostics._diag_grid_quad_sweep
 """
 
 from __future__ import annotations

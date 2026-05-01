@@ -1,7 +1,7 @@
 """
 _diag_quadrature_cloud.py — Diagnostic tests on the joint state×return quadrature cloud.
 
-Implements T-Q1 through T-Q7 from HANDOFF_UNCONSTRAINED_LEVERAGE.md, all of
+Implements T-Q1 through T-Q7 from handoff/HANDOFF_UNCONSTRAINED_LEVERAGE.md, all of
 which run on (model, pc) plus the saved policy bundle — no fresh solves.
 
 The tests are designed to localize the source of the residual unconstrained-
@@ -14,7 +14,7 @@ leverage pathology to one of:
   - per-state Merton vs saved-policy alpha mismatch (T-Q6)
   - quadrature moment recovery against the analytical Σ (T-Q7)
 
-Run: PYTHONPATH=. python _diag_quadrature_cloud.py
+Run from repo root: python -m scripts.diagnostics._diag_quadrature_cloud
 """
 
 from __future__ import annotations

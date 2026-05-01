@@ -26,8 +26,8 @@ Key ideas
 
 Usage
 -----
-    python _diag_wealth_grid_tightness.py
-    python _diag_wealth_grid_tightness.py saved_runs/unconstrained_principal_grid5x5x5_nz9
+    python -m scripts.diagnostics._diag_wealth_grid_tightness
+    python -m scripts.diagnostics._diag_wealth_grid_tightness saved_runs/unconstrained_principal_grid5x5x5_nz9
 """
 
 from __future__ import annotations

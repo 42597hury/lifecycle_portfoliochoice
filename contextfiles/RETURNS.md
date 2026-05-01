@@ -18,7 +18,7 @@ conditional return means),
 `solver.py` (bracket/trilinear interpolation, FOC with quadrature integration).
 
 **Data references:** `data/var_dataset.csv` (clean annual dataset, 63 obs),
-`HANDOFF_VAR_RESTRUCTURE_new.md` (full specification of the restructure),
+`handoff/HANDOFF_VAR_RESTRUCTURE_new.md` (full specification of the restructure),
 `data/Thesisdata/` (raw source files).
 
 ---
@@ -443,7 +443,7 @@ higher-order moment integration on the cloud at any *fixed* state.
 
 #### Empirical sweep at the production calibration
 
-`_diag_grid_quad_sweep.py` builds a Precompute for each cell and computes
+`scripts/diagnostics/_diag_grid_quad_sweep.py` builds a Precompute for each cell and computes
 the metrics above. Selected rows from a sweep at the production VAR
 parameters and `γ=3, n_z=5, n_eps_nodes=3, n_eta_nodes=3`:
 
@@ -531,10 +531,11 @@ away, only the deepest tail (`p_α>5`, `p_α>10`) thins out.
 
 #### Pointer
 
-Reproduce the table with `python _diag_grid_quad_sweep.py`. The cell-level
-metrics for the saved bundle are produced by `_diag_quadrature_cloud.py`
+Reproduce the table with `python -m scripts.diagnostics._diag_grid_quad_sweep`.
+The cell-level metrics for the saved bundle are produced by
+`scripts/diagnostics/_diag_quadrature_cloud.py`
 (per-state Merton, Sharpe, arbitrage gap, moment recovery — T-Q1 through
-T-Q7 in `HANDOFF_UNCONSTRAINED_LEVERAGE.md`).
+T-Q7 in `handoff/HANDOFF_UNCONSTRAINED_LEVERAGE.md`).
 
 #### Choosing `state_n_stds` — what the knob solves and how to pick a value
 
@@ -613,7 +614,7 @@ the cost:
 **Diagnostic workflow for choosing the value**
 
 1. Solve at the current default (`state_n_stds=2.0` scalar).
-2. Inspect `_diag_quadrature_cloud.py` output for the saved bundle — look at
+2. Inspect `scripts/diagnostics/_diag_quadrature_cloud.py` output for the saved bundle — look at
    `max_α`, `max joint Sharpe`, and per-state arbitrage gap.
 3. If `max_α > 5` or `max Sharpe > 1.5` and you don't believe the
    corner-state economics, identify the worst axis (look at which
@@ -734,7 +735,7 @@ cross-validation against the old 5-variable quarterly dataset is not meaningful.
 
 - [x] **Terminal condition** — VERIFIED. Terminal solver replaced with `@njit`
       2D Newton (no scipy dependency). Uses state quadrature consistent with
-      rest of solver. Verified by 12 automated tests (`test_terminal_correctness.py`):
+      rest of solver. Verified by 12 automated tests (`scripts/validation/test_terminal_correctness.py`):
       - CRRA homogeneity: c/W constant across wealth (CV = 3e-16)
       - z-independence: policy identical across income states (spread = 0)
       - KKT conditions at solution (violation = 6e-13)
@@ -801,17 +802,18 @@ mean that affected the old unconstrained estimator.
       `n_ret_nodes_1d` in `DiscretizationConfig` accepts either a scalar `int`
       (uniform across all return dimensions, legacy default) or a length-3
       tuple `(K_rtb, K_xr, K_xb)`. The arbitrage is eliminated most cheaply
-      by refining the stock residual (xr) axis: with the eigendecomposition
-      transform, K_xr controls the principal eigenvector direction (largest
-      residual variance), which is where the missing joint stock+bond crash
-      scenarios live. Empirical (smoke-test config above): bond-only
-      refinement `(3,3,21)`=189 nodes leaves 18 arbitrages; stock-only
-      `(3,15,3)`=135 nodes eliminates all 24; uniform `(9,9,9)`=729 nodes
-      leaves 1. The user picks the production tuple after measuring full-solve
-      runtime; default stays at scalar `2` for backward compatibility.
-      `get_return_quadrature` and `Precompute` normalize either form via
-      `discretization._normalize_ret_nodes` before building the asymmetric
-      Hermite tensor product.
+      by refining the stock residual (xr) axis: under the **Cholesky** transform
+      (default since 2026-04-30; previously eigendecomposition with mislabelled
+      axes), `K_xr` directly refines the xr-residual direction. The empirical
+      arbitrage-suppression numbers below were measured under the legacy
+      eigendecomposition transform — re-validate at production config after
+      switching to Cholesky if needed: bond-only refinement `(3,3,21)`=189
+      nodes leaves 18 arbitrages; stock-only `(3,15,3)`=135 nodes eliminates
+      all 24; uniform `(9,9,9)`=729 nodes leaves 1. The user picks the
+      production tuple after measuring full-solve runtime; default stays at
+      scalar `2` for backward compatibility. `get_return_quadrature` and
+      `Precompute` normalize either form via `discretization._normalize_ret_nodes`
+      before building the asymmetric Hermite tensor product.
 - [ ] **State-grid pruning of arbitrage points** — Complement to the above.
       During grid construction, after building the principal-axis lattice,
       compute the arbitrage gap at every candidate state and drop those with

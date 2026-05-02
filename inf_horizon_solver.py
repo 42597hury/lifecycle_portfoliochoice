@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from numba import njit
+from numba import njit, objmode
 
 from model import SolverConfig
 from solver import DI_NEWTON_FAIL, _solve_retirement_step_quad_jit
@@ -22,6 +22,34 @@ DEFAULT_TOL = 1e-6
 DEFAULT_MAX_ITER = 500
 DEFAULT_DAMPING = 1.0
 DEFAULT_TRIM_WEALTH_POINTS = 5
+COLD_START_COV_RIDGE = 1e-10
+
+
+def _print_progress_line_py(
+    iter_idx: int,
+    xi_err: float,
+    share_err: float,
+    stop_err: float,
+    iter_newton_failures: int,
+    total_newton_failures: int,
+    show_probe: bool,
+    probe_w: float,
+    probe_c_over_w: float,
+    probe_alpha_s: float,
+    probe_alpha_b: float,
+    probe_alpha_bill: float,
+) -> None:
+    """Render one compact progress line in-place for long notebook/script runs."""
+    line = (
+        f"\rih iter {iter_idx:4d} | xi {xi_err:.2e} | share {share_err:.2e} | stop {stop_err:.2e}"
+        f" | nf {iter_newton_failures}/{total_newton_failures}"
+    )
+    if show_probe:
+        line += (
+            f" | W {probe_w:.2f} | c/W {probe_c_over_w:.2e}"
+            f" | s {probe_alpha_s:.3f} b {probe_alpha_b:.3f} bill {probe_alpha_bill:.3f}"
+        )
+    print(line, end="", flush=True)
 
 
 @njit(cache=True)
@@ -231,6 +259,12 @@ def _run_infinite_horizon_core_jit(
     max_iter,
     damping,
     trim_wealth_points,
+    show_progress,
+    progress_every,
+    show_progress_probe,
+    progress_probe_z_idx,
+    progress_probe_state_idx,
+    progress_probe_wealth_idx,
 ):
     total_newton_failures = 0
     converged = False
@@ -273,7 +307,8 @@ def _run_infinite_horizon_core_jit(
             out_b,
         )
 
-        total_newton_failures += _count_diag_column(diag_int, DI_NEWTON_FAIL)
+        iter_newton_failures = _count_diag_column(diag_int, DI_NEWTON_FAIL)
+        total_newton_failures += iter_newton_failures
 
         policy_err, xi_err, share_err = _compute_ih_metrics_jit(
             C_old,
@@ -289,10 +324,57 @@ def _run_infinite_horizon_core_jit(
         xi_supnorm_history[it] = xi_err
         share_supnorm_history[it] = share_err
 
+        stop_err = xi_err
+        if share_err > stop_err:
+            stop_err = share_err
+
+        if show_progress and progress_every > 0 and ((it + 1) % progress_every == 0):
+            probe_w = 0.0
+            probe_c_over_w = 0.0
+            probe_alpha_s = 0.0
+            probe_alpha_b = 0.0
+            probe_alpha_bill = 0.0
+
+            if show_progress_probe:
+                probe_w = wealth_grid[progress_probe_wealth_idx]
+                probe_alpha_s = out_s[
+                    progress_probe_z_idx,
+                    progress_probe_state_idx,
+                    progress_probe_wealth_idx,
+                ]
+                probe_alpha_b = out_b[
+                    progress_probe_z_idx,
+                    progress_probe_state_idx,
+                    progress_probe_wealth_idx,
+                ]
+                probe_alpha_bill = 1.0 - probe_alpha_s - probe_alpha_b
+                probe_c_over_w = (
+                    out_c[
+                        progress_probe_z_idx,
+                        progress_probe_state_idx,
+                        progress_probe_wealth_idx,
+                    ] / probe_w
+                )
+            with objmode():
+                _print_progress_line_py(
+                    it + 1,
+                    xi_err,
+                    share_err,
+                    stop_err,
+                    iter_newton_failures,
+                    total_newton_failures,
+                    show_progress_probe,
+                    probe_w,
+                    probe_c_over_w,
+                    probe_alpha_s,
+                    probe_alpha_b,
+                    probe_alpha_bill,
+                )
+
         _apply_update_in_place(C_old, S_old, B_old, out_c, out_s, out_b, damping)
 
         n_iter_done = it + 1
-        if it > 0 and max(xi_err, share_err) < tol:
+        if it > 0 and stop_err < tol:
             converged = True
             break
 
@@ -320,13 +402,121 @@ def _coerce_policy_array(
     if out.ndim == 4:
         out = out[_retirement_entry_index(pc, retire_age)]
     if out.shape != expected_shape:
-        raise ValueError(f"{name} must have shape {expected_shape} or lifecycle shape (n_age, {expected_shape[0]}, {expected_shape[1]}, {expected_shape[2]}), got {out.shape}")
+        raise ValueError(
+            f"{name} must have shape {expected_shape} or lifecycle shape "
+            f"(n_age, {expected_shape[0]}, {expected_shape[1]}, {expected_shape[2]}), got {out.shape}"
+        )
     if not np.all(np.isfinite(out)):
         raise ValueError(f"{name} contains NaN or Inf")
     return np.ascontiguousarray(out.copy())
 
 
+def _project_simplex_nonnegative(alpha_raw: np.ndarray) -> np.ndarray:
+    alpha_clipped = np.maximum(alpha_raw, 0.0)
+    total = float(np.sum(alpha_clipped))
+    if total > 0.0:
+        return alpha_clipped / total
+    return np.full(3, 1.0 / 3.0, dtype=np.float64)
+
+
+def _markowitz_cold_start(model, pc) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    State-dependent cold-start for the infinite-horizon solver.
+
+    Computes a Markowitz no-risk-free-asset myopic portfolio at each financial
+    state using the same return quadrature as the solver kernel. Pairs this
+    with a log-utility-limit consumption rule xi = 1 - beta (state-independent).
+    """
+    n_z = pc.n_z
+    N_state = pc.N_state
+    n_w = pc.n_w
+    gamma = float(model.gamma)
+    beta = float(model.beta)
+
+    ones3 = np.ones(3, dtype=np.float64)
+    identity3 = np.eye(3, dtype=np.float64)
+
+    alpha_s_per_state = np.empty(N_state, dtype=np.float64)
+    alpha_b_per_state = np.empty(N_state, dtype=np.float64)
+
+    raw_weights = np.outer(np.asarray(pc.v_weights, dtype=np.float64), np.asarray(pc.ret_weights, dtype=np.float64))
+    weight_vec = raw_weights.reshape(-1)
+    weight_sum = float(np.sum(weight_vec))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise ValueError("Quadrature weights must sum to a positive finite number")
+    weight_vec = weight_vec / weight_sum
+
+    for i_s in range(N_state):
+        base_mu_r = pc.const_r + pc.A_r @ pc.state_grid[i_s]
+
+        returns = np.empty((weight_vec.size, 3), dtype=np.float64)
+        row = 0
+        for k_v in range(len(pc.v_weights)):
+            mu_bill = base_mu_r[0] + pc.M_v_nodes[k_v, 0]
+            mu_stock = base_mu_r[1] + pc.M_v_nodes[k_v, 1]
+            mu_bond = base_mu_r[2] + pc.M_v_nodes[k_v, 2]
+
+            exp_mu_bill = np.exp(mu_bill)
+            exp_mu_stock = np.exp(mu_stock)
+            exp_mu_bond = np.exp(mu_bond)
+
+            for k_r in range(len(pc.ret_weights)):
+                R_bill = exp_mu_bill * pc.exp_ret_bill[k_r]
+                R_stock = R_bill * exp_mu_stock * pc.exp_ret_stock[k_r]
+                R_bond = R_bill * exp_mu_bond * pc.exp_ret_bond[k_r]
+                returns[row, 0] = R_bill
+                returns[row, 1] = R_stock
+                returns[row, 2] = R_bond
+                row += 1
+
+        Rbar = np.sum(returns * weight_vec[:, None], axis=0)
+        centered = returns - Rbar[None, :]
+        Sigma = centered.T @ (centered * weight_vec[:, None])
+        Sigma_reg = Sigma + COLD_START_COV_RIDGE * identity3
+
+        try:
+            x = np.linalg.solve(Sigma_reg, np.column_stack((Rbar, ones3)))
+            x_R = x[:, 0]
+            x_1 = x[:, 1]
+            denom = float(ones3 @ x_1)
+            if abs(denom) <= 1e-14:
+                raise np.linalg.LinAlgError("Degenerate Markowitz denominator")
+            lam = (1.0 - (1.0 / gamma) * float(ones3 @ x_R)) / denom
+            alpha_raw = (1.0 / gamma) * x_R + lam * x_1
+            if not np.all(np.isfinite(alpha_raw)):
+                raise np.linalg.LinAlgError("Non-finite Markowitz solution")
+        except np.linalg.LinAlgError:
+            alpha_raw = np.full(3, 1.0 / 3.0, dtype=np.float64)
+
+        alpha_proj = _project_simplex_nonnegative(np.asarray(alpha_raw, dtype=np.float64))
+        alpha_s_per_state[i_s] = alpha_proj[1]
+        alpha_b_per_state[i_s] = alpha_proj[2]
+
+    xi_init = 1.0 - beta
+    expected_shape = (n_z, N_state, n_w)
+
+    C_init = np.broadcast_to(
+        (xi_init * pc.wealth_grid).reshape(1, 1, -1),
+        expected_shape,
+    ).astype(np.float64, copy=True)
+    S_init = np.broadcast_to(
+        alpha_s_per_state.reshape(1, N_state, 1),
+        expected_shape,
+    ).astype(np.float64, copy=True)
+    B_init = np.broadcast_to(
+        alpha_b_per_state.reshape(1, N_state, 1),
+        expected_shape,
+    ).astype(np.float64, copy=True)
+
+    return (
+        np.ascontiguousarray(C_init),
+        np.ascontiguousarray(S_init),
+        np.ascontiguousarray(B_init),
+    )
+
+
 def _prepare_initial_policies(
+    model,
     pc,
     retire_age: int,
     solver_config: SolverConfig,
@@ -339,6 +529,11 @@ def _prepare_initial_policies(
     C_old = _coerce_policy_array("warm_start_c", warm_start_c, expected_shape, pc, retire_age)
     S_old = _coerce_policy_array("warm_start_s", warm_start_s, expected_shape, pc, retire_age)
     B_old = _coerce_policy_array("warm_start_b", warm_start_b, expected_shape, pc, retire_age)
+
+    all_cold = (warm_start_c is None) and (warm_start_s is None) and (warm_start_b is None)
+
+    if all_cold:
+        return _markowitz_cold_start(model, pc)
 
     if C_old is None:
         C_old = np.broadcast_to(
@@ -369,6 +564,27 @@ def _validate_runtime_options(pc, tol, max_iter, damping, trim_wealth_points):
         raise ValueError("trim_wealth_points must be non-negative")
     if trim_wealth_points >= pc.n_w:
         raise ValueError("trim_wealth_points must be strictly smaller than pc.n_w")
+
+
+def _resolve_progress_probe_indices(
+    pc,
+    progress_probe_wealth: float | None,
+    progress_probe_state_idx: int | None,
+    progress_probe_z_idx: int | None,
+):
+    if progress_probe_wealth is None:
+        return False, 0, 0, 0
+
+    i_z = pc.n_z // 2 if progress_probe_z_idx is None else int(progress_probe_z_idx)
+    i_s = pc.N_state // 2 if progress_probe_state_idx is None else int(progress_probe_state_idx)
+    if i_z < 0 or i_z >= pc.n_z:
+        raise ValueError(f"progress_probe_z_idx must lie in [0, {pc.n_z - 1}]")
+    if i_s < 0 or i_s >= pc.N_state:
+        raise ValueError(f"progress_probe_state_idx must lie in [0, {pc.N_state - 1}]")
+
+    target_w = float(progress_probe_wealth)
+    i_w = int(np.argmin(np.abs(pc.wealth_grid - target_w)))
+    return True, i_z, i_s, i_w
 
 
 def _compute_z_invariance(C, S, B):
@@ -567,6 +783,12 @@ def compile_inner_kernel_smoke_test(
             1,
             1.0,
             0,
+            False,
+            1,
+            False,
+            0,
+            0,
+            0,
         )
     except Exception as exc:  # pragma: no cover - exercised only on failure path
         raise RuntimeError(
@@ -594,14 +816,21 @@ def run_infinite_horizon_solver(
     constrained: bool | None = None,
     run_smoke_test: bool = False,
     verbose: bool = True,
+    show_progress: bool = False,
+    progress_every: int = 1,
+    progress_probe_wealth: float | None = None,
+    progress_probe_state_idx: int | None = None,
+    progress_probe_z_idx: int | None = None,
 ):
     """
     Solve the stationary no-income, no-mortality benchmark by fixed-point iteration.
 
-    Warm-start arrays may be passed either as 3D arrays with shape
-    ``(n_z, N_state, n_w)`` or as lifecycle arrays with shape
-    ``(n_age, n_z, N_state, n_w)``. In the latter case the retirement-entry
-    slice is extracted automatically.
+    When all three ``warm_start_*`` arguments are ``None``, the cold start uses
+    a state-dependent Markowitz no-risk-free-asset myopic portfolio together
+    with a log-utility-limit consumption ratio ``xi = 1 - beta``. When at least
+    one ``warm_start_*`` argument is provided but others are ``None``, the
+    missing components fall back to the simple per-quantity defaults
+    (consume-all for consumption, ``solver_config.init_alpha_*`` for shares).
     """
     if solver_config is None:
         solver_config = SolverConfig()
@@ -609,6 +838,16 @@ def run_infinite_horizon_solver(
         constrained = bool(model.constrained)
 
     _validate_runtime_options(pc, tol, max_iter, damping, trim_wealth_points)
+    if progress_every < 1:
+        raise ValueError("progress_every must be at least 1")
+    show_progress_probe, progress_probe_z_idx_eff, progress_probe_state_idx_eff, progress_probe_wealth_idx_eff = (
+        _resolve_progress_probe_indices(
+            pc,
+            progress_probe_wealth,
+            progress_probe_state_idx,
+            progress_probe_z_idx,
+        )
+    )
 
     if verbose:
         print("Preparing infinite-horizon benchmark solve...")
@@ -623,6 +862,7 @@ def run_infinite_horizon_solver(
         )
 
     C_old, S_old, B_old = _prepare_initial_policies(
+        model,
         pc,
         model.retire_age,
         solver_config,
@@ -630,7 +870,6 @@ def run_infinite_horizon_solver(
         warm_start_s,
         warm_start_b,
     )
-
     used_warm_start = any(x is not None for x in (warm_start_c, warm_start_s, warm_start_b))
 
     out_c = np.empty_like(C_old)
@@ -691,6 +930,12 @@ def run_infinite_horizon_solver(
         max_iter,
         damping,
         trim_wealth_points,
+        show_progress,
+        progress_every,
+        show_progress_probe,
+        progress_probe_z_idx_eff,
+        progress_probe_state_idx_eff,
+        progress_probe_wealth_idx_eff,
     )
 
     diagnostics = _build_diagnostics(
@@ -711,6 +956,9 @@ def run_infinite_horizon_solver(
         trim_wealth_points,
         used_warm_start=used_warm_start,
     )
+
+    if show_progress and n_iter_done > 0:
+        print()
 
     if verbose:
         status = "converged" if converged else "hit max_iter"

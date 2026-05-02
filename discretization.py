@@ -87,10 +87,12 @@ def _normal_bin_probs(grid, mean=0.0, std=1.0):
     """Probability mass of N(mean, std^2) over bins induced by a sorted grid."""
     grid = np.asarray(grid, dtype=float)
     n = grid.shape[0]
-    if n < 2:
-        raise ValueError("grid must contain at least two points")
+    if n < 1:
+        raise ValueError("grid must contain at least one point")
     if std <= 0.0:
         raise ValueError("std must be strictly positive")
+    if n == 1:
+        return np.ones(1, dtype=float)
 
     edges = np.empty(n + 1, dtype=float)
     edges[0] = -np.inf
@@ -136,7 +138,11 @@ def _independence_rouwenhorst_pi(N_vec, Phi, Sigma_innov):
 
     marginals = []
     for d in range(k):
-        _, Pi_d = rouwenhorst_univariate(int(N_vec[d]), 0.0, float(rho_diag[d]), float(sigma_diag[d]))
+        Nd = int(N_vec[d])
+        if Nd == 1:
+            Pi_d = np.ones((1, 1), dtype=float)
+        else:
+            _, Pi_d = rouwenhorst_univariate(Nd, 0.0, float(rho_diag[d]), float(sigma_diag[d]))
         marginals.append(Pi_d)
 
     n_total = int(np.prod(N_vec))
@@ -209,16 +215,16 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     mu_intercept = np.asarray(mu_intercept, dtype=float)
 
     k = len(N_vec)
-    if k != 3:
-        raise ValueError("build_state_grid currently requires exactly 3 state dimensions")
+    if k < 1 or k > 3:
+        raise ValueError("build_state_grid currently requires 1, 2, or 3 state dimensions")
     if Phi.shape != (k, k):
         raise ValueError(f"Phi must have shape {(k, k)}")
     if Sigma_innov.shape != (k, k):
         raise ValueError(f"Sigma_innov must have shape {(k, k)}")
     if mu_intercept.shape != (k,):
         raise ValueError(f"mu_intercept must have shape {(k,)}")
-    if np.any(N_vec < 2):
-        raise ValueError("Each state grid dimension must have at least 2 points")
+    if np.any(N_vec < 1):
+        raise ValueError("Each state grid dimension must have at least 1 point")
 
     if mode not in {"naive", "lyapunov-axis", "principal"}:
         raise ValueError(f"Unknown state grid mode: {mode!r}")
@@ -235,10 +241,15 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     n_total = int(np.prod(N_vec))
 
     if mode == "principal":
-        state_bracket_grids = [
-            np.linspace(-n_stds_arr[d], n_stds_arr[d], int(N_vec[d]), dtype=float)
-            for d in range(k)
-        ]
+        state_bracket_grids = []
+        for d in range(k):
+            Nd = int(N_vec[d])
+            if Nd == 1:
+                state_bracket_grids.append(np.array([0.0], dtype=float))
+            else:
+                state_bracket_grids.append(
+                    np.linspace(-n_stds_arr[d], n_stds_arr[d], Nd, dtype=float)
+                )
         state_grid = np.empty((n_total, k), dtype=float)
         for i in range(n_total):
             u = np.empty(k, dtype=float)
@@ -259,18 +270,27 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
         bracket_L_inv = np.array(L_inv, copy=True)
     else:
         if mode == "lyapunov-axis":
-            state_bracket_grids = [
-                np.linspace(mu_s[d] - n_stds_arr[d] * sigma_z[d],
-                            mu_s[d] + n_stds_arr[d] * sigma_z[d],
-                            int(N_vec[d]), dtype=float)
-                for d in range(k)
-            ]
+            state_bracket_grids = []
+            for d in range(k):
+                Nd = int(N_vec[d])
+                if Nd == 1:
+                    state_bracket_grids.append(np.array([float(mu_s[d])], dtype=float))
+                else:
+                    state_bracket_grids.append(
+                        np.linspace(mu_s[d] - n_stds_arr[d] * sigma_z[d],
+                                    mu_s[d] + n_stds_arr[d] * sigma_z[d],
+                                    Nd, dtype=float)
+                    )
         else:
             state_bracket_grids = []
             for d in range(k):
                 rho_d = float(Phi[d, d])
                 sigma_d = float(np.sqrt(max(1e-14, Sigma_innov[d, d])))
-                grid_d, _ = rouwenhorst_univariate(int(N_vec[d]), float(mu_s[d]), rho_d, sigma_d)
+                Nd = int(N_vec[d])
+                if Nd == 1:
+                    grid_d = np.array([float(mu_s[d])], dtype=float)
+                else:
+                    grid_d, _ = rouwenhorst_univariate(Nd, float(mu_s[d]), rho_d, sigma_d)
                 state_bracket_grids.append(grid_d.astype(float))
 
         state_grid = np.empty((n_total, k), dtype=float)

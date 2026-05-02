@@ -113,9 +113,17 @@ class Precompute:
         if effective_savings_max > disc_config.wealth_max:
             raise ValueError("savings_max cannot exceed wealth_max; widen wealth_max instead")
 
-        self.wealth_grid = np.geomspace(disc_config.wealth_min, disc_config.wealth_max, disc_config.n_wealth)
+        self.wealth_grid = np.expm1(np.linspace(
+            np.log1p(disc_config.wealth_min),
+            np.log1p(disc_config.wealth_max),
+            disc_config.n_wealth,
+        ))
         self.savings_max = effective_savings_max
-        self.s_grid      = np.geomspace(disc_config.savings_min, self.savings_max, disc_config.n_savings)
+        self.s_grid      = np.expm1(np.linspace(
+            np.log1p(disc_config.savings_min),
+            np.log1p(self.savings_max),
+            disc_config.n_savings,
+        ))
         self.ages        = np.arange(model.start_age, model.terminal_age + 1)
 
         # --- Financial state VAR discretization ---
@@ -192,8 +200,25 @@ class Precompute:
         # --- Bequest annuity factors (one per financial state) ---
         # A(y_1, spr, b_bar): PV of b_bar annual payments discounted at a
         # linearly interpolated term structure from y_1 to y_20 = y_1 + spr.
-        _y_1 = self.state_grid[:, model.y_1_index_in_state]
-        _spr = self.state_grid[:, model.spr_index_in_state]
+        # Read y_1 and spread from the state grid when they are state variables
+        # (the original System IV path), or fall back to scalar values when one
+        # or both are omitted from the state vector.
+        y_1_idx = model.y_1_index_in_state
+        spr_idx = model.spr_index_in_state
+
+        if y_1_idx is not None and spr_idx is not None:
+            _y_1 = self.state_grid[:, model.y_1_index_in_state]
+            _spr = self.state_grid[:, model.spr_index_in_state]
+        else:
+            if y_1_idx is not None:
+                _y_1 = self.state_grid[:, y_1_idx]
+            else:
+                _y_1 = np.full(self.N_state, model.y_1_scalar_fallback, dtype=float)
+            if spr_idx is not None:
+                _spr = self.state_grid[:, spr_idx]
+            else:
+                _spr = np.full(self.N_state, model.spr_scalar_fallback, dtype=float)
+
         self.annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
         # (N_state,) float64 - A(y_1, spr, b_bar) for each financial state
         # Used by bequest_utility / bequest_marginal / bequest_marginal_inv in solver.
@@ -370,7 +395,11 @@ class Precompute:
 
     def regenerate_savings_grid(self, n_s_points):
         """Utility for sensitivity runs in Part 2."""
-        return np.geomspace(self.disc_config.savings_min, self.savings_max, int(n_s_points))
+        return np.expm1(np.linspace(
+            np.log1p(self.disc_config.savings_min),
+            np.log1p(self.savings_max),
+            int(n_s_points),
+        ))
 
     def _print_summary(self):
         print("=" * 64)
@@ -407,10 +436,16 @@ class Precompute:
         print(f"mu_r         : {self.mu_r.shape}"
               f"  ({self.N_state * self.N_state * self.model.n_ret:,} values)")
         print(f"ret_nodes    : {self.ret_nodes.shape}")
-        print(f"y_1 idx in state : {self.model.y_1_index_in_state}"
-              f"  ({self.model.state_names[self.model.y_1_index_in_state]})")
-        print(f"spr idx in state : {self.model.spr_index_in_state}"
-              f"  ({self.model.state_names[self.model.spr_index_in_state]})")
+        if self.model.y_1_index_in_state is not None:
+            print(f"y_1 idx in state : {self.model.y_1_index_in_state}"
+                  f"  ({self.model.state_names[self.model.y_1_index_in_state]})")
+        else:
+            print(f"y_1 (scalar)     : {self.model.y_1_scalar_fallback:.4%}")
+        if self.model.spr_index_in_state is not None:
+            print(f"spr idx in state : {self.model.spr_index_in_state}"
+                  f"  ({self.model.state_names[self.model.spr_index_in_state]})")
+        else:
+            print(f"spr (scalar)     : {self.model.spr_scalar_fallback:.4%}")
         print(f"annuity_factors   : {self.annuity_factors.shape}  range=[{self.annuity_factors.min():.2f}, {self.annuity_factors.max():.2f}]")
         print(f"working_income    : {self.working_income.shape}  (n_age x n_z x n_eps)")
         print(f"pension_after_tax : {self.pension_after_tax.shape}  (n_age x n_z)")
@@ -435,16 +470,51 @@ def build_model(base_config, var_config, verbose=True):
         verbose=verbose,
     )
 
-    y_1_index_in_state = int(var_config["y_1_index_in_state"])
-    if y_1_index_in_state < 0 or y_1_index_in_state >= parts["n_state"]:
-        raise ValueError("y_1_index_in_state is out of bounds for state vector")
+    y_1_idx_raw = var_config.get("y_1_index_in_state", None)
+    y_1_scalar = var_config.get("y_1_scalar_fallback", None)
+    if y_1_idx_raw is None:
+        if y_1_scalar is None:
+            raise ValueError(
+                "var_config must provide either y_1_index_in_state "
+                "or y_1_scalar_fallback (both are None)"
+            )
+        y_1_index_in_state = None
+        y_1_scalar_fallback = float(y_1_scalar)
+    else:
+        y_1_index_in_state = int(y_1_idx_raw)
+        if y_1_index_in_state < 0 or y_1_index_in_state >= parts["n_state"]:
+            raise ValueError(
+                f"y_1_index_in_state ({y_1_index_in_state}) out of bounds "
+                f"for state vector of size {parts['n_state']}"
+            )
+        y_1_scalar_fallback = None
 
-    spr_index_in_state = int(var_config["spr_index_in_state"])
-    if spr_index_in_state < 0 or spr_index_in_state >= parts["n_state"]:
-        raise ValueError("spr_index_in_state is out of bounds for state vector")
+    spr_idx_raw = var_config.get("spr_index_in_state", None)
+    spr_scalar = var_config.get("spr_scalar_fallback", None)
+    if spr_idx_raw is None:
+        if spr_scalar is None:
+            raise ValueError(
+                "var_config must provide either spr_index_in_state "
+                "or spr_scalar_fallback (both are None)"
+            )
+        spr_index_in_state = None
+        spr_scalar_fallback = float(spr_scalar)
+    else:
+        spr_index_in_state = int(spr_idx_raw)
+        if spr_index_in_state < 0 or spr_index_in_state >= parts["n_state"]:
+            raise ValueError(
+                f"spr_index_in_state ({spr_index_in_state}) out of bounds "
+                f"for state vector of size {parts['n_state']}"
+            )
+        spr_scalar_fallback = None
 
-    if y_1_index_in_state == spr_index_in_state:
-        raise ValueError("y_1_index_in_state and spr_index_in_state must be distinct")
+    if (y_1_index_in_state is not None
+            and spr_index_in_state is not None
+            and y_1_index_in_state == spr_index_in_state):
+        raise ValueError(
+            "y_1_index_in_state and spr_index_in_state must be distinct "
+            "when both are grid indices"
+        )
 
     return LifecyclePortfolioModel(
         u=u,
@@ -488,5 +558,7 @@ def build_model(base_config, var_config, verbose=True):
         Sigma_r_cond=parts["Sigma_r_cond"],
         y_1_index_in_state=y_1_index_in_state,
         spr_index_in_state=spr_index_in_state,
+        y_1_scalar_fallback=y_1_scalar_fallback,
+        spr_scalar_fallback=spr_scalar_fallback,
         constrained=bool(base_config.get("constrained", True)),
     )

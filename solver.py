@@ -26,6 +26,8 @@ import numpy as np
 from numba import njit, prange
 from math import exp
 import time
+import csv
+from functools import lru_cache
 from pathlib import Path
 
 from model import SolveControl, SolverConfig, scalar_disposable_income
@@ -87,6 +89,171 @@ _EC_TO_DI = np.array([
     DI_INTERIOR,        # EC=7
     DI_NEWTON_FAIL,     # EC=8
 ], dtype=np.int64)
+
+
+_AWI_2019_USD = 54_099.99
+_AWI_2019_KUSD = _AWI_2019_USD / 1_000.0
+_SCF_WEALTH_CSV = Path(__file__).resolve().parent / "data" / "scf_net_worth_by_age_2022.csv"
+_PROGRESS_WEALTH_SOURCES = frozenset({"grid_midpoint", "scf_median", "scf_mean"})
+
+
+def _pad_state_solver_inputs_to_3d(
+    state_grid,
+    state_bracket_grids,
+    state_bracket_shift,
+    state_bracket_L_inv,
+    v_nodes,
+    Phi_0_state,
+    Phi_11,
+    A_r,
+):
+    """Pad 1D/2D state objects to the solver's 3-coordinate layout.
+
+    The hot JIT kernels are still written in a 3-coordinate style. For System I
+    and II/III we embed the lower-dimensional state into that layout with
+    singleton dummy axes. The omitted coordinates stay identically zero, so the
+    economic model is unchanged; this just preserves the existing kernel shape.
+    """
+    n_state = int(state_grid.shape[1])
+    if n_state == 3:
+        grids_0 = np.ascontiguousarray(state_bracket_grids[0], dtype=float)
+        grids_1 = np.ascontiguousarray(state_bracket_grids[1], dtype=float)
+        grids_2 = np.ascontiguousarray(state_bracket_grids[2], dtype=float)
+        return (
+            np.ascontiguousarray(state_grid, dtype=float),
+            grids_0,
+            grids_1,
+            grids_2,
+            np.ascontiguousarray(state_bracket_shift, dtype=float),
+            np.ascontiguousarray(state_bracket_L_inv, dtype=float),
+            np.ascontiguousarray(v_nodes, dtype=float),
+            np.ascontiguousarray(Phi_0_state, dtype=float),
+            np.ascontiguousarray(Phi_11, dtype=float),
+            np.ascontiguousarray(A_r, dtype=float),
+        )
+
+    state_grid_pad = np.zeros((state_grid.shape[0], 3), dtype=float)
+    state_grid_pad[:, :n_state] = np.asarray(state_grid, dtype=float)
+
+    grids = []
+    for d in range(3):
+        if d < n_state:
+            grids.append(np.ascontiguousarray(np.asarray(state_bracket_grids[d], dtype=float)))
+        else:
+            grids.append(np.zeros(1, dtype=float))
+
+    shift_pad = np.zeros(3, dtype=float)
+    shift_pad[:n_state] = np.asarray(state_bracket_shift, dtype=float)
+
+    L_inv_pad = np.zeros((3, 3), dtype=float)
+    L_inv_pad[:n_state, :n_state] = np.asarray(state_bracket_L_inv, dtype=float)
+
+    v_nodes_pad = np.zeros((v_nodes.shape[0], 3), dtype=float)
+    v_nodes_pad[:, :n_state] = np.asarray(v_nodes, dtype=float)
+
+    Phi_0_state_pad = np.zeros(3, dtype=float)
+    Phi_0_state_pad[:n_state] = np.asarray(Phi_0_state, dtype=float)
+
+    Phi_11_pad = np.zeros((3, 3), dtype=float)
+    Phi_11_pad[:n_state, :n_state] = np.asarray(Phi_11, dtype=float)
+
+    A_r_pad = np.zeros((A_r.shape[0], 3), dtype=float)
+    A_r_pad[:, :n_state] = np.asarray(A_r, dtype=float)
+
+    return (
+        np.ascontiguousarray(state_grid_pad),
+        grids[0],
+        grids[1],
+        grids[2],
+        np.ascontiguousarray(shift_pad),
+        np.ascontiguousarray(L_inv_pad),
+        np.ascontiguousarray(v_nodes_pad),
+        np.ascontiguousarray(Phi_0_state_pad),
+        np.ascontiguousarray(Phi_11_pad),
+        np.ascontiguousarray(A_r_pad),
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_scf_wealth_age_table():
+    """Load SCF wealth-by-age targets once per process.
+
+    The source CSV stores wealth in thousands of 2022 USD. We keep those units
+    here and normalize to model units only when building the per-age probe
+    schedule.
+    """
+    age_mid = []
+    med_kusd = []
+    mean_kusd = []
+
+    with _SCF_WEALTH_CSV.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(
+            line for line in f
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        for row in reader:
+            if row["age_group"].strip().lower() == "all":
+                continue
+            age_mid.append(float(row["age_midpoint"]))
+            med_kusd.append(float(row["median_2022_k2022usd"]))
+            mean_kusd.append(float(row["mean_2022_k2022usd"]))
+
+    if len(age_mid) == 0:
+        raise ValueError(f"SCF wealth file {_SCF_WEALTH_CSV} is empty")
+
+    age_mid = np.asarray(age_mid, dtype=float)
+    med_kusd = np.asarray(med_kusd, dtype=float)
+    mean_kusd = np.asarray(mean_kusd, dtype=float)
+    valid = np.isfinite(age_mid) & np.isfinite(med_kusd) & np.isfinite(mean_kusd)
+    if not np.all(valid):
+        raise ValueError(f"SCF wealth file {_SCF_WEALTH_CSV} has no valid age rows")
+
+    return age_mid, med_kusd, mean_kusd
+
+
+def _build_progress_wealth_schedule(ages, w_grid, source):
+    """Return the per-age wealth probe used in verbose progress output."""
+    source = str(source).strip().lower()
+    w_grid = np.asarray(w_grid, dtype=float)
+    ages = np.asarray(ages, dtype=float)
+
+    if w_grid.ndim != 1 or w_grid.size < 2:
+        raise ValueError("w_grid must be a 1D array with at least two points")
+
+    if source == "grid_midpoint":
+        probe_w = float(w_grid[len(w_grid) // 2])
+        return np.full(ages.shape, probe_w, dtype=float), (
+            f"grid midpoint (legacy constant probe, W={probe_w:.3f})"
+        )
+
+    age_mid, med_kusd, mean_kusd = _load_scf_wealth_age_table()
+    if source == "scf_median":
+        wealth_kusd = med_kusd
+        label = "SCF median wealth by age (2022 $, linear age interp, AWI-normalized)"
+    elif source == "scf_mean":
+        wealth_kusd = mean_kusd
+        label = "SCF mean wealth by age (2022 $, linear age interp, AWI-normalized)"
+    else:
+        raise ValueError(
+            "progress_wealth_source must be one of "
+            f"{sorted(_PROGRESS_WEALTH_SOURCES)}, got {source!r}"
+        )
+
+    wealth_model_units = wealth_kusd / _AWI_2019_KUSD
+    schedule = np.interp(ages, age_mid, wealth_model_units)
+    schedule = np.clip(schedule, float(w_grid[0]), float(w_grid[-1]))
+    return schedule, label
+
+
+def _interp_progress_policy_at_wealth(policy_by_wealth, w_grid, wealth):
+    """Interpolate one 1D policy slice at the requested reporting wealth."""
+    return float(
+        np.interp(
+            float(wealth),
+            np.asarray(w_grid, dtype=float),
+            np.asarray(policy_by_wealth, dtype=float),
+        )
+    )
 
 
 # =============================================================================
@@ -233,7 +400,9 @@ def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
     """
     # Dimension 0
     n0 = len(grids_0)
-    if s0 <= grids_0[0]:
+    if n0 == 1:
+        lo0 = 0; f0 = 0.0
+    elif s0 <= grids_0[0]:
         lo0 = 0; f0 = 0.0
     elif s0 >= grids_0[n0 - 1]:
         lo0 = n0 - 2; f0 = 1.0
@@ -249,7 +418,9 @@ def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
 
     # Dimension 1
     n1 = len(grids_1)
-    if s1 <= grids_1[0]:
+    if n1 == 1:
+        lo1 = 0; f1 = 0.0
+    elif s1 <= grids_1[0]:
         lo1 = 0; f1 = 0.0
     elif s1 >= grids_1[n1 - 1]:
         lo1 = n1 - 2; f1 = 1.0
@@ -265,7 +436,9 @@ def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
 
     # Dimension 2
     n2 = len(grids_2)
-    if s2 <= grids_2[0]:
+    if n2 == 1:
+        lo2 = 0; f2 = 0.0
+    elif s2 <= grids_2[0]:
         lo2 = 0; f2 = 0.0
     elif s2 >= grids_2[n2 - 1]:
         lo2 = n2 - 2; f2 = 1.0
@@ -449,6 +622,9 @@ def compute_foc_jac_retirement_quad(
         lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
             b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
         )
+        hi0 = lo0 if len(grids_0) == 1 else lo0 + 1
+        hi1 = lo1 if len(grids_1) == 1 else lo1 + 1
+        hi2 = lo2 if len(grids_2) == 1 else lo2 + 1
 
         # 8 trilinear weights
         w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
@@ -462,13 +638,13 @@ def compute_foc_jac_retirement_quad(
 
         # 8 flat indices into c_next_full's j_s dimension
         j000 = lo0 * N1 * N2 + lo1 * N2 + lo2
-        j001 = lo0 * N1 * N2 + lo1 * N2 + (lo2 + 1)
-        j010 = lo0 * N1 * N2 + (lo1 + 1) * N2 + lo2
-        j011 = lo0 * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
-        j100 = (lo0 + 1) * N1 * N2 + lo1 * N2 + lo2
-        j101 = (lo0 + 1) * N1 * N2 + lo1 * N2 + (lo2 + 1)
-        j110 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + lo2
-        j111 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
+        j001 = lo0 * N1 * N2 + lo1 * N2 + hi2
+        j010 = lo0 * N1 * N2 + hi1 * N2 + lo2
+        j011 = lo0 * N1 * N2 + hi1 * N2 + hi2
+        j100 = hi0 * N1 * N2 + lo1 * N2 + lo2
+        j101 = hi0 * N1 * N2 + lo1 * N2 + hi2
+        j110 = hi0 * N1 * N2 + hi1 * N2 + lo2
+        j111 = hi0 * N1 * N2 + hi1 * N2 + hi2
 
         # --- Conditional return mean (3 returns: rtb, xr, xb) ---
         mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
@@ -492,8 +668,11 @@ def compute_foc_jac_retirement_quad(
             Rex_s = R_s - R_bill
             Rex_b = R_b - R_bill
 
-            w_inv = max(s_val * R_p, min_wealth_inv)
-            x_next = w_inv + pension_next_scalar
+            sR_p = s_val * R_p
+            if sR_p > 0.0:
+                x_next = sR_p + pension_next_scalar
+            else:
+                x_next = pension_next_scalar
 
             # --- Trilinear interpolation of c_next and mpc ---
             c000, mpc000 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j000, :])
@@ -515,12 +694,15 @@ def compute_foc_jac_retirement_quad(
 
             # --- Marginal utilities ---
             mu_alive = c_next ** (-gamma)
-            w_A = w_inv / annuity_factor_is
-            mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_is
-            mu_comb = psi * mu_alive + prob_death * mu_bequest
-
             mup_alive = -gamma * mu_alive / c_next * mpc
-            mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_is)
+            if sR_p > 0.0:
+                w_A = sR_p / annuity_factor_is
+                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_is
+                mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_is)
+            else:
+                mu_bequest = 0.0
+                mup_bequest = 0.0
+            mu_comb = psi * mu_alive + prob_death * mu_bequest
             mup_comb = psi * mup_alive + prob_death * mup_bequest
 
             wmu = weight * mu_comb
@@ -619,6 +801,9 @@ def compute_foc_jac_working_quad(
         lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
             b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
         )
+        hi0 = lo0 if len(grids_0) == 1 else lo0 + 1
+        hi1 = lo1 if len(grids_1) == 1 else lo1 + 1
+        hi2 = lo2 if len(grids_2) == 1 else lo2 + 1
 
         # 8 trilinear weights
         w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
@@ -632,13 +817,13 @@ def compute_foc_jac_working_quad(
 
         # 8 flat indices
         j000 = lo0 * N1 * N2 + lo1 * N2 + lo2
-        j001 = lo0 * N1 * N2 + lo1 * N2 + (lo2 + 1)
-        j010 = lo0 * N1 * N2 + (lo1 + 1) * N2 + lo2
-        j011 = lo0 * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
-        j100 = (lo0 + 1) * N1 * N2 + lo1 * N2 + lo2
-        j101 = (lo0 + 1) * N1 * N2 + lo1 * N2 + (lo2 + 1)
-        j110 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + lo2
-        j111 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
+        j001 = lo0 * N1 * N2 + lo1 * N2 + hi2
+        j010 = lo0 * N1 * N2 + hi1 * N2 + lo2
+        j011 = lo0 * N1 * N2 + hi1 * N2 + hi2
+        j100 = hi0 * N1 * N2 + lo1 * N2 + lo2
+        j101 = hi0 * N1 * N2 + lo1 * N2 + hi2
+        j110 = hi0 * N1 * N2 + hi1 * N2 + lo2
+        j111 = hi0 * N1 * N2 + hi1 * N2 + hi2
 
         # --- Conditional return mean (3 returns: rtb, xr, xb) ---
         mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
@@ -662,24 +847,28 @@ def compute_foc_jac_working_quad(
             Rex_s = R_s - R_bill
             Rex_b = R_b - R_bill
 
-            w_inv = max(s_val * R_p, min_wealth_inv)
+            sR_p = s_val * R_p
+            if sR_p > 0.0:
+                w_inv = sR_p
+                w_A = w_inv / annuity_factor_is
+                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_is
+                mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_is)
 
-            w_A = w_inv / annuity_factor_is
-            mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_is
-            mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_is)
+                # Bequest contribution (once per (k_v, k_r), independent of income)
+                death_mu = p_state_ret * prob_death * mu_bequest
+                death_mup = p_state_ret * prob_death * mup_bequest
 
-            # Bequest contribution (once per (k_v, k_r), independent of income)
-            death_mu = p_state_ret * prob_death * mu_bequest
-            death_mup = p_state_ret * prob_death * mup_bequest
+                euler_sum += death_mu * R_p
+                foc_s += death_mu * Rex_s
+                foc_b += death_mu * Rex_b
 
-            euler_sum += death_mu * R_p
-            foc_s += death_mu * Rex_s
-            foc_b += death_mu * Rex_b
-
-            jac_b = death_mup * s_val
-            J_ss += jac_b * Rex_s * Rex_s
-            J_bb += jac_b * Rex_b * Rex_b
-            J_sb += jac_b * Rex_s * Rex_b
+                jac_b = death_mup * s_val
+                J_ss += jac_b * Rex_s * Rex_s
+                J_bb += jac_b * Rex_b * Rex_b
+                J_sb += jac_b * Rex_s * Rex_b
+            else:
+                # Bankruptcy: heirs inherit nothing; alive branch uses w_inv = 0.
+                w_inv = 0.0
 
             # Alive contribution: quadrature over persistent and transitory innovations
             for k_eta in range(n_eta):
@@ -1021,7 +1210,8 @@ def solve_portfolio_unconstrained_terminal_njit(
         step_damp=0.3, grad_denom_eps=1e-10,
         min_return_power=1e-15, prob_skip=1e-12,
         use_line_search=True, max_backtrack_iter=10,
-        line_search_max_step=2.0):
+        line_search_max_step=2.0,
+        alpha_min=-1e30, alpha_max=+1e30):
     """
     Unconstrained 2D Newton for the terminal portfolio problem.
 
@@ -1075,6 +1265,10 @@ def solve_portfolio_unconstrained_terminal_njit(
             for _bt in range(max_backtrack_iter):
                 a_s_t = a_s + alpha * step_s
                 a_b_t = a_b + alpha * step_b
+                if a_s_t < alpha_min: a_s_t = alpha_min
+                elif a_s_t > alpha_max: a_s_t = alpha_max
+                if a_b_t < alpha_min: a_b_t = alpha_min
+                elif a_b_t > alpha_max: a_b_t = alpha_max
                 fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = _foc(a_s_t, a_b_t)
                 err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
                 if err_t < err:
@@ -1094,6 +1288,10 @@ def solve_portfolio_unconstrained_terminal_njit(
                 step_b *= cap
             a_s += step_s
             a_b += step_b
+            if a_s < alpha_min: a_s = alpha_min
+            elif a_s > alpha_max: a_s = alpha_max
+            if a_b < alpha_min: a_b = alpha_min
+            elif a_b > alpha_max: a_b = alpha_max
             fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
             err = (fs * fs + fb * fb) ** 0.5
 
@@ -1154,6 +1352,8 @@ def solve_terminal_age(wealth_grid, annuity_factors,
                 use_line_search=solver_config.use_line_search,
                 max_backtrack_iter=solver_config.max_backtrack_iter,
                 line_search_max_step=solver_config.line_search_max_step,
+                alpha_min=solver_config.alpha_min,
+                alpha_max=solver_config.alpha_max,
             )
 
         terminal_diag_int[i_s] = exit_code
@@ -1387,7 +1587,8 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                                                    min_wealth_inv=1e-10, min_consumption=1e-10,
                                                    prob_skip=1e-12,
                                                    use_line_search=True, max_backtrack_iter=10,
-                                                   line_search_max_step=2.0):
+                                                   line_search_max_step=2.0,
+                                                   alpha_min=-1e30, alpha_max=+1e30):
     """Unconstrained Newton for retirement portfolio using state quadrature."""
 
 
@@ -1456,6 +1657,10 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
             for _bt in range(max_backtrack_iter):
                 a_s_t = a_s + alpha * step_s
                 a_b_t = a_b + alpha * step_b
+                if a_s_t < alpha_min: a_s_t = alpha_min
+                elif a_s_t > alpha_max: a_s_t = alpha_max
+                if a_b_t < alpha_min: a_b_t = alpha_min
+                elif a_b_t > alpha_max: a_b_t = alpha_max
                 fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_retirement_quad(
                     a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                     v_nodes, v_weights, M_v_nodes, base_mu_r_i,
@@ -1483,6 +1688,10 @@ def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
                 step_b *= cap
             a_s += step_s
             a_b += step_b
+            if a_s < alpha_min: a_s = alpha_min
+            elif a_s > alpha_max: a_s = alpha_max
+            if a_b < alpha_min: a_b = alpha_min
+            elif a_b > alpha_max: a_b = alpha_max
             fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement_quad(
                 a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
                 v_nodes, v_weights, M_v_nodes, base_mu_r_i,
@@ -1739,7 +1948,8 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                                                 min_wealth_inv=1e-10, min_consumption=1e-10,
                                                 prob_skip=1e-12,
                                                 use_line_search=True, max_backtrack_iter=10,
-                                                line_search_max_step=2.0):
+                                                line_search_max_step=2.0,
+                                                alpha_min=-1e30, alpha_max=+1e30):
     """Unconstrained Newton for working-age portfolio using state quadrature."""
 
     # Line search is the global default — it prevents Newton overshoots and now
@@ -1820,6 +2030,10 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
             for _bt in range(max_backtrack_iter):
                 a_s_t = a_s + alpha * step_s
                 a_b_t = a_b + alpha * step_b
+                if a_s_t < alpha_min: a_s_t = alpha_min
+                elif a_s_t > alpha_max: a_s_t = alpha_max
+                if a_b_t < alpha_min: a_b_t = alpha_min
+                elif a_b_t > alpha_max: a_b_t = alpha_max
                 fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_working_quad(
                     a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
                     z_grid, rho, eta_nodes, eta_weights, dz,
@@ -1850,6 +2064,10 @@ def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
                 step_b *= cap
             a_s += step_s
             a_b += step_b
+            if a_s < alpha_min: a_s = alpha_min
+            elif a_s > alpha_max: a_s = alpha_max
+            if a_b < alpha_min: a_b = alpha_min
+            elif a_b > alpha_max: a_b = alpha_max
             fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working_quad(
                 a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
                 z_grid, rho, eta_nodes, eta_weights, dz,
@@ -1970,7 +2188,8 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         prob_skip=sc.prob_skip_threshold,
                         use_line_search=sc.use_line_search,
                         max_backtrack_iter=sc.max_backtrack_iter,
-                        line_search_max_step=sc.line_search_max_step)
+                        line_search_max_step=sc.line_search_max_step,
+                        alpha_min=sc.alpha_min, alpha_max=sc.alpha_max)
 
                 # Diagnostic tracking (same as original)
                 diag_int[i_s, 10] += 1
@@ -2184,7 +2403,8 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                         prob_skip=sc.prob_skip_threshold,
                         use_line_search=sc.use_line_search,
                         max_backtrack_iter=sc.max_backtrack_iter,
-                        line_search_max_step=sc.line_search_max_step)
+                        line_search_max_step=sc.line_search_max_step,
+                        alpha_min=sc.alpha_min, alpha_max=sc.alpha_max)
 
                 diag_int[i_s, 10] += 1
                 if exit_code == 0:    diag_int[i_s, 9] += 1
@@ -2333,7 +2553,23 @@ def _normalize_solve_control(model, pc, solve_control):
     if solve_control is None:
         return SolveControl(), False
     if not isinstance(solve_control, SolveControl):
-        raise TypeError("solve_control must be a SolveControl instance or None")
+        # In notebook workflows with autoreload, NamedTuple classes can be
+        # redefined, so a SolveControl instance created from the reloaded
+        # `model` module may fail `isinstance(..., SolveControl)` here even
+        # though it has the correct fields. Normalize any solve-control-shaped
+        # object into the local SolveControl class before validating values.
+        try:
+            defaults = SolveControl()._asdict()
+            solve_control = SolveControl(
+                **{
+                    field: getattr(solve_control, field, default)
+                    for field, default in defaults.items()
+                }
+            )
+        except Exception as exc:
+            raise TypeError(
+                "solve_control must be a SolveControl instance or None"
+            ) from exc
 
     youngest = solve_control.youngest_age_to_solve
     if youngest is not None:
@@ -2359,10 +2595,21 @@ def _normalize_solve_control(model, pc, solve_control):
     if checkpoint_path is not None:
         checkpoint_path = str(Path(checkpoint_path))
 
+    progress_wealth_source = solve_control.progress_wealth_source
+    if progress_wealth_source is None:
+        progress_wealth_source = SolveControl().progress_wealth_source
+    progress_wealth_source = str(progress_wealth_source).strip().lower()
+    if progress_wealth_source not in _PROGRESS_WEALTH_SOURCES:
+        raise ValueError(
+            "progress_wealth_source must be one of "
+            f"{sorted(_PROGRESS_WEALTH_SOURCES)}, got {progress_wealth_source!r}"
+        )
+
     return solve_control._replace(
         youngest_age_to_solve=youngest,
         checkpoint_path=checkpoint_path,
         checkpoint_every_n_ages=every,
+        progress_wealth_source=progress_wealth_source,
     ), True
 
 
@@ -2558,17 +2805,32 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     M_v_nodes       = pc.M_v_nodes
     const_r         = pc.const_r
     A_r             = pc.A_r
-    state_grid      = pc.state_grid
-    grids_0         = pc.state_bracket_grids[0]
-    grids_1         = pc.state_bracket_grids[1]
-    grids_2         = pc.state_bracket_grids[2]
-    state_bracket_shift = pc.state_bracket_shift
-    state_bracket_L_inv = pc.state_bracket_L_inv
+    (state_grid,
+     grids_0,
+     grids_1,
+     grids_2,
+     state_bracket_shift,
+     state_bracket_L_inv,
+     v_nodes_solver,
+     Phi_0_state_solver,
+     Phi_11_solver,
+     A_r_solver) = _pad_state_solver_inputs_to_3d(
+        pc.state_grid,
+        pc.state_bracket_grids,
+        pc.state_bracket_shift,
+        pc.state_bracket_L_inv,
+        pc.v_nodes,
+        model.Phi_0_state,
+        model.Phi_11,
+        pc.A_r,
+    )
     exp_ret_bill    = pc.exp_ret_bill
     exp_ret_stock   = pc.exp_ret_stock
     exp_ret_bond    = pc.exp_ret_bond
-    Phi_0_state     = model.Phi_0_state
-    Phi_11          = model.Phi_11
+    Phi_0_state     = Phi_0_state_solver
+    Phi_11          = Phi_11_solver
+    v_nodes         = v_nodes_solver
+    A_r             = A_r_solver
 
     # ---- Income tables ----
     pension_table        = pc.pension_after_tax      # (n_age, n_z)
@@ -2600,10 +2862,31 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
               f"labor eta={n_eta_q}, labor eps={n_eps_q}  "
               f"(FOC evals/call: retire={n_v_q*n_r_q:,}, work={n_v_q*n_r_q*(1+n_eta_q*n_eps_q):,})")
 
-    # ---- Median indices for per-age summary ----
+    # ---- Representative state for per-age summary ----
     i_z_med = n_z // 2
     i_s_med = N_state // 2
-    i_w_med = n_w // 2
+    progress_wealth_source = solve_control.progress_wealth_source
+    progress_wealth_by_age = None
+    progress_wealth_label = None
+
+    if verbose >= 1:
+        try:
+            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
+                ages=ages,
+                w_grid=w_grid,
+                source=progress_wealth_source,
+            )
+        except Exception as exc:
+            progress_wealth_source = "grid_midpoint"
+            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
+                ages=ages,
+                w_grid=w_grid,
+                source=progress_wealth_source,
+            )
+            print(
+                "  WARNING: could not build SCF wealth probe "
+                f"({exc}); falling back to {progress_wealth_label}."
+            )
 
     # ---- Policy arrays ----
     shape = (n_age, n_z, N_state, n_w)
@@ -2648,11 +2931,16 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     # ---- Backward induction ----
     if verbose >= 1:
         print(f"\n{'='*120}")
+        print(
+            "  Live policy probe: "
+            f"z=z_grid[{i_z_med}], state midpoint, wealth={progress_wealth_label}"
+        )
+        print("  W column reports the probe wealth in model units.")
         # avg_it / max_it columns are only meaningful for unconstrained
         # (constrained Newton iter counts are not tracked → always 0).
         iter_hdr = f"  {'avg_it':>6} {'max_it':>6}" if not constrained else ""
         hdr = (f" {'Age':>3}  {'Phase':<6} {'Time':>5}  {'Newt%':>5} {'Fail':>6}"
-               f"  {'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'c/W':>5}"
+               f"  {'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'W':>6}  {'c/W':>5}"
                f"  {'%int':>4}  {'%edge':>5}  {'%corn':>5}  {'mono':>4}"
                f"{iter_hdr}")
         print(hdr)
@@ -2737,13 +3025,20 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                                + ti[DI_TINY_SAVINGS])
                 mono_v = int(ti[DI_MONO_VIOLATIONS])
 
-                # Median-state policy values
-                med_as = float(out_s[i_z_med, i_s_med, i_w_med])
-                med_ab = float(out_b[i_z_med, i_s_med, i_w_med])
-                med_bill = 1.0 - med_as - med_ab
-                med_c = float(out_c[i_z_med, i_s_med, i_w_med])
-                med_w = float(w_grid[i_w_med])
-                c_over_w = med_c / med_w if med_w > 0 else 0.0
+                # Representative-state policy values at the chosen age-specific
+                # wealth probe. This stays outside the hot JIT kernels.
+                probe_w = float(progress_wealth_by_age[t])
+                probe_as = _interp_progress_policy_at_wealth(
+                    out_s[i_z_med, i_s_med, :], w_grid, probe_w
+                )
+                probe_ab = _interp_progress_policy_at_wealth(
+                    out_b[i_z_med, i_s_med, :], w_grid, probe_w
+                )
+                probe_bill = 1.0 - probe_as - probe_ab
+                probe_c = _interp_progress_policy_at_wealth(
+                    out_c[i_z_med, i_s_med, :], w_grid, probe_w
+                )
+                c_over_w = probe_c / probe_w if probe_w > 0 else 0.0
 
                 mono_str = f"{mono_v:4d}" if mono_v == 0 else f"\033[91m{mono_v:4d}\033[0m"
 
@@ -2757,7 +3052,8 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                     iter_str = ""
 
                 print(f" {age:3d}  {label:<6} {elapsed:5.1f}s  {newton_pct:5.1f}% {n_fail:>6}"
-                      f"  {med_as:7.3f}  {med_ab:7.3f}  {med_bill:7.3f}  {c_over_w:5.3f}"
+                      f"  {probe_as:7.3f}  {probe_ab:7.3f}  {probe_bill:7.3f}"
+                      f"  {probe_w:6.2f}  {c_over_w:5.3f}"
                       f"  {_format_pct(n_interior, total_calls)}"
                       f"  {_format_pct(n_edge, total_calls)}"
                       f"  {_format_pct(n_corner, total_calls)}"

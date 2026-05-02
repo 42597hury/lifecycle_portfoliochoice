@@ -1,0 +1,27 @@
+[diag] same mode
+Bundle: system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+Eval mode: same
+Probe count: 4860 (valid 4860)
+Mean `log10|EE|`: `-6.3040`
+P95 `log10|EE|`: `-0.5787`
+Max `log10|EE|`: `-0.0945`
+Min `log10|EE|`: `-14.5396`
+Share with `log10|EE| < -4`: `3579/4860`
+Share with `log10|EE| < -5`: `3183/4860`
+Share with `log10|EE| < -6`: `2726/4860`
+
+Wrote markdown report to diagnostics_gridpoint_ee_log1p_pathB_same.md
+[diag] next_finer mode
+Bundle: system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+Eval mode: next_finer
+Probe count: 4860 (valid 3966)
+Mean `log10|EE|`: `-1.6862`
+P95 `log10|EE|`: `-0.0192`
+Max `log10|EE|`: `-0.0002`
+Min `log10|EE|`: `-5.5846`
+Share with `log10|EE| < -4`: `48/3966`
+Share with `log10|EE| < -5`: `6/3966`
+Share with `log10|EE| < -6`: `0/3966`
+
+Wrote markdown report to diagnostics_gridpoint_ee_log1p_pathB_nextfiner.md
+[diag] done

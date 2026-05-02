@@ -308,6 +308,8 @@ def build_var_config_from_dataset(
     return_indices,
     y_1_index_in_state=2,
     spr_index_in_state=1,
+    y_1_scalar_fallback=None,
+    spr_scalar_fallback=None,
     trend="c",
     estimation="restricted",
 ):
@@ -340,8 +342,10 @@ def build_var_config_from_dataset(
         **var_core,
         "state_indices": list(state_indices),
         "return_indices": list(return_indices),
-        "y_1_index_in_state": int(y_1_index_in_state),
-        "spr_index_in_state": int(spr_index_in_state),
+        "y_1_index_in_state": None if y_1_index_in_state is None else int(y_1_index_in_state),
+        "spr_index_in_state": None if spr_index_in_state is None else int(spr_index_in_state),
+        "y_1_scalar_fallback": None if y_1_scalar_fallback is None else float(y_1_scalar_fallback),
+        "spr_scalar_fallback": None if spr_scalar_fallback is None else float(spr_scalar_fallback),
     }
 
     ret_idx_arr = np.asarray(return_indices, dtype=int)
@@ -423,6 +427,120 @@ def build_nominal_system1_var_config(
         trend=trend,
         estimation=estimation,
     )
+
+
+def _read_y1_spread_sample_means(csv_path):
+    """Read sample means of y_1 and spread from the VAR dataset."""
+    data = _load_var_dataset(csv_path=csv_path, columns=["y_1", "spr"])
+    return float(data["y_1"].mean()), float(data["spr"].mean())
+
+
+def build_no_cy_var_config(
+    csv_path="data/var_dataset.csv",
+    columns=("y_1", "spr", "rtb", "xr", "xb"),
+    state_indices=(1, 0),
+    trend="c",
+    estimation="restricted",
+):
+    """Build the System III var_config: y_1 and spread predict returns, cy dropped.
+
+    Returns the same tuple shape as the existing baseline builder:
+    `(var_config, fit_details, data)`.
+    """
+    state_idx_list = list(state_indices)
+    column_at_state_pos = [columns[i] for i in state_idx_list]
+    spr_pos = column_at_state_pos.index("spr")
+    y_1_pos = column_at_state_pos.index("y_1")
+
+    return build_var_config_from_dataset(
+        csv_path=csv_path,
+        columns=list(columns),
+        state_indices=state_idx_list,
+        return_indices=(2, 3, 4),
+        y_1_index_in_state=y_1_pos,
+        spr_index_in_state=spr_pos,
+        trend=trend,
+        estimation=estimation,
+    )
+
+
+def build_y1_only_var_config(
+    csv_path="data/var_dataset.csv",
+    columns=("y_1", "rtb", "xr", "xb"),
+    trend="c",
+    estimation="restricted",
+):
+    """Build the System II var_config: y_1 is the only state predictor.
+
+    Spread is supplied as a scalar fallback equal to its sample mean.
+    Returns `(var_config, fit_details, data)`.
+    """
+    _, spr_mean = _read_y1_spread_sample_means(csv_path)
+
+    return build_var_config_from_dataset(
+        csv_path=csv_path,
+        columns=list(columns),
+        state_indices=(0,),
+        return_indices=(1, 2, 3),
+        y_1_index_in_state=0,
+        spr_index_in_state=None,
+        spr_scalar_fallback=spr_mean,
+        trend=trend,
+        estimation=estimation,
+    )
+
+
+def build_iid_var_config(
+    csv_path="data/var_dataset.csv",
+    return_columns=("rtb", "xr", "xb"),
+):
+    """Build the System I var_config: iid returns with a dummy state axis.
+
+    Returns `(var_config, fit_details, data)`.
+    """
+    data = _load_var_dataset(
+        csv_path=csv_path,
+        columns=["y_1", "spr", *return_columns],
+    )
+    ret_data = data[list(return_columns)].to_numpy()
+    z_bar_ret = ret_data.mean(axis=0)
+    Sigma_rr = np.cov(ret_data, rowvar=False, ddof=1)
+    y_1_mean, spr_mean = _read_y1_spread_sample_means(csv_path)
+
+    n_ret = len(return_columns)
+    n = 1 + n_ret
+    Phi = np.zeros((n, n), dtype=float)
+    Omega = np.zeros((n, n), dtype=float)
+    Omega[0, 0] = 1.0
+    Omega[1:, 1:] = Sigma_rr
+    z_bar = np.concatenate(([0.0], z_bar_ret))
+    const = (np.eye(n) - Phi) @ z_bar
+
+    var_config = {
+        "z_bar": z_bar,
+        "Phi": Phi,
+        "Omega": Omega,
+        "variable_names": ["dummy", *return_columns],
+        "const": const,
+        "residual_correlation": None,
+        "equation_r2": None,
+        "state_indices": [0],
+        "return_indices": list(range(1, n)),
+        "y_1_index_in_state": None,
+        "spr_index_in_state": None,
+        "y_1_scalar_fallback": y_1_mean,
+        "spr_scalar_fallback": spr_mean,
+        "max_abs_return_lag_coeff": 0.0,
+        "estimation": "iid_system_I",
+        "trend": "sample_mean_cov",
+        "state_predictor_columns": ["dummy"],
+    }
+    fit_details = {
+        "residuals": ret_data - z_bar_ret,
+        "n_obs_effective": len(ret_data),
+        "dof": len(ret_data) - 1,
+    }
+    return var_config, fit_details, data
 
 
 # =============================================================================
@@ -514,6 +632,8 @@ def build_nominal_system1_var_config_hardcoded():
         "return_indices":         list(_RET_IDX),
         "y_1_index_in_state":     2,
         "spr_index_in_state":     1,
+        "y_1_scalar_fallback":    None,
+        "spr_scalar_fallback":    None,
         "max_abs_return_lag_coeff": 0.0,
         "estimation":             "restricted_constrained_hardcoded",
         "trend":                  "c",

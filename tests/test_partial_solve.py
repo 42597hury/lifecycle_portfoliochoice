@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -12,7 +13,7 @@ if str(ROOT) not in sys.path:
 from model import DiscretizationConfig, SolveControl, SolverConfig
 from policy_io import load_policy_bundle
 from precompute import Precompute, build_model
-from solver import run_lifecycle_solver
+from solver import _build_progress_wealth_schedule, _normalize_solve_control, run_lifecycle_solver
 from var import build_nominal_system1_var_config
 
 
@@ -110,3 +111,56 @@ def test_partial_solve_checkpoint_bundle(tmp_path):
     assert np.all(np.isnan(C_loaded[~solved_mask]))
     assert np.all(np.isnan(S_loaded[~solved_mask]))
     assert np.all(np.isnan(B_loaded[~solved_mask]))
+
+
+def test_progress_wealth_schedule_uses_scf_median_with_linear_age_interpolation():
+    ages = np.array([22, 30, 35, 40, 50, 80, 99], dtype=np.int64)
+    w_grid = np.geomspace(1e-4, 200.0, 12)
+
+    schedule, label = _build_progress_wealth_schedule(ages, w_grid, "scf_median")
+    awi_kusd = 54.09999
+
+    expected_age30 = 39.0 / awi_kusd
+    expected_age40 = 135.6 / awi_kusd
+    expected_age35 = 0.5 * (expected_age30 + expected_age40)
+    expected_age50 = 247.2 / awi_kusd
+    expected_age80 = 335.6 / awi_kusd
+
+    assert "SCF median wealth" in label
+    assert schedule[0] == pytest.approx(expected_age30)
+    assert schedule[1] == pytest.approx(expected_age30)
+    assert schedule[2] == pytest.approx(expected_age35)
+    assert schedule[3] == pytest.approx(expected_age40)
+    assert schedule[4] == pytest.approx(expected_age50)
+    assert schedule[5] == pytest.approx(expected_age80)
+    assert schedule[6] == pytest.approx(expected_age80)
+
+
+def test_progress_wealth_schedule_grid_midpoint_matches_legacy_constant_probe():
+    ages = np.array([22, 45, 80], dtype=np.int64)
+    w_grid = np.geomspace(1e-4, 200.0, 12)
+
+    schedule, label = _build_progress_wealth_schedule(ages, w_grid, "grid_midpoint")
+    expected = float(w_grid[len(w_grid) // 2])
+
+    assert "legacy constant probe" in label
+    assert np.allclose(schedule, expected)
+
+
+def test_normalize_solve_control_accepts_legacy_shape_and_defaults_progress_source():
+    model, pc = _build_small_problem()
+
+    class LegacySolveControl:
+        youngest_age_to_solve = 95
+        checkpoint_path = None
+        checkpoint_every_n_ages = 1
+        save_on_interrupt = True
+        return_partial_on_interrupt = False
+
+    solve_control, control_active = _normalize_solve_control(model, pc, LegacySolveControl())
+
+    assert control_active is True
+    assert solve_control.youngest_age_to_solve == 95
+    assert solve_control.checkpoint_every_n_ages == 1
+    assert solve_control.save_on_interrupt is True
+    assert solve_control.progress_wealth_source == "scf_median"

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from inf_horizon_solver import (
+    _markowitz_cold_start,
     compile_inner_kernel_smoke_test,
     extract_policy_at_point,
     run_infinite_horizon_solver,
@@ -83,12 +84,52 @@ def test_compile_inner_kernel_smoke():
     assert result["shape"] == (pc.n_z, pc.N_state, pc.n_w)
 
 
-def test_infinite_horizon_solver_converges_from_lifecycle_warm_start():
+def test_markowitz_cold_start_properties():
+    model, pc = _build_small_problem()
+    C_init, S_init, B_init = _markowitz_cold_start(model, pc)
+
+    expected_shape = (pc.n_z, pc.N_state, pc.n_w)
+    assert C_init.shape == expected_shape
+    assert S_init.shape == expected_shape
+    assert B_init.shape == expected_shape
+    assert C_init.dtype == np.float64
+    assert S_init.dtype == np.float64
+    assert B_init.dtype == np.float64
+
+    assert C_init.flags["C_CONTIGUOUS"]
+    assert S_init.flags["C_CONTIGUOUS"]
+    assert B_init.flags["C_CONTIGUOUS"]
+
+    assert np.all(np.isfinite(C_init))
+    assert np.all(np.isfinite(S_init))
+    assert np.all(np.isfinite(B_init))
+
+    assert np.all(S_init >= 0.0)
+    assert np.all(B_init >= 0.0)
+    assert np.all(S_init + B_init <= 1.0 + 1e-12)
+
+    xi_expected = 1.0 - float(model.beta)
+    xi_actual = C_init / pc.wealth_grid[None, None, :]
+    assert np.allclose(xi_actual, xi_expected, atol=1e-12)
+
+    for i_s in range(pc.N_state):
+        s_slice_S = S_init[:, i_s, :]
+        s_slice_B = B_init[:, i_s, :]
+        assert np.ptp(s_slice_S) < 1e-15
+        assert np.ptp(s_slice_B) < 1e-15
+
+    s_per_state = S_init[0, :, 0]
+    b_per_state = B_init[0, :, 0]
+    assert np.ptp(s_per_state) > 1e-6, "Stock share should vary across states"
+    assert np.ptp(b_per_state) > 1e-6, "Bond share should vary across states"
+
+
+def test_infinite_horizon_solver_converges_from_markowitz_cold_start():
     model, pc = _build_small_problem()
     solver_config = SolverConfig()
 
     solve_control = SolveControl(youngest_age_to_solve=model.retire_age)
-    C_mat, S_mat, B_mat, lifecycle_diag = run_lifecycle_solver(
+    C_mat, S_mat, B_mat, _ = run_lifecycle_solver(
         model,
         pc,
         solver_config=solver_config,
@@ -96,40 +137,62 @@ def test_infinite_horizon_solver_converges_from_lifecycle_warm_start():
         verbose=0,
     )
 
-    assert lifecycle_diag["youngest_solved_age"] == model.retire_age
-
-    C_inf, S_inf, B_inf, diag = run_infinite_horizon_solver(
+    C_warm, S_warm, B_warm, _ = run_infinite_horizon_solver(
         model,
         pc,
         solver_config=solver_config,
         warm_start_c=C_mat,
         warm_start_s=S_mat,
         warm_start_b=B_mat,
-        tol=1e-5,
-        max_iter=300,
+        tol=5e-7,
+        max_iter=500,
         damping=1.0,
         trim_wealth_points=2,
         verbose=False,
     )
 
-    assert diag["converged"] is True
-    assert diag["n_iter"] >= 1
-    assert np.all(np.isfinite(C_inf))
-    assert np.all(np.isfinite(S_inf))
-    assert np.all(np.isfinite(B_inf))
-    assert diag["final_stopping_supnorm"] < 1e-5
-    assert diag["max_z_slice_diff_c"] < 1e-5
-    assert diag["max_z_slice_diff_s"] < 5e-5
-    assert diag["max_z_slice_diff_b"] < 5e-5
-    assert diag["max_xi_spread_across_w"] < 1e-4
-    assert diag["max_share_spread_across_w"] < 1e-3
-    assert np.isfinite(diag["stability_proxy"])
-    assert diag["stability_proxy"] < 1.0
+    C_cold, S_cold, B_cold, diag_cold = run_infinite_horizon_solver(
+        model,
+        pc,
+        solver_config=solver_config,
+        tol=5e-7,
+        max_iter=500,
+        damping=1.0,
+        trim_wealth_points=2,
+        verbose=False,
+    )
+
+    assert diag_cold["converged"] is True
+    assert diag_cold["n_iter"] >= 1
+    assert np.all(np.isfinite(C_cold))
+    assert np.all(np.isfinite(S_cold))
+    assert np.all(np.isfinite(B_cold))
+    assert diag_cold["final_stopping_supnorm"] < 5e-7
+    assert diag_cold["max_z_slice_diff_c"] < 1e-5
+    assert diag_cold["max_z_slice_diff_s"] < 5e-5
+    assert diag_cold["max_z_slice_diff_b"] < 5e-5
+    assert diag_cold["max_xi_spread_across_w"] < 1e-4
+    assert diag_cold["max_share_spread_across_w"] < 1e-3
+    assert np.isfinite(diag_cold["stability_proxy"])
+    assert diag_cold["stability_proxy"] < 1.0
+
+    cross_tol = 1e-4
+    trim = 2
+    diff_C = np.max(
+        np.abs(C_warm[:, :, trim:] - C_cold[:, :, trim:])
+        / np.maximum(np.abs(C_warm[:, :, trim:]), 1.0)
+    )
+    diff_S = np.max(np.abs(S_warm[:, :, trim:] - S_cold[:, :, trim:]))
+    diff_B = np.max(np.abs(B_warm[:, :, trim:] - B_cold[:, :, trim:]))
+
+    assert diff_C < cross_tol, f"C diverges between cold and warm: {diff_C}"
+    assert diff_S < cross_tol, f"S diverges between cold and warm: {diff_S}"
+    assert diff_B < cross_tol, f"B diverges between cold and warm: {diff_B}"
 
     point = extract_policy_at_point(
-        C_inf,
-        S_inf,
-        B_inf,
+        C_cold,
+        S_cold,
+        B_cold,
         i_z=pc.n_z // 2,
         i_s=pc.N_state // 2,
         i_w=pc.n_w // 2,

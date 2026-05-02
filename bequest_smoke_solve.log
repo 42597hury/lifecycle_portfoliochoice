@@ -1,0 +1,137 @@
+================================================================
+VAR ESTIMATION SUMMARY
+================================================================
+Estimation mode: restricted_constrained
+Sample rows: 63
+Columns: ['y_1', 'spr', 'cy', 'rtb', 'xr', 'xb']
+State indices: (2, 1, 0)
+Return indices: (3, 4, 5)
+VAR k=6, T=62
+Max |Phi[:, return_lag_cols]|: 0.000e+00
+
+Intercept vector (const):
+[ 0.062312 -0.025114 -0.242387 -0.162459  0.471994 -0.311008]
+
+Residual correlation matrix:
+[[ 1.     -0.8646  0.1664 -0.4893 -0.0963 -0.7144]
+ [-0.8646  1.      0.0066  0.289  -0.0794  0.299 ]
+ [ 0.1664  0.0066  1.     -0.4272 -0.9807 -0.3178]
+ [-0.4893  0.289  -0.4272  1.      0.3046  0.502 ]
+ [-0.0963 -0.0794 -0.9807  0.3046  1.      0.2904]
+ [-0.7144  0.299  -0.3178  0.502   0.2904  1.    ]]
+
+Equation R2:
+  y_1: 0.7843
+  spr: 0.5211
+  cy: 0.8733
+  rtb: 0.5179
+  xr: 0.0591
+  xb: 0.3215
+================================================================
+[bequest_smoke] System IV (full VAR baseline) unconstrained partial solve, ages 87-99
+[bequest_smoke] disc: DiscretizationConfig(n_wealth=150, wealth_min=0.0001, wealth_max=200.0, n_savings=150, savings_min=1e-08, savings_max=None, state_grid_sizes=(7, 7, 7), state_grid_mode='principal', state_n_stds=(2.0, 2.25, 2.25), n_z=9, n_stds=3.0, n_eps_nodes=3, n_eta_nodes=3, n_ret_nodes_1d=(3, 7, 5), n_state_quad_nodes=(2, 2, 5))
+[bequest_smoke] checkpoint: C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+[bequest_smoke] starting solver wall clock
+
+======================================================================
+LIFECYCLE PORTFOLIO SOLVER  (EGM + 2D Newton)
+  Mode: UNCONSTRAINED | STATE_QUADRATURE
+  Solver: SolverConfig(tol=1e-07, max_iter=20, max_iter_unconstrained=8000, edge_max_iter=8, init_alpha_s=0.85, init_alpha_b=0.44, step_damp_constrained=0.2, step_damp_unconstrained=0.3, grad_step_size=0.05, use_line_search=True, max_backtrack_iter=10, line_search_max_step=2.0, tiny_savings=1e-06, corner_tol=1e-08, edge_accept_factor=10.0, singular_det=1e-15, grad_denom_eps=1e-10, min_wealth_inv=1e-10, min_consumption=1e-10, min_return_power=1e-15, prob_skip_threshold=1e-12, euler_inv_floor=1e-20, egm_anchor=1e-10)
+  Discretization: DiscretizationConfig(n_wealth=150, wealth_min=0.0001, wealth_max=200.0, n_savings=150, savings_min=1e-08, savings_max=None, state_grid_sizes=(7, 7, 7), state_grid_mode='principal', state_n_stds=(2.0, 2.25, 2.25), n_z=9, n_stds=3.0, n_eps_nodes=3, n_eta_nodes=3, n_ret_nodes_1d=(3, 7, 5), n_state_quad_nodes=(2, 2, 5))
+  Solve control: SolveControl(youngest_age_to_solve=87, checkpoint_path='C:\\Users\\carlh\\Projekt\\thesisscripts\\saved_runs\\checkpoints\\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1', checkpoint_every_n_ages=1, save_on_interrupt=True, return_partial_on_interrupt=True, progress_wealth_source='scf_median')
+======================================================================
+  Ages 22–99  (78 periods)
+  Grids: n_w=150, n_s=150, n_z=9, N_state=343
+  gamma=5.0, beta=0.96, b_bar=10
+  States per period: 9 × 343 = 3,087
+  Quadrature nodes: state-innov=20, return-resid=105, labor eta=3, labor eps=3  (FOC evals/call: retire=2,100, work=21,000)
+
+  Terminal condition (age 99) ... done  [c range: 0.000–37.851]  [portfolio: 343 interior, 0 corner/edge]
+
+========================================================================================================================
+  Live policy probe: z=z_grid[4], state midpoint, wealth=SCF median wealth by age (2022 $, linear age interp, AWI-normalized)
+  W column reports the probe wealth in model units.
+ Age  Phase   Time  Newt%   Fail  alpha_s  alpha_b   a_bill       W    c/W  %int  %edge  %corn  mono  avg_it max_it
+========================================================================================================================
+  98  RETIRE  82.3s  100.0%      0    0.498    0.601   -0.099    6.20  0.112   99%    0%    1%     0     0.8     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  97  RETIRE 154.1s  100.0%      0    0.547    0.528   -0.074    6.20  0.111   99%    0%    1%     0     0.8     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  96  RETIRE 216.2s  100.0%      0    0.582    0.485   -0.067    6.20  0.111   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  95  RETIRE 279.2s  100.0%      0    0.609    0.459   -0.067    6.20  0.111   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  94  RETIRE 338.6s  100.0%      0    0.629    0.442   -0.071    6.20  0.111   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  93  RETIRE 398.6s  100.0%      0    0.645    0.430   -0.075    6.20  0.111   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  92  RETIRE 462.9s  100.0%      0    0.659    0.421   -0.080    6.20  0.111   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  91  RETIRE 532.0s  100.0%      0    0.672    0.413   -0.085    6.20  0.112   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  90  RETIRE 600.6s  100.0%      0    0.684    0.405   -0.089    6.20  0.112   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  89  RETIRE 665.3s  100.0%      0    0.696    0.397   -0.093    6.20  0.112   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  88  RETIRE 736.8s  100.0%      0    0.708    0.389   -0.097    6.20  0.112   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+  87  RETIRE 809.7s  100.0%      0    0.719    0.381   -0.100    6.20  0.112   99%    0%    1%     0     0.9     11
+    checkpoint saved -> C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+
+========================================================================================================================
+  DONE in 13.65 min  (avg 68.25s per age)
+========================================================================================================================
+
+======================================================================
+  POST-SOLVE DIAGNOSTICS
+======================================================================
+
+  Solve status: stopped_early  (solved ages 87 to 99)
+  Saved partial bundle: C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1
+
+  1. NEWTON CONVERGENCE
+     Total calls:     5,556,600
+     Converged:       5,556,600  (100.000%)
+     Failed:                  0  (0.000%)
+     Worst FOC:        1.00e-07
+     RMS FOC:          2.76e-08
+
+  1b. NEWTON ITERATIONS  (unconstrained Newton only)
+     Total iters:     4,896,465  (across 5,556,600 calls)
+     Avg iters:            0.88  per call
+     Max iters:              11  in any single call  (max_iter_unconstrained=8000)
+     Warm resets:             0  (times init_alpha_* fell back after EC_NEWTON_FAIL)
+
+     Top 5 ages by avg iters:
+       Age  Phase   avg_iter  max_iter     calls
+        87  RETIRE      0.93        11   463,050
+        88  RETIRE      0.92        11   463,050
+        89  RETIRE      0.91        11   463,050
+        90  RETIRE      0.90        11   463,050
+        91  RETIRE      0.89        11   463,050
+
+  2. PORTFOLIO REGIME BREAKDOWN
+                    Bills  Stocks   Bonds  S+Bill  B+Bill  S+Bond  Inter.    Fail
+     Retirement:     0.7%    0.0%    0.0%    0.0%    0.0%    0.0%   99.3%    0.0%
+     Overall:        0.7%    0.0%    0.0%    0.0%    0.0%    0.0%   99.3%    0.0%
+
+  3. PORTFOLIO SHARE RANGES
+     Stock:  [-1.093, 9.249]  mean=0.810
+     Bond:   [-5.985, 7.181]  mean=0.407
+     Bill:   mean=-0.218  (inferred: 1-s-b)
+
+  4. EGM MONOTONICITY
+     PASS
+
+  5. POLICY FUNCTION SANITY
+     PASS  (18,058,950 elements checked)
+======================================================================
+
+[bequest_smoke] wall = 832.0s
+[bequest_smoke] status = stopped_early
+[bequest_smoke] partial = True
+[bequest_smoke] ages solved: 87-99
+[bequest_smoke] total_newton_failures = 0
+[bequest_smoke] total_mono_violations = 0
+[bequest_smoke] worst_foc_resid = 9.999974692606882e-08
+[bequest_smoke] bundle saved to: C:\Users\carlh\Projekt\thesisscripts\saved_runs\checkpoints\system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_from_age87_kret3x7x5_ns2p0x2p25x2p25_log1p_pathB_v1

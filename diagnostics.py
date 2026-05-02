@@ -700,8 +700,11 @@ def diagnose_var_pre(model, pc):
               f"Grid spans enough of {name}'s distribution",
               f"+/-{cover:.2f} sigma")
     # Bill rate is now uncertain (no r_bill_grid); show y_1 state grid range instead
-    y1_grid = pc.state_grid[:, model.y_1_index_in_state]
-    print(f"  y_1 state grid: [{y1_grid.min()*100:.3f}%, {y1_grid.max()*100:.3f}%]  Mean: {y1_grid.mean()*100:.3f}%")
+    if model.y_1_index_in_state is not None:
+        y1_grid = pc.state_grid[:, model.y_1_index_in_state]
+        print(f"  y_1 state grid: [{y1_grid.min()*100:.3f}%, {y1_grid.max()*100:.3f}%]  Mean: {y1_grid.mean()*100:.3f}%")
+    else:
+        print(f"  y_1 scalar fallback: {model.y_1_scalar_fallback*100:.3f}%")
 
     # ── Return Distribution Quality ────────────────────────────────────
     _sub("Return Distribution Quality")

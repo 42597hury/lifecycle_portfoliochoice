@@ -216,6 +216,77 @@ def _build_return_factor(Sigma_r_cond: np.ndarray) -> np.ndarray:
     return np.linalg.cholesky(Sigma)
 
 
+def _pad_simulation_state_inputs_to_3d(pc, model, init_state_coords: np.ndarray):
+    """Pad lower-dimensional state inputs to the simulation core's 3-coordinate layout."""
+    n_state = int(model.n_state)
+    if n_state == 3:
+        L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
+            0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)
+        ))
+        return {
+            "initial_s": np.ascontiguousarray(init_state_coords, dtype=float),
+            "state_grids_0": np.ascontiguousarray(pc.state_bracket_grids[0], dtype=float),
+            "state_grids_1": np.ascontiguousarray(pc.state_bracket_grids[1], dtype=float),
+            "state_grids_2": np.ascontiguousarray(pc.state_bracket_grids[2], dtype=float),
+            "state_bracket_shift": np.ascontiguousarray(pc.state_bracket_shift, dtype=float),
+            "state_bracket_L_inv": np.ascontiguousarray(pc.state_bracket_L_inv, dtype=float),
+            "L_ss": L_ss_arr,
+            "Phi_0_state": np.ascontiguousarray(model.Phi_0_state, dtype=float),
+            "Phi_11": np.ascontiguousarray(model.Phi_11, dtype=float),
+            "A_r": np.ascontiguousarray(pc.A_r, dtype=float),
+            "M_matrix": np.ascontiguousarray(model.M, dtype=float),
+        }
+
+    init_s_pad = np.zeros((init_state_coords.shape[0], 3), dtype=float)
+    init_s_pad[:, :n_state] = np.asarray(init_state_coords, dtype=float)
+
+    grids = []
+    for d in range(3):
+        if d < n_state:
+            grids.append(np.ascontiguousarray(np.asarray(pc.state_bracket_grids[d], dtype=float)))
+        else:
+            grids.append(np.zeros(1, dtype=float))
+
+    shift_pad = np.zeros(3, dtype=float)
+    shift_pad[:n_state] = np.asarray(pc.state_bracket_shift, dtype=float)
+
+    L_inv_pad = np.zeros((3, 3), dtype=float)
+    L_inv_pad[:n_state, :n_state] = np.asarray(pc.state_bracket_L_inv, dtype=float)
+
+    L_ss_pad = np.zeros((3, 3), dtype=float)
+    is_dummy_state = n_state == 1 and tuple(model.state_names) == ("dummy",)
+    if not is_dummy_state:
+        L_ss_pad[:n_state, :n_state] = np.linalg.cholesky(
+            0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)
+        )
+
+    Phi_0_state_pad = np.zeros(3, dtype=float)
+    Phi_0_state_pad[:n_state] = np.asarray(model.Phi_0_state, dtype=float)
+
+    Phi_11_pad = np.zeros((3, 3), dtype=float)
+    Phi_11_pad[:n_state, :n_state] = np.asarray(model.Phi_11, dtype=float)
+
+    A_r_pad = np.zeros((pc.A_r.shape[0], 3), dtype=float)
+    A_r_pad[:, :n_state] = np.asarray(pc.A_r, dtype=float)
+
+    M_pad = np.zeros((model.M.shape[0], 3), dtype=float)
+    M_pad[:, :n_state] = np.asarray(model.M, dtype=float)
+
+    return {
+        "initial_s": np.ascontiguousarray(init_s_pad),
+        "state_grids_0": grids[0],
+        "state_grids_1": grids[1],
+        "state_grids_2": grids[2],
+        "state_bracket_shift": np.ascontiguousarray(shift_pad),
+        "state_bracket_L_inv": np.ascontiguousarray(L_inv_pad),
+        "L_ss": np.ascontiguousarray(L_ss_pad),
+        "Phi_0_state": np.ascontiguousarray(Phi_0_state_pad),
+        "Phi_11": np.ascontiguousarray(Phi_11_pad),
+        "A_r": np.ascontiguousarray(A_r_pad),
+        "M_matrix": np.ascontiguousarray(M_pad),
+    }
+
+
 def _initialize_initial_wealth(n_simulations: int,
                                initial_wealth: Optional[Union[float, np.ndarray]],
                                initial_wealth_distribution: Optional[str],
@@ -535,6 +606,7 @@ def simulate_lifecycle_core(
     sim_z = np.zeros((n_simulations, n_age))
     sim_z_idx = np.zeros((n_simulations, n_age), dtype=np.int32)
     sim_state = np.zeros((n_simulations, n_age), dtype=np.int32)
+    sim_state_coords = np.zeros((n_simulations, n_age, 3))
     sim_alive = np.zeros((n_simulations, n_age), dtype=np.bool_)
 
     death_age = np.full(n_simulations, -1, dtype=np.int32)
@@ -555,6 +627,9 @@ def simulate_lifecycle_core(
             sim_z[i, t] = z_val
             sim_x[i, t] = x_t
             sim_income[i, t] = income_t
+            sim_state_coords[i, t, 0] = s0_t
+            sim_state_coords[i, t, 1] = s1_t
+            sim_state_coords[i, t, 2] = s2_t
 
             # --- z bracketing ---
             iz_lo = int((z_val - z_lo) / dz)
@@ -573,7 +648,9 @@ def simulate_lifecycle_core(
             b2 = state_bracket_L_inv[2, 0] * ds0 + state_bracket_L_inv[2, 1] * ds1 + state_bracket_L_inv[2, 2] * ds2
 
             # Bracket b0 in state_grids_0
-            if b0 <= state_grids_0[0]:
+            if N0_s == 1:
+                lo0 = 0; f0 = 0.0
+            elif b0 <= state_grids_0[0]:
                 lo0 = 0; f0 = 0.0
             elif b0 >= state_grids_0[N0_s - 1]:
                 lo0 = N0_s - 2; f0 = 1.0
@@ -587,7 +664,9 @@ def simulate_lifecycle_core(
                 f0 = (b0 - state_grids_0[lo0]) / dg0 if dg0 > 1e-30 else 0.0
                 f0 = max(0.0, min(1.0, f0))
 
-            if b1 <= state_grids_1[0]:
+            if N1_s == 1:
+                lo1 = 0; f1 = 0.0
+            elif b1 <= state_grids_1[0]:
                 lo1 = 0; f1 = 0.0
             elif b1 >= state_grids_1[N1_s - 1]:
                 lo1 = N1_s - 2; f1 = 1.0
@@ -601,7 +680,9 @@ def simulate_lifecycle_core(
                 f1 = (b1 - state_grids_1[lo1]) / dg1 if dg1 > 1e-30 else 0.0
                 f1 = max(0.0, min(1.0, f1))
 
-            if b2 <= state_grids_2[0]:
+            if N2_s == 1:
+                lo2 = 0; f2 = 0.0
+            elif b2 <= state_grids_2[0]:
                 lo2 = 0; f2 = 0.0
             elif b2 >= state_grids_2[N2_s - 1]:
                 lo2 = N2_s - 2; f2 = 1.0
@@ -621,15 +702,19 @@ def simulate_lifecycle_core(
             d2 = lo2 if f2 <= 0.5 else lo2 + 1
             sim_state[i, t] = d0 * N1_s * N2_s + d1 * N2_s + d2
 
+            hi0 = lo0 if N0_s == 1 else lo0 + 1
+            hi1 = lo1 if N1_s == 1 else lo1 + 1
+            hi2 = lo2 if N2_s == 1 else lo2 + 1
+
             # 8 trilinear corners — same flat indexing as the solver
             j000 = lo0 * N1_s * N2_s + lo1 * N2_s + lo2
-            j001 = lo0 * N1_s * N2_s + lo1 * N2_s + (lo2 + 1)
-            j010 = lo0 * N1_s * N2_s + (lo1 + 1) * N2_s + lo2
-            j011 = lo0 * N1_s * N2_s + (lo1 + 1) * N2_s + (lo2 + 1)
-            j100 = (lo0 + 1) * N1_s * N2_s + lo1 * N2_s + lo2
-            j101 = (lo0 + 1) * N1_s * N2_s + lo1 * N2_s + (lo2 + 1)
-            j110 = (lo0 + 1) * N1_s * N2_s + (lo1 + 1) * N2_s + lo2
-            j111 = (lo0 + 1) * N1_s * N2_s + (lo1 + 1) * N2_s + (lo2 + 1)
+            j001 = lo0 * N1_s * N2_s + lo1 * N2_s + hi2
+            j010 = lo0 * N1_s * N2_s + hi1 * N2_s + lo2
+            j011 = lo0 * N1_s * N2_s + hi1 * N2_s + hi2
+            j100 = hi0 * N1_s * N2_s + lo1 * N2_s + lo2
+            j101 = hi0 * N1_s * N2_s + lo1 * N2_s + hi2
+            j110 = hi0 * N1_s * N2_s + hi1 * N2_s + lo2
+            j111 = hi0 * N1_s * N2_s + hi1 * N2_s + hi2
 
             w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
             w001 = (1.0 - f0) * (1.0 - f1) * f2
@@ -729,7 +814,7 @@ def simulate_lifecycle_core(
 
             alpha_bill_t = 1.0 - alpha_s_t - alpha_b_t
             R_port = alpha_s_t * R_stock + alpha_b_t * R_bond + alpha_bill_t * R_bill
-            estate_t = savings_t * R_port
+            estate_t = max(savings_t * R_port, 0.0)
 
             sim_R_port[i, t] = R_port
             sim_estate[i, t] = estate_t
@@ -815,6 +900,7 @@ def simulate_lifecycle_core(
         sim_z,
         sim_z_idx,
         sim_state,
+        sim_state_coords,
         sim_alive,
         death_age,
         estate_at_death,
@@ -1081,9 +1167,11 @@ def simulate_lifecycle(C_mat: np.ndarray,
     # uniform_draws columns: [survival, eta-mix, eps-mix, ret-node]
     uniform_draws = rng.uniform(size=(n_simulations, n_age, 4))
 
-    # normal_draws columns: n_ret return residuals + 1 eta + 1 eps + n_state innovations
+    # normal_draws columns: n_ret return residuals + 1 eta + 1 eps + 3 padded
+    # state innovations. Lower-dimensional systems use zeros in the omitted
+    # state-transition rows/cols of the padded Cholesky factor.
     n_state = int(model.n_state)
-    n_normal_cols = n_ret + 2 + n_state
+    n_normal_cols = n_ret + 2 + 3
     normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
     if return_draw_mode == "monte_carlo":
         ret_factor_arr = _build_return_factor(model.Sigma_r_cond)
@@ -1097,23 +1185,11 @@ def simulate_lifecycle(C_mat: np.ndarray,
 
     t_start = time.perf_counter()
 
-    # Continuous state-transition arrays (always used)
-    L_ss_arr = np.ascontiguousarray(np.linalg.cholesky(
-        0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T)))
-    sg0 = np.ascontiguousarray(pc.state_bracket_grids[0])
-    sg1 = np.ascontiguousarray(pc.state_bracket_grids[1])
-    sg2 = np.ascontiguousarray(pc.state_bracket_grids[2])
-    state_bracket_shift_arr = np.ascontiguousarray(pc.state_bracket_shift)
-    state_bracket_L_inv_arr = np.ascontiguousarray(pc.state_bracket_L_inv)
-    Phi_0_state_arr = np.ascontiguousarray(model.Phi_0_state)
-    Phi_11_arr = np.ascontiguousarray(model.Phi_11)
-    const_r_arr = np.ascontiguousarray(pc.const_r)
-    A_r_arr = np.ascontiguousarray(pc.A_r)
-    M_matrix_arr = np.ascontiguousarray(model.M)
-
     # Resolve the integer state index (still used to seed each household at
     # an on-grid economic state vector) and convert to continuous s coords.
     init_s_coords = np.ascontiguousarray(pc.state_grid[init_state_idx, :])
+    state_inputs = _pad_simulation_state_inputs_to_3d(pc, model, init_s_coords)
+    const_r_arr = np.ascontiguousarray(pc.const_r)
 
     results = simulate_lifecycle_core(
         C_mat=np.ascontiguousarray(C_mat),
@@ -1144,22 +1220,22 @@ def simulate_lifecycle(C_mat: np.ndarray,
         constrained=bool(model.constrained),
         use_mc_returns=use_mc_returns,
         initial_z=np.ascontiguousarray(init_z_val),
-        initial_s=init_s_coords,
+        initial_s=state_inputs["initial_s"],
         initial_x=np.ascontiguousarray(init_x),
         initial_income=np.ascontiguousarray(initial_income_arr),
         uniform_draws=np.ascontiguousarray(uniform_draws),
         normal_draws=np.ascontiguousarray(normal_draws),
-        state_grids_0=sg0,
-        state_grids_1=sg1,
-        state_grids_2=sg2,
-        state_bracket_shift=state_bracket_shift_arr,
-        state_bracket_L_inv=state_bracket_L_inv_arr,
-        L_ss=L_ss_arr,
-        Phi_0_state=Phi_0_state_arr,
-        Phi_11=Phi_11_arr,
+        state_grids_0=state_inputs["state_grids_0"],
+        state_grids_1=state_inputs["state_grids_1"],
+        state_grids_2=state_inputs["state_grids_2"],
+        state_bracket_shift=state_inputs["state_bracket_shift"],
+        state_bracket_L_inv=state_inputs["state_bracket_L_inv"],
+        L_ss=state_inputs["L_ss"],
+        Phi_0_state=state_inputs["Phi_0_state"],
+        Phi_11=state_inputs["Phi_11"],
         const_r=const_r_arr,
-        A_r=A_r_arr,
-        M_matrix=M_matrix_arr,
+        A_r=state_inputs["A_r"],
+        M_matrix=state_inputs["M_matrix"],
     )
 
     elapsed = time.perf_counter() - t_start
@@ -1176,6 +1252,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
         sim_z,
         sim_z_idx,
         sim_state,
+        sim_state_coords,
         sim_alive,
         death_age,
         estate_at_death,
@@ -1227,6 +1304,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
         "z": sim_z,
         "z_idx": sim_z_idx,
         "state_idx": sim_state,
+        "state_coords": sim_state_coords[:, :, :n_state],
         "alive": sim_alive,
         "death_age": death_age,
         "ages": pc.ages.copy(),

@@ -79,8 +79,10 @@ class LifecyclePortfolioModel(NamedTuple):
     M: np.ndarray
     Sigma_r_cond: np.ndarray
 
-    y_1_index_in_state: int       # Index of y_1 (1-year nominal yield) in state vector (= 2 under default cy-first ordering; = 0 under legacy y_1-first ordering)
-    spr_index_in_state: int       # Index of spr (yield spread) in state vector (= 1)
+    y_1_index_in_state: int | None      # Index of y_1 in state vector if present on the grid; None if y_1 is supplied as a scalar fallback
+    spr_index_in_state: int | None      # Index of spr in state vector if present on the grid; None if spread is supplied as a scalar fallback
+    y_1_scalar_fallback: float | None   # Required iff y_1_index_in_state is None; sample mean of y_1 used by the bequest annuity factor
+    spr_scalar_fallback: float | None   # Required iff spr_index_in_state is None; sample mean of spread used by the bequest annuity factor
 
     # Portfolio constraints
     constrained: bool            # True = no short-selling/leverage, False = unconstrained
@@ -95,7 +97,7 @@ class DiscretizationConfig(NamedTuple):
 
     # Wealth grid
     n_wealth: int = 150
-    wealth_min: float = 1e-4
+    wealth_min: float = 0.01
     wealth_max: float = 200.0
 
     # Savings grid (EGM)
@@ -161,6 +163,10 @@ class SolverConfig(NamedTuple):
     euler_inv_floor: float = 1e-20             # floor for beta*euler before inversion
     egm_anchor: float = 1e-10                  # anchor value for EGM grid at zero savings
 
+    # --- Numerical leverage cap (unconstrained branch only) ---
+    alpha_min: float = -10.0                   # lower bound on alpha_s and alpha_b in the unconstrained Newton
+    alpha_max: float = +10.0                   # upper bound on alpha_s and alpha_b in the unconstrained Newton
+
 
 # =============================================================================
 # SOLVE CONTROL
@@ -174,6 +180,7 @@ class SolveControl(NamedTuple):
     checkpoint_every_n_ages: int | None = None
     save_on_interrupt: bool = False
     return_partial_on_interrupt: bool = False
+    progress_wealth_source: str = "scf_median"
 
 
 # =============================================================================

@@ -1,0 +1,16 @@
+# SCF 2022 family net worth by age of reference person
+# Source: Federal Reserve Bulletin, "Changes in U.S. Family Finances from 2019 to 2022",
+#         Vol. 109 No. 4, Oct 2023, Table 2, p. 12.
+#         https://www.federalreserve.gov/publications/files/scf23.pdf
+# Units : thousands of 2022 USD (CPI-U-RS deflated)
+# Concept: family (PEU) net worth = total assets - total liabilities.
+#          Excludes Social Security and DB-pension wealth.
+# Bins  : age of the SCF reference person.
+age_group,age_lo,age_hi,age_midpoint,median_2019_k2022usd,median_2022_k2022usd,mean_2019_k2022usd,mean_2022_k2022usd
+<35,18,34,30,16.1,39.0,88.5,183.5
+35-44,35,44,40,105.9,135.6,505.6,549.6
+45-54,45,54,50,195.4,247.2,965.9,975.8
+55-64,55,64,60,246.3,364.5,1363.1,1566.9
+65-74,65,74,70,308.8,409.9,1411.6,1794.6
+75+,75,95,80,295.4,335.6,1133.2,1624.1
+all,18,95,,141.1,192.9,868.0,1063.7

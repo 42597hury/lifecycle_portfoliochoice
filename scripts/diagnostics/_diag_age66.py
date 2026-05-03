@@ -14,7 +14,7 @@ import dataclasses
 
 from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.precompute import build_model, Precompute
-import solver as _solver
+import lifecycle.solver as _solver
 
 # ----- Setup (same as smoke test) -----
 RUN_DIR = Path("saved_runs/unconstrained_principal_grid5x5x5_nz9")

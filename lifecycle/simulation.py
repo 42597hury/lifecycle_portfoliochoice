@@ -1037,8 +1037,8 @@ def simulate_lifecycle(C_mat: np.ndarray,
     init_state_idx = _resolve_initial_state_indices(n_simulations, pc, initial_state, rng)
 
     # --- Initial income: continuous mixture eps draw, direct from continuous z ---
-    from model import disposable_income_working as _disp_inc_vec
-    from model import compute_pension_after_tax as _pension_vec
+    from lifecycle.model import disposable_income_working as _disp_inc_vec
+    from lifecycle.model import compute_pension_after_tax as _pension_vec
     if retire_age_idx > 0:
         init_eps_uniform = rng.uniform(size=n_simulations)
         init_eps_normal = rng.standard_normal(size=n_simulations)

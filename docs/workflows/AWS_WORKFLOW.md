@@ -177,7 +177,7 @@ aws s3 rm s3://hugo-thesis-runs/launches/ --recursive
 
 ```python
 import numpy as np
-from policy_io import load_policy_bundle
+from lifecycle.policy_io import load_policy_bundle
 C_l, S_l, B_l, _, _ = load_policy_bundle('saved_runs/<local-bundle>')
 C_e, S_e, B_e, _, _ = load_policy_bundle('saved_runs/<ec2-bundle>')
 print('C match:', np.allclose(C_l, C_e, rtol=1e-5))

@@ -2803,7 +2803,7 @@ def _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask):
 
 def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
     """Persist a solver checkpoint bundle."""
-    from policy_io import save_policy_bundle
+    from lifecycle.policy_io import save_policy_bundle
 
     C_save, S_save, B_save = _prepare_policy_snapshot(
         C_mat, S_mat, B_mat, diagnostics["solved_age_mask"]
@@ -2991,7 +2991,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     if checkpoint_path is not None:
         ckpt_dir = Path(checkpoint_path)
         if (ckpt_dir / "policy_arrays.npz").exists():
-            from policy_io import load_policy_bundle
+            from lifecycle.policy_io import load_policy_bundle
             try:
                 Cc, Sc, Bc, ckpt_diag, _ = load_policy_bundle(ckpt_dir)
             except Exception as exc:

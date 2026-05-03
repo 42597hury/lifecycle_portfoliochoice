@@ -22,6 +22,25 @@ from typing import Any
 import numpy as np
 
 
+def _dictify_namedtuples(value: Any) -> Any:
+    """Recursively replace NamedTuple instances with plain dicts.
+
+    Why: bundles are pickled, and a NamedTuple pickles its class identity
+    (module + qualname). Storing the data as plain dicts removes any
+    dependency on Python module structure, so bundles unpickle without
+    needing the lifecycle.* (or legacy `model`) modules to be importable.
+    """
+    if hasattr(value, "_asdict") and hasattr(value, "_fields"):
+        return {k: _dictify_namedtuples(v) for k, v in value._asdict().items()}
+    if isinstance(value, dict):
+        return {k: _dictify_namedtuples(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_dictify_namedtuples(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_dictify_namedtuples(v) for v in value)
+    return value
+
+
 def _to_jsonable(value: Any) -> Any:
     """Convert values to JSON-friendly representations."""
     if hasattr(value, "_asdict"):
@@ -118,7 +137,10 @@ def save_policy_bundle(
 
     if diagnostics is not None:
         with diag_path.open("wb") as f:
-            pickle.dump(diagnostics, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(
+                _dictify_namedtuples(diagnostics), f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
 
     metadata = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -182,11 +204,11 @@ def load_policy_bundle(
             metadata = json.load(f)
 
     # State-ordering guard: warn if the bundle was produced under a different
-    # state_indices than the current var.py default.  Prevents silent column
-    # mislabelling when an old (y_1, spr, cy) bundle is loaded after the
+    # state_indices than the current lifecycle.var default.  Prevents silent
+    # column mislabelling when an old (y_1, spr, cy) bundle is loaded after the
     # 2026-04-30 reorder default to (cy, spr, y_1).
     try:
-        from var import build_nominal_system1_var_config as _bn
+        from lifecycle.var import build_nominal_system1_var_config as _bn
         import inspect as _inspect
         _default_state_indices = list(
             _inspect.signature(_bn).parameters["state_indices"].default
@@ -201,7 +223,7 @@ def load_policy_bundle(
         ):
             warnings.warn(
                 f"Bundle '{bundle.name}' was solved with state_indices="
-                f"{list(_bundle_state_indices)}, but the current var.py default is "
+                f"{list(_bundle_state_indices)}, but the current lifecycle.var default is "
                 f"{_default_state_indices}. The bundle's state_grid columns are in "
                 f"the OLD order; do not mix with arrays from a freshly-built "
                 f"Precompute under the current default. Re-solve to migrate."

@@ -29,7 +29,7 @@ import numpy as np
 
 from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.precompute import Precompute, build_model
-import solver as solver_live
+import lifecycle.solver as solver_live
 
 
 DEFAULT_RUN_DIR = Path("saved_runs/unconstrained_principal_grid9x9x9_nz9_retirement_only")

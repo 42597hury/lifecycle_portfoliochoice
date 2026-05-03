@@ -230,8 +230,8 @@ guard the Cholesky-specific structure.
 is lower-triangular.
 
 ```python
-from var import build_nominal_system1_var_config
-from precompute import build_model
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.precompute import build_model
 import numpy as np
 
 # Build model exactly as production does.
@@ -255,7 +255,7 @@ because the change-of-variable identity in §1.2 doesn't hold.
 theoretical moments of `N(0, Σ_r_cond)`.
 
 ```python
-from discretization import get_return_quadrature
+from lifecycle.discretization import get_return_quadrature
 
 for K_per_axis in [(2,2,2), (3,5,3), (2,2,5), (5,2,2), (3,3,3), (5,5,5)]:
     r, w = get_return_quadrature(model, n_nodes=K_per_axis)

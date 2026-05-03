@@ -352,10 +352,10 @@ if __name__ == '__main__':
 
     print("\n3. Numba compilation check:")
     try:
-        import solver
-        print("  [PASS] solver.py compiles with Numba")
+        import lifecycle.solver  # noqa: F401
+        print("  [PASS] lifecycle/solver.py compiles with Numba")
     except Exception as e:
-        print(f"  [FAIL] solver.py compilation error: {e}")
+        print(f"  [FAIL] lifecycle/solver.py compilation error: {e}")
         sys.exit(1)
 
     print("\n" + "=" * 60)

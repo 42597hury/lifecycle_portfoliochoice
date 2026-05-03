@@ -1,7 +1,7 @@
 """
 lifecycle — life-cycle portfolio choice model with stocks, nominal bonds, and bills.
 
-Core modules (importable as lifecycle.X or via root shims X for backward compat):
+Core modules:
 
   model               LifecyclePortfolioModel + utility/tax/bequest helpers
   var                 VAR estimation, partition, and predictability ablations
@@ -22,9 +22,8 @@ sys.path either via tests/conftest.py, scripts/run_solve.py boot, or
 direct `pip install -e .` (no pyproject.toml is shipped — sys.path
 discovery is sufficient for the use cases).
 
-Backward compatibility: each module also has a top-level shim file at
-the repo root (e.g. `model.py`) that aliases `sys.modules[__name__]`
-to the lifecycle implementation. This preserves both `from model import X`
-imports across the codebase and the pickle qualified names embedded in
-existing saved_runs/ bundles.
+Bundle compatibility: saved_runs/*/diagnostics.pkl stores configs as
+plain dicts (not NamedTuples), so bundles unpickle without depending on
+any Python module structure. Older bundles that pre-date this convention
+must be migrated once with scripts/migrate_bundle_pickles.py.
 """

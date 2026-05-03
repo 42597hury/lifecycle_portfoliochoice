@@ -12,12 +12,12 @@ This repo is the code companion to a master's thesis in economics.
 ## Quick start
 
 ```python
-from precompute import build_model, Precompute
-from solver import run_lifecycle_solver
-from simulation import simulate_lifecycle
-from policy_io import save_policy_bundle, load_policy_bundle
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.simulation import simulate_lifecycle
+from lifecycle.policy_io import save_policy_bundle, load_policy_bundle
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
-from predictability_ablation import prepare_predictability_system
+from lifecycle.predictability_ablation import prepare_predictability_system
 
 # 1. Estimate the VAR (or pick an ablation: "I", "II", "III", "IV")
 system = prepare_predictability_system("IV", csv_path="data/var_dataset.csv",

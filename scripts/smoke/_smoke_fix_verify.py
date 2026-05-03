@@ -18,7 +18,7 @@ from pathlib import Path
 
 from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.precompute import build_model, Precompute
-import solver as _solver
+import lifecycle.solver as _solver
 
 RUN_DIR = Path("saved_runs/unconstrained_principal_grid5x5x5_nz9")
 META = json.loads((RUN_DIR / "metadata.json").read_text())

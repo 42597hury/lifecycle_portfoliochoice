@@ -31,7 +31,8 @@ Two tiers of tests run on a simulation of the saved unconstrained bundle:
         sampling: Var(log R_port) decomposes into within-state +
         between-state components matching the model.
 
-Run: PYTHONIOENCODING=utf-8 PYTHONPATH=. python _diag_simulator_validation.py
+Run from repo root:
+  PYTHONIOENCODING=utf-8 python -m scripts.validation._diag_simulator_validation
 """
 
 from __future__ import annotations

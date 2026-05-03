@@ -666,15 +666,24 @@ def _evaluate_age_errors(
     b_bar: int,
     y_1_idx: int,
     spr_idx: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    kink_tol: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(household_idx)
     ee = np.empty(n, dtype=np.float64)
     valid = np.zeros(n, dtype=np.bool_)
+    is_constrained = np.zeros(n, dtype=np.bool_)
     use_pension_next = age == retire_age - 1
 
     for j in prange(n):
         i = household_idx[j]
         c_t = c_age[i]
+        s_t = savings_age[i]
+        x_t = c_t + s_t
+        # Constraint kink: savings≈0 means the borrowing limit (savings>=0) binds and
+        # the FOC has KKT slack rather than holding with equality. Detected as a
+        # share-of-cash-on-hand below kink_tol so the test is scale-free.
+        if x_t > 1e-12 and s_t / x_t < kink_tol:
+            is_constrained[j] = True
         if c_t <= 0.0:
             ee[j] = np.nan
             valid[j] = False
@@ -770,7 +779,7 @@ def _evaluate_age_errors(
             ee[j] = 1.0 - c_implied / c_t
             valid[j] = True
 
-    return ee, valid
+    return ee, valid, is_constrained
 
 
 def _simulate_bundle_window(ctx: EulerBundleContext,
@@ -1029,6 +1038,7 @@ def _summarize_ee(age: int,
                   phase: str,
                   ee: np.ndarray,
                   valid: np.ndarray,
+                  is_constrained: np.ndarray,
                   n_alive: int,
                   n_eval_target: int) -> dict[str, Any]:
     vals = ee[valid]
@@ -1040,37 +1050,71 @@ def _summarize_ee(age: int,
         "n_eval": int(ee.size),
         "n_valid": int(vals.size),
         "n_invalid": int(ee.size - vals.size),
+        "n_constrained": int(np.sum(is_constrained)),
+        "n_constrained_valid": int(np.sum(is_constrained & valid)),
+    }
+    nan_block = {
+        "mean_log10_abs_ee": np.nan,
+        "p99_log10_abs_ee": np.nan,
+        "max_log10_abs_ee": np.nan,
+        "mean_abs_ee_pct": np.nan,
+        "p95_abs_ee_pct": np.nan,
+        "max_abs_ee_pct": np.nan,
     }
     if vals.size == 0:
-        out.update({
-            "mean_log10_abs_ee": np.nan,
-            "p99_log10_abs_ee": np.nan,
-            "max_log10_abs_ee": np.nan,
-            "mean_abs_ee_pct": np.nan,
-            "p95_abs_ee_pct": np.nan,
-            "max_abs_ee_pct": np.nan,
-        })
+        out.update(nan_block)
+        out.update({k + "_unc": np.nan for k in nan_block})
+        out["n_unconstrained_valid"] = 0
         return out
 
-    abs_ee = np.abs(vals)
-    log_abs = np.log10(np.maximum(abs_ee, 1e-16))
-    out.update({
-        "mean_log10_abs_ee": float(np.mean(log_abs)),
-        "p99_log10_abs_ee": float(np.percentile(log_abs, 99.0)),
-        "max_log10_abs_ee": float(np.max(log_abs)),
-        "mean_abs_ee_pct": float(100.0 * np.mean(abs_ee)),
-        "p95_abs_ee_pct": float(100.0 * np.percentile(abs_ee, 95.0)),
-        "max_abs_ee_pct": float(100.0 * np.max(abs_ee)),
-    })
+    def _stats(arr: np.ndarray) -> dict[str, float]:
+        if arr.size == 0:
+            return {k: np.nan for k in nan_block}
+        abs_ee = np.abs(arr)
+        log_abs = np.log10(np.maximum(abs_ee, 1e-16))
+        return {
+            "mean_log10_abs_ee": float(np.mean(log_abs)),
+            "p99_log10_abs_ee": float(np.percentile(log_abs, 99.0)),
+            "max_log10_abs_ee": float(np.max(log_abs)),
+            "mean_abs_ee_pct": float(100.0 * np.mean(abs_ee)),
+            "p95_abs_ee_pct": float(100.0 * np.percentile(abs_ee, 95.0)),
+            "max_abs_ee_pct": float(100.0 * np.max(abs_ee)),
+        }
+
+    out.update(_stats(vals))
+    unc_mask = valid & ~is_constrained
+    vals_unc = ee[unc_mask]
+    out["n_unconstrained_valid"] = int(vals_unc.size)
+    out.update({k + "_unc": v for k, v in _stats(vals_unc).items()})
     return out
 
 
-def _phase_gate(rows: list[dict[str, Any]], phase: str, grade: str) -> dict[str, Any]:
-    phase_rows = [r for r in rows if r["phase"] == phase and r["n_valid"] > 0]
+def _phase_gate(rows: list[dict[str, Any]], phase: str, grade: str,
+                cell_set: str = "all") -> dict[str, Any]:
+    """Compute pass/fail for a phase × grade.
+
+    cell_set controls which subset of cells the gate sees:
+      - "all": every valid cell (current behaviour, includes constraint-binding cells
+        whose EE reflects KKT slack rather than discretization error).
+      - "unconstrained": only cells where savings/x >= kink_tol (the FOC-interior
+        subset). This is the convention HARK and AFV-RR (2006) use because the
+        constrained branch has a slack term that is not a discretization error.
+    """
+    if cell_set == "all":
+        valid_key = "n_valid"
+        mean_key, max_key = "mean_log10_abs_ee", "max_log10_abs_ee"
+    elif cell_set == "unconstrained":
+        valid_key = "n_unconstrained_valid"
+        mean_key, max_key = "mean_log10_abs_ee_unc", "max_log10_abs_ee_unc"
+    else:
+        raise ValueError(f"Unknown cell_set: {cell_set}")
+
+    phase_rows = [r for r in rows if r["phase"] == phase and r.get(valid_key, 0) > 0]
     if not phase_rows:
         return {
             "phase": phase,
             "grade": grade,
+            "cell_set": cell_set,
             "passes": False,
             "mean_log10_abs_ee": np.nan,
             "max_log10_abs_ee": np.nan,
@@ -1078,8 +1122,8 @@ def _phase_gate(rows: list[dict[str, Any]], phase: str, grade: str) -> dict[str,
             "max_gate": np.nan,
         }
 
-    mean_log = float(np.nanmean([r["mean_log10_abs_ee"] for r in phase_rows]))
-    max_log = float(np.nanmax([r["max_log10_abs_ee"] for r in phase_rows]))
+    mean_log = float(np.nanmean([r[mean_key] for r in phase_rows]))
+    max_log = float(np.nanmax([r[max_key] for r in phase_rows]))
 
     if phase == "working":
         mean_gate = -4.0 if grade == "publication" else -5.0
@@ -1090,6 +1134,7 @@ def _phase_gate(rows: list[dict[str, Any]], phase: str, grade: str) -> dict[str,
     return {
         "phase": phase,
         "grade": grade,
+        "cell_set": cell_set,
         "passes": bool(mean_log < mean_gate and max_log < max_gate),
         "mean_log10_abs_ee": mean_log,
         "max_log10_abs_ee": max_log,
@@ -1132,11 +1177,13 @@ def _markdown_report(ctx: EulerBundleContext,
 
     lines.append("## Gates")
     lines.append("")
-    lines.append("| phase | grade | pass | mean log10|EE| | gate | max log10|EE| | gate |")
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("`cell_set=all` includes constraint-binding cells (savings≈0). Their EE reflects KKT slack on the no-borrowing constraint, not discretization error. `cell_set=unconstrained` is the FOC-interior subset (savings/x ≥ kink_tol) — this is the convention HARK and AFV-RR (2006) use to gate solver accuracy.")
+    lines.append("")
+    lines.append("| cell_set | phase | grade | pass | mean log10|EE| | gate | max log10|EE| | gate |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |")
     for g in gates:
         lines.append(
-            f"| {g['phase']} | {g['grade']} | {'yes' if g['passes'] else 'no'} | "
+            f"| {g['cell_set']} | {g['phase']} | {g['grade']} | {'yes' if g['passes'] else 'no'} | "
             f"{g['mean_log10_abs_ee']:.3f} | < {g['mean_gate']:.1f} | "
             f"{g['max_log10_abs_ee']:.3f} | < {g['max_gate']:.1f} |"
         )
@@ -1144,13 +1191,16 @@ def _markdown_report(ctx: EulerBundleContext,
 
     lines.append("## By Age")
     lines.append("")
-    lines.append("| age | phase | alive | eval | valid | invalid | mean log10|EE| | p99 log10|EE| | max log10|EE| | mean |EE| % | p95 |EE| % | max |EE| % |")
-    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(f"`*_unc` columns restrict to the unconstrained-cell subset (savings/x ≥ kink_tol = {args.kink_tol:g}). `n_cstr` = number of constraint-binding cells in the age sample.")
+    lines.append("")
+    lines.append("| age | phase | alive | eval | valid | n_cstr | mean log10|EE| | p99 log10|EE| | max log10|EE| | mean log10|EE| (unc) | p99 log10|EE| (unc) | max log10|EE| (unc) | max |EE| % | max |EE| % (unc) |")
+    lines.append("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for r in rows:
         lines.append(
-            f"| {r['age']} | {r['phase']} | {r['n_alive']} | {r['n_eval']} | {r['n_valid']} | {r['n_invalid']} | "
+            f"| {r['age']} | {r['phase']} | {r['n_alive']} | {r['n_eval']} | {r['n_valid']} | {r['n_constrained']} | "
             f"{r['mean_log10_abs_ee']:.3f} | {r['p99_log10_abs_ee']:.3f} | {r['max_log10_abs_ee']:.3f} | "
-            f"{r['mean_abs_ee_pct']:.4f} | {r['p95_abs_ee_pct']:.4f} | {r['max_abs_ee_pct']:.4f} |"
+            f"{r['mean_log10_abs_ee_unc']:.3f} | {r['p99_log10_abs_ee_unc']:.3f} | {r['max_log10_abs_ee_unc']:.3f} | "
+            f"{r['max_abs_ee_pct']:.4f} | {r['max_abs_ee_pct_unc']:.4f} |"
         )
     lines.append("")
 
@@ -1164,7 +1214,10 @@ def _markdown_report(ctx: EulerBundleContext,
         "- `EE` is reported in the unit-free consumption-error form `1 - c_implied / c_policy`, where `c_implied` is backed out from an independent expectation rule."
     )
     lines.append(
-        "- The working/retirement publication-grade gates follow `contextfiles/GRID_CONVERGENCE_CRITERIA.md`."
+        f"- A cell is flagged `is_constrained` when `savings/x < kink_tol = {args.kink_tol:g}`. At such cells the FOC has KKT slack (the agent would want savings<0 but the savings≥0 constraint binds), so `1 - c_implied/c_policy` measures slack, not discretization error."
+    )
+    lines.append(
+        "- The working/retirement publication-grade gates follow `contextfiles/GRID_CONVERGENCE_CRITERIA.md`. The `unconstrained` cell-set rows are the gate the literature reports (HARK, AFV-RR 2006); the `all` rows are kept for backwards compatibility."
     )
     return "\n".join(lines) + "\n"
 
@@ -1218,7 +1271,7 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
         sample_idx = _age_sample_indices(alive_mask, args.eval_households_per_age, rng)
         phase = "retirement" if age >= model.retire_age else "working"
 
-        ee, valid = _evaluate_age_errors(
+        ee, valid, is_constrained = _evaluate_age_errors(
             sample_idx,
             np.ascontiguousarray(sim["z"][:, t]),
             np.ascontiguousarray(sim["state_coords"][:, t, :]),
@@ -1263,6 +1316,7 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
             int(model.b_bar),
             int(model.y_1_index_in_state),
             int(model.spr_index_in_state),
+            float(args.kink_tol),
         )
 
         rows.append(_summarize_ee(
@@ -1270,15 +1324,20 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
             phase=phase,
             ee=ee,
             valid=valid,
+            is_constrained=is_constrained,
             n_alive=int(np.sum(alive_mask)),
             n_eval_target=int(args.eval_households_per_age),
         ))
 
     gates = [
-        _phase_gate(rows, "working", "publication"),
-        _phase_gate(rows, "retirement", "publication"),
-        _phase_gate(rows, "working", "welfare"),
-        _phase_gate(rows, "retirement", "welfare"),
+        _phase_gate(rows, "working", "publication", cell_set="all"),
+        _phase_gate(rows, "retirement", "publication", cell_set="all"),
+        _phase_gate(rows, "working", "welfare", cell_set="all"),
+        _phase_gate(rows, "retirement", "welfare", cell_set="all"),
+        _phase_gate(rows, "working", "publication", cell_set="unconstrained"),
+        _phase_gate(rows, "retirement", "publication", cell_set="unconstrained"),
+        _phase_gate(rows, "working", "welfare", cell_set="unconstrained"),
+        _phase_gate(rows, "retirement", "welfare", cell_set="unconstrained"),
     ]
     return ctx, sim, rows, gates
 
@@ -1339,6 +1398,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--markdown-out", type=str, default=None)
+    p.add_argument(
+        "--kink-tol",
+        type=float,
+        default=1e-3,
+        help=(
+            "Threshold on savings/x below which a cell is treated as constraint-binding "
+            "and excluded from the `unconstrained` cell-set. EE there reflects KKT slack "
+            "rather than discretization error; default 1e-3 matches HARK's convention."
+        ),
+    )
     return p
 
 
@@ -1355,7 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
     print("")
     for g in gates:
         print(
-            f"{g['phase']:>10} | {g['grade']:<11} | pass={str(g['passes']).lower():<5} "
+            f"{g['cell_set']:>13} | {g['phase']:>10} | {g['grade']:<11} | pass={str(g['passes']).lower():<5} "
             f"| mean log10|EE|={g['mean_log10_abs_ee']:.3f} (gate {g['mean_gate']:.1f}) "
             f"| max log10|EE|={g['max_log10_abs_ee']:.3f} (gate {g['max_gate']:.1f})"
         )

@@ -215,8 +215,9 @@ next_state_idx = best_d0 * N1_s * N2_s + best_d1 * N2_s + best_d2
 ## 4. Wealth Dimension (axis 3)
 
 ```
-wealth_grid : (n_w,) float64     geometric spacing
-  wealth_min = 1e-4
+wealth_grid : (n_w,) float64     log1p spacing
+  wealth_min = 0.05  (raised from 1e-4 on 2026-05-03 to skip the EGM constrained region;
+                     pre-2026-05-03 bundles report 0.0001 in metadata)
   wealth_max = 200.0
   n_w = 150 (default)
 ```

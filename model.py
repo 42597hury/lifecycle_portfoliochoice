@@ -97,7 +97,7 @@ class DiscretizationConfig(NamedTuple):
 
     # Wealth grid
     n_wealth: int = 150
-    wealth_min: float = 0.01
+    wealth_min: float = 0.05
     wealth_max: float = 200.0
 
     # Savings grid (EGM)

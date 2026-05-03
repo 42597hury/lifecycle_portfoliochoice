@@ -490,6 +490,94 @@ def _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11):
     return h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
 
 
+@njit(fastmath=True, inline='always')
+def _pchip_slope_nonuniform(d_left, d_right, h_left, h_right):
+    # Fritsch-Carlson slope at an interior node on a non-uniform grid.
+    # Returns 0 at sign changes (preserves monotonicity at extrema).
+    if d_left == 0.0 or d_right == 0.0:
+        return 0.0
+    if d_left * d_right <= 0.0:
+        return 0.0
+    w_left = 2.0 * h_right + h_left
+    w_right = h_right + 2.0 * h_left
+    return (w_left + w_right) / (w_left / d_left + w_right / d_right)
+
+
+@njit(fastmath=True, inline='always')
+def _pchip_endpoint_slope(d_near, d_far, h_near, h_far):
+    # Three-point one-sided slope at a grid boundary, with monotonicity clamp.
+    # Hyman / Fritsch-Butland formula.
+    m = ((2.0 * h_near + h_far) * d_near - h_near * d_far) / (h_near + h_far)
+    if m * d_near <= 0.0:
+        return 0.0
+    if abs(m) > 3.0 * abs(d_near):
+        return 3.0 * d_near
+    return m
+
+
+@njit(fastmath=True)
+def pchip_interp_1d(x, x_grid, y_grid):
+    """Monotonicity-preserving cubic Hermite interpolation on a non-uniform grid.
+
+    Linear extrapolation outside [x_grid[0], x_grid[-1]] to match
+    fast_interp_1d boundary semantics. Boundary-segment slopes use
+    three-point one-sided estimates with monotonicity clamping.
+    """
+    n = len(x_grid)
+    if n < 2:
+        return y_grid[0]
+
+    if x <= x_grid[0]:
+        h = x_grid[1] - x_grid[0] + 1e-30
+        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / h
+    if x >= x_grid[n - 1]:
+        h = x_grid[n - 1] - x_grid[n - 2] + 1e-30
+        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / h
+
+    lo, hi = 0, n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if x_grid[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+    i = lo
+
+    h_i = x_grid[i + 1] - x_grid[i]
+    if h_i < 1e-30:
+        return y_grid[i]
+    d_i = (y_grid[i + 1] - y_grid[i]) / h_i
+
+    if i == 0:
+        h_next = x_grid[2] - x_grid[1] if n >= 3 else h_i
+        d_next = (y_grid[2] - y_grid[1]) / h_next if n >= 3 else d_i
+        m_left = _pchip_endpoint_slope(d_i, d_next, h_i, h_next)
+    else:
+        h_prev = x_grid[i] - x_grid[i - 1]
+        d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev
+        m_left = _pchip_slope_nonuniform(d_prev, d_i, h_prev, h_i)
+
+    if i == n - 2:
+        h_prev = x_grid[i] - x_grid[i - 1] if n >= 3 else h_i
+        d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev if n >= 3 else d_i
+        m_right = _pchip_endpoint_slope(d_i, d_prev, h_i, h_prev)
+    else:
+        h_next = x_grid[i + 2] - x_grid[i + 1]
+        d_next = (y_grid[i + 2] - y_grid[i + 1]) / h_next
+        m_right = _pchip_slope_nonuniform(d_i, d_next, h_i, h_next)
+
+    t = (x - x_grid[i]) / h_i
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+
+    return (h00 * y_grid[i] + h10 * h_i * m_left
+            + h01 * y_grid[i + 1] + h11 * h_i * m_right)
+
+
 @njit(fastmath=True)
 def _interp_z_wealth(c_next_full, j_s, iz_lo, frac_z, iw, frac_w, inv_dw, n_z, use_cubic, min_c):
     """Interpolate c_next and mpc at a single state-grid corner j_s.
@@ -2251,9 +2339,9 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
 
             for w_i in range(n_wealth):
                 w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_c)
-                policy_alpha_s[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_s)
-                policy_alpha_b[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_b)
+                policy_c[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_c)
+                policy_alpha_s[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_s)
+                policy_alpha_b[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_b)
 
     return diag_int, diag_float
 
@@ -2466,9 +2554,9 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
 
             for w_i in range(n_wealth):
                 w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_c)
-                policy_alpha_s[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_s)
-                policy_alpha_b[z_i, i_s, w_i] = fast_interp_1d(w, temp_x, temp_b)
+                policy_c[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_c)
+                policy_alpha_s[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_s)
+                policy_alpha_b[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_b)
 
     return diag_int, diag_float
 
@@ -2909,18 +2997,86 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     age_diag_fmax    = np.zeros((n_age, N_DIAG_FLOAT))
     age_diag_fmin    = np.full((n_age, N_DIAG_FLOAT), np.inf)
 
+    # ---- Optional resume from checkpoint ----
+    # If `checkpoint_path` exists on disk and contains a valid bundle whose
+    # arrays match the current shape, pre-fill C/S/B and solved_age_mask from
+    # it so the loop below skips already-solved ages. Mismatched checkpoints
+    # are refused loudly to avoid silently mixing incompatible policies.
+    if checkpoint_path is not None:
+        ckpt_dir = Path(checkpoint_path)
+        if (ckpt_dir / "policy_arrays.npz").exists():
+            from policy_io import load_policy_bundle
+            try:
+                Cc, Sc, Bc, ckpt_diag, _ = load_policy_bundle(ckpt_dir)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Found checkpoint at {ckpt_dir} but failed to load it: {exc}. "
+                    "Delete the checkpoint or fix the bundle before retrying."
+                ) from exc
+            if Cc.shape != C_mat.shape:
+                raise RuntimeError(
+                    f"Checkpoint shape mismatch at {ckpt_dir}: "
+                    f"got {Cc.shape}, expected {C_mat.shape}. "
+                    "Different grid/quadrature/system — refuse to resume."
+                )
+            ckpt_mask = None
+            if ckpt_diag is not None:
+                ckpt_mask = ckpt_diag.get("solved_age_mask")
+                ckpt_age_int = ckpt_diag.get("age_diag_int")
+                ckpt_age_fsum = ckpt_diag.get("age_diag_fsum")
+                ckpt_age_fmax = ckpt_diag.get("age_diag_fmax")
+                ckpt_age_fmin = ckpt_diag.get("age_diag_fmin")
+            if ckpt_mask is None or len(ckpt_mask) != n_age:
+                raise RuntimeError(
+                    f"Checkpoint at {ckpt_dir} missing or malformed "
+                    "solved_age_mask in diagnostics — refuse to resume."
+                )
+            ckpt_mask = np.asarray(ckpt_mask, dtype=bool)
+            for t in range(n_age):
+                if ckpt_mask[t]:
+                    C_mat[t] = Cc[t]
+                    S_mat[t] = Sc[t]
+                    B_mat[t] = Bc[t]
+                    solved_age_mask[t] = True
+            if ckpt_age_int is not None and np.shape(ckpt_age_int) == age_diag_int.shape:
+                age_diag_int[:] = ckpt_age_int
+            if ckpt_age_fsum is not None and np.shape(ckpt_age_fsum) == age_diag_fsum.shape:
+                age_diag_fsum[:] = ckpt_age_fsum
+            if ckpt_age_fmax is not None and np.shape(ckpt_age_fmax) == age_diag_fmax.shape:
+                age_diag_fmax[:] = ckpt_age_fmax
+            if ckpt_age_fmin is not None and np.shape(ckpt_age_fmin) == age_diag_fmin.shape:
+                age_diag_fmin[:] = ckpt_age_fmin
+            n_resumed = int(np.sum(solved_age_mask))
+            if verbose >= 1 and n_resumed > 0:
+                resumed_ages = ages[np.flatnonzero(solved_age_mask)]
+                print(
+                    f"\n  Resumed from checkpoint {ckpt_dir}: "
+                    f"{n_resumed}/{n_age} ages already solved "
+                    f"(ages {int(resumed_ages.min())}-{int(resumed_ages.max())})"
+                )
+
     # ---- Terminal condition ----
-    if verbose >= 1:
-        print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
-    c_T, a_s_T, a_b_T, term_diag = solve_terminal_age(
-        w_grid, annuity_factors,
-        state_grid, const_r, A_r, M_v_nodes, v_weights,
-        ret_nodes, ret_weights,
-        gamma, beta, b_bar, N_state, n_z, constrained=constrained, solver_config=solver_config)
-    C_mat[-1] = c_T
-    S_mat[-1] = a_s_T
-    B_mat[-1] = a_b_T
-    solved_age_mask[-1] = True
+    if not solved_age_mask[-1]:
+        if verbose >= 1:
+            print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
+        c_T, a_s_T, a_b_T, term_diag = solve_terminal_age(
+            w_grid, annuity_factors,
+            state_grid, const_r, A_r, M_v_nodes, v_weights,
+            ret_nodes, ret_weights,
+            gamma, beta, b_bar, N_state, n_z, constrained=constrained, solver_config=solver_config)
+        C_mat[-1] = c_T
+        S_mat[-1] = a_s_T
+        B_mat[-1] = a_b_T
+        solved_age_mask[-1] = True
+    else:
+        # Skip terminal solve; it was loaded from the checkpoint. Use the
+        # loaded slice for downstream summary so subsequent prints are sane.
+        c_T = C_mat[-1]
+        a_s_T = S_mat[-1]
+        a_b_T = B_mat[-1]
+        term_diag = np.full((n_z, N_state), EC_INTERIOR, dtype=np.int8)
+        if verbose >= 1:
+            print(f"\n  Terminal condition (age {terminal_age}) ... loaded from checkpoint", end="", flush=True)
     if verbose >= 1:
         n_term_interior = int(np.sum(term_diag == EC_INTERIOR))
         n_term_fail = int(np.sum(term_diag == EC_NEWTON_FAIL))
@@ -2960,6 +3116,9 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             if youngest_age_to_solve is not None and age < youngest_age_to_solve:
                 solve_status = "stopped_early"
                 break
+            if solved_age_mask[t]:
+                # Already loaded from checkpoint — skip the solve for this age.
+                continue
             psi = survival_probs[t, :]      # (n_z,) -- z-dependent survival
             c_next = C_mat[t + 1]
 

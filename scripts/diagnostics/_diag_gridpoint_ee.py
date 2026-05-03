@@ -20,7 +20,7 @@ python -m scripts.diagnostics._diag_gridpoint_ee \\
   --model-bundle saved_runs/<full-lifecycle-bundle> \\
   saved_runs/checkpoints/<bundle> \\
   --eval-mode same \\
-  --markdown-out diagnostics_gridpoint_ee_log1p_same.md
+  --markdown-out diagnostics_reports/diagnostics_gridpoint_ee_log1p_same.md
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
 
         household_idx = np.arange(n_probe, dtype=np.int64)
 
-        ee, valid = _evaluate_age_errors(
+        ee, valid, is_constrained = _evaluate_age_errors(
             household_idx,
             z_age,
             state_coords_age,
@@ -287,6 +287,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
             int(model.b_bar),
             int(model.y_1_index_in_state),
             int(model.spr_index_in_state),
+            float(args.kink_tol),
         )
 
         for j in range(n_probe):
@@ -300,6 +301,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
                 "ee": ee_val,
                 "abs_ee": abs_ee,
                 "log10_abs_ee": log10_abs,
+                "is_constrained": bool(is_constrained[j]),
                 "phase": "retirement" if age_int >= int(model.retire_age) else "working",
             })
             rows.append(meta)
@@ -373,6 +375,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--z-indices", nargs="+", type=int, default=None)
     p.add_argument("--wealth-indices", nargs="+", type=int, default=None)
     p.add_argument("--markdown-out", type=str, default=None)
+    p.add_argument(
+        "--kink-tol",
+        type=float,
+        default=1e-3,
+        help=(
+            "Threshold on savings/x below which a probe is flagged is_constrained "
+            "(EE there reflects KKT slack on savings>=0, not discretization error). "
+            "Default 1e-3 matches HARK's convention."
+        ),
+    )
     return p
 
 

@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from solver import (
+from lifecycle.solver import (
     solve_portfolio_unconstrained_terminal_njit,
     compute_terminal_portfolio_foc_jac,
     EC_INTERIOR,

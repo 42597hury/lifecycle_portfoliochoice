@@ -11,10 +11,10 @@ Tests:
   7. Gradient-free finite-difference check on FOC
 """
 import numpy as np
-from model import SolverConfig, DiscretizationConfig
-from var import build_nominal_system1_var_config_hardcoded
-from precompute import build_model, Precompute
-from solver import (
+from lifecycle.model import SolverConfig, DiscretizationConfig
+from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.solver import (
     _build_terminal_quad_returns,
     compute_terminal_portfolio_foc_jac,
     solve_portfolio_2d_terminal_constrained_njit,

@@ -12,7 +12,7 @@ z_bar = np.array(vc['z_bar']['values'])
 Phi_full = np.array(vc['Phi']['values'])
 Omega = np.array(vc['Omega']['values'])
 
-from discretization import build_state_grid, stationary_covariance
+from lifecycle.discretization import build_state_grid, stationary_covariance
 
 # Honor the saved bundle's state ordering (legacy (0,1,2)=y_1/spr/cy
 # vs default (2,1,0)=cy/spr/y_1 after 2026-04-30 reorder).

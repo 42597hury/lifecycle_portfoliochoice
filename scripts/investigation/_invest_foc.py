@@ -11,12 +11,12 @@ z_bar = np.array(vc['z_bar']['values'])
 Phi_full = np.array(vc['Phi']['values'])
 Omega = np.array(vc['Omega']['values'])
 
-from discretization import (
+from lifecycle.discretization import (
     build_state_grid, get_state_quadrature, get_return_quadrature,
     discretize_income_ar1_mixture, get_eta_quadrature_mixture,
     get_eps_quadrature_corrected,
 )
-from model import disposable_income_working
+from lifecycle.model import disposable_income_working
 
 Phi_11 = Phi_full[np.ix_([0,1,2],[0,1,2])]
 Phi_21 = Phi_full[np.ix_([3,4,5],[0,1,2])]

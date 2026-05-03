@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from solver import find_bracket, fast_interp_1d_with_slope, _interp_z_wealth
+from lifecycle.solver import find_bracket, fast_interp_1d_with_slope, _interp_z_wealth
 
 
 def test_find_bracket_extrapolates_both_boundaries():

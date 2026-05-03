@@ -27,8 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
-from model import DiscretizationConfig, SolverConfig
-from precompute import Precompute, build_model
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import Precompute, build_model
 import solver as solver_live
 
 

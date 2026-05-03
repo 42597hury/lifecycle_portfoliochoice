@@ -39,8 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
-from model import DiscretizationConfig, scalar_disposable_income
-from precompute import Precompute, build_model
+from lifecycle.model import DiscretizationConfig, scalar_disposable_income
+from lifecycle.precompute import Precompute, build_model
 
 
 DEFAULT_RUN_DIR = Path("saved_runs/unconstrained_principal_grid5x5x5_nz9")

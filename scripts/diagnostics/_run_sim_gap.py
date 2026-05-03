@@ -5,10 +5,10 @@ import io, sys
 # Suppress verbose precompute output
 old_stdout = sys.stdout
 sys.stdout = io.StringIO()
-from model import DiscretizationConfig, SolverConfig
-from var import build_nominal_system1_var_config
-from precompute import build_model, Precompute
-from simulation import simulate_lifecycle
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.simulation import simulate_lifecycle
 var_config, _, _ = build_nominal_system1_var_config(csv_path="data/var_dataset.csv")
 base_config = {
     "beta": 0.96, "gamma": 3.0, "b_bar": 10,

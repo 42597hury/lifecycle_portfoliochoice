@@ -6,15 +6,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from model import DiscretizationConfig, annuity_factor
-from predictability_ablation import (
+from lifecycle.model import DiscretizationConfig, annuity_factor
+from lifecycle.predictability_ablation import (
     get_predictability_system_spec,
     prepare_predictability_system,
 )
-from precompute import Precompute, build_model
-from simulation import simulate_lifecycle
-from solver import run_lifecycle_solver
-from var import (
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.simulation import simulate_lifecycle
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.var import (
     build_iid_var_config,
     build_no_cy_var_config,
     build_nominal_system1_var_config,

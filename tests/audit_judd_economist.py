@@ -37,7 +37,7 @@ from pathlib import Path
 # allow running as a script from project root or tests/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from discretization import _judd_mixture_quadrature  # noqa: E402
+from lifecycle.discretization import _judd_mixture_quadrature  # noqa: E402
 
 ETA_CAL = dict(p=0.176, mu1=-0.524, sigma1=0.113, sigma2=0.046)
 EPS_CAL = dict(p=0.044, mu1=0.134,  sigma1=0.762, sigma2=0.055)

@@ -24,10 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from var import build_nominal_system1_var_config
-from precompute import build_model, Precompute
-from model import DiscretizationConfig, SolverConfig
-from solver import (
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.solver import (
     solve_portfolio_unconstrained_terminal_njit,
     compute_terminal_portfolio_foc_jac,
     _build_terminal_quad_returns,

@@ -12,10 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import DiscretizationConfig, SolverConfig
-from precompute import Precompute, build_model
-from solver import run_lifecycle_solver
-from var import build_nominal_system1_var_config_hardcoded
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.var import build_nominal_system1_var_config_hardcoded
 
 
 def _reference_base_config(constrained: bool, gamma: float = 3.0,

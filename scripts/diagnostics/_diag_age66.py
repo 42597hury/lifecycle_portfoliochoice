@@ -12,8 +12,8 @@ import numpy as np
 from pathlib import Path
 import dataclasses
 
-from model import DiscretizationConfig, SolverConfig
-from precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import build_model, Precompute
 import solver as _solver
 
 # ----- Setup (same as smoke test) -----

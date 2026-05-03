@@ -24,8 +24,8 @@ with open(RUN_DIR / "metadata.json") as f:
 base_config = meta["run_config"]["base_config"]
 disc_meta = meta["run_config"]["discretization_config"]
 
-from model import DiscretizationConfig
-from precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig
+from lifecycle.precompute import build_model, Precompute
 
 var_raw = meta["run_config"]["var_config"]
 
@@ -69,7 +69,7 @@ disc_config = DiscretizationConfig(
 
 pc = Precompute(model, disc_config, verbose=False)
 
-from solver import (
+from lifecycle.solver import (
     build_gross_return_arrays,
     _terminal_portfolio_moment,
     _terminal_portfolio_grad,

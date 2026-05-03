@@ -33,11 +33,11 @@ for k, v in var_raw.items():
     else:
         var_config[k] = v
 
-from precompute import build_model, Precompute
+from lifecycle.precompute import build_model, Precompute
 
 # Reconstruct disc_config
 disc_raw = meta["diagnostics_summary"]["disc_config"]
-from precompute import DiscretizationConfig
+from lifecycle.precompute import DiscretizationConfig
 disc_config = DiscretizationConfig(**disc_raw)
 
 model = build_model(base_config, var_config, verbose=False)
@@ -84,7 +84,7 @@ print("SECTION 8: Simulation Consistency")
 print("=" * 70)
 
 print("Running simulation (10,000 agents)...")
-from simulation import simulate_lifecycle
+from lifecycle.simulation import simulate_lifecycle
 
 sim = simulate_lifecycle(
     C_mat, S_mat, B_mat, pc, model,

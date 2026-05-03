@@ -40,10 +40,10 @@ from __future__ import annotations
 import warnings
 import numpy as np
 
-from policy_io import load_policy_bundle
-from precompute import build_model, Precompute
-from model import DiscretizationConfig, compute_pension_after_tax, disposable_income_working
-from simulation import simulate_lifecycle
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig, compute_pension_after_tax, disposable_income_working
+from lifecycle.simulation import simulate_lifecycle
 
 
 # =============================================================================

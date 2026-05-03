@@ -13,10 +13,10 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from model import DiscretizationConfig
-from policy_io import load_policy_bundle, save_policy_bundle
-from precompute import Precompute, build_model
-from var import build_nominal_system1_var_config
+from lifecycle.model import DiscretizationConfig
+from lifecycle.policy_io import load_policy_bundle, save_policy_bundle
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.var import build_nominal_system1_var_config
 
 
 def _reference_base_config() -> dict:

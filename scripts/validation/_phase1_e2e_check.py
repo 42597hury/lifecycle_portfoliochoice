@@ -13,10 +13,10 @@ import numpy as np
 
 sys.path.insert(0, '.')
 
-from model import DiscretizationConfig
-from precompute import Precompute, build_model
-from var import build_nominal_system1_var_config
-from policy_io import _to_jsonable
+from lifecycle.model import DiscretizationConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.policy_io import _to_jsonable
 
 # ----- model -----
 base = {

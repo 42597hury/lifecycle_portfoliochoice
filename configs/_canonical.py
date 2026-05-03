@@ -14,7 +14,7 @@ Exports:
 See `docs/CONFIG.md` for the rationale behind every value.
 """
 
-from model import DiscretizationConfig, SolverConfig
+from lifecycle.model import DiscretizationConfig, SolverConfig
 
 PREDICTABILITY_SYSTEM = "IV"
 

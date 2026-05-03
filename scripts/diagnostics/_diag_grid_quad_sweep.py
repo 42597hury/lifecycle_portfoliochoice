@@ -34,9 +34,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from var import build_nominal_system1_var_config
-from precompute import build_model, Precompute
-from model import DiscretizationConfig
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig
 
 
 def base_config():

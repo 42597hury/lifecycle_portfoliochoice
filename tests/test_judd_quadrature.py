@@ -27,7 +27,7 @@ import pytest
 from scipy.linalg import eigh_tridiagonal
 from scipy.stats import norm
 
-from discretization import (
+from lifecycle.discretization import (
     _judd_mixture_quadrature,
     _mixture_raw_moments,
     _normal_raw_moment,

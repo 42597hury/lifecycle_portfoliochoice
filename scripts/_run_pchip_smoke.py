@@ -23,10 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import DiscretizationConfig, SolveControl, SolverConfig
-from precompute import Precompute, build_model
-from predictability_ablation import prepare_predictability_system
-from solver import run_lifecycle_solver
+from lifecycle.model import DiscretizationConfig, SolveControl, SolverConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.predictability_ablation import prepare_predictability_system
+from lifecycle.solver import run_lifecycle_solver
 
 
 def _base_config() -> dict:

@@ -16,8 +16,8 @@ import json
 import numpy as np
 from pathlib import Path
 
-from model import DiscretizationConfig, SolverConfig
-from precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import build_model, Precompute
 import solver as _solver
 
 RUN_DIR = Path("saved_runs/unconstrained_principal_grid5x5x5_nz9")

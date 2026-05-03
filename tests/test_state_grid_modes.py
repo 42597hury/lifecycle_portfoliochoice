@@ -15,12 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from discretization import build_state_grid, stationary_covariance
-from model import DiscretizationConfig, SolverConfig
-from precompute import Precompute, build_model
-from simulation import simulate_lifecycle
-from solver import run_lifecycle_solver
-from var import build_nominal_system1_var_config
+from lifecycle.discretization import build_state_grid, stationary_covariance
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.simulation import simulate_lifecycle
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.var import build_nominal_system1_var_config
 
 
 N_PASS = 0
@@ -412,7 +412,7 @@ def run_per_axis_n_state_quad_checks(model):
     print("\n" + "=" * 70)
     print("PER-AXIS n_state_quad_nodes CHECKS")
     print("=" * 70)
-    from discretization import get_state_quadrature
+    from lifecycle.discretization import get_state_quadrature
     Sigma_ss = np.asarray(model.Sigma_ss, dtype=float)
 
     # T-A: scalar broadcast equals tuple-of-same — bit-equivalence regression
@@ -479,7 +479,7 @@ def run_per_axis_n_ret_quad_checks(model):
     print("\n" + "=" * 70)
     print("PER-AXIS n_ret_nodes_1d (Cholesky transform) CHECKS")
     print("=" * 70)
-    from discretization import get_return_quadrature
+    from lifecycle.discretization import get_return_quadrature
     Sigma_r_cond = np.asarray(model.Sigma_r_cond, dtype=float)
     n_ret = int(model.n_ret)
 

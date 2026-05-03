@@ -2,10 +2,10 @@
 
 import time
 import numpy as np
-from model import DiscretizationConfig, SolverConfig
-from precompute import build_model, Precompute
-from var import build_nominal_system1_var_config
-from solver import solve_terminal_age, solve_retirement_step_quad
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.var import build_nominal_system1_var_config
+from lifecycle.solver import solve_terminal_age, solve_retirement_step_quad
 
 # --- Build model ---
 var_config, _, _ = build_nominal_system1_var_config("data/var_dataset.csv")

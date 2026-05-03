@@ -10,10 +10,10 @@ Runs three checks:
 import numpy as np
 from scipy.special import roots_hermite
 
-from model import (
+from lifecycle.model import (
     disposable_income_working, scalar_disposable_income,
 )
-from discretization import discretize_income_ar1_mixture
+from lifecycle.discretization import discretize_income_ar1_mixture
 
 # -------------------------------------------------------------------
 # (a) Scalar vs vectorized disposable income

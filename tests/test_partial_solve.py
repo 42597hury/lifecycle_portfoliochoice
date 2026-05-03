@@ -10,11 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import DiscretizationConfig, SolveControl, SolverConfig
-from policy_io import load_policy_bundle
-from precompute import Precompute, build_model
-from solver import _build_progress_wealth_schedule, _normalize_solve_control, run_lifecycle_solver
-from var import build_nominal_system1_var_config
+from lifecycle.model import DiscretizationConfig, SolveControl, SolverConfig
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.solver import _build_progress_wealth_schedule, _normalize_solve_control, run_lifecycle_solver
+from lifecycle.var import build_nominal_system1_var_config
 
 
 def _reference_base_config() -> dict:

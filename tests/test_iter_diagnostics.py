@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # Importing solver triggers Python parse of every JIT function (but not codegen).
 # A syntax error in the conditional-unpack would surface here.
 import solver
-from solver import (
+from lifecycle.solver import (
     DI_SUM_ITER,
     DI_WARM_RESET,
     DI_TOTAL_CALLS,

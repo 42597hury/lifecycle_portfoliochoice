@@ -13,7 +13,7 @@ These cover the surface contract:
 
 import numpy as np
 
-from solver import fast_interp_1d, pchip_interp_1d
+from lifecycle.solver import fast_interp_1d, pchip_interp_1d
 
 
 def test_pchip_interp_1d_affine_reproduction_nonuniform():

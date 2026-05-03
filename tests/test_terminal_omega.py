@@ -41,8 +41,8 @@ base_config = meta["run_config"]["base_config"]
 disc_meta = meta["run_config"]["discretization_config"]
 
 # ── Rebuild model + Precompute (no solver run needed) ────────────────
-from model import DiscretizationConfig, SolverConfig
-from precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import build_model, Precompute
 
 # Reconstruct var_config with numpy arrays
 var_raw = meta["run_config"]["var_config"]
@@ -95,7 +95,7 @@ assert C_mat.shape == (pc.n_age, pc.n_z, pc.N_state, pc.n_w), \
     f"Shape mismatch: C_mat {C_mat.shape} vs expected {(pc.n_age, pc.n_z, pc.N_state, pc.n_w)}"
 
 # ── Import solver helpers ────────────────────────────────────────────
-from solver import (build_gross_return_arrays, _terminal_portfolio_moment,
+from lifecycle.solver import (build_gross_return_arrays, _terminal_portfolio_moment,
                     _terminal_prepare_scenarios)
 
 # ── Test parameters ──────────────────────────────────────────────────

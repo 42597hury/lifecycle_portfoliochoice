@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from policy_io import load_policy_bundle
-from precompute import build_model, Precompute
-from model import DiscretizationConfig
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.model import DiscretizationConfig
 
 
 # =============================================================================

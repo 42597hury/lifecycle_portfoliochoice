@@ -37,9 +37,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import DiscretizationConfig, disposable_income_working, scalar_disposable_income
-from policy_io import load_policy_bundle
-from precompute import Precompute
+from lifecycle.model import DiscretizationConfig, disposable_income_working, scalar_disposable_income
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import Precompute
 from scripts.diagnostics._diag_policy_convergence import (
     _build_disc_config,
     _build_model_from_bundle,
@@ -47,7 +47,7 @@ from scripts.diagnostics._diag_policy_convergence import (
     _infer_solved_mask,
     _summary,
 )
-from simulation import (
+from lifecycle.simulation import (
     _build_return_factor,
     _initialize_initial_wealth,
     _normal_bin_probs,
@@ -56,7 +56,7 @@ from simulation import (
     simulate_lifecycle,
     simulate_lifecycle_core,
 )
-from solver import _interp_z_wealth, find_bracket
+from lifecycle.solver import _interp_z_wealth, find_bracket
 
 
 @dataclass

@@ -5,16 +5,16 @@ import sys
 import numpy as np
 import pytest
 
-from inf_horizon_solver import (
+from lifecycle.inf_horizon_solver import (
     _markowitz_cold_start,
     compile_inner_kernel_smoke_test,
     extract_policy_at_point,
     run_infinite_horizon_solver,
 )
-from model import DiscretizationConfig, SolveControl, SolverConfig
-from precompute import Precompute, build_model
-from solver import run_lifecycle_solver
-from var import build_nominal_system1_var_config_hardcoded
+from lifecycle.model import DiscretizationConfig, SolveControl, SolverConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.var import build_nominal_system1_var_config_hardcoded
 
 
 def _reference_base_config() -> dict:

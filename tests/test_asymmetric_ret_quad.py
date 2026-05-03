@@ -26,10 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from discretization import _normalize_ret_nodes, get_return_quadrature
-from model import DiscretizationConfig
-from precompute import Precompute, build_model
-from var import build_nominal_system1_var_config
+from lifecycle.discretization import _normalize_ret_nodes, get_return_quadrature
+from lifecycle.model import DiscretizationConfig
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.var import build_nominal_system1_var_config
 
 
 N_PASS = 0

@@ -14,7 +14,7 @@ z_bar = np.array(vc['z_bar']['values'])
 Phi_full = np.array(vc['Phi']['values'])
 Omega = np.array(vc['Omega']['values'])
 
-from discretization import build_state_grid, discretize_income_ar1_mixture
+from lifecycle.discretization import build_state_grid, discretize_income_ar1_mixture
 
 Phi_11 = Phi_full[np.ix_([0, 1, 2], [0, 1, 2])]
 Sigma_ss = Omega[np.ix_([0, 1, 2], [0, 1, 2])]

@@ -38,10 +38,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import DiscretizationConfig
-from policy_io import load_policy_bundle
-from precompute import Precompute, build_model
-from simulation import _interp_policy_zx
+from lifecycle.model import DiscretizationConfig
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.simulation import _interp_policy_zx
 
 
 DEFAULT_AGES = (65, 66, 67, 75, 85, 95)

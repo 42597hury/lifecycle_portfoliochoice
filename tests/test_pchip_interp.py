@@ -22,7 +22,7 @@ PCHIP is monotonicity-preserving, not exact on quadratics.
 
 import numpy as np
 
-from solver import (
+from lifecycle.solver import (
     _interp_z_wealth,
     _pchip_eval_with_basis,
     _pchip_slope_uniform,

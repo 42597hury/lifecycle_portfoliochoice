@@ -116,11 +116,11 @@ def main():
 
     cfg = load_config(args.config)
 
-    from precompute import build_model, Precompute
-    from predictability_ablation import prepare_predictability_system
-    from solver import run_lifecycle_solver
-    from model import SolveControl
-    from policy_io import save_policy_bundle
+    from lifecycle.precompute import build_model, Precompute
+    from lifecycle.predictability_ablation import prepare_predictability_system
+    from lifecycle.solver import run_lifecycle_solver
+    from lifecycle.model import SolveControl
+    from lifecycle.policy_io import save_policy_bundle
 
     var_csv = PROJECT_ROOT / "data" / "var_dataset.csv"
     if not var_csv.exists():

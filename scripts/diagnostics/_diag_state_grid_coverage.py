@@ -52,7 +52,7 @@ import numpy as np
 from scipy.linalg import solve_discrete_lyapunov, cholesky as _chol
 from scipy.stats import norm
 
-from var import build_nominal_system1_var_config, partition_var
+from lifecycle.var import build_nominal_system1_var_config, partition_var
 
 
 def stationary_moments(Phi_11, Sigma_ss, Phi_0):

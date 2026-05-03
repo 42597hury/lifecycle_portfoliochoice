@@ -14,13 +14,13 @@ Tests:
 
 import sys
 import numpy as np
-from policy_io import load_policy_bundle
-from precompute import Precompute, build_model
-from model import (
+from lifecycle.policy_io import load_policy_bundle
+from lifecycle.precompute import Precompute, build_model
+from lifecycle.model import (
     DiscretizationConfig, disposable_income_working, compute_pension_after_tax,
     scalar_disposable_income,
 )
-from simulation import (
+from lifecycle.simulation import (
     simulate_lifecycle, _scalar_pension_after_tax,
     fast_interp_1d,
 )

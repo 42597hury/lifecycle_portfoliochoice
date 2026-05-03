@@ -26,12 +26,12 @@ print("=" * 74)
 print("  SETUP: Building model + precompute, loading policy, running sim")
 print("=" * 74)
 
-from mortality import (SSA_DEATH_PROB_2017, life_expectancy_at_40,
+from lifecycle.mortality import (SSA_DEATH_PROB_2017, life_expectancy_at_40,
                        calibrate_earnings_dependent_mortality,
                        compute_sigma_z, build_survival_probs_2d,
                        chetty_expected_age_at_death, CHETTY_EXPECTED_AGE_AT_DEATH)
-from precompute import build_model, Precompute, DiscretizationConfig
-from simulation import simulate_lifecycle
+from lifecycle.precompute import build_model, Precompute, DiscretizationConfig
+from lifecycle.simulation import simulate_lifecycle
 from scipy.stats import norm
 
 with open("saved_runs/constrained_grid5x5x5_nz11/metadata.json") as f:

@@ -2,7 +2,7 @@
 MORTALITY MODULE — FULL VERIFICATION TEST SUITE (Sections 1-6, 9)
 """
 import numpy as np
-from mortality import (SSA_DEATH_PROB_2017, CHETTY_EXPECTED_AGE_AT_DEATH,
+from lifecycle.mortality import (SSA_DEATH_PROB_2017, CHETTY_EXPECTED_AGE_AT_DEATH,
                        chetty_expected_age_at_death, compute_sigma_z,
                        life_expectancy_at_40, calibrate_chi_vector,
                        calibrate_earnings_dependent_mortality,

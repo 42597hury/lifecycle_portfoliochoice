@@ -12,9 +12,9 @@ import json
 import numpy as np
 from pathlib import Path
 
-from model import DiscretizationConfig, SolverConfig
-from precompute import build_model, Precompute
-from solver import (solve_working_age_step_quad,
+from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.solver import (solve_working_age_step_quad,
                     DI_NEWTON_FAIL, DI_TOTAL_CALLS, DI_WARM_RESET,
                     DI_SUM_ITER, DF_MAX_FOC_RESID, DF_MAX_NEWTON_ITER)
 

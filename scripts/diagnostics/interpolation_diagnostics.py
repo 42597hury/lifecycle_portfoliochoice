@@ -31,8 +31,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from discretization import discretize_income_ar1_mixture, get_eta_quadrature_mixture
-from policy_io import load_policy_bundle
+from lifecycle.discretization import discretize_income_ar1_mixture, get_eta_quadrature_mixture
+from lifecycle.policy_io import load_policy_bundle
 
 
 def _catmull_rom(p0, p1, p2, p3, f):

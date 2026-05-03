@@ -22,7 +22,7 @@ import pandas as pd
 from scipy.linalg import solve_discrete_lyapunov
 from scipy.stats import chi2
 
-from var import build_nominal_system1_var_config, partition_var
+from lifecycle.var import build_nominal_system1_var_config, partition_var
 
 CSV_PATH = "data/var_dataset.csv"
 # State variable names; resolved dynamically below from the partition so this

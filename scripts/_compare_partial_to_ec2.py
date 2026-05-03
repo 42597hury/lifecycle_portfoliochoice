@@ -15,11 +15,11 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import SolveControl
-from precompute import build_model, Precompute
-from predictability_ablation import prepare_predictability_system
-from solver import run_lifecycle_solver
-from policy_io import load_policy_bundle
+from lifecycle.model import SolveControl
+from lifecycle.precompute import build_model, Precompute
+from lifecycle.predictability_ablation import prepare_predictability_system
+from lifecycle.solver import run_lifecycle_solver
+from lifecycle.policy_io import load_policy_bundle
 
 
 def load_config(path: Path):

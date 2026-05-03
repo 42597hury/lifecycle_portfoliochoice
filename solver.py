@@ -31,6 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from model import SolveControl, SolverConfig, scalar_disposable_income
+from numerics import _pchip_slope_uniform, _pchip_eval_with_basis
 
 # =============================================================================
 # DIAGNOSTIC CONSTANTS
@@ -263,8 +264,15 @@ def _interp_progress_policy_at_wealth(policy_by_wealth, w_grid, wealth):
 
 @njit(fastmath=True)
 def fast_interp_1d(x, x_grid, y_grid):
-    """Linear interpolation on a sorted grid with binary search.
-    Uses linear extrapolation beyond grid boundaries."""
+    """Linear interpolation on a sorted grid with binary search,
+    using LINEAR extrapolation beyond grid boundaries.
+
+    Solver-internal: the policy continuation values must remain smooth
+    at the wealth-grid edge so Newton-Raphson converges cleanly across
+    boundary cells. simulation.py has its own `fast_interp_1d` that uses
+    FLAT extrapolation; the two functions are deliberately divergent.
+    Do not "fix" either one to match the other.
+    """
     n = len(x_grid)
     if x <= x_grid[0]:
         dx = x_grid[1] - x_grid[0] + 1e-30
@@ -466,28 +474,6 @@ def transform_state_for_bracketing_3d(s0, s1, s2, bracket_shift, bracket_L_inv):
     u1 = bracket_L_inv[1, 0] * ds0 + bracket_L_inv[1, 1] * ds1 + bracket_L_inv[1, 2] * ds2
     u2 = bracket_L_inv[2, 0] * ds0 + bracket_L_inv[2, 1] * ds1 + bracket_L_inv[2, 2] * ds2
     return u0, u1, u2
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_slope_uniform(d_left, d_right):
-    # Uniform-grid Fritsch-Carlson slope at an interior node. Result is the
-    # derivative per unit of fractional index, matching Hermite eval on [0,1].
-    # Uniform z-spacing required; do not use on non-uniform grids.
-    if d_left == 0.0 or d_right == 0.0:
-        return 0.0
-    if d_left * d_right <= 0.0:
-        return 0.0
-    return 2.0 * d_left * d_right / (d_left + d_right)
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11):
-    d_l = p1 - p0
-    d_m = p2 - p1
-    d_r = p3 - p2
-    m0 = _pchip_slope_uniform(d_l, d_m)
-    m1 = _pchip_slope_uniform(d_m, d_r)
-    return h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
 
 
 @njit(fastmath=True, inline='always')

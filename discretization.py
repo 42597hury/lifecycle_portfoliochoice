@@ -9,7 +9,7 @@ Contains:
   - get_eta_quadrature_mixture() — persistent innovation Judd-style mixture quadrature
   - mixture_cdf() — mixture-normal CDF helper
 
-Dependencies: numpy, scipy (no project imports)
+Dependencies: numpy, scipy, numerics (project)
 """
 
 from math import comb
@@ -19,6 +19,8 @@ from scipy.linalg import solve_discrete_lyapunov
 from scipy.special import roots_hermite
 from scipy.stats import norm
 import warnings
+
+from numerics import _normal_bin_probs
 
 
 # =============================================================================
@@ -81,33 +83,6 @@ def stationary_covariance(Phi, Sigma_innov):
     Sigma_z = solve_discrete_lyapunov(Phi, Sigma_innov)
     Sigma_z = 0.5 * (Sigma_z + Sigma_z.T)
     return Sigma_z
-
-
-def _normal_bin_probs(grid, mean=0.0, std=1.0):
-    """Probability mass of N(mean, std^2) over bins induced by a sorted grid."""
-    grid = np.asarray(grid, dtype=float)
-    n = grid.shape[0]
-    if n < 1:
-        raise ValueError("grid must contain at least one point")
-    if std <= 0.0:
-        raise ValueError("std must be strictly positive")
-    if n == 1:
-        return np.ones(1, dtype=float)
-
-    edges = np.empty(n + 1, dtype=float)
-    edges[0] = -np.inf
-    edges[-1] = np.inf
-    edges[1:-1] = 0.5 * (grid[:-1] + grid[1:])
-
-    probs = np.empty(n, dtype=float)
-    for j in range(n):
-        probs[j] = norm.cdf(edges[j + 1], loc=mean, scale=std) - norm.cdf(edges[j], loc=mean, scale=std)
-
-    probs = np.clip(probs, 0.0, None)
-    mass = probs.sum()
-    if mass <= 0.0:
-        raise ValueError("Normal bin probabilities sum to zero")
-    return probs / mass
 
 
 def _stationary_probs_from_transition(Pi, tol=1e-12, max_iter=10000):

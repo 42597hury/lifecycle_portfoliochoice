@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import time
 import warnings
-from math import erf, sqrt
 from typing import Optional, Union
 
 import numpy as np
@@ -86,6 +85,11 @@ except ImportError:  # pragma: no cover
     warnings.warn("Numba not available. Simulation will run in pure Python.")
 
 from model import scalar_disposable_income
+from numerics import (
+    _pchip_slope_uniform,
+    _pchip_eval_with_basis,
+    _normal_bin_probs,
+)
 
 __all__ = ["simulate_lifecycle"]
 
@@ -153,51 +157,6 @@ def _resolve_initial_state_indices(n_simulations: int,
         probs = probs / probs.sum()
         return rng.choice(pc.N_state, size=n_simulations, p=probs).astype(np.int32)
     return initialize_states(n_simulations, pc.N_state, pc.Pi_state, initial_state, rng)
-
-
-def _normal_cdf(x: float, mean: float, std: float) -> float:
-    """Scalar normal CDF using the error function."""
-    if x == np.inf:
-        return 1.0
-    if x == -np.inf:
-        return 0.0
-    z = (x - mean) / (std * sqrt(2.0))
-    return 0.5 * (1.0 + erf(z))
-
-
-def _normal_bin_probs(grid: np.ndarray,
-                      mean: float = 0.0,
-                      std: float = 0.652) -> np.ndarray:
-    """
-    Probability mass of N(mean, std^2) over the bins implied by a sorted grid.
-
-    Bin edges are the midpoints between neighboring grid points, with
-    (-inf, +inf) at the tails.
-    """
-    grid = np.asarray(grid, dtype=float)
-    n = grid.shape[0]
-
-    if n == 0:
-        raise ValueError("grid must contain at least one point.")
-    if std <= 0.0:
-        raise ValueError("initial_z_normal_std must be strictly positive.")
-    if n == 1:
-        return np.ones(1, dtype=float)
-
-    edges = np.empty(n + 1, dtype=float)
-    edges[0] = -np.inf
-    edges[-1] = np.inf
-    edges[1:-1] = 0.5 * (grid[:-1] + grid[1:])
-
-    probs = np.empty(n, dtype=float)
-    for j in range(n):
-        probs[j] = _normal_cdf(edges[j + 1], mean, std) - _normal_cdf(edges[j], mean, std)
-
-    probs = np.clip(probs, 0.0, None)
-    mass = probs.sum()
-    if mass <= 0.0:
-        raise ValueError("Normal bin probabilities sum to zero; check the grid and std.")
-    return probs / mass
 
 
 def _build_return_factor(Sigma_r_cond: np.ndarray) -> np.ndarray:
@@ -345,6 +304,11 @@ def fast_interp_1d(x: float, x_grid: np.ndarray, y_grid: np.ndarray) -> float:
     [wealth_min, wealth_max]. Flat extrapolation contains the simulation
     inside the solved domain; off-grid visits should be diagnosed by
     widening the wealth grid or capping leverage rather than by extrapolating.
+
+    Simulator-internal: solver.py has its own `fast_interp_1d` that uses
+    LINEAR extrapolation (needed for Newton convergence at the boundary).
+    The two functions are deliberately divergent — do not "fix" either one
+    to match the other.
     """
     n = len(x_grid)
 
@@ -401,31 +365,6 @@ def _clean_constrained_shares(alpha_s: float, alpha_b: float) -> tuple:
 
 # Backward-compatible alias — canonical version now in model.py
 _scalar_disposable_income = scalar_disposable_income
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_slope_uniform(d_left: float, d_right: float) -> float:
-    """Uniform-grid Fritsch-Carlson slope at an interior z-node. Mirrors
-    `solver._pchip_slope_uniform` so simulator and solver use the same
-    monotone cubic on identical 4-point z stencils."""
-    if d_left == 0.0 or d_right == 0.0:
-        return 0.0
-    if d_left * d_right <= 0.0:
-        return 0.0
-    return 2.0 * d_left * d_right / (d_left + d_right)
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_eval_with_basis(p0: float, p1: float, p2: float, p3: float,
-                           h00: float, h10: float, h01: float, h11: float) -> float:
-    """Evaluate PCHIP cubic Hermite given pre-computed basis values at
-    `frac_z`. Mirrors `solver._pchip_eval_with_basis`."""
-    d_l = p1 - p0
-    d_m = p2 - p1
-    d_r = p3 - p2
-    m0 = _pchip_slope_uniform(d_l, d_m)
-    m1 = _pchip_slope_uniform(d_m, d_r)
-    return h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
 
 
 @njit(fastmath=True)

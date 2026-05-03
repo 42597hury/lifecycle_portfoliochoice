@@ -1,0 +1,34 @@
+# ── Python bytecode + Numba JIT caches ────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.nbc
+*.nbi
+
+# ── Test / tooling caches ────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Run artifacts: large binary outputs of solver / diagnostics ──────────────
+# These are reproducible from the configs in configs/ and should not be in git.
+saved_runs/
+diagnostics_reports/
+
+# ── One-off investigation artifacts ──────────────────────────────────────────
+# 70 MB cache produced by scripts/investigation/_t9_min_rport_map.py.
+# Already excluded from AWS tarballs (see scripts/launch_run.py TARBALL_EXCLUDES).
+_t9_min_rport_map.npz
+
+# ── Temporary / scratch files ────────────────────────────────────────────────
+tmp_*
+*.log
+
+# ── Editor / OS state ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Claude Code local-only state ─────────────────────────────────────────────
+.claude/scheduled_tasks.lock

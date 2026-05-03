@@ -400,7 +400,7 @@ def build_nominal_system1_var_config(
     (cy, spr, y_1).  This ordering puts cy in Cholesky column 0 (pure cy,
     100% of cy variance) so per-axis state_n_stds[0] is a clean cy knob;
     spr stays in the middle; y_1 takes the residual leakage in column 2.
-    See contextfiles/RETURNS.md sec.5.6 for why this ordering matters.
+    See docs/RETURNS.md sec.5.6 for why this ordering matters.
 
     Data is at ANNUAL frequency. The VAR is estimated directly at annual
     frequency using the CCV constrained estimator (z_bar pinned to sample mean).

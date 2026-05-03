@@ -1,7 +1,7 @@
 """
 _diag_quadrature_cloud.py — Diagnostic tests on the joint state×return quadrature cloud.
 
-Implements T-Q1 through T-Q7 from handoff/HANDOFF_UNCONSTRAINED_LEVERAGE.md, all of
+Implements T-Q1 through T-Q7 from docs/handoff/HANDOFF_UNCONSTRAINED_LEVERAGE.md, all of
 which run on (model, pc) plus the saved policy bundle — no fresh solves.
 
 The tests are designed to localize the source of the residual unconstrained-

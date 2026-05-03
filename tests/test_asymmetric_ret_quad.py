@@ -2,7 +2,7 @@
 
 Verifies that `discretization.get_return_quadrature` accepts a per-dimension
 tuple `(K_1, ..., K_{n_ret})` and that all properties from
-`contextfiles/RETURNS.md §6.5` continue to hold:
+`docs/RETURNS.md §6.5` continue to hold:
 
   1. weights sum to one
   2. all weights positive

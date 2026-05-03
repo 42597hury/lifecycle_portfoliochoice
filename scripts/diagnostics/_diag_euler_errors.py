@@ -1217,7 +1217,7 @@ def _markdown_report(ctx: EulerBundleContext,
         f"- A cell is flagged `is_constrained` when `savings/x < kink_tol = {args.kink_tol:g}`. At such cells the FOC has KKT slack (the agent would want savings<0 but the savings≥0 constraint binds), so `1 - c_implied/c_policy` measures slack, not discretization error."
     )
     lines.append(
-        "- The working/retirement publication-grade gates follow `contextfiles/GRID_CONVERGENCE_CRITERIA.md`. The `unconstrained` cell-set rows are the gate the literature reports (HARK, AFV-RR 2006); the `all` rows are kept for backwards compatibility."
+        "- The working/retirement publication-grade gates follow `docs/GRID_CONVERGENCE_CRITERIA.md`. The `unconstrained` cell-set rows are the gate the literature reports (HARK, AFV-RR 2006); the `all` rows are kept for backwards compatibility."
     )
     return "\n".join(lines) + "\n"
 

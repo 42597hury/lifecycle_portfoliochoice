@@ -37,7 +37,7 @@ from discretization import (
 
 
 # =============================================================================
-# Calibrated mixture parameters (from contextfiles/LABOUR.md)
+# Calibrated mixture parameters (from docs/LABOUR.md)
 # =============================================================================
 
 ETA_PARAMS = dict(

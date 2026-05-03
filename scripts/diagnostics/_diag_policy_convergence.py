@@ -10,7 +10,7 @@ immediately on saved policy bundles, before we add simulation-based Euler-error
 3. Publication-grade / welfare-grade gates for solver-health diagnostics
 
 The comparison follows the guidance in:
-  contextfiles/GRID_CONVERGENCE_CRITERIA.md
+  docs/GRID_CONVERGENCE_CRITERIA.md
 
 Usage
 -----
@@ -510,7 +510,7 @@ def _render_report(
         f"Reference bundle: `{reference.path}`",
         f"Threshold mode: `{mode}`",
         "",
-        "Implemented subset from `contextfiles/GRID_CONVERGENCE_CRITERIA.md`:",
+        "Implemented subset from `docs/GRID_CONVERGENCE_CRITERIA.md`:",
         "",
         "- bundle integrity / loadability",
         "- solver-health gates (Newton convergence, worst FOC residual, monotonicity)",

@@ -27,7 +27,7 @@ from var import build_nominal_system1_var_config, partition_var
 CSV_PATH = "data/var_dataset.csv"
 # State variable names; resolved dynamically below from the partition so this
 # script keeps working under either ordering (legacy (y_1, spr, cy) or default
-# (cy, spr, y_1) after 2026-04-30).  See contextfiles/RETURNS.md sec.5.6.
+# (cy, spr, y_1) after 2026-04-30).  See docs/RETURNS.md sec.5.6.
 N_STATE = 3
 
 

@@ -26,8 +26,8 @@ from collections import namedtuple
 from numba import njit
 from math import exp
 
-from model import SolverConfig, disposable_income_working, compute_pension_after_tax
-from solver import (
+from lifecycle.model import SolverConfig, disposable_income_working, compute_pension_after_tax
+from lifecycle.solver import (
     compute_terminal_portfolio_foc_jac,
     solve_portfolio_2d_terminal_constrained_njit,
     solve_portfolio_unconstrained_terminal_njit,

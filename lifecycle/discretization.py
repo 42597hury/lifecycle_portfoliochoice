@@ -20,7 +20,7 @@ from scipy.special import roots_hermite
 from scipy.stats import norm
 import warnings
 
-from numerics import _normal_bin_probs
+from lifecycle.numerics import _normal_bin_probs
 
 
 # =============================================================================

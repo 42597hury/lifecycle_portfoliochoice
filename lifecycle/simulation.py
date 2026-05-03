@@ -86,8 +86,8 @@ except ImportError:  # pragma: no cover
     prange = range
     warnings.warn("Numba not available. Simulation will run in pure Python.")
 
-from model import scalar_disposable_income
-from numerics import (
+from lifecycle.model import scalar_disposable_income
+from lifecycle.numerics import (
     _pchip_slope_uniform,
     _pchip_eval_with_basis,
     _normal_bin_probs,

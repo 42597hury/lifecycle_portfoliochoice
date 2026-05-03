@@ -10,18 +10,18 @@ Dependencies: model, var, discretization, mortality
 
 import numpy as np
 
-from model import (
+from lifecycle.model import (
     LifecyclePortfolioModel, DiscretizationConfig,
     create_utility_functions, annuity_factor,
     disposable_income_working, compute_pension_after_tax,
 )
-from var import partition_var
-from discretization import (
+from lifecycle.var import partition_var
+from lifecycle.discretization import (
     build_state_grid, discretize_income_ar1_mixture,
     get_eps_quadrature_corrected, get_eta_quadrature_mixture, get_return_quadrature,
     get_state_quadrature, _normalize_ret_nodes,
 )
-from mortality import calibrate_earnings_dependent_mortality
+from lifecycle.mortality import calibrate_earnings_dependent_mortality
 
 
 # =============================================================================

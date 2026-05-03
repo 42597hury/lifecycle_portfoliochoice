@@ -30,8 +30,8 @@ import csv
 from functools import lru_cache
 from pathlib import Path
 
-from model import SolveControl, SolverConfig, scalar_disposable_income
-from numerics import _pchip_slope_uniform, _pchip_eval_with_basis
+from lifecycle.model import SolveControl, SolverConfig, scalar_disposable_income
+from lifecycle.numerics import _pchip_slope_uniform, _pchip_eval_with_basis
 
 # =============================================================================
 # DIAGNOSTIC CONSTANTS

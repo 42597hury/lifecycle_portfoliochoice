@@ -3,8 +3,8 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable, NamedTuple
 
-from model import DiscretizationConfig
-from var import (
+from lifecycle.model import DiscretizationConfig
+from lifecycle.var import (
     build_iid_var_config,
     build_no_cy_var_config,
     build_nominal_system1_var_config,

@@ -25,6 +25,30 @@ from lifecycle.mortality import calibrate_earnings_dependent_mortality
 
 
 # =============================================================================
+# Banner helper
+# =============================================================================
+
+def _format_lobatto_axes(lobatto_Z):
+    """Render '  (Lobatto axes 0:Z=3.0, 2:Z=4.0)' suffix for the print banner.
+
+    Returns '' when Lobatto is unused so the existing banner is unchanged
+    for production-default configs.
+    """
+    if lobatto_Z is None:
+        return ""
+    if isinstance(lobatto_Z, (int, float)):
+        return f"  (Lobatto all axes Z={float(lobatto_Z)})"
+    try:
+        seq = list(lobatto_Z)
+    except TypeError:
+        return ""
+    parts = [f"{d}:Z={float(v)}" for d, v in enumerate(seq) if v is not None]
+    if not parts:
+        return ""
+    return "  (Lobatto " + ", ".join(parts) + ")"
+
+
+# =============================================================================
 # PRECOMPUTE CLASS (GENERIC STATE/RETURN VERSION)
 # =============================================================================
 
@@ -163,7 +187,9 @@ class Precompute:
         # mu_r[i, j, 2] = E[xb  | s_t=i, s_{t+1}=j]  - log excess bond return
 
         self.ret_nodes, self.ret_weights = get_return_quadrature(
-            model, n_nodes=disc_config.n_ret_nodes_1d
+            model,
+            n_nodes=disc_config.n_ret_nodes_1d,
+            lobatto_Z=getattr(disc_config, "ret_lobatto_Z", None),
         )
         # ret_nodes:   (n_ret_quad, n_ret) float64 - residual log-return shocks around mu_r
         # ret_weights: (n_ret_quad,) float64       - tensor-product weights, sum(ret_weights)=1
@@ -171,7 +197,9 @@ class Precompute:
 
         # --- State innovation quadrature ---
         self.v_nodes, self.v_weights = get_state_quadrature(
-            model, n_nodes=disc_config.n_state_quad_nodes
+            model,
+            n_nodes=disc_config.n_state_quad_nodes,
+            lobatto_Z=getattr(disc_config, "state_lobatto_Z", None),
         )
         # v_nodes:   (n_state_quad, n_state) float64 — innovation nodes in original coords
         # v_weights: (n_state_quad,) float64 — tensor-product weights, sum to 1
@@ -388,10 +416,7 @@ class Precompute:
         base_pension = compute_pension_after_tax(self.z_grid, self.avg_det)
         n_age = len(self.ages)
         n_z = len(self.z_grid)
-        out = np.empty((n_age, n_z), dtype=float)
-        for t_idx in range(n_age):
-            out[t_idx, :] = base_pension
-        return out
+        return np.broadcast_to(base_pension, (n_age, n_z)).copy()
 
     def regenerate_savings_grid(self, n_s_points):
         """Utility for sensitivity runs in Part 2."""
@@ -422,15 +447,17 @@ class Precompute:
         print(f"Income grid  : {self.n_z} persistent states"
               f"  x  {self.n_eps} transitory nodes")
         K_str = "x".join(str(k) for k in self.n_ret_nodes_1d)
+        ret_Z_axes = _format_lobatto_axes(getattr(self.disc_config, "ret_lobatto_Z", None))
         print(f"Return quad  : ({K_str}) nodes/dim"
-              f"  ->  {self.n_ret_quad} joint nodes")
+              f"  ->  {self.n_ret_quad} joint nodes" + ret_Z_axes)
         K_state_disp = self.disc_config.n_state_quad_nodes
         if hasattr(K_state_disp, "__len__"):
             K_state_str = "(" + "x".join(str(k) for k in K_state_disp) + ")"
         else:
             K_state_str = str(K_state_disp)
+        state_Z_axes = _format_lobatto_axes(getattr(self.disc_config, "state_lobatto_Z", None))
         print(f"State quad   : {K_state_str} nodes/dim"
-              f"  ->  {self.n_state_quad} joint nodes")
+              f"  ->  {self.n_state_quad} joint nodes" + state_Z_axes)
         print(f"Wealth grid  : {self.n_w} points  [{self.wealth_grid[0]:.3e}, {self.wealth_grid[-1]:.3e}]")
         print(f"Savings grid : {self.n_s} points  [{self.s_grid[0]:.3e}, {self.s_grid[-1]:.3e}]")
         print(f"mu_r         : {self.mu_r.shape}"

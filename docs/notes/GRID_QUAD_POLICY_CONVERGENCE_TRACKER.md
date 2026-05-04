@@ -1,6 +1,6 @@
 # Grid/Quadrature Policy Convergence Tracker
 
-Last updated: 2026-05-02
+Last updated: 2026-05-03
 
 ## Purpose
 
@@ -336,6 +336,72 @@ Only if policy differences still look material after Phases 1-3.
   - but direct reconstructed old-vs-new policy comparisons are not reliable
     until the bundle metadata records the wealth/savings grid spacing mode
 
+### 2026-05-03
+
+Battery of 8 partial sweeps (`system_iv_full_var_unconstrained_principal_grid7x7x7_nz9_*` and one `9x9x9` companion) plus the two full `7x7x7` baselines (`base`, `cap_only`). All terminated as `is_partial=True`. **All 8 sweeps unfortunately used the narrow `state_n_stds=(0.6, 1.75, 2.0)`** — same support as the runs flagged in the Open Questions block below — so absolute EE numbers are dominated by support clipping. The **relative** rankings across configs are still informative.
+
+Sweep grid tested (one axis at a time, holding others fixed):
+
+| label | grid | state-quad | ret-quad | η/ε | cap | youngest age solved |
+| --- | --- | --- | --- | --- | --- | --- |
+| `base` | 7×7×7 | (2,2,5) | (3,7,5) | 3/3 | ±10 | 22 |
+| `cap_only` | 7×7×7 | (2,2,5) | (3,7,5) | 3/3 | ±5 | 22 |
+| `state33` | 7×7×7 | (3,3,5) | (3,7,5) | 3/3 | ±10 | 38 |
+| `state33_cap` | 7×7×7 | (3,3,5) | (3,7,5) | 3/3 | ±5 | 41 |
+| `state44_cap` | 7×7×7 | (4,4,5) | (3,7,5) | 3/3 | ±5 | 53 |
+| `inc55_cap` | 7×7×7 | (2,2,5) | (3,7,5) | 5/5 | ±5 | 46 |
+| `mid_rich_cap` | 7×7×7 | (3,3,5) | (3,7,5) | 5/5 | ±5 | 58 |
+| `tight_cap` | 7×7×7 | (3,3,5) | (3,7,5) | 3/3 | ±3 | 55 |
+| `grid9_base` | 9×9×9 | (2,2,5) | (3,7,5) | 3/3 | ±10 | 36 |
+| `grid9_state33_cap` | 9×9×9 | (3,3,5) | (3,7,5) | 3/3 | ±5 | 56 |
+
+Full diagnostic battery (A/B/C) run on the priority subset; A and B run on all 8 partials. Per-bundle reports under `diagnostics_reports/diagnostics_gridpoint_<label>_{same,nextfiner}.md` and `diagnostics_simpath_<label>_nextfiner.md`. Cross-bundle comparison report: [`diagnostics_reports/diagnostics_partial_sweeps_comparison.md`](../../diagnostics_reports/diagnostics_partial_sweeps_comparison.md).
+
+#### Headline findings
+
+1. **State quadrature is the dominant solver lever.** Bumping (2,2,5)→(3,3,5) closes ~0.33 orders of Diagnostic-B mean and ~1.4 orders of sim-path retirement max. (3,3,5)→(4,4,5) gives diminishing returns (≈0.04 orders Diag B mean, but still ~1.1 orders on sim-path retirement max). All other levers are smaller in magnitude.
+
+2. **The "extreme leverage tail" in `base` was a state-quad artifact, not real economics.** With (2,2,5) state-quad the policy wants α_s up to 5.5 and α_b up to 6.4 in retirement state corners. Refining to (3,3,5) cuts max α_s to 2.2; (4,4,5) cuts to 2.0. The integrand truncation under coarse state-quad made over-leveraged positions look locally optimal; richer sampling reveals they aren't. **Implication:** the leverage cap intervention was solving an artifact. Once state-quad is in, the cap=±5 stops binding meaningfully.
+
+3. **Cap=±5 is essentially neutral.** sim-path EE between `base` and `cap_only` differs by 0.02 orders. Newton-failure counts in cap-bound runs are KKT slack at the cap, **not** convergence failures. Only `tight_cap` (±3) actually moves sim-path EE — by 1.5 orders on retirement mean — but does so by clipping a *real* part of the policy, with unknown welfare implications.
+
+4. **Income quadrature does not enter retirement directly** (z is frozen, pension is deterministic — confirmed by bit-identical retirement policy arrays between η=3 and η=5 bundles). The apparent retirement-EE benefit of η=5 is **indirect**: better working-age policy → tamer simulated wealth growth → fewer agents end retirement at x values past `wealth_max=200`. Under `cap_only` (η=3) simulated x reaches 2.5M at age 67 and 88M at age 90; under `inc55_cap` (η=5) the same ages cap at 69k and 4.6M. **Working-age policy is calibrated to a slightly wrong income process under η=3, and the bias compounds across 45 years.**
+
+5. **Wealth-grid extrapolation is a hidden source of retirement-EE blow-up.** `wealth_max=200` is being exceeded by simulated agents by orders of magnitude. The "retirement EE failure" in `base`-like bundles is partly the EE script computing residuals at extrapolated (x, c, α) values, not real policy quality. **Bumping `wealth_max` would do real work for sim-path EE in retirement, independent of any quadrature change.** This is a separate diagnostic axis worth a dedicated test.
+
+6. **Grid refinement (9×9×9) is dominated by state-quad refinement.** `grid9_base` (9×9×9, (2,2,5) quad) gives sim-path retirement mean −0.84; `state33` (7×7×7, (3,3,5) quad) gives −1.18 — better by 0.34 orders. **Spending compute on more state grid nodes without refining the integrating quadrature is a near-no-op.**
+
+7. **Income-quad on top of state-quad still helps** (the cleanest A/B test: `state33_cap` η=3 vs `mid_rich_cap` η=5, same retirement window): retirement mean −1.28 → −1.82 (+0.54 orders), retirement max +4.79 → +2.73 (+2.06 orders). Working-age (overlap window only) is more modest: +0.15 mean, +0.60 max. So η/ε=5 is a worthwhile second axis but its effect is **mediated by working-age wealth dynamics**, not by retirement-FOC accuracy.
+
+8. **Tight cap (±3) and η=5 are partial substitutes.** Both clip the dangerous working-age policy tail by different mechanisms. `tight_cap` (state33+cap3, η=3) ≈ `mid_rich_cap` (state33+inc55+cap5) on sim-path retirement mean (−1.89 vs −1.82). **For policy interpretation it's safer to fix the artifact at the source (state-quad refinement + η=5) than to clamp it (cap=±3).**
+
+9. **Same-Q EE is self-grading and badly misleading.** Diagnostic A reported mean ~−5.5 (looks publication-grade) for every bundle; Diagnostic B reported mean ~−2.0 (catastrophic) for the same bundles. **3.5 orders of self-grading bias** under `(2,2,5)` state quadrature. Always run next_finer; never trust same-Q. Refining state-quad to (3,3,5) closes the same-Q vs next_finer gap from 3.5 to 3.3 orders — much of the gap remains because narrow support distorts both.
+
+10. **None of these bundles pass the publication gates** (best is `mid_rich_cap` at retirement max +2.73 vs gate −3.0; ~5.7 orders to close). The narrow `state_n_stds=(0.6, 1.75, 2.0)` is the elephant. Widening to `(2.0, 2.25, 2.25)` is the first required step before any of these refinements can be meaningfully evaluated against the gates.
+
+11. **A large fraction of simulated agents are above the solver's `wealth_max=200` at retirement entry, and the fraction grows through retirement.** Off-grid share at age 67 / 80 / 90 / 99, with `wealth_max=200`:
+
+    | bundle | start | %off-grid @67 | @80 | @90 | @99 |
+    | --- | ---: | ---: | ---: | ---: | ---: |
+    | `base` | 22 | **30.5%** | 45.3% | 57.4% | **70.3%** |
+    | `cap_only` | 22 | 30.0% | 44.8% | 56.9% | 70.3% |
+    | `grid9_base` | 36 | 21.2% | 36.1% | 48.7% | 62.8% |
+    | `state33` | 38 | 15.8% | 27.1% | 39.6% | 52.2% |
+    | `inc55_cap` | 46 | 10.4% | 21.5% | 33.4% | 48.3% |
+
+    Headline: in the full-lifecycle `base` bundle, **30% of agents enter retirement with x > wealth_max, and 70% exceed it by terminal age**. Even refined-quadrature bundles (which only have partial accumulation horizons) leave 50%+ off-grid at age 99. Once x > 200 the policy is iw=149 extrapolated linearly — economically meaningless. **A non-trivial fraction of every sim-path EE result is grading the extrapolation, not the solved policy.** The improvements we attribute to state-quad and η refinement partly reflect those bundles producing tamer working-age leverage and so smaller off-grid mass — the true policy quality on agents who stay on-grid is harder to pin down without a wealth-grid extension.
+
+    This makes `wealth_max` extension an independent, high-priority axis for any subsequent solve. A solve with `wealth_max ∈ [10000, 50000]` (or log1p tail extension) would let us:
+    - separate "policy quality" from "extrapolation noise" on sim-path EE,
+    - measure `% off-grid` as a first-class bundle-health metric (call it `frac_above_wealth_max[t]`), and
+    - reduce the runaway-feedback path where extrapolated policy at high x recommends more leverage which generates higher x next period.
+
+#### Untested axes (open after this battery)
+
+- **Per-axis state-quad sensitivity.** All bumps moved axes 0 and 1 in lockstep. We have not tested `(3,2,5)`, `(2,3,5)`, `(2,2,7)`, or `(3,3,7)`. The three principal-mode axes have different stationary spread (axis-0 needs `1.42` for p90, axis-1 needs `1.59`, axis-2 needs `1.56`), so they probably need different node counts. Three single-axis solves would tell you which axis is binding.
+- **Wealth-grid coverage.** The `wealth_max=200` ceiling is too low for the simulated trajectory. A solve with `wealth_max=10000` (or a log1p tail extension) would isolate the extrapolation contribution to retirement-max EE.
+- **Wide support × refined state-quad.** The natural next solve: 7×7×7, **`state_n_stds=(2.0, 2.25, 2.25)`**, `state_quad=(3,3,5)`, η/ε=5, cap=±5. This is the candidate for actually clearing publication gates.
+
 ## Planned Run Matrix
 
 These are the next natural runs once the current `from_age65` baseline finishes.
@@ -452,14 +518,16 @@ Working rule of thumb:
 
 ## Open Questions
 
-- The original narrow support `state_n_stds=(0.6,1.75,2.0)` now looks too
-  tight for retirement diagnostics. The wide-support `9x9x9` test materially
-  improves both clipping and retirement Euler accuracy, so future retirement
-  solves should not go back to the narrow support.
-- The bundle metadata currently does not record the wealth/savings grid spacing
-  rule (`legacy` vs `log1p`). After the restretched-grid change, this makes
-  some historical reconstructed-grid comparisons ambiguous.
-- Should the main comparison metric be raw policy differences, portfolio-share
-  differences, or Euler-equation objects implied by the policies?
-- Do we want a dedicated comparison script that loads two bundles and emits a
-  markdown summary table for this tracker?
+### Resolved or substantially answered as of 2026-05-03
+- ~~State-quad refinement helps; magnitude unknown~~ → confirmed (3,3,5) gives ~0.33 orders Diag B mean and ~1.4 orders sim-path retirement max over (2,2,5). (4,4,5) gives diminishing returns at the second-order margin.
+- ~~Does cap intervention help?~~ → cap=±5 is neutral; cap=±3 helps but distorts the policy. The "leverage tail" was largely a quadrature artifact, not real economics; refining state-quad is the principled fix.
+- ~~Does income-quad refinement matter for retirement?~~ → no, not directly (retirement policies are bit-identical between η=3 and η=5). Indirect via working-age wealth dynamics — η=5 still helps sim-path retirement EE through this path.
+- ~~Does grid refinement (9×9×9) help?~~ → dominated by state-quad refinement. 7×7×7 + (3,3,5) beats 9×9×9 + (2,2,5) on every metric.
+
+### Still open
+- The narrow `state_n_stds=(0.6, 1.75, 2.0)` is the unresolved blocker. Wide support `(2.0, 2.25, 2.25)` confirmed to materially help retirement Euler accuracy in earlier runs, but has not been tested in combination with refined state-quadrature `(3,3,5)`. **This is the priority next solve.**
+- **Per-axis state-quad sensitivity**: (3,2,5) vs (2,3,5) vs (2,2,7) vs (3,3,7). Three single-axis bumps would identify which of the three principal-component axes is binding so we don't waste nodes on axes that don't need them.
+- **Wealth-grid coverage**: `wealth_max=200` is breached by 30% of `base`-bundle agents at retirement entry and by 70% at terminal age (see 2026-05-03 finding 11). Once off-grid, the policy is iw=149 extrapolated, which feeds back into more leverage and runaway wealth growth. A solve with `wealth_max ∈ [10000, 50000]` (or log1p tail extension) would isolate the extrapolation contribution to retirement EE, and `frac_above_wealth_max` should become a first-class bundle-health metric reported by the solver and the diagnostics.
+- The bundle metadata currently does not record the wealth/savings grid spacing rule (`legacy` vs `log1p`). After the restretched-grid change, this makes some historical reconstructed-grid comparisons ambiguous.
+- Should the main comparison metric be raw policy differences, portfolio-share differences, or Euler-equation objects implied by the policies?
+- Do we want a dedicated comparison script that loads two bundles and emits a markdown summary table for this tracker?

@@ -37,6 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.diagnostics._diag_euler_errors import (
+    _annuity_factors_per_household,
     _evaluate_age_errors,
     _load_bundle_context,
 )
@@ -180,6 +181,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
         state_override=tuple(args.eval_state_nodes) if args.eval_state_nodes else None,
         eta_override=args.eval_eta_nodes,
         eps_override=args.eval_eps_nodes,
+        disable_lobatto=bool(getattr(args, "eval_disable_lobatto", False)),
     )
     pc_eval = ctx.pc_eval
     model = ctx.model
@@ -241,6 +243,8 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
                     k += 1
 
         household_idx = np.arange(n_probe, dtype=np.int64)
+        annuity_factors_age = _annuity_factors_per_household(model, state_coords_age)
+        N0_g = len(pc_eval.state_bracket_grids[0])
 
         ee, valid, is_constrained = _evaluate_age_errors(
             household_idx,
@@ -276,6 +280,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
             np.ascontiguousarray(pc_eval.state_bracket_grids[0]),
             np.ascontiguousarray(pc_eval.state_bracket_grids[1]),
             np.ascontiguousarray(pc_eval.state_bracket_grids[2]),
+            int(N0_g),
             int(N1),
             int(N2),
             np.ascontiguousarray(pc_eval.exp_ret_bill),
@@ -285,8 +290,7 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
             float(model.gamma),
             float(model.beta),
             int(model.b_bar),
-            int(model.y_1_index_in_state),
-            int(model.spr_index_in_state),
+            annuity_factors_age,
             float(args.kink_tol),
         )
 
@@ -371,6 +375,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-state-nodes", nargs="+", type=int, default=None)
     p.add_argument("--eval-eta-nodes", type=int, default=None)
     p.add_argument("--eval-eps-nodes", type=int, default=None)
+    p.add_argument(
+        "--eval-disable-lobatto",
+        action="store_true",
+        help=(
+            "Build the eval rule as pure Gauss-Hermite even when the solver used "
+            "Hermite-Lobatto. See `_diag_euler_errors.py` for the rationale."
+        ),
+    )
     p.add_argument("--ages", nargs="+", type=int, default=None)
     p.add_argument("--z-indices", nargs="+", type=int, default=None)
     p.add_argument("--wealth-indices", nargs="+", type=int, default=None)

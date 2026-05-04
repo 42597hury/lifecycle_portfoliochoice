@@ -118,6 +118,14 @@ class DiscretizationConfig(NamedTuple):
     n_ret_nodes_1d: Any = 2             # Gauss-Hermite order per return dim; int (uniform) OR tuple of length n_ret
     n_state_quad_nodes: Any = 3         # GH order per state dim; int (uniform) OR tuple of length n_state for per-axis (e.g. (2,2,5) refines axis 2 only)
 
+    # Prescribed-tails (Lobatto-style) Gauss-Hermite, per axis. None means
+    # standard Gauss-Hermite on that axis (default; backward compatible).
+    # A float means tail nodes prescribed at +/- Z on that axis with closed-
+    # form K in {3,5,7}. A length-n tuple selects per-axis: e.g.
+    # (None, None, 4.0) puts Lobatto on axis 2 only with Z=4.
+    ret_lobatto_Z: Any = None           # None | float | tuple[None|float, ...]
+    state_lobatto_Z: Any = None         # None | float | tuple[None|float, ...]
+
 
 # =============================================================================
 # SOLVER CONFIG

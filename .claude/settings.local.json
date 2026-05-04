@@ -6,7 +6,8 @@
       "WebFetch(domain:sylvaincatherine.net)",
       "WebFetch(domain:www.federalreserve.gov)",
       "Bash(python3:*)",
-      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=. python _diag_quadrature_cloud.py)"
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=. python _diag_quadrature_cloud.py)",
+      "PowerShell(python scripts/_pull_bundle.py system_iv_full_var_unconstrained_principal_grid7x7x7_nz11_v5_wmin13 saved_runs)"
     ]
   }
 }

@@ -16,7 +16,7 @@ from math import comb
 
 import numpy as np
 from scipy.linalg import solve_discrete_lyapunov
-from scipy.special import roots_hermite
+from scipy.special import eval_legendre, roots_hermite, roots_jacobi
 from scipy.stats import norm
 import warnings
 
@@ -411,6 +411,73 @@ def _judd_mixture_quadrature(probs, mus, sigmas, n):
     return nodes, weights
 
 
+def _gauss_lobatto_1d(n, a=-1.0, b=1.0):
+    """1-D Gauss–Lobatto quadrature on [a, b] with unit weight.
+
+    Returns n nodes (with `a`, `b` as fixed endpoints) and n weights such
+    that the rule is exact for polynomials of degree ≤ 2n − 3 against
+    the unit weight on [a, b].
+
+    Construction
+    ------------
+    On [−1, 1]: endpoints fixed at ±1; the n − 2 interior nodes are roots
+    of P′_{n−1}(x), equivalently the roots of the Jacobi polynomial
+    P^{(1,1)}_{n−2}(x). Weights use the closed-form Lobatto formula
+    `w_i = 2 / (n(n−1) [P_{n−1}(x_i)]²)`. Linear scaling to [a, b]
+    multiplies nodes and weights by `(b − a)/2` and shifts nodes by
+    `(a + b)/2`.
+
+    Parameters
+    ----------
+    n : int
+        Total node count, n ≥ 2. The n = 2 case is the trapezoidal rule
+        on [a, b].
+    a, b : float
+        Interval endpoints with b > a.
+
+    Returns
+    -------
+    nodes : ndarray, shape (n,)
+        Sorted ascending; nodes[0] = a, nodes[-1] = b.
+    weights : ndarray, shape (n,)
+        All strictly positive; sum to (b − a).
+
+    Notes
+    -----
+    Polynomial exactness verified to machine precision for n ∈ {3..6} on
+    [−1, 1]: degrees 0..(2n−3) integrated to ≤ 1e-15; degree (2n−2) has
+    a non-zero residual (e.g. ≈ 0.27 for n = 3 at degree 4).
+
+    This is a primitive — to integrate against the standard-normal weight
+    φ(z) requires either a φ-reweight construction (truncate, multiply
+    weights by φ(z_k), renormalise) or a generalised Lobatto rule
+    constructed via moment-matching against the truncated Gaussian. The
+    correct choice for the lifecycle return / state quadrature is under
+    review; see `docs/handoff/HANDOFF_LOBATTO_QUADRATURE_REVIEW.md`.
+    """
+    if not isinstance(n, (int, np.integer)) or n < 2:
+        raise ValueError("Gauss–Lobatto requires integer n >= 2")
+    if not (b > a):
+        raise ValueError(f"require b > a; got a={a}, b={b}")
+
+    if n == 2:
+        nodes_std = np.array([-1.0, 1.0], dtype=float)
+        weights_std = np.array([1.0, 1.0], dtype=float)
+    else:
+        interior, _ = roots_jacobi(int(n) - 2, 1.0, 1.0)
+        nodes_std = np.concatenate(
+            [[-1.0], np.sort(np.asarray(interior, dtype=float)), [1.0]]
+        )
+        P_nm1 = eval_legendre(int(n) - 1, nodes_std)
+        weights_std = 2.0 / (int(n) * (int(n) - 1) * P_nm1 ** 2)
+
+    half_width = 0.5 * (b - a)
+    midpoint = 0.5 * (a + b)
+    nodes = half_width * nodes_std + midpoint
+    weights = half_width * weights_std
+    return nodes, weights
+
+
 def get_eps_quadrature_corrected(model, n_nodes=3):
     """Transitory shock quadrature, Judd (1998) construction.
 
@@ -463,6 +530,83 @@ def get_eta_quadrature_mixture(model, n_nodes=3):
     return eta_nodes, eta_weights
 
 
+def _normalize_lobatto_Z(value, n_axes, axis_kind):
+    """Normalise a Lobatto-Z spec to a length-`n_axes` tuple of None|float.
+
+    Accepts:
+      - None: no Lobatto on any axis (every entry is None).
+      - float / int: Lobatto with this Z on every axis.
+      - sequence of length n_axes: per-axis (entries None or float).
+
+    Raises ValueError on length mismatch and TypeError on bad scalar types.
+    """
+    if value is None:
+        return (None,) * int(n_axes)
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{axis_kind}_lobatto_Z must be None|float|sequence, not bool")
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        Z = float(value)
+        if Z <= 0:
+            raise ValueError(f"{axis_kind}_lobatto_Z must be positive; got {Z}")
+        return (Z,) * int(n_axes)
+    try:
+        seq = list(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"{axis_kind}_lobatto_Z must be None|float|sequence, "
+            f"got {type(value).__name__}"
+        ) from exc
+    if len(seq) != int(n_axes):
+        raise ValueError(
+            f"{axis_kind}_lobatto_Z length {len(seq)} does not match {axis_kind}={int(n_axes)}"
+        )
+    out = []
+    for d, v in enumerate(seq):
+        if v is None:
+            out.append(None)
+            continue
+        if isinstance(v, (bool, np.bool_)):
+            raise TypeError(f"{axis_kind}_lobatto_Z[{d}] must be None|float, not bool")
+        try:
+            Zf = float(v)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"{axis_kind}_lobatto_Z[{d}] must be None|float, got {type(v).__name__}"
+            ) from exc
+        if Zf <= 0:
+            raise ValueError(f"{axis_kind}_lobatto_Z[{d}] must be positive; got {Zf}")
+        out.append(Zf)
+    return tuple(out)
+
+
+def _build_axis_grid(K_d, Z_d):
+    """Build the 1D (z_nodes, weights) grid for a single quadrature axis.
+
+    K_d=1   -> single zero node (degenerate axis).
+    Z_d is None -> standard Gauss-Hermite of order K_d on N(0,1), nodes
+                   in z = sqrt(2)*x, weights in w/sqrt(pi).
+    Z_d float   -> closed-form prescribed-tails rule (Gauss-Hermite-Lobatto)
+                   with tail nodes at +/- Z_d. Validity is enforced inside
+                   `gauss_hermite_prescribed_tails`.
+    """
+    if K_d == 1:
+        if Z_d is not None:
+            raise ValueError("Lobatto requires K >= 3; got K=1 with Z set")
+        return np.zeros(1, dtype=float), np.ones(1, dtype=float)
+    if Z_d is None:
+        z, w = roots_hermite(int(K_d))
+        return z * np.sqrt(2.0), w / np.sqrt(np.pi)
+    # Lobatto branch -- import here to avoid a top-level cycle
+    # (quadrature_with_tails defers its imports of `_normalize_*` likewise).
+    from lifecycle.quadrature_with_tails import gauss_hermite_prescribed_tails
+    if int(K_d) % 2 == 0 or int(K_d) not in (3, 5, 7):
+        raise ValueError(
+            f"Lobatto axis requires odd K in {{3,5,7}}; got K={K_d}. "
+            f"For K >= 9, use Hermite (set lobatto_Z entry to None)."
+        )
+    return gauss_hermite_prescribed_tails(int(K_d), float(Z_d))
+
+
 def _normalize_ret_nodes(value, n_ret):
     """Normalize per-dimension return-quadrature node count to a length-`n_ret` tuple.
 
@@ -487,7 +631,7 @@ def _normalize_ret_nodes(value, n_ret):
     return t
 
 
-def get_return_quadrature(model, n_nodes=1):
+def get_return_quadrature(model, n_nodes=1, lobatto_Z=None):
     """Residual return quadrature for N(0, Sigma_r_cond).
 
     Uses tensor-product Gauss-Hermite in standardized coordinates `z`,
@@ -540,21 +684,18 @@ def get_return_quadrature(model, n_nodes=1):
     """
     n_ret = int(model.n_ret)
     K_per_dim = _normalize_ret_nodes(n_nodes, n_ret)
+    Z_per_dim = _normalize_lobatto_Z(lobatto_Z, n_ret, "ret")
     if any(k < 1 for k in K_per_dim):
         raise ValueError("All entries of n_ret_nodes_1d must be >= 1")
 
-    if all(k == 1 for k in K_per_dim):
+    if all(k == 1 for k in K_per_dim) and all(z is None for z in Z_per_dim):
         return np.zeros((1, n_ret), dtype=float), np.ones(1, dtype=float)
 
     grids_z, grids_w = [], []
-    for K in K_per_dim:
-        if K == 1:
-            grids_z.append(np.zeros(1, dtype=float))
-            grids_w.append(np.ones(1, dtype=float))
-        else:
-            z, w = roots_hermite(K)
-            grids_z.append(z * np.sqrt(2.0))
-            grids_w.append(w / np.sqrt(np.pi))
+    for K, Z in zip(K_per_dim, Z_per_dim):
+        z, w = _build_axis_grid(K, Z)
+        grids_z.append(z)
+        grids_w.append(w)
 
     grid_1d = np.meshgrid(*grids_z, indexing="ij")
     weight_1d = np.meshgrid(*grids_w, indexing="ij")
@@ -601,7 +742,7 @@ def _normalize_state_nodes(value, n_state):
     return t
 
 
-def get_state_quadrature(model, n_nodes=3):
+def get_state_quadrature(model, n_nodes=3, lobatto_Z=None):
     """State innovation quadrature for N(0, Sigma_ss).
 
     Constructs tensor-product Gauss-Hermite nodes for integrating over the
@@ -635,18 +776,15 @@ def get_state_quadrature(model, n_nodes=3):
     """
     n_state = int(model.n_state)
     K_per_dim = _normalize_state_nodes(n_nodes, n_state)
+    Z_per_dim = _normalize_lobatto_Z(lobatto_Z, n_state, "state")
     if any(k < 1 for k in K_per_dim):
         raise ValueError("All entries of n_state_quad_nodes must be >= 1")
 
     grids_z, grids_w = [], []
-    for K in K_per_dim:
-        if K == 1:
-            grids_z.append(np.zeros(1, dtype=float))
-            grids_w.append(np.ones(1, dtype=float))
-        else:
-            z, w = roots_hermite(K)
-            grids_z.append(z * np.sqrt(2.0))
-            grids_w.append(w / np.sqrt(np.pi))
+    for K, Z in zip(K_per_dim, Z_per_dim):
+        z, w = _build_axis_grid(K, Z)
+        grids_z.append(z)
+        grids_w.append(w)
 
     # Tensor product in standard-normal space (per-axis K)
     grid_1d = np.meshgrid(*grids_z, indexing="ij")

@@ -92,6 +92,21 @@ def _coerce_seq(x: Any) -> Any:
     return x
 
 
+def _coerce_lobatto_seq(x: Any) -> Any:
+    """Coerce a Lobatto-Z spec read from JSON metadata.
+
+    JSON has no `None` for tuple entries, so a per-axis Lobatto config
+    arrives as a list with `null` entries (decoded to Python `None`).
+    Preserve the entry-wise `None|float` shape; pass scalars / `None`
+    through unchanged so `_normalize_lobatto_Z` sees what it expects.
+    """
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    return tuple(None if v is None else float(v) for v in x)
+
+
 def _build_disc_config(raw: dict[str, Any]) -> DiscretizationConfig:
     return DiscretizationConfig(
         n_wealth=int(raw["n_wealth"]),
@@ -109,6 +124,8 @@ def _build_disc_config(raw: dict[str, Any]) -> DiscretizationConfig:
         n_eta_nodes=int(raw.get("n_eta_nodes", 3)),
         n_ret_nodes_1d=_coerce_seq(raw.get("n_ret_nodes_1d", 2)),
         n_state_quad_nodes=_coerce_seq(raw.get("n_state_quad_nodes", 3)),
+        ret_lobatto_Z=_coerce_lobatto_seq(raw.get("ret_lobatto_Z")),
+        state_lobatto_Z=_coerce_lobatto_seq(raw.get("state_lobatto_Z")),
     )
 
 

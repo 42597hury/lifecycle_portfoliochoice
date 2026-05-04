@@ -37,7 +37,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lifecycle.model import DiscretizationConfig, disposable_income_working, scalar_disposable_income
+from lifecycle.model import (
+    DiscretizationConfig,
+    annuity_factor,
+    disposable_income_working,
+    scalar_disposable_income,
+)
 from lifecycle.policy_io import load_policy_bundle
 from lifecycle.precompute import Precompute
 from scripts.diagnostics._diag_policy_convergence import (
@@ -51,12 +56,115 @@ from lifecycle.simulation import (
     _build_return_factor,
     _initialize_initial_wealth,
     _normal_bin_probs,
+    _pad_simulation_state_inputs_to_3d,
     _resolve_initial_state_indices,
     initialize_states,
     simulate_lifecycle,
     simulate_lifecycle_core,
 )
 from lifecycle.solver import _interp_z_wealth, find_bracket
+
+
+def _pad_eval_state_inputs_to_3d(pc: Precompute, model: Any) -> dict[str, Any]:
+    """Pad EE-evaluator state inputs to the 3-coord kernel layout.
+
+    Mirrors `_pad_simulation_state_inputs_to_3d` and additionally pads the
+    state-quadrature `v_nodes` to width 3 (the simulator helper does not need
+    those). The padded layout uses singleton bracket grids on the absent axes
+    so the kernel's trilinear corner indexing collapses to the right linear
+    index in `c_next_full` (which has shape (n_z, N_state, n_w) with
+    `N_state = prod(state_grid_sizes)` of the actual model).
+
+    For System IV (n_state == 3) every padded array equals the un-padded
+    input, so the full-model numerical path is unchanged.
+    """
+    n_state = int(model.n_state)
+    state_grids = list(pc.state_bracket_grids)
+    if len(state_grids) != n_state:
+        raise ValueError(
+            f"pc.state_bracket_grids has length {len(state_grids)} but model.n_state={n_state}"
+        )
+
+    grids_padded = []
+    for d in range(3):
+        if d < n_state:
+            grids_padded.append(np.ascontiguousarray(np.asarray(state_grids[d], dtype=float)))
+        else:
+            grids_padded.append(np.zeros(1, dtype=float))
+
+    if n_state == 3:
+        shift_pad = np.ascontiguousarray(np.asarray(pc.state_bracket_shift, dtype=float))
+        L_inv_pad = np.ascontiguousarray(np.asarray(pc.state_bracket_L_inv, dtype=float))
+        Phi_0_state_pad = np.ascontiguousarray(np.asarray(model.Phi_0_state, dtype=float))
+        Phi_11_pad = np.ascontiguousarray(np.asarray(model.Phi_11, dtype=float))
+        A_r_pad = np.ascontiguousarray(np.asarray(pc.A_r, dtype=float))
+        v_nodes_pad = np.ascontiguousarray(np.asarray(pc.v_nodes, dtype=float))
+    else:
+        shift_pad = np.zeros(3, dtype=float)
+        shift_pad[:n_state] = np.asarray(pc.state_bracket_shift, dtype=float)
+
+        L_inv_pad = np.zeros((3, 3), dtype=float)
+        L_inv_pad[:n_state, :n_state] = np.asarray(pc.state_bracket_L_inv, dtype=float)
+
+        Phi_0_state_pad = np.zeros(3, dtype=float)
+        Phi_0_state_pad[:n_state] = np.asarray(model.Phi_0_state, dtype=float)
+
+        Phi_11_pad = np.zeros((3, 3), dtype=float)
+        Phi_11_pad[:n_state, :n_state] = np.asarray(model.Phi_11, dtype=float)
+
+        n_ret = int(pc.A_r.shape[0])
+        A_r_pad = np.zeros((n_ret, 3), dtype=float)
+        A_r_pad[:, :n_state] = np.asarray(pc.A_r, dtype=float)
+
+        K_v = int(pc.v_nodes.shape[0])
+        v_nodes_pad = np.zeros((K_v, 3), dtype=float)
+        v_nodes_pad[:, :n_state] = np.asarray(pc.v_nodes, dtype=float)
+
+    return {
+        "state_grids_0": grids_padded[0],
+        "state_grids_1": grids_padded[1],
+        "state_grids_2": grids_padded[2],
+        "state_bracket_shift": np.ascontiguousarray(shift_pad),
+        "state_bracket_L_inv": np.ascontiguousarray(L_inv_pad),
+        "Phi_0_state": np.ascontiguousarray(Phi_0_state_pad),
+        "Phi_11": np.ascontiguousarray(Phi_11_pad),
+        "A_r": np.ascontiguousarray(A_r_pad),
+        "v_nodes": np.ascontiguousarray(v_nodes_pad),
+        "N0": len(grids_padded[0]),
+        "N1": len(grids_padded[1]),
+        "N2": len(grids_padded[2]),
+    }
+
+
+def _annuity_factors_per_household(model: Any, state_coords_age: np.ndarray) -> np.ndarray:
+    """Annuity factor at each household's continuous state.
+
+    Mirrors what the kernels used to compute inline via `_annuity_factor_scalar`
+    using `state_cur[y_1_idx]` and `state_cur[spr_idx]`. For ablation systems
+    where one or both axes are absent from the state vector, falls back to the
+    model's scalar y_1/spr (set by `build_model` from the VAR sample mean).
+
+    `state_coords_age` is the per-household state at one age, shape
+    (n_household, k) with k >= n_state. Both un-padded (k == n_state) and
+    width-3 padded inputs are accepted. Indices `y_1_index_in_state` and
+    `spr_index_in_state` are in the original n_state space and remain valid
+    against the padded layout because originals occupy positions [0:n_state].
+    """
+    n = state_coords_age.shape[0]
+    y_1_idx = model.y_1_index_in_state
+    spr_idx = model.spr_index_in_state
+
+    if y_1_idx is not None:
+        y_1_arr = np.asarray(state_coords_age[:, int(y_1_idx)], dtype=float)
+    else:
+        y_1_arr = np.full(n, float(model.y_1_scalar_fallback), dtype=float)
+
+    if spr_idx is not None:
+        spr_arr = np.asarray(state_coords_age[:, int(spr_idx)], dtype=float)
+    else:
+        spr_arr = np.full(n, float(model.spr_scalar_fallback), dtype=float)
+
+    return np.ascontiguousarray(annuity_factor(y_1_arr, spr_arr, int(model.b_bar)), dtype=float)
 
 
 @dataclass
@@ -85,6 +193,104 @@ def _coerce_tuple(value: Any, n: int) -> tuple[int, ...]:
     return tuple(int(v) for v in value)
 
 
+# Lobatto Z windows must agree with `gauss_hermite_prescribed_tails` in
+# lifecycle/quadrature_with_tails.py. K=7 has three disjoint valid windows.
+_LOBATTO_K7_LO = 1.36
+_LOBATTO_K7_MID = (1.81, 2.86)
+_LOBATTO_K7_HI = 3.28
+
+
+def _is_Z_valid_for_lobatto_K(Z: float, K: int) -> bool:
+    """Echo the validity windows enforced inside `gauss_hermite_prescribed_tails`."""
+    if K == 3:
+        return Z > 1.0
+    if K == 5:
+        return Z >= math.sqrt(5.0)
+    if K == 7:
+        return (Z < _LOBATTO_K7_LO
+                or (_LOBATTO_K7_MID[0] < Z < _LOBATTO_K7_MID[1])
+                or Z >= _LOBATTO_K7_HI)
+    return False
+
+
+def _adjust_lobatto_axis(K_target: int,
+                         Z_base: float | None,
+                         axis_label: str) -> tuple[int, float | None, str | None]:
+    """Choose the eval (K, Z) for one axis given the eval-mode K_target.
+
+    Returns
+    -------
+    K_eval : int
+        K to use on this axis. Always >= 1.
+    Z_eval : float | None
+        Z if the axis remains Lobatto; None if we fall back to GH.
+    warning : str | None
+        Human-readable note if behaviour deviates from the requested K.
+
+    Strategy when `K_target` is not directly usable by the closed-form
+    Lobatto rule (only K in {3, 5, 7} is legal, and Z must be in the
+    K-specific valid window):
+
+    1. If `K_target in {3, 5, 7}` and Z is valid for it, use it.
+    2. Otherwise prefer the smallest valid Lobatto K >= K_target (capped
+       at 7) that admits Z — `next_finer` / `double` ought to produce a
+       rule at least as fine as the solver's, never coarser.
+    3. If no K >= K_target works, fall back to the largest valid K
+       <= K_target so the eval rule remains Lobatto rather than silently
+       dropping the explicit tail node.
+    4. If no Lobatto K admits Z, drop this axis to pure Gauss-Hermite
+       at K_target (Z = None).
+    """
+    if Z_base is None:
+        return K_target, None, None
+
+    if K_target in (3, 5, 7) and _is_Z_valid_for_lobatto_K(Z_base, K_target):
+        return K_target, float(Z_base), None
+
+    for K_alt in (3, 5, 7):
+        if K_alt >= K_target and _is_Z_valid_for_lobatto_K(Z_base, K_alt):
+            return K_alt, float(Z_base), (
+                f"{axis_label}: clamped K {K_target}->{K_alt} "
+                f"(Lobatto needs K in {{3,5,7}}; Z={Z_base} valid for K={K_alt})."
+            )
+
+    for K_alt in (7, 5, 3):
+        if K_alt <= K_target and _is_Z_valid_for_lobatto_K(Z_base, K_alt):
+            return K_alt, float(Z_base), (
+                f"{axis_label}: clamped K {K_target}->{K_alt} "
+                f"(no larger Lobatto K admits Z={Z_base})."
+            )
+
+    return K_target, None, (
+        f"{axis_label}: Z={Z_base} outside every Lobatto window in "
+        f"{{3,5,7}}; falling back to pure Gauss-Hermite on this axis."
+    )
+
+
+def _normalize_lobatto_per_axis(value: Any, n_axes: int) -> tuple[float | None, ...]:
+    """Materialise a `lobatto_Z` field to a length-`n_axes` tuple of None|float.
+
+    Mirrors `lifecycle.discretization._normalize_lobatto_Z` semantics so we
+    can map per-axis without rebuilding a `Precompute`.
+    """
+    if value is None:
+        return (None,) * int(n_axes)
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
+        Z = float(value)
+        return (Z,) * int(n_axes)
+    out: list[float | None] = []
+    for v in value:
+        if v is None:
+            out.append(None)
+        else:
+            out.append(float(v))
+    if len(out) != int(n_axes):
+        raise ValueError(
+            f"lobatto_Z length {len(out)} does not match expected {n_axes}"
+        )
+    return tuple(out)
+
+
 def _build_eval_disc(base: DiscretizationConfig,
                      n_state: int,
                      n_ret: int,
@@ -92,7 +298,20 @@ def _build_eval_disc(base: DiscretizationConfig,
                      ret_override: tuple[int, ...] | None,
                      state_override: tuple[int, ...] | None,
                      eta_override: int | None,
-                     eps_override: int | None) -> DiscretizationConfig:
+                     eps_override: int | None,
+                     *,
+                     disable_lobatto: bool = False) -> DiscretizationConfig:
+    """Build the eval-rule `DiscretizationConfig` from a solver-config base.
+
+    The eval rule mirrors the solver's quadrature with K bumped per
+    `eval_mode`. As of 2026-05-04 this also propagates the solver's
+    `ret_lobatto_Z` and `state_lobatto_Z` per-axis (see
+    `_adjust_lobatto_axis` for the K/Z compatibility logic). Pre-fix
+    behaviour (pure Gauss-Hermite eval rule, ignoring solver's Lobatto
+    config) is recoverable via `disable_lobatto=True`; that variant is
+    diagnostically interesting because the rule-mismatch term is exactly
+    what the fix removes.
+    """
     ret_base = _coerce_tuple(base.n_ret_nodes_1d, n_ret)
     state_base = _coerce_tuple(base.n_state_quad_nodes, n_state)
 
@@ -123,6 +342,41 @@ def _build_eval_disc(base: DiscretizationConfig,
     if eps_override is not None:
         eps_eval = int(eps_override)
 
+    if disable_lobatto:
+        ret_lobatto_eval: Any = None
+        state_lobatto_eval: Any = None
+    else:
+        ret_Z_base = _normalize_lobatto_per_axis(base.ret_lobatto_Z, n_ret)
+        state_Z_base = _normalize_lobatto_per_axis(base.state_lobatto_Z, n_state)
+
+        ret_K_out: list[int] = []
+        ret_Z_out: list[float | None] = []
+        warnings: list[str] = []
+        for d, (K_t, Z_b) in enumerate(zip(ret_eval, ret_Z_base)):
+            K_e, Z_e, warn = _adjust_lobatto_axis(int(K_t), Z_b, f"ret axis {d}")
+            ret_K_out.append(K_e)
+            ret_Z_out.append(Z_e)
+            if warn is not None:
+                warnings.append(warn)
+        ret_eval = tuple(ret_K_out)
+        ret_lobatto_eval = (tuple(ret_Z_out)
+                            if any(z is not None for z in ret_Z_out) else None)
+
+        state_K_out: list[int] = []
+        state_Z_out: list[float | None] = []
+        for d, (K_t, Z_b) in enumerate(zip(state_eval, state_Z_base)):
+            K_e, Z_e, warn = _adjust_lobatto_axis(int(K_t), Z_b, f"state axis {d}")
+            state_K_out.append(K_e)
+            state_Z_out.append(Z_e)
+            if warn is not None:
+                warnings.append(warn)
+        state_eval = tuple(state_K_out)
+        state_lobatto_eval = (tuple(state_Z_out)
+                              if any(z is not None for z in state_Z_out) else None)
+
+        for w in dict.fromkeys(warnings):  # dedupe, preserve order
+            print(f"[_build_eval_disc] WARNING: {w}")
+
     return DiscretizationConfig(
         n_wealth=int(base.n_wealth),
         wealth_min=float(base.wealth_min),
@@ -139,6 +393,8 @@ def _build_eval_disc(base: DiscretizationConfig,
         n_eta_nodes=int(eta_eval),
         n_ret_nodes_1d=tuple(int(v) for v in ret_eval),
         n_state_quad_nodes=tuple(int(v) for v in state_eval),
+        ret_lobatto_Z=ret_lobatto_eval,
+        state_lobatto_Z=state_lobatto_eval,
     )
 
 
@@ -148,7 +404,9 @@ def _load_bundle_context(bundle_path: Path,
                          ret_override: tuple[int, ...] | None,
                          state_override: tuple[int, ...] | None,
                          eta_override: int | None,
-                         eps_override: int | None) -> EulerBundleContext:
+                         eps_override: int | None,
+                         *,
+                         disable_lobatto: bool = False) -> EulerBundleContext:
     model, ages = _build_model_from_bundle(model_bundle)
     C, S, B, _diag, metadata = load_policy_bundle(bundle_path)
     summary = _summary(metadata)
@@ -166,6 +424,7 @@ def _load_bundle_context(bundle_path: Path,
         state_override=state_override,
         eta_override=eta_override,
         eps_override=eps_override,
+        disable_lobatto=disable_lobatto,
     )
 
     pc_policy = Precompute(model, disc_policy, verbose=False)
@@ -246,10 +505,15 @@ def _interp_continuation_c_mpc(
     grids_0: np.ndarray,
     grids_1: np.ndarray,
     grids_2: np.ndarray,
+    N0: int,
     N1: int,
     N2: int,
     min_consumption: float,
 ) -> tuple[float, float]:
+    # Singleton-aware bracketing: an axis with size 1 is an absent state
+    # dimension (ablation padding), and the corner indexing collapses to use
+    # the lone slot via hi == lo. Preserves the System IV path (all sizes > 1)
+    # bit-for-bit.
     ds0 = s_next_0 - state_bracket_shift[0]
     ds1 = s_next_1 - state_bracket_shift[1]
     ds2 = s_next_2 - state_bracket_shift[2]
@@ -257,15 +521,18 @@ def _interp_continuation_c_mpc(
     b1 = state_bracket_L_inv[1, 0] * ds0 + state_bracket_L_inv[1, 1] * ds1 + state_bracket_L_inv[1, 2] * ds2
     b2 = state_bracket_L_inv[2, 0] * ds0 + state_bracket_L_inv[2, 1] * ds1 + state_bracket_L_inv[2, 2] * ds2
 
-    if b0 <= grids_0[0]:
+    if N0 == 1:
         lo0 = 0
         f0 = 0.0
-    elif b0 >= grids_0[len(grids_0) - 1]:
-        lo0 = len(grids_0) - 2
+    elif b0 <= grids_0[0]:
+        lo0 = 0
+        f0 = 0.0
+    elif b0 >= grids_0[N0 - 1]:
+        lo0 = N0 - 2
         f0 = 1.0
     else:
         lo0 = 0
-        for ii in range(len(grids_0) - 1):
+        for ii in range(N0 - 1):
             if grids_0[ii + 1] > b0:
                 lo0 = ii
                 break
@@ -273,15 +540,18 @@ def _interp_continuation_c_mpc(
         f0 = (b0 - grids_0[lo0]) / dg0 if dg0 > 1e-30 else 0.0
         f0 = max(0.0, min(1.0, f0))
 
-    if b1 <= grids_1[0]:
+    if N1 == 1:
         lo1 = 0
         f1 = 0.0
-    elif b1 >= grids_1[len(grids_1) - 1]:
-        lo1 = len(grids_1) - 2
+    elif b1 <= grids_1[0]:
+        lo1 = 0
+        f1 = 0.0
+    elif b1 >= grids_1[N1 - 1]:
+        lo1 = N1 - 2
         f1 = 1.0
     else:
         lo1 = 0
-        for ii in range(len(grids_1) - 1):
+        for ii in range(N1 - 1):
             if grids_1[ii + 1] > b1:
                 lo1 = ii
                 break
@@ -289,15 +559,18 @@ def _interp_continuation_c_mpc(
         f1 = (b1 - grids_1[lo1]) / dg1 if dg1 > 1e-30 else 0.0
         f1 = max(0.0, min(1.0, f1))
 
-    if b2 <= grids_2[0]:
+    if N2 == 1:
         lo2 = 0
         f2 = 0.0
-    elif b2 >= grids_2[len(grids_2) - 1]:
-        lo2 = len(grids_2) - 2
+    elif b2 <= grids_2[0]:
+        lo2 = 0
+        f2 = 0.0
+    elif b2 >= grids_2[N2 - 1]:
+        lo2 = N2 - 2
         f2 = 1.0
     else:
         lo2 = 0
-        for ii in range(len(grids_2) - 1):
+        for ii in range(N2 - 1):
             if grids_2[ii + 1] > b2:
                 lo2 = ii
                 break
@@ -314,14 +587,18 @@ def _interp_continuation_c_mpc(
     w110 = f0 * f1 * (1.0 - f2)
     w111 = f0 * f1 * f2
 
+    hi0 = lo0 if N0 == 1 else lo0 + 1
+    hi1 = lo1 if N1 == 1 else lo1 + 1
+    hi2 = lo2 if N2 == 1 else lo2 + 1
+
     j000 = lo0 * N1 * N2 + lo1 * N2 + lo2
-    j001 = lo0 * N1 * N2 + lo1 * N2 + (lo2 + 1)
-    j010 = lo0 * N1 * N2 + (lo1 + 1) * N2 + lo2
-    j011 = lo0 * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
-    j100 = (lo0 + 1) * N1 * N2 + lo1 * N2 + lo2
-    j101 = (lo0 + 1) * N1 * N2 + lo1 * N2 + (lo2 + 1)
-    j110 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + lo2
-    j111 = (lo0 + 1) * N1 * N2 + (lo1 + 1) * N2 + (lo2 + 1)
+    j001 = lo0 * N1 * N2 + lo1 * N2 + hi2
+    j010 = lo0 * N1 * N2 + hi1 * N2 + lo2
+    j011 = lo0 * N1 * N2 + hi1 * N2 + hi2
+    j100 = hi0 * N1 * N2 + lo1 * N2 + lo2
+    j101 = hi0 * N1 * N2 + lo1 * N2 + hi2
+    j110 = hi0 * N1 * N2 + hi1 * N2 + lo2
+    j111 = hi0 * N1 * N2 + hi1 * N2 + hi2
 
     iz_lo = int((z_next - z_grid[0]) / dz)
     iz_lo = max(0, min(iz_lo, len(z_grid) - 2))
@@ -376,6 +653,7 @@ def _compute_euler_sum_retirement_continuous(
     grids_0: np.ndarray,
     grids_1: np.ndarray,
     grids_2: np.ndarray,
+    N0: int,
     N1: int,
     N2: int,
     exp_ret_bill: np.ndarray,
@@ -384,8 +662,7 @@ def _compute_euler_sum_retirement_continuous(
     ret_weights: np.ndarray,
     gamma: float,
     b_bar: int,
-    y_1_idx: int,
-    spr_idx: int,
+    annuity_factor_cur: float,
     min_wealth_inv: float = 1e-10,
     min_consumption: float = 1e-10,
     prob_skip: float = 1e-12,
@@ -395,11 +672,9 @@ def _compute_euler_sum_retirement_continuous(
     prob_death = 1.0 - psi
     pension_next = _interp_z_row_value(z_cur, z_grid, pension_row)
 
-    annuity_factor_cur = _annuity_factor_scalar(
-        float(state_cur[y_1_idx]),
-        float(state_cur[spr_idx]),
-        b_bar,
-    )
+    # annuity_factor_cur is precomputed by the caller from state_cur[y_1_idx]
+    # / state_cur[spr_idx], or from the model's scalar fallback when one or
+    # both axes are absent (System I/II/III).
     base_mu_r_0 = const_r[0] + A_r[0, 0] * state_cur[0] + A_r[0, 1] * state_cur[1] + A_r[0, 2] * state_cur[2]
     base_mu_r_1 = const_r[1] + A_r[1, 0] * state_cur[0] + A_r[1, 1] * state_cur[1] + A_r[1, 2] * state_cur[2]
     base_mu_r_2 = const_r[2] + A_r[2, 0] * state_cur[0] + A_r[2, 1] * state_cur[1] + A_r[2, 2] * state_cur[2]
@@ -449,6 +724,7 @@ def _compute_euler_sum_retirement_continuous(
                 grids_0,
                 grids_1,
                 grids_2,
+                N0,
                 N1,
                 N2,
                 min_consumption,
@@ -497,6 +773,7 @@ def _compute_euler_sum_working_continuous(
     grids_0: np.ndarray,
     grids_1: np.ndarray,
     grids_2: np.ndarray,
+    N0: int,
     N1: int,
     N2: int,
     exp_ret_bill: np.ndarray,
@@ -505,8 +782,7 @@ def _compute_euler_sum_working_continuous(
     ret_weights: np.ndarray,
     gamma: float,
     b_bar: int,
-    y_1_idx: int,
-    spr_idx: int,
+    annuity_factor_cur: float,
     use_pension_next: bool,
     min_wealth_inv: float = 1e-10,
     min_consumption: float = 1e-10,
@@ -516,11 +792,8 @@ def _compute_euler_sum_working_continuous(
     psi = _interp_z_row_value(z_cur, z_grid, survival_row)
     prob_death = 1.0 - psi
 
-    annuity_factor_cur = _annuity_factor_scalar(
-        float(state_cur[y_1_idx]),
-        float(state_cur[spr_idx]),
-        b_bar,
-    )
+    # annuity_factor_cur is precomputed by the caller (see retirement-branch
+    # comment above).
     base_mu_r_0 = const_r[0] + A_r[0, 0] * state_cur[0] + A_r[0, 1] * state_cur[1] + A_r[0, 2] * state_cur[2]
     base_mu_r_1 = const_r[1] + A_r[1, 0] * state_cur[0] + A_r[1, 1] * state_cur[1] + A_r[1, 2] * state_cur[2]
     base_mu_r_2 = const_r[2] + A_r[2, 0] * state_cur[0] + A_r[2, 1] * state_cur[1] + A_r[2, 2] * state_cur[2]
@@ -610,6 +883,7 @@ def _compute_euler_sum_working_continuous(
                         grids_0,
                         grids_1,
                         grids_2,
+                        N0,
                         N1,
                         N2,
                         min_consumption,
@@ -655,6 +929,7 @@ def _evaluate_age_errors(
     grids_0: np.ndarray,
     grids_1: np.ndarray,
     grids_2: np.ndarray,
+    N0: int,
     N1: int,
     N2: int,
     exp_ret_bill: np.ndarray,
@@ -664,8 +939,7 @@ def _evaluate_age_errors(
     gamma: float,
     beta: float,
     b_bar: int,
-    y_1_idx: int,
-    spr_idx: int,
+    annuity_factors_age: np.ndarray,
     kink_tol: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(household_idx)
@@ -691,6 +965,7 @@ def _evaluate_age_errors(
 
         state_cur = state_coords_age[i]
         z_cur = z_age[i]
+        annuity_cur = annuity_factors_age[i]
         if age >= retire_age:
             e_sum = _compute_euler_sum_retirement_continuous(
                 alpha_s_age[i],
@@ -716,6 +991,7 @@ def _evaluate_age_errors(
                 grids_0,
                 grids_1,
                 grids_2,
+                N0,
                 N1,
                 N2,
                 exp_ret_bill,
@@ -724,8 +1000,7 @@ def _evaluate_age_errors(
                 ret_weights,
                 gamma,
                 b_bar,
-                y_1_idx,
-                spr_idx,
+                annuity_cur,
             )
         else:
             e_sum = _compute_euler_sum_working_continuous(
@@ -758,6 +1033,7 @@ def _evaluate_age_errors(
                 grids_0,
                 grids_1,
                 grids_2,
+                N0,
                 N1,
                 N2,
                 exp_ret_bill,
@@ -766,8 +1042,7 @@ def _evaluate_age_errors(
                 ret_weights,
                 gamma,
                 b_bar,
-                y_1_idx,
-                spr_idx,
+                annuity_cur,
                 use_pension_next,
             )
 
@@ -820,7 +1095,18 @@ def _simulate_bundle_window(ctx: EulerBundleContext,
 
     if warm_start is not None:
         init_z_val = np.asarray(warm_start["z"], dtype=np.float64)
-        init_s_coords = np.ascontiguousarray(warm_start["state_coords"], dtype=np.float64)
+        warm_coords = np.asarray(warm_start["state_coords"], dtype=np.float64)
+        # `_pad_simulation_state_inputs_to_3d` expects (n_sim, n_state). The
+        # in-tree warm-start path goes through `simulate_lifecycle`, which
+        # truncates state_coords to (n_sim, n_age, n_state) — already correct.
+        # If a caller hands in width-3 padded coords (e.g. chained from
+        # `_simulate_bundle_window` itself), trim the padded zeros back off.
+        n_state_model = int(model.n_state)
+        if warm_coords.ndim != 2:
+            raise ValueError(f"warm_start['state_coords'] must be 2D, got shape {warm_coords.shape}")
+        if warm_coords.shape[1] == 3 and n_state_model < 3:
+            warm_coords = warm_coords[:, :n_state_model]
+        init_s_coords = np.ascontiguousarray(warm_coords)
         init_x = np.asarray(warm_start["x"], dtype=np.float64)
         initial_income_arr = np.asarray(warm_start["income"], dtype=np.float64)
         if init_z_val.shape[0] != n_simulations or init_s_coords.shape[0] != n_simulations or init_x.shape[0] != n_simulations:
@@ -871,9 +1157,12 @@ def _simulate_bundle_window(ctx: EulerBundleContext,
         raise ValueError("Constructed initial_x must be non-negative.")
 
     uniform_draws = rng.uniform(size=(n_simulations, len(ages_win), 4))
-    n_state = int(model.n_state)
     n_ret = int(model.n_ret)
-    normal_draws = rng.standard_normal(size=(n_simulations, len(ages_win), n_ret + 2 + n_state))
+    # The 3-coord simulation core always reads three state-innovation columns
+    # from `normal_draws`; ablations get zeros in the absent rows of the padded
+    # Cholesky factor, so the extra columns are unused but must be present.
+    n_normal_cols = n_ret + 2 + 3
+    normal_draws = rng.standard_normal(size=(n_simulations, len(ages_win), n_normal_cols))
 
     if return_draw_mode == "monte_carlo":
         ret_factor_arr = _build_return_factor(model.Sigma_r_cond)
@@ -881,6 +1170,8 @@ def _simulate_bundle_window(ctx: EulerBundleContext,
     else:
         ret_factor_arr = np.zeros((n_ret, n_ret), dtype=float)
         use_mc_returns = False
+
+    state_inputs = _pad_simulation_state_inputs_to_3d(pc, model, init_s_coords)
 
     results = simulate_lifecycle_core(
         C_mat=C_win,
@@ -911,22 +1202,22 @@ def _simulate_bundle_window(ctx: EulerBundleContext,
         constrained=bool(model.constrained),
         use_mc_returns=use_mc_returns,
         initial_z=np.ascontiguousarray(init_z_val),
-        initial_s=init_s_coords,
+        initial_s=state_inputs["initial_s"],
         initial_x=np.ascontiguousarray(init_x),
         initial_income=np.ascontiguousarray(initial_income_arr),
         uniform_draws=np.ascontiguousarray(uniform_draws),
         normal_draws=np.ascontiguousarray(normal_draws),
-        state_grids_0=np.ascontiguousarray(pc.state_bracket_grids[0]),
-        state_grids_1=np.ascontiguousarray(pc.state_bracket_grids[1]),
-        state_grids_2=np.ascontiguousarray(pc.state_bracket_grids[2]),
-        state_bracket_shift=np.ascontiguousarray(pc.state_bracket_shift),
-        state_bracket_L_inv=np.ascontiguousarray(pc.state_bracket_L_inv),
-        L_ss=np.ascontiguousarray(np.linalg.cholesky(0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T))),
-        Phi_0_state=np.ascontiguousarray(model.Phi_0_state),
-        Phi_11=np.ascontiguousarray(model.Phi_11),
+        state_grids_0=state_inputs["state_grids_0"],
+        state_grids_1=state_inputs["state_grids_1"],
+        state_grids_2=state_inputs["state_grids_2"],
+        state_bracket_shift=state_inputs["state_bracket_shift"],
+        state_bracket_L_inv=state_inputs["state_bracket_L_inv"],
+        L_ss=state_inputs["L_ss"],
+        Phi_0_state=state_inputs["Phi_0_state"],
+        Phi_11=state_inputs["Phi_11"],
         const_r=np.ascontiguousarray(pc.const_r),
-        A_r=np.ascontiguousarray(pc.A_r),
-        M_matrix=np.ascontiguousarray(model.M),
+        A_r=state_inputs["A_r"],
+        M_matrix=state_inputs["M_matrix"],
     )
 
     (
@@ -1231,6 +1522,7 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
         state_override=tuple(args.eval_state_nodes) if args.eval_state_nodes else None,
         eta_override=args.eval_eta_nodes,
         eps_override=args.eval_eps_nodes,
+        disable_lobatto=bool(getattr(args, "eval_disable_lobatto", False)),
     )
 
     warm_start = None
@@ -1261,8 +1553,7 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
     pension_row = np.ascontiguousarray(
         pc_eval.pension_after_tax[int(model.retire_age - model.start_age), :]
     )
-    N1 = len(pc_eval.state_bracket_grids[1])
-    N2 = len(pc_eval.state_bracket_grids[2])
+    eval_pad = _pad_eval_state_inputs_to_3d(pc_eval, model)
 
     ages_win = sim["ages"]
     for t in range(len(ages_win) - 1):
@@ -1271,10 +1562,13 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
         sample_idx = _age_sample_indices(alive_mask, args.eval_households_per_age, rng)
         phase = "retirement" if age >= model.retire_age else "working"
 
+        state_coords_age = np.ascontiguousarray(sim["state_coords"][:, t, :])
+        annuity_factors_age = _annuity_factors_per_household(model, state_coords_age)
+
         ee, valid, is_constrained = _evaluate_age_errors(
             sample_idx,
             np.ascontiguousarray(sim["z"][:, t]),
-            np.ascontiguousarray(sim["state_coords"][:, t, :]),
+            state_coords_age,
             np.ascontiguousarray(sim["c"][:, t]),
             np.ascontiguousarray(sim["alpha_s"][:, t]),
             np.ascontiguousarray(sim["alpha_b"][:, t]),
@@ -1293,20 +1587,21 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
             np.ascontiguousarray(pc_eval.eta_weights),
             np.ascontiguousarray(pc_eval.eps_nodes),
             np.ascontiguousarray(pc_eval.eps_weights),
-            np.ascontiguousarray(pc_eval.v_nodes),
+            eval_pad["v_nodes"],
             np.ascontiguousarray(pc_eval.v_weights),
             np.ascontiguousarray(pc_eval.M_v_nodes),
             np.ascontiguousarray(pc_eval.const_r),
-            np.ascontiguousarray(pc_eval.A_r),
-            np.ascontiguousarray(model.Phi_0_state),
-            np.ascontiguousarray(model.Phi_11),
-            np.ascontiguousarray(pc_eval.state_bracket_shift),
-            np.ascontiguousarray(pc_eval.state_bracket_L_inv),
-            np.ascontiguousarray(pc_eval.state_bracket_grids[0]),
-            np.ascontiguousarray(pc_eval.state_bracket_grids[1]),
-            np.ascontiguousarray(pc_eval.state_bracket_grids[2]),
-            int(N1),
-            int(N2),
+            eval_pad["A_r"],
+            eval_pad["Phi_0_state"],
+            eval_pad["Phi_11"],
+            eval_pad["state_bracket_shift"],
+            eval_pad["state_bracket_L_inv"],
+            eval_pad["state_grids_0"],
+            eval_pad["state_grids_1"],
+            eval_pad["state_grids_2"],
+            int(eval_pad["N0"]),
+            int(eval_pad["N1"]),
+            int(eval_pad["N2"]),
             np.ascontiguousarray(pc_eval.exp_ret_bill),
             np.ascontiguousarray(pc_eval.exp_ret_stock),
             np.ascontiguousarray(pc_eval.exp_ret_bond),
@@ -1314,8 +1609,7 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
             float(model.gamma),
             float(model.beta),
             int(model.b_bar),
-            int(model.y_1_index_in_state),
-            int(model.spr_index_in_state),
+            annuity_factors_age,
             float(args.kink_tol),
         )
 
@@ -1360,6 +1654,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-state-nodes", nargs="+", type=int, default=None)
     p.add_argument("--eval-eta-nodes", type=int, default=None)
     p.add_argument("--eval-eps-nodes", type=int, default=None)
+    p.add_argument(
+        "--eval-disable-lobatto",
+        action="store_true",
+        help=(
+            "Build the eval rule as pure Gauss-Hermite even when the solver used "
+            "Hermite-Lobatto with prescribed +/-Z tail nodes. Default behaviour "
+            "(without this flag) propagates the solver's `ret_lobatto_Z` and "
+            "`state_lobatto_Z` so eval and solver agree on tail coverage. The "
+            "GH-only variant is useful for measuring the rule-mismatch term in "
+            "isolation."
+        ),
+    )
     p.add_argument("--n-simulations", type=int, default=1000)
     p.add_argument("--eval-households-per-age", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)

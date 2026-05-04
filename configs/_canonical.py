@@ -57,18 +57,28 @@ BASE_CONFIG = {
 #   region (see docs/STATE_SPACE.md §wealth_min and
 #   docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md). precompute.py reads this directly.
 CANONICAL_DISC = DiscretizationConfig(
-    n_wealth=150,
-    wealth_min=0.05,
-    n_savings=150,
+    n_wealth=180,
+    wealth_min=0.13,
+    wealth_max=750.0,
+    n_savings=180,
     state_grid_sizes=(7, 7, 7),
     state_grid_mode="principal",
     state_n_stds=(2.0, 2.25, 2.25),
-    n_z=9,
+    n_z=11,
     n_stds=3.0,
-    n_eps_nodes=3,
-    n_eta_nodes=3,
-    n_ret_nodes_1d=(3, 7, 5),
-    n_state_quad_nodes=(2, 2, 5),
+    n_eps_nodes=4,
+    n_eta_nodes=4,
+    # Lobatto on stock/bond return-residual axes (ret[1], ret[2]) and on the
+    # spr/y_1 state-innovation axes (state[1], state[2]). These are the four
+    # axes where the empirical bond-tail discrete-free-lunch lives. See
+    # diagnostics_reports/diagnostics_quadrature_arbitrage_nz11_v3.md and
+    # scripts/diagnostics/_diag_per_axis_tail.py for the per-axis evidence.
+    # Z=7 (sigma units of the standardised orthogonalised axis) puts the
+    # explicit tail node at +/-7 sigma => +/-17% R_bond surprise on ret[2].
+    n_ret_nodes_1d=(3, 5, 5),
+    ret_lobatto_Z=(None, 7.0, 7.0),
+    n_state_quad_nodes=(3, 5, 5),
+    state_lobatto_Z=(None, 7.0, 7.0),
 )
 
 

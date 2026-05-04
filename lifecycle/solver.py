@@ -325,6 +325,25 @@ def fast_interp_1d_with_slope(x, x_grid, y_grid):
     return val, slope
 
 
+@njit(fastmath=True, inline='always')
+def _eval_linear_bracketed(y_grid, iw, dx_lo, inv_dw):
+    """Linear interp (val, slope) on a precomputed wealth bracket.
+
+    Caller obtains:
+        iw, _, inv_dw = find_bracket(x, x_grid)
+        dx_lo = x - x_grid[iw]
+    Then calls this for each y stencil — one binary search amortized over
+    many corner evaluations. Result matches fast_interp_1d_with_slope(x,
+    x_grid, y_grid) (find_bracket's lo/inv_dw are derived the same way,
+    including extrap clamping to lo=0 / lo=n-2 with off-segment frac).
+    """
+    y0 = y_grid[iw]
+    y1 = y_grid[iw + 1]
+    slope = (y1 - y0) * inv_dw
+    val = y0 + slope * dx_lo
+    return val, slope
+
+
 @njit(fastmath=True)
 def find_bracket(x, grid):
     """Binary search for interpolation bracket on a sorted grid.
@@ -565,6 +584,85 @@ def pchip_interp_1d(x, x_grid, y_grid):
 
 
 @njit(fastmath=True)
+def _pchip_precompute_slopes(x_grid, y_grid, m_left, m_right):
+    """Fill m_left, m_right (length n-1) with per-segment Hermite slopes
+    matching pchip_interp_1d. Lets callers reuse slopes across many x
+    queries on the same (x_grid, y_grid). Degenerate segments (h_i <
+    1e-30) get zero slopes; the eval helper short-circuits on those.
+    """
+    n = len(x_grid)
+    if n < 2:
+        return
+    n_seg = n - 1
+
+    for i in range(n_seg):
+        h_i = x_grid[i + 1] - x_grid[i]
+        if h_i < 1e-30:
+            m_left[i] = 0.0
+            m_right[i] = 0.0
+            continue
+        d_i = (y_grid[i + 1] - y_grid[i]) / h_i
+
+        if i == 0:
+            h_next = x_grid[2] - x_grid[1] if n >= 3 else h_i
+            d_next = (y_grid[2] - y_grid[1]) / h_next if n >= 3 else d_i
+            m_left[i] = _pchip_endpoint_slope(d_i, d_next, h_i, h_next)
+        else:
+            h_prev = x_grid[i] - x_grid[i - 1]
+            d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev
+            m_left[i] = _pchip_slope_nonuniform(d_prev, d_i, h_prev, h_i)
+
+        if i == n_seg - 1:
+            h_prev = x_grid[i] - x_grid[i - 1] if n >= 3 else h_i
+            d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev if n >= 3 else d_i
+            m_right[i] = _pchip_endpoint_slope(d_i, d_prev, h_i, h_prev)
+        else:
+            h_next = x_grid[i + 2] - x_grid[i + 1]
+            d_next = (y_grid[i + 2] - y_grid[i + 1]) / h_next
+            m_right[i] = _pchip_slope_nonuniform(d_i, d_next, h_i, h_next)
+
+
+@njit(fastmath=True)
+def _pchip_eval_with_slopes(x, x_grid, y_grid, m_left, m_right):
+    """Evaluate PCHIP at x using slopes from _pchip_precompute_slopes.
+    Boundary and degenerate-segment behavior matches pchip_interp_1d."""
+    n = len(x_grid)
+    if n < 2:
+        return y_grid[0]
+
+    if x <= x_grid[0]:
+        h = x_grid[1] - x_grid[0] + 1e-30
+        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / h
+    if x >= x_grid[n - 1]:
+        h = x_grid[n - 1] - x_grid[n - 2] + 1e-30
+        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / h
+
+    lo, hi = 0, n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if x_grid[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+    i = lo
+
+    h_i = x_grid[i + 1] - x_grid[i]
+    if h_i < 1e-30:
+        return y_grid[i]
+
+    t = (x - x_grid[i]) / h_i
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+
+    return (h00 * y_grid[i] + h10 * h_i * m_left[i]
+            + h01 * y_grid[i + 1] + h11 * h_i * m_right[i])
+
+
+@njit(fastmath=True)
 def _interp_z_wealth(c_next_full, j_s, iz_lo, frac_z, iw, frac_w, inv_dw, n_z, use_cubic, min_c):
     """Interpolate c_next and mpc at a single state-grid corner j_s.
 
@@ -749,14 +847,17 @@ def compute_foc_jac_retirement_quad(
                 x_next = pension_next_scalar
 
             # --- Trilinear interpolation of c_next and mpc ---
-            c000, mpc000 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j000, :])
-            c001, mpc001 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j001, :])
-            c010, mpc010 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j010, :])
-            c011, mpc011 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j011, :])
-            c100, mpc100 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j100, :])
-            c101, mpc101 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j101, :])
-            c110, mpc110 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j110, :])
-            c111, mpc111 = fast_interp_1d_with_slope(x_next, wealth_grid, c_next_full[j111, :])
+            # Bracket x_next in wealth_grid once; all 8 state corners share it.
+            iw_x, _, inv_dw_x = find_bracket(x_next, wealth_grid)
+            dx_x = x_next - wealth_grid[iw_x]
+            c000, mpc000 = _eval_linear_bracketed(c_next_full[j000, :], iw_x, dx_x, inv_dw_x)
+            c001, mpc001 = _eval_linear_bracketed(c_next_full[j001, :], iw_x, dx_x, inv_dw_x)
+            c010, mpc010 = _eval_linear_bracketed(c_next_full[j010, :], iw_x, dx_x, inv_dw_x)
+            c011, mpc011 = _eval_linear_bracketed(c_next_full[j011, :], iw_x, dx_x, inv_dw_x)
+            c100, mpc100 = _eval_linear_bracketed(c_next_full[j100, :], iw_x, dx_x, inv_dw_x)
+            c101, mpc101 = _eval_linear_bracketed(c_next_full[j101, :], iw_x, dx_x, inv_dw_x)
+            c110, mpc110 = _eval_linear_bracketed(c_next_full[j110, :], iw_x, dx_x, inv_dw_x)
+            c111, mpc111 = _eval_linear_bracketed(c_next_full[j111, :], iw_x, dx_x, inv_dw_x)
 
             c_next = (w000 * c000 + w001 * c001 + w010 * c010 + w011 * c011
                       + w100 * c100 + w101 * c101 + w110 * c110 + w111 * c111)
@@ -2210,6 +2311,9 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
         temp_c = np.empty(n_savings + 1)
         temp_s = np.empty(n_savings + 1)
         temp_b = np.empty(n_savings + 1)
+        ml_c = np.empty(n_savings); mr_c = np.empty(n_savings)
+        ml_s = np.empty(n_savings); mr_s = np.empty(n_savings)
+        ml_b = np.empty(n_savings); mr_b = np.empty(n_savings)
 
         for z_i in range(n_z):
             psi = psi_vec[z_i]
@@ -2323,11 +2427,14 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                     if drop > diag_float[i_s, 0]:
                         diag_float[i_s, 0] = drop
 
+            _pchip_precompute_slopes(temp_x, temp_c, ml_c, mr_c)
+            _pchip_precompute_slopes(temp_x, temp_s, ml_s, mr_s)
+            _pchip_precompute_slopes(temp_x, temp_b, ml_b, mr_b)
             for w_i in range(n_wealth):
                 w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_c)
-                policy_alpha_s[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_s)
-                policy_alpha_b[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_b)
+                policy_c[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_c, ml_c, mr_c)
+                policy_alpha_s[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_s, ml_s, mr_s)
+                policy_alpha_b[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_b, ml_b, mr_b)
 
     return diag_int, diag_float
 
@@ -2421,6 +2528,9 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
         temp_c = np.empty(n_savings + 1)
         temp_s = np.empty(n_savings + 1)
         temp_b = np.empty(n_savings + 1)
+        ml_c = np.empty(n_savings); mr_c = np.empty(n_savings)
+        ml_s = np.empty(n_savings); mr_s = np.empty(n_savings)
+        ml_b = np.empty(n_savings); mr_b = np.empty(n_savings)
 
         for z_i in range(n_z):
             psi = psi_vec[z_i]
@@ -2538,11 +2648,14 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
                     if drop > diag_float[i_s, 0]:
                         diag_float[i_s, 0] = drop
 
+            _pchip_precompute_slopes(temp_x, temp_c, ml_c, mr_c)
+            _pchip_precompute_slopes(temp_x, temp_s, ml_s, mr_s)
+            _pchip_precompute_slopes(temp_x, temp_b, ml_b, mr_b)
             for w_i in range(n_wealth):
                 w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_c)
-                policy_alpha_s[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_s)
-                policy_alpha_b[z_i, i_s, w_i] = pchip_interp_1d(w, temp_x, temp_b)
+                policy_c[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_c, ml_c, mr_c)
+                policy_alpha_s[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_s, ml_s, mr_s)
+                policy_alpha_b[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_b, ml_b, mr_b)
 
     return diag_int, diag_float
 
@@ -3185,7 +3298,7 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 )
                 c_over_w = probe_c / probe_w if probe_w > 0 else 0.0
 
-                mono_str = f"{mono_v:4d}" if mono_v == 0 else f"\033[91m{mono_v:4d}\033[0m"
+                mono_str = f"{mono_v:4d}"
 
                 # Iter columns: only printed when unconstrained
                 if not constrained:

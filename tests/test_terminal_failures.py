@@ -62,7 +62,7 @@ def build_smoke_precompute():
         n_wealth=150,
         n_savings=150,
         state_grid_sizes=(5, 5, 5),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=3.0,
         n_z=11,
         n_stds=3.0,

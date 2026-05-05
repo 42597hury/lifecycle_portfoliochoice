@@ -70,7 +70,7 @@ def build_reference_model():
     return model, data
 
 
-def _trilinear_interp_principal(u_point, u_grids, state_grid, coeff):
+def _trilinear_interp_cholesky(u_point, u_grids, state_grid, coeff):
     N1 = len(u_grids[1])
     N2 = len(u_grids[2])
     lo = []
@@ -104,13 +104,13 @@ def run_geometry_checks(model, data):
     Sigma_z = stationary_covariance(Phi, Sigma_ss)
     sigma_z = np.sqrt(np.diag(Sigma_z))
 
-    principal = build_state_grid(
+    cholesky = build_state_grid(
         N_vec=(7, 7, 7),
         mu_intercept=model.Phi_0_state,
         Phi=model.Phi_11,
         Sigma_innov=model.Sigma_ss,
         n_stds=3.0,
-        mode="principal",
+        mode="cholesky",
     )
     ly_axis = build_state_grid(
         N_vec=(7, 7, 7),
@@ -126,19 +126,19 @@ def run_geometry_checks(model, data):
 
     center_flat = 3 * 7 * 7 + 3 * 7 + 3
     check(
-        "Principal center point equals mu_s",
-        np.allclose(principal["state_grid"][center_flat], principal["mu_s"], atol=1e-12),
-        f"center = {principal['state_grid'][center_flat]}, mu = {principal['mu_s']}",
+        "Cholesky center point equals mu_s",
+        np.allclose(cholesky["state_grid"][center_flat], cholesky["mu_s"], atol=1e-12),
+        f"center = {cholesky['state_grid'][center_flat]}, mu = {cholesky['mu_s']}",
     )
 
-    U = (principal["state_grid"] - principal["mu_s"]) @ principal["L_inv"].T
-    check("Principal u-min exact", np.isclose(U.min(), -3.0, atol=1e-12), f"min = {U.min():.6f}")
-    check("Principal u-max exact", np.isclose(U.max(), 3.0, atol=1e-12), f"max = {U.max():.6f}")
+    U = (cholesky["state_grid"] - cholesky["mu_s"]) @ cholesky["L_inv"].T
+    check("Cholesky u-min exact", np.isclose(U.min(), -3.0, atol=1e-12), f"min = {U.min():.6f}")
+    check("Cholesky u-max exact", np.isclose(U.max(), 3.0, atol=1e-12), f"max = {U.max():.6f}")
 
     flat_ok = True
     N1 = 7
     N2 = 7
-    for i, idx in enumerate(principal["state_indices"]):
+    for i, idx in enumerate(cholesky["state_indices"]):
         if i != idx[0] * N1 * N2 + idx[1] * N2 + idx[2]:
             flat_ok = False
             break
@@ -148,31 +148,31 @@ def run_geometry_checks(model, data):
     # against mu_s, sigma_z, L are well-defined regardless of state_indices.
     state_cols = list(model.state_names)
     hist = data[state_cols].to_numpy()
-    inside_principal = np.mean(np.all(np.abs((hist - principal["mu_s"]) @ principal["L_inv"].T) <= 3.0, axis=1))
+    inside_cholesky = np.mean(np.all(np.abs((hist - cholesky["mu_s"]) @ cholesky["L_inv"].T) <= 3.0, axis=1))
     inside_axis = np.mean(np.all(np.abs(hist - mu_s) <= 3.0 * sigma_z, axis=1))
-    check("Principal historical coverage >= 99%", inside_principal >= 0.99, f"{inside_principal:.3f}")
+    check("Cholesky historical coverage >= 99%", inside_cholesky >= 0.99, f"{inside_cholesky:.3f}")
     check("Lyapunov-axis historical coverage >= 99%", inside_axis >= 0.99, f"{inside_axis:.3f}")
 
     vol_axis = np.prod(2.0 * 3.0 * sigma_z)
-    vol_principal = (6.0 ** 3) * abs(np.linalg.det(principal["L"]))
-    ratio = vol_principal / vol_axis
-    check("Principal volume ratio in expected range", 0.3 < ratio < 0.6, f"ratio = {ratio:.3f}")
+    vol_cholesky = (6.0 ** 3) * abs(np.linalg.det(cholesky["L"]))
+    ratio = vol_cholesky / vol_axis
+    check("Cholesky volume ratio in expected range", 0.3 < ratio < 0.6, f"ratio = {ratio:.3f}")
 
     rng = np.random.default_rng(123)
     coeff = np.array([1.234, 0.3, -0.5, 0.1])
     max_err = 0.0
     for _ in range(200):
         u_point = rng.uniform(-3.0, 3.0, size=3)
-        s_point = principal["mu_s"] + principal["L"] @ u_point
+        s_point = cholesky["mu_s"] + cholesky["L"] @ u_point
         exact = coeff[0] + coeff[1:] @ s_point
-        interp = _trilinear_interp_principal(u_point, principal["state_bracket_grids"], principal["state_grid"], coeff)
+        interp = _trilinear_interp_cholesky(u_point, cholesky["state_bracket_grids"], cholesky["state_grid"], coeff)
         max_err = max(max_err, abs(interp - exact))
-    check("Principal trilinear exact for linear functions", max_err < 1e-12, f"max err = {max_err:.2e}")
+    check("Cholesky trilinear exact for linear functions", max_err < 1e-12, f"max err = {max_err:.2e}")
 
     check(
-        "Principal stationary probs sum to one",
-        abs(principal["stationary_probs"].sum() - 1.0) < 1e-14,
-        f"sum = {principal['stationary_probs'].sum():.16f}",
+        "Cholesky stationary probs sum to one",
+        abs(cholesky["stationary_probs"].sum() - 1.0) < 1e-14,
+        f"sum = {cholesky['stationary_probs'].sum():.16f}",
     )
     check(
         "Lyapunov-axis stationary probs sum to one",
@@ -186,7 +186,7 @@ def run_precompute_mode_checks(model):
     print("PRECOMPUTE MODE CHECKS")
     print("=" * 70)
 
-    for mode in ("naive", "lyapunov-axis", "principal"):
+    for mode in ("naive", "lyapunov-axis", "cholesky"):
         disc = DiscretizationConfig(
             n_wealth=20,
             n_savings=20,
@@ -204,7 +204,7 @@ def run_precompute_mode_checks(model):
         check(f"{mode}: stationary probs sum", abs(pc.state_stationary_probs.sum() - 1.0) < 1e-12)
         check(f"{mode}: state_grid finite", np.all(np.isfinite(pc.state_grid)))
         check(f"{mode}: annuity factors finite", np.all(np.isfinite(pc.annuity_factors)))
-        if mode == "principal":
+        if mode == "cholesky":
             check(f"{mode}: nonzero bracket shift", np.max(np.abs(pc.state_bracket_shift)) > 0.0)
             check(f"{mode}: transformed axes centered at 0", abs(pc.state_bracket_grids[0].mean()) < 1e-14)
         else:
@@ -214,14 +214,14 @@ def run_precompute_mode_checks(model):
 
 def run_solver_simulation_smoke(model):
     print("\n" + "=" * 70)
-    print("PRINCIPAL-MODE SOLVER/SIMULATION SMOKE")
+    print("CHOLESKY-MODE SOLVER/SIMULATION SMOKE")
     print("=" * 70)
 
     disc = DiscretizationConfig(
         n_wealth=20,
         n_savings=20,
         state_grid_sizes=(3, 3, 3),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=3.0,
         n_z=5,
         n_eps_nodes=2,
@@ -232,12 +232,12 @@ def run_solver_simulation_smoke(model):
     pc = Precompute(model, disc, verbose=False)
 
     C, S, B, diag = run_lifecycle_solver(model, pc, solver_config=SolverConfig(), verbose=0)
-    check("Principal solve: no NaN in C", not np.any(np.isnan(C)))
-    check("Principal solve: no NaN in S", not np.any(np.isnan(S)))
-    check("Principal solve: no NaN in B", not np.any(np.isnan(B)))
-    check("Principal solve: shares feasible", np.all(S >= -1e-8) and np.all(B >= -1e-8) and np.all(S + B <= 1.0 + 1e-6))
+    check("Cholesky solve: no NaN in C", not np.any(np.isnan(C)))
+    check("Cholesky solve: no NaN in S", not np.any(np.isnan(S)))
+    check("Cholesky solve: no NaN in B", not np.any(np.isnan(B)))
+    check("Cholesky solve: shares feasible", np.all(S >= -1e-8) and np.all(B >= -1e-8) and np.all(S + B <= 1.0 + 1e-6))
     fail_rate = diag["total_newton_failures"] / max(diag["total_calls"], 1)
-    check("Principal solve: low Newton failure rate", fail_rate < 0.02, f"{diag['total_newton_failures']} / {diag['total_calls']} = {fail_rate:.3%}")
+    check("Cholesky solve: low Newton failure rate", fail_rate < 0.02, f"{diag['total_newton_failures']} / {diag['total_calls']} = {fail_rate:.3%}")
 
     sim = simulate_lifecycle(
         C,
@@ -251,8 +251,8 @@ def run_solver_simulation_smoke(model):
         seed=42,
         verbose=False,
     )
-    check("Principal sim: valid state indices", sim["state_idx"].min() >= 0 and sim["state_idx"].max() < pc.N_state)
-    check("Principal sim: estate finite", np.all(np.isfinite(sim["estate"])))
+    check("Cholesky sim: valid state indices", sim["state_idx"].min() >= 0 and sim["state_idx"].max() < pc.N_state)
+    check("Cholesky sim: estate finite", np.all(np.isfinite(sim["estate"])))
 
 
 def run_per_axis_n_stds_checks(model):
@@ -261,7 +261,7 @@ def run_per_axis_n_stds_checks(model):
     print("=" * 70)
 
     # T-A: scalar broadcast equals tuple-of-same — bit-equivalence regression
-    for mode in ("principal", "lyapunov-axis"):
+    for mode in ("cholesky", "lyapunov-axis"):
         g_scalar = build_state_grid(
             N_vec=(7, 7, 7),
             mu_intercept=model.Phi_0_state,
@@ -292,19 +292,19 @@ def run_per_axis_n_stds_checks(model):
         )
         check(f"{mode}: scalar==tuple bracket grids", same_brackets)
 
-    # T-B: per-axis bounds in principal mode (u-coords half-widths)
+    # T-B: per-axis bounds in cholesky mode (u-coords half-widths)
     g = build_state_grid(
         N_vec=(7, 7, 7),
         mu_intercept=model.Phi_0_state,
         Phi=model.Phi_11,
         Sigma_innov=model.Sigma_ss,
         n_stds=(2.0, 1.0, 1.5),
-        mode="principal",
+        mode="cholesky",
     )
     bracks = g["state_bracket_grids"]
-    check("principal per-axis: bracket[0] half-width = 2.0", np.isclose(bracks[0].min(), -2.0) and np.isclose(bracks[0].max(), +2.0))
-    check("principal per-axis: bracket[1] half-width = 1.0", np.isclose(bracks[1].min(), -1.0) and np.isclose(bracks[1].max(), +1.0))
-    check("principal per-axis: bracket[2] half-width = 1.5", np.isclose(bracks[2].min(), -1.5) and np.isclose(bracks[2].max(), +1.5))
+    check("cholesky per-axis: bracket[0] half-width = 2.0", np.isclose(bracks[0].min(), -2.0) and np.isclose(bracks[0].max(), +2.0))
+    check("cholesky per-axis: bracket[1] half-width = 1.0", np.isclose(bracks[1].min(), -1.0) and np.isclose(bracks[1].max(), +1.0))
+    check("cholesky per-axis: bracket[2] half-width = 1.5", np.isclose(bracks[2].min(), -1.5) and np.isclose(bracks[2].max(), +1.5))
 
     # T-C: per-axis bounds in lyapunov-axis mode (physical-axis half-widths)
     g_la = build_state_grid(
@@ -332,10 +332,10 @@ def run_per_axis_n_stds_checks(model):
         Phi=model.Phi_11,
         Sigma_innov=model.Sigma_ss,
         n_stds=(1.5, 2.5, 1.0),
-        mode="principal",
+        mode="cholesky",
     )
     check(
-        "principal asym: stationary probs sum to one",
+        "cholesky asym: stationary probs sum to one",
         abs(g_asym["stationary_probs"].sum() - 1.0) < 1e-14,
         f"sum = {g_asym['stationary_probs'].sum():.16f}",
     )
@@ -348,9 +348,9 @@ def run_per_axis_n_stds_checks(model):
         u_point = rng.uniform(low=[-1.5, -2.5, -1.0], high=[1.5, 2.5, 1.0], size=3)
         s_point = g_asym["mu_s"] + g_asym["L"] @ u_point
         exact = coeff[0] + coeff[1:] @ s_point
-        interp = _trilinear_interp_principal(u_point, g_asym["state_bracket_grids"], g_asym["state_grid"], coeff)
+        interp = _trilinear_interp_cholesky(u_point, g_asym["state_bracket_grids"], g_asym["state_grid"], coeff)
         max_err = max(max_err, abs(interp - exact))
-    check("principal asym: trilinear exact-on-linear", max_err < 1e-12, f"max err = {max_err:.2e}")
+    check("cholesky asym: trilinear exact-on-linear", max_err < 1e-12, f"max err = {max_err:.2e}")
 
     # T-F: validation errors
     for bad in [(2.0, -1.0, 2.0), (2.0, 0.0, 2.0)]:
@@ -361,7 +361,7 @@ def run_per_axis_n_stds_checks(model):
                 Phi=model.Phi_11,
                 Sigma_innov=model.Sigma_ss,
                 n_stds=bad,
-                mode="principal",
+                mode="cholesky",
             )
             check(f"validation: rejects non-positive n_stds {bad}", False, "did not raise")
         except ValueError:
@@ -374,7 +374,7 @@ def run_per_axis_n_stds_checks(model):
                 Phi=model.Phi_11,
                 Sigma_innov=model.Sigma_ss,
                 n_stds=bad,
-                mode="principal",
+                mode="cholesky",
             )
             check(f"validation: rejects length-mismatch n_stds (len={len(bad)})", False, "did not raise")
         except ValueError:
@@ -384,7 +384,7 @@ def run_per_axis_n_stds_checks(model):
     disc_axis = DiscretizationConfig(
         n_wealth=20, n_savings=20,
         state_grid_sizes=(5, 5, 5),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=(2.0, 1.0, 1.5),
         n_z=5,
         n_eps_nodes=2,

@@ -9,12 +9,8 @@ Pre-solve diagnostics (call after Precompute, before solver):
 
 Post-simulation diagnostics (call after simulate_lifecycle):
   - diagnose_income_post(model, pc, sim)   -- simulated income & SS
-  - diagnose_simulation_post(model, pc, sim) -- policy-domain compatibility
-  - diagnose_var_post(model, pc, sim)      -- stub (not yet implemented)
-  - diagnose_all_post(model, pc, sim)      -- convenience: all post-sim
 
 Solver diagnostics (unchanged from prior version):
-  - diagnose_solver(model, pc, sol)                -- thin wrapper / TODO
   - diagnose_terminal_portfolio_states(...)         -- terminal portfolio per-state
   - diagnose_newton_failures_retirement(...)        -- Newton failure classification
 
@@ -685,9 +681,9 @@ def diagnose_var_pre(model, pc):
               f"{mu_d:>11.5f}  {sig_y:>13.5f}")
         _grid_coverage.append((name, cover))
 
-    if getattr(pc, "state_grid_mode", "naive") == "principal":
+    if getattr(pc, "state_grid_mode", "naive") in ("cholesky", "principal"):
         print()
-        print("  Principal-mode bracketing axes (u-coordinates):")
+        print("  Cholesky-mode bracketing axes (u-coordinates):")
         for d in range(len(pc.state_bracket_grids)):
             g = pc.state_bracket_grids[d]
             print(f"    u[{d}] range = [{g.min():+.2f}, {g.max():+.2f}]")
@@ -1124,181 +1120,7 @@ def diagnose_income_post(model, pc, sim):
 
 
 # =============================================================================
-# Post-simulation: VAR (stub)
-# =============================================================================
-
-def diagnose_simulation_post(model, pc, sim,
-                             warn_offgrid_share=0.05,
-                             fail_offgrid_share=0.20):
-    """
-    Post-simulation diagnostics for policy-domain compatibility.
-
-    The solver only computes policies on `pc.wealth_grid`, which is strictly
-    positive. The simulation currently evaluates those policies with linear
-    wealth extrapolation outside the grid. A large off-grid share therefore
-    means the simulated panel is no longer spending most of its time inside the
-    state space that was actually solved.
-    """
-    results = []
-
-    sim_x = sim["x"]
-    sim_alive = sim["alive"]
-    sim_alpha_s = sim["alpha_s"]
-    sim_alpha_b = sim["alpha_b"]
-    ages = sim["ages"]
-
-    n_sim, n_age = sim_x.shape
-    w_min = float(pc.wealth_grid[0])
-    w_max = float(pc.wealth_grid[-1])
-
-    _header("POST-SIMULATION: POLICY DOMAIN & NUMERICAL COMPATIBILITY")
-    print(f"  Simulation: {n_sim} agents, ages {ages[0]}-{ages[-1]}, {n_age} periods")
-    print(f"  Solver wealth domain: [{w_min:.4e}, {w_max:.4e}]")
-    print("  Note: outside this interval the simulator uses linear wealth extrapolation.")
-    print("        Large off-grid shares indicate a mismatch between the simulated")
-    print("        panel and the state space the solver actually covered.")
-
-    alive_mask = sim_alive.astype(bool)
-    x_alive = sim_x[alive_mask]
-    alpha_s_alive = sim_alpha_s[alive_mask]
-    alpha_b_alive = sim_alpha_b[alive_mask]
-
-    finite_x = np.isfinite(x_alive)
-    finite_alpha = np.isfinite(alpha_s_alive) & np.isfinite(alpha_b_alive)
-
-    pooled_neg_share = float(np.mean(x_alive < 0.0)) if x_alive.size else float("nan")
-    pooled_below_share = float(np.mean(x_alive < w_min)) if x_alive.size else float("nan")
-    pooled_above_share = float(np.mean(x_alive > w_max)) if x_alive.size else float("nan")
-    pooled_offgrid_share = float(np.mean((x_alive < w_min) | (x_alive > w_max))) if x_alive.size else float("nan")
-
-    key_ages = [model.start_age, 25, 30, 35, 40, 50, 60, model.retire_age, model.terminal_age]
-    key_ages = sorted(set(a for a in key_ages if model.start_age <= a <= model.terminal_age))
-
-    print()
-    print(f"  {'Age':>4}  {'N_alive':>7}  {'Below':>7}  {'Above':>7}  {'Off-grid':>9}  "
-          f"{'Neg x':>7}  {'Median x':>10}  {'P90 x':>10}")
-    print(f"  {'---':>4}  {'---':>7}  {'---':>7}  {'---':>7}  {'---':>9}  "
-          f"{'---':>7}  {'---':>10}  {'---':>10}")
-
-    worst_offgrid_share = 0.0
-    worst_offgrid_age = None
-    worst_negative_share = 0.0
-    worst_negative_age = None
-
-    for age in key_ages:
-        t = age - model.start_age
-        alive_t = sim_alive[:, t]
-        n_alive = int(np.sum(alive_t))
-        if n_alive == 0:
-            continue
-
-        x_t = sim_x[alive_t, t]
-        below = float(np.mean(x_t < w_min))
-        above = float(np.mean(x_t > w_max))
-        offgrid = float(np.mean((x_t < w_min) | (x_t > w_max)))
-        neg = float(np.mean(x_t < 0.0))
-        finite_t = np.isfinite(x_t)
-        if np.any(finite_t):
-            median_x = float(np.median(x_t[finite_t]))
-            p90_x = float(np.quantile(x_t[finite_t], 0.90))
-        else:
-            median_x = float("nan")
-            p90_x = float("nan")
-
-        if offgrid > worst_offgrid_share:
-            worst_offgrid_share = offgrid
-            worst_offgrid_age = age
-        if neg > worst_negative_share:
-            worst_negative_share = neg
-            worst_negative_age = age
-
-        print(f"  {age:>4}  {n_alive:>7}  {below:>7.1%}  {above:>7.1%}  {offgrid:>9.1%}  "
-              f"{neg:>7.1%}  {median_x:>10.4f}  {p90_x:>10.4f}")
-
-    _test(results,
-          "pass" if bool(np.all(finite_x)) else "fail",
-          "All alive cash-on-hand values are finite",
-          "Exploding or NaN wealth means the simulation has left the numerically safe region",
-          f"finite share = {np.mean(finite_x):.4%}")
-
-    _test(results,
-          "pass" if bool(np.all(finite_alpha)) else "fail",
-          "All alive portfolio weights are finite",
-          "NaN or inf portfolio weights break the wealth recursion directly",
-          f"finite share = {np.mean(finite_alpha):.4%}")
-
-    if worst_negative_share == 0.0:
-        _neg_status = "pass"
-    elif worst_negative_share < warn_offgrid_share:
-        _neg_status = "warn"
-    else:
-        _neg_status = "fail"
-    _test(results, _neg_status,
-          "Negative wealth is rare or absent",
-          "The current solver is only defined on a strictly positive wealth grid",
-          f"pooled share = {pooled_neg_share:.1%}; worst age = {worst_negative_age} ({worst_negative_share:.1%})")
-
-    if worst_offgrid_share < warn_offgrid_share:
-        _offgrid_status = "pass"
-    elif worst_offgrid_share < fail_offgrid_share:
-        _offgrid_status = "warn"
-    else:
-        _offgrid_status = "fail"
-    _test(results, _offgrid_status,
-          "Most simulated cash-on-hand stays inside the solved wealth grid",
-          "Off-grid paths use linear wealth extrapolation rather than the solved policy domain",
-          f"pooled share = {pooled_offgrid_share:.1%}; worst age = {worst_offgrid_age} ({worst_offgrid_share:.1%})")
-
-    if pooled_above_share < warn_offgrid_share:
-        _upper_status = "pass"
-    elif pooled_above_share < fail_offgrid_share:
-        _upper_status = "warn"
-    else:
-        _upper_status = "fail"
-    _test(results, _upper_status,
-          "Upper-grid exits are limited",
-          "Large mass above wealth_max means the top end of the wealth grid is too tight for this simulation",
-          f"pooled share above grid = {pooled_above_share:.1%}")
-
-    print()
-    print("  Interpretation note:")
-    print("    The simulation currently carries the financial state forward by")
-    print("    propagating a continuous shock, then snapping to the nearest state-grid")
-    print("    point for next period's policy lookup. That is an intentional simulation")
-    print("    approximation, but it should be paired with low off-grid wealth shares.")
-
-    _summary("POST-SIMULATION: POLICY DOMAIN & NUMERICAL COMPATIBILITY", results)
-    return results
-
-def diagnose_var_post(model, pc, sim):
-    """Post-simulation return and state diagnostics. Not yet implemented."""
-    _header("POST-SIMULATION VAR DIAGNOSTICS")
-    print("  (Not yet implemented)")
-    return []
-
-
-# =============================================================================
-# Solver diagnostics wrapper
-# =============================================================================
-
-def diagnose_solver(model, pc, sol=None):
-    """Solver quality diagnostics. Currently a stub.
-
-    TODO: expand with post-solve policy function checks.
-    For detailed solver diagnostics, call directly:
-      - diagnose_terminal_portfolio_states(model, pc)
-      - diagnose_newton_failures_retirement(...)
-    """
-    _header("SOLVER DIAGNOSTICS")
-    print("  Available via:")
-    print("    diagnose_terminal_portfolio_states(model, pc)")
-    print("    diagnose_newton_failures_retirement(...)")
-    print("  (Automated solver quality checks: TODO)")
-    return []
-
-
-# =============================================================================
-# Convenience wrappers
+# Convenience wrapper
 # =============================================================================
 
 def diagnose_all_pre(model, pc):
@@ -1311,36 +1133,6 @@ def diagnose_all_pre(model, pc):
     if n_fail:
         print(f"\n  *** {n_fail} FAILURE(S) across all pre-solve diagnostics ***")
     return r
-
-
-def diagnose_all_post(model, pc, sim):
-    """All post-simulation diagnostics."""
-    r = []
-    r += diagnose_income_post(model, pc, sim)
-    r += diagnose_simulation_post(model, pc, sim)
-    r += diagnose_var_post(model, pc, sim)
-    n_fail = sum(1 for res in r if res.status == 'fail')
-    if n_fail:
-        print(f"\n  *** {n_fail} FAILURE(S) across all post-simulation diagnostics ***")
-    return r
-
-
-# =============================================================================
-# Deprecation wrappers
-# =============================================================================
-
-def print_model_diagnostic_report(model, pc, periods_per_year=1):
-    """Deprecated. Use diagnose_all_pre() instead."""
-    import warnings
-    warnings.warn("Use diagnose_all_pre(model, pc) instead", DeprecationWarning, stacklevel=2)
-    return diagnose_all_pre(model, pc)
-
-
-def print_simulation_income_report(model, pc, sim):
-    """Deprecated. Use diagnose_income_post() instead."""
-    import warnings
-    warnings.warn("Use diagnose_income_post(model, pc, sim)", DeprecationWarning, stacklevel=2)
-    return diagnose_income_post(model, pc, sim)
 
 
 # =============================================================================

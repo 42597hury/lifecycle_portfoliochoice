@@ -176,6 +176,58 @@ else:
 
 Same pattern as (c). Search for the analogous block (`if sR_p > 0.0: ... mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur`) and replace.
 
+### (e) Sanity-check script's bespoke kernels, [scripts/diagnostics/_diag_split_rule_sanity.py](../../scripts/diagnostics/_diag_split_rule_sanity.py)
+
+This script has two njit kernels — `_foc_and_decomp_kernel` and `_per_node_bequest_kernel` — that duplicate the Path B math. They were written when the spike was being diagnosed, before this fix existed. **Both must be updated to the shifted spec or the validation harness reports stale numbers.**
+
+In `_foc_and_decomp_kernel` (search for `if sR_p > 0.0:` followed by `w_A = sR_p / annuity_factor_cur`):
+
+OLD:
+```python
+if sR_p > 0.0:
+    w_A = sR_p / annuity_factor_cur
+    mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
+    mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_cur)
+else:
+    mu_bequest = 0.0
+    mup_bequest = 0.0
+```
+
+NEW:
+```python
+if sR_p > 0.0:
+    C_bar = sR_p / annuity_factor_cur + DELTA_BEQUEST
+    mu_bequest = b_bar * C_bar ** (-gamma) / annuity_factor_cur
+    mup_bequest = -gamma * mu_bequest / (annuity_factor_cur * C_bar)
+else:
+    mu_bequest = 0.0
+    mup_bequest = 0.0
+```
+
+In `_per_node_bequest_kernel` (analogous, only `mu_bequest` is computed there):
+
+OLD:
+```python
+if sR_p > 0.0:
+    w_A = sR_p / annuity_factor_cur
+    mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
+else:
+    mu_bequest = 0.0
+```
+
+NEW:
+```python
+if sR_p > 0.0:
+    C_bar = sR_p / annuity_factor_cur + DELTA_BEQUEST
+    mu_bequest = b_bar * C_bar ** (-gamma) / annuity_factor_cur
+else:
+    mu_bequest = 0.0
+```
+
+Add `from lifecycle.model import DELTA_BEQUEST` to the script's imports.
+
+**Also recommended**: add a CLI flag `--use-unshifted-bequest` (default `False`) that toggles back to the original spec. This preserves the "before" picture as a regression demonstration: `python -m scripts.diagnostics._diag_split_rule_sanity --use-unshifted-bequest` should still reproduce the `10³⁰` spike on the legacy bundle, while the default run on a shifted bundle should show the spike gone. Implement by passing a `delta` argument (with `delta = 0.0` triggering the unshifted formula) into the kernels, since numba can't gracefully handle conditional formula switching.
+
 ## Terminal-step re-derivation (the load-bearing change)
 
 The existing terminal step ([lifecycle/solver.py:1180-1546](../../lifecycle/solver.py#L1180-L1546)) is built on the pure-CRRA homogeneity of the bequest:

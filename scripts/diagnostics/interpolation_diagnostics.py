@@ -225,7 +225,7 @@ def _extract_state_grid_sizes(metadata):
 def _infer_state_axis_labels(metadata):
     disc = _extract_disc_config(metadata)
     mode = disc.get("state_grid_mode")
-    if mode == "principal":
+    if mode in ("cholesky", "principal"):
         return ["u0", "u1", "u2"]
 
     run_config = metadata.get("run_config", {})
@@ -1369,7 +1369,7 @@ def main():
         print(
             "These diagnostics reshape the flat financial-state index back to its 3D grid and "
             "run the same local-curvature and centered leave-one-out tests along each axis.\n"
-            "For principal grids, the axes are transformed interpolation coordinates; otherwise "
+            "For cholesky grids, the axes are transformed interpolation coordinates; otherwise "
             "they correspond to the stored state-variable axes."
         )
 

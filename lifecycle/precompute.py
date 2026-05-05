@@ -98,7 +98,9 @@ class Precompute:
 
     Bequest:
       annuity_factors  (N_state,)           A(r_f, b_bar) annuity factor at each state
-                                            (used in bequest_utility / bequest_marginal)
+                                            (used by the shifted bequest_utility /
+                                            bequest_marginal; shift parameter
+                                            DELTA_BEQUEST lives in lifecycle.model)
 
     Lookup tables:
       working_income    (n_age, n_z, n_eps)
@@ -174,7 +176,7 @@ class Precompute:
         self.state_grid = grid_info["state_grid"]
         self.Pi_state = grid_info["Pi_state"]
         self.state_stationary_probs = grid_info["stationary_probs"]
-        # state_bracket_grids: interpolation axes; in principal mode these live in transformed coordinates.
+        # state_bracket_grids: interpolation axes; in cholesky mode these live in transformed coordinates.
         # state_grid: economic slow-state vectors at the flat lattice points.
         self.N_state = self.state_grid.shape[0]  # int — total joint states = prod(state_grid_sizes)
 
@@ -225,6 +227,15 @@ class Precompute:
 
         # No r_bill_grid — bill rate is now uncertain (part of return quadrature).
 
+        # --- Conditional-covariance scalars for the CCV log wealth-dynamics ---
+        # Σ_xx is the conditional 2×2 covariance of (xr, xb) — bottom-right block of
+        # Sigma_r_cond. CCV r_p^CVC formula uses these constants in Jensen and Itô
+        # corrections; precomputing avoids indexing into the model's array inside
+        # the njit hot loop. Used only when SolverConfig.wealth_dynamics_spec="ccv_log".
+        self.sigma2_xr  = float(model.Sigma_r_cond[1, 1])
+        self.sigma2_xb  = float(model.Sigma_r_cond[2, 2])
+        self.sigma_xrxb = float(model.Sigma_r_cond[1, 2])
+
         # --- Bequest annuity factors (one per financial state) ---
         # A(y_1, spr, b_bar): PV of b_bar annual payments discounted at a
         # linearly interpolated term structure from y_1 to y_20 = y_1 + spr.
@@ -248,8 +259,10 @@ class Precompute:
                 _spr = np.full(self.N_state, model.spr_scalar_fallback, dtype=float)
 
         self.annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
-        # (N_state,) float64 - A(y_1, spr, b_bar) for each financial state
-        # Used by bequest_utility / bequest_marginal / bequest_marginal_inv in solver.
+        # (N_state,) float64 - A(y_1, spr, b_bar) for each financial state.
+        # Used by the shifted bequest_utility / bequest_marginal /
+        # bequest_marginal_inv (De Nardi 2004 luxury form). The shift parameter
+        # DELTA_BEQUEST is set in lifecycle.model.
 
         # --- Income discretization ---
         self.z_grid, self.Pi_z = discretize_income_ar1_mixture(

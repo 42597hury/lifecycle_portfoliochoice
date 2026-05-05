@@ -372,7 +372,7 @@ solver integrates over:
 
 | knob | type | what it controls |
 |------|------|------------------|
-| `state_n_stds` | float OR length-3 sequence | half-width of the state grid in standardized state-stationary units; scalar broadcasts to all axes, sequence applies a per-axis bound. In `principal` mode the axes are Cholesky directions (mixed across physical state vars); in `lyapunov-axis` mode the axes are physical state vars. |
+| `state_n_stds` | float OR length-3 sequence | half-width of the state grid in standardized state-stationary units; scalar broadcasts to all axes, sequence applies a per-axis bound. In `cholesky` mode the axes are Cholesky directions (mixed across physical state vars); in `lyapunov-axis` mode the axes are physical state vars. |
 | `state_grid_sizes` | tuple `(N_y_1, N_spr, N_cy)` | number of grid points per state dimension |
 | `n_state_quad_nodes` (K_state) | int | Gauss-Hermite order per state-innovation dim |
 | `n_ret_nodes_1d` | tuple `(K_rtb, K_xr, K_xb)` | per-dimension GH order for return residuals |
@@ -385,7 +385,7 @@ solver integrates over:
 `L[:, 1] = (-0.054, +0.0158, 0)` — mostly spr with mild cy leakage,
 `L[:, 2] = (+0.378, -0.0187, +0.0165)` — y_1 absorbing the residual coupling.
 Reading off the dominant physical contribution of each Cholesky direction
-in `principal` mode under the default ordering:
+in `cholesky` mode under the default ordering:
 
 - `state_n_stds[0]` ↓ shrinks Cholesky axis 0 → **pure cy**, 100% of cy variance (clean)
 - `state_n_stds[1]` ↓ shrinks Cholesky axis 1 → primarily reduces spr (~99%) and a small share of y_1
@@ -512,7 +512,7 @@ E[xb | s] = const_xb + Phi_21[xb,:] · s
 ```
 
 The bond loading on `spr` (+4.49) and the stock loading on `y_1` (-1.80)
-dominate the corner extremes. At `state_n_stds=2.0` in principal mode the
+dominate the corner extremes. At `state_n_stds=2.0` in cholesky mode the
 grid corner combinations push these into the 0.18–0.22 log-return range
 (18–22% conditional excess), which exceeds the in-sample VAR equation R²
 ranges (xr R²=5.9%, xb R²=32.2%) — i.e., the corners sit outside the
@@ -520,7 +520,7 @@ data hull where the linear projection is an extrapolation rather than an
 in-sample prediction. Tightening `n_stds` shrinks this extrapolation
 margin proportionally; refining the grid does not.
 
-The corner *probabilities* under principal mode go in the opposite
+The corner *probabilities* under cholesky mode go in the opposite
 direction: in `_normal_bin_probs`, the corner bin spans `(-∞, midpoint)`
 in standardized coordinates, so tightening `n_stds` makes the corner bin
 *larger* in stationary mass (its tail share grows) even though the corner
@@ -546,7 +546,7 @@ between *tail coverage* (high values) and *corner discipline* (low values).
 
 **Recommended baseline (production):** `state_n_stds=2.0` scalar. Verified
 arbitrage-free at K_ret=(3,5,3), K_state=2 across γ ∈ {3, 5}, with ≥99%
-historical hull coverage in principal mode at this setting.
+historical hull coverage in cholesky mode at this setting.
 
 **Per-axis tightening when the unconstrained solver shows extreme tail leverage**
 (under the default cy-first ordering, `state_indices=(2, 1, 0)` since 2026-04-30):
@@ -599,7 +599,7 @@ Dialing up only "buys" you tail-state coverage. Two reasons it's rarely worth
 the cost:
 
 1. **The corners are not in-sample.** Our VAR was estimated on T=63 annual
-   observations. `n_stds=3` in principal mode pushes corner physical-axis
+   observations. `n_stds=3` in cholesky mode pushes corner physical-axis
    values out to roughly `±10σ_innov` on cy and `±6σ_innov` on spr — these
    are extrapolations past anything historically observed, and the linear
    `Phi_21·s` projection there has no empirical anchor.
@@ -795,7 +795,7 @@ mean that affected the old unconstrained estimator.
       per unit leverage in the discrete model. Unconstrained CRRA then has no
       interior optimum and Newton runs to budget. Add a `convex_hull_arb_gap`
       diagnostic that flags any i_s with gap > 0 (current smoke-test config:
-      state_grid=5×5×5 principal/3.0σ, K_state=2, K_ret=3 → 24/125 states
+      state_grid=5×5×5 cholesky/3.0σ, K_state=2, K_ret=3 → 24/125 states
       arbitrage). Note one such state passes EC_INTERIOR by phantom convergence
       at huge α.
 - [x] **Per-dimension K_ret with stock-axis priority** — IMPLEMENTED.
@@ -815,7 +815,7 @@ mean that affected the old unconstrained estimator.
       `Precompute` normalize either form via `discretization._normalize_ret_nodes`
       before building the asymmetric Hermite tensor product.
 - [ ] **State-grid pruning of arbitrage points** — Complement to the above.
-      During grid construction, after building the principal-axis lattice,
+      During grid construction, after building the cholesky-axis lattice,
       compute the arbitrage gap at every candidate state and drop those with
       gap > 0 (or refine quadrature locally for them). Verify the dropped
       states are economically implausible by checking the simulated

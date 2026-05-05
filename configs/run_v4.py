@@ -1,6 +1,6 @@
 """Production run v4 — canonical with Lobatto on tail axes.
 
-Inherits canonical: 7x7x7 principal, n_z=11, n_eps=4, n_eta=4,
+Inherits canonical: 7x7x7 cholesky, n_z=11, n_eps=4, n_eta=4,
 ret_quad=(3,5,5) + ret_lobatto_Z=(None,7,7), state_quad=(3,5,5) +
 state_lobatto_Z=(None,7,7).
 """

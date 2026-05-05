@@ -128,41 +128,49 @@ so it never binds in practice.
 
 ### 2.1 Theoretical Specification
 
-Source: Catherine (2025, Section 3.6, equations 21–22).
+Source: De Nardi (2004) luxury-bequest form, with Catherine (2025, Section 3.6,
+equations 21–22) annuity normalisation. The shift `δ` removes the unshifted
+CRRA-with-clamp's `∞` discontinuity in marginal utility at the bankruptcy
+boundary — the original form is recovered as `δ → 0`.
 
 The bequest is valued as if the agent lives b̄ = 10 extra years on a fixed
 consumption stream C̄, where C̄ is the annual coupon from investing the estate
-in a b̄-year annuity at the current nominal yield:
+in a b̄-year annuity at the current nominal yield, plus a small luxury shift:
 
 ```
-b(W, r_f) = b̄ · (W / A)^{1-γ} / (1-γ)
+b(W, r_f) = b̄ · (max(W,0)/A + δ)^{1-γ} / (1-γ)
 
 where:
-  C̄ = W / A(y_nom)                    flow-equivalent consumption
-  A(y) = (1 - (1+y)^{-b̄}) / y        annuity factor (flat yield approx.)
-  y = y_nom                           annual nominal yield (SVENY10/100, annual decimal)
+  C̄ = max(W,0)/A(y_nom) + δ           shifted flow-equivalent consumption
+  A(y) = Σ (1+y(k))^{-k}              annuity factor (interpolated term struct.)
+  δ = DELTA_BEQUEST                    luxury shift (lifecycle/model.py)
   b̄ = 10                              bequest horizon (years of heir consumption)
 ```
 
-Marginal bequest utility:
+Marginal bequest utility (W > 0):
 ```
-b'(W)  = b̄ · (W/A)^{-γ} / A
-b''(W) = -γ · b̄ · (W/A)^{-γ-1} / A²
+b'(W)  =  b̄ · (W/A + δ)^{-γ} / A
+b''(W) = -γ · b'(W) / (A · (W/A + δ))
 ```
 
-Inverse marginal:
+Marginal utility is bounded above by `mu_max = b̄·δ^{-γ}/A` (vs. `∞` in the
+unshifted spec). For W ≤ 0 (bankrupt heirs), `b'(W) = 0` — the realised-estate
+clamp `max(W,0)` survives unchanged.
+
+Inverse marginal (clamps to W = 0 above mu_max):
 ```
-W = A · (μ·A/b̄)^{-1/γ}
+W = A · max( (μ·A/b̄)^{-1/γ} - δ,  0 )
 ```
 
 ### 2.2 Code Implementation
 
-| Function | File | Line | Formula |
-|----------|------|------|---------|
-| `annuity_factor(y_ann, b_bar)` | model.py | [196](model.py#L196) | `(1-(1+y)^{-b̄})/y` |
-| `bequest_utility(W, A, gamma, b_bar)` | model.py | [217](model.py#L217) | `b̄·(W/A)^{1-γ}/(1-γ)` |
-| `bequest_marginal(W, A, gamma, b_bar)` | model.py | [236](model.py#L236) | `b̄·(W/A)^{-γ}/A` |
-| `bequest_marginal_inv(mu, A, gamma, b_bar)` | model.py | [251](model.py#L251) | `A·(μA/b̄)^{-1/γ}` |
+| Function | File | Formula |
+|----------|------|---------|
+| `annuity_factor(y_1, spr, b_bar)` | [model.py](../lifecycle/model.py) | `Σ (1+y(k))^{-k}` |
+| `bequest_utility(W, A, gamma, b_bar, delta)` | [model.py](../lifecycle/model.py) | `b̄·(max(W,0)/A + δ)^{1-γ}/(1-γ)` |
+| `bequest_marginal(W, A, gamma, b_bar, delta)` | [model.py](../lifecycle/model.py) | `b̄·(W/A + δ)^{-γ}/A` for W>0; else 0 |
+| `bequest_marginal_inv(mu, A, gamma, b_bar, delta)` | [model.py](../lifecycle/model.py) | `A·max((μA/b̄)^{-1/γ} - δ, 0)` |
+| `DELTA_BEQUEST` | [model.py](../lifecycle/model.py) | calibrated shift parameter |
 
 **Annuity factor array:** Precomputed at [precompute.py:168–169](precompute.py#L168-L169):
 ```python
@@ -175,62 +183,52 @@ rate is not yet finalized (see Section 2.5).
 
 ### 2.3 How Bequest Enters the Solver
 
-**Retirement FOC** ([solver.py:474–480](solver.py#L474-L480)):
+**Retirement FOC** ([solver.py](../lifecycle/solver.py)):
 ```python
-w_A         = w_inv / annuity_factor_is           # C̄ = invested_wealth / A
-mu_bequest  = b_bar * w_A ** (-gamma) / annuity_factor_is  # b'(W)
-mu_comb     = psi * mu_alive + prob_death * mu_bequest     # weighted marginal
-mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_is)  # b''(W)
-mup_comb    = psi * mup_alive + prob_death * mup_bequest       # weighted second deriv
+# Solvent branch (sR_p > 0): shifted-bequest helper.
+mu_bequest, mup_bequest = _shifted_bequest_mu_and_mup(
+    sR_p, annuity_factor_is, gamma, b_bar, DELTA_BEQUEST
+)
+# Bankrupt branch (sR_p <= 0): mu_bequest = mup_bequest = 0.
+mu_comb  = psi * mu_alive + prob_death * mu_bequest
+mup_comb = psi * mup_alive + prob_death * mup_bequest
 ```
 
-**Working-age FOC** ([solver.py:828–843](solver.py#L828-L843)):
-Same bequest marginal and second derivative, but the bequest contribution is hoisted
-outside the `(k_eta, i_e)` income quadrature loops. This is valid because:
+**Working-age FOC** ([solver.py](../lifecycle/solver.py)):
+Same bequest marginal and second derivative (now from `_shifted_bequest_mu_and_mup`),
+hoisted outside the `(k_eta, i_e)` income quadrature loops. This is valid because:
 - Bequest depends only on invested wealth `a·R_p` (determined by `j_s, k_r`)
 - Bequest does not depend on income realization (no `Y_{t+1}` in the dead branch)
 - The sum of income quadrature weights = 1, so hoisting doesn't change the level
 
-**Terminal age** ([solver.py:1549–1597](solver.py#L1549-L1597)):
-At age 99, death is certain (ψ = 0). The portfolio FOC decouples from consumption
-due to CRRA homogeneity. Derivation:
+**Terminal age** ([solver.py](../lifecycle/solver.py) — `solve_terminal_age`):
+At age 99, death is certain (ψ = 0). Under the **shifted** bequest the
+homogeneity that gave the closed-form `c* = W·ratio/(1+ratio)` is broken —
+the bequest is no longer proportional to `a^{1-γ}`. The terminal step is
+instead solved by EGM on a savings grid:
 
-The terminal Bellman with certain death is:
 ```
 V_T(W) = max_{c,α}  u(c) + β · E[ b(a·R_p, A) ]
-```
-Substituting the CRRA bequest `b = b̄·(aR_p/A)^{1-γ}/(1-γ)` and factoring:
-```
-= max_{c,α}  c^{1-γ}/(1-γ)  +  β · [b̄ · A^{γ-1}/(1-γ)] · a^{1-γ} · E[R_p^{1-γ}]
-```
-Because the bequest has CRRA form, it factors into separate functions of savings
-`a^{1-γ}` and portfolio return `E[R_p^{1-γ}]`. The portfolio FOC is:
-```
-∂/∂α_k E[R_p^{1-γ}] = (1-γ) · E[R_p^{-γ} · (R_k - R_bill)] = 0
-```
-This contains no W, c, or a — the portfolio problem decouples from the consumption
-problem. The code solves it once per financial state via `minimize` on the simplex
-([solver.py:329–418](solver.py#L329-L418)), obtaining `moment = E[R_p^{1-γ}]`.
-
-The gradient at [solver.py:270–281](solver.py#L270-L281) implements exactly this:
-```python
-coef = (1.0 - gamma) * scenario_weights * R_port ** (-gamma)
-grad = [sum(coef * Rex_s), sum(coef * Rex_b)]
+       = max_{c,α}  c^{1-γ}/(1-γ)  +  β · E[ b̄·(max(aR_p,0)/A + δ)^{1-γ}/(1-γ) ]
 ```
 
-With α* fixed, define `Ω = b̄ · A^{γ-1} · E[R_p^{1-γ}]`. The consumption FOC gives:
-```
-c^{-γ} = β · Ω · (W-c)^{-γ}   →   c/(W-c) = (β·Ω)^{-1/γ} ≡ ratio
-→  c* = W · ratio / (1 + ratio)
-```
-In code ([solver.py:1588–1590](solver.py#L1588-L1590)):
-```python
-omega = b_bar * A_is ** (gamma - 1.0) * moment    # Ω
-ratio = (beta * omega) ** (-1.0 / gamma)
-c_vec = wealth_grid * ratio / (ratio + 1.0)
-```
-Consumption is a constant fraction of wealth: `c*/W = ratio/(ratio+1)`, identical
-across all wealth levels (CRRA homogeneity).
+For each savings level `a = s_grid[j_s]`:
+1. Solve the s-dependent portfolio FOC
+   `Σ w · b'(s·R_p) · (R_k − R_bill) = 0` for `(α_s*, α_b*)` via 2D Newton
+   (constrained or unconstrained, mirroring the working/retirement solvers).
+2. Compute `V_dot = E[b'(s·R_p) · R_p]`.
+3. Invert the consumption Euler `u'(c) = β · V_dot`:
+   `c* = (β · V_dot)^{-1/γ}`.
+4. Implied wealth `W = c* + s`.
+
+Then for each `i_w` on the wealth grid, interpolate `(c, α_s, α_b)` from the
+EGM arrays. Below the smallest implied W we hold `s = s_grid[0]` and consume
+the residual; above the largest W we extrapolate `c` linearly with `α` held
+flat at the largest-s solution. Bequest depends on (s, A_is) only — not on z —
+so the policy is broadcast across the z dimension.
+
+Cost: `N_state × N_s` Newton solves vs. the original `N_state` (terminal step
+is still negligible relative to the working/retirement induction loop).
 
 ### 2.4 Timing
 
@@ -699,6 +697,14 @@ Total weight sums to 1 because: `Σ π_{ij} · Σ w_k = 1` (state × return) and
       survival-weighted alive+bequest marginal utility behaves correctly.
 
 ### 5.2 Bequest Utility
+
+> **Status note (post-shift):** the audit items below were performed against
+> the *unshifted* CRRA-with-clamp specification. The bequest has since moved
+> to the De Nardi (2004) shifted form `b̄·(W/A + δ)^{1-γ}/(1-γ)` to remove the
+> bankruptcy-boundary discontinuity. The structural arguments (annuity-factor
+> indexing, b̄=10, MU = derivative of level, second-derivative formula in the
+> Jacobian, identity check vs. solver) still hold with `W/A` replaced by
+> `W/A + δ`; the `delta → 0` limit recovers the originally audited code path.
 
 - [x] **Functional forms match Catherine (2025) eqs. 21–22** —
       `bequest_utility` ([model.py:232–233](model.py#L232-L233)):

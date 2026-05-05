@@ -34,13 +34,13 @@ sigma_stat = np.sqrt(np.diag(Sigma_z))
 # Build (9, 9, 9) grid, n_stds=2
 info_999 = build_state_grid(N_vec=[9,9,9], mu_intercept=Phi_0_state,
                             Phi=Phi_11, Sigma_innov=Sigma_ss,
-                            n_stds=2.0, mode='principal')
+                            n_stds=2.0, mode='cholesky')
 state_grid_999 = info_999['state_grid']
 
 # Build (5, 5, 5) grid for reference
 info_555 = build_state_grid(N_vec=[5,5,5], mu_intercept=Phi_0_state,
                             Phi=Phi_11, Sigma_innov=Sigma_ss,
-                            n_stds=2.0, mode='principal')
+                            n_stds=2.0, mode='cholesky')
 state_grid_555 = info_555['state_grid']
 
 print("=" * 90)
@@ -60,8 +60,8 @@ print()
 print("=" * 90)
 print("PER-STEP SPACING (in innov sigma, by physical axis)")
 print("=" * 90)
-print("  Note: principal axes mix all 3 physical vars, so per-physical-axis spacing")
-print("  varies depending on which principal-coord step you make.")
+print("  Note: cholesky axes mix all 3 physical vars, so per-physical-axis spacing")
+print("  varies depending on which cholesky-coord step you make.")
 print()
 for d in range(3):
     vals = np.unique(np.round(state_grid_999[:, d], 6))
@@ -89,7 +89,7 @@ print(f"  1D weights (sum to 1): {weights_1d}")
 print(f"  Total joint nodes for v^s: {len(nodes_1d)**3} (= 3^3)")
 print()
 print("  Innovation v^s ~ N(0, Sigma_ss). After Cholesky transform, the joint nodes")
-print("  span the v^s distribution at +/-{:.3f} sigma along each principal innovation axis.".format(nodes_1d.max()))
+print("  span the v^s distribution at +/-{:.3f} sigma along each cholesky innovation axis.".format(nodes_1d.max()))
 print()
 print("  Compared to K=2 (production, prior bundle): nodes at +/- 1.0 sigma standardized.")
 print("  K=3 reaches +/- 1.225 sigma — modestly wider but symmetric weighting includes")

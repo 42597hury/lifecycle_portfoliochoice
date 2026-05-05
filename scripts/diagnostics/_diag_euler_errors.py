@@ -38,6 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lifecycle.model import (
+    DELTA_BEQUEST,
     DiscretizationConfig,
     annuity_factor,
     disposable_income_working,
@@ -63,6 +64,25 @@ from lifecycle.simulation import (
     simulate_lifecycle_core,
 )
 from lifecycle.solver import _interp_z_wealth, find_bracket
+
+
+# =============================================================================
+# SHIFTED-BEQUEST MARGINAL UTILITY (De Nardi 2004) -- mirror of solver helper
+# =============================================================================
+# Duplicated from lifecycle.solver._shifted_bequest_mu_and_mup; this file is
+# not in the solver cache hierarchy so it must define its own copy. KEEP IN
+# LOCKSTEP with the solver helper. The EE kernels below use only `mu` and
+# discard `mup`, but the math is identical to the solver call sites for
+# auditing.
+@njit(fastmath=True, inline='always')
+def _shifted_bequest_mu(W, A, gamma, b_bar, delta):
+    """Return shifted-bequest marginal utility b'(W). Caller must ensure W > 0.
+
+    fastmath + always-inline matches the EE kernels' decorator style so the
+    helper folds into the fastmath-compiled euler-sum loops cleanly.
+    """
+    C_bar = W / A + delta
+    return b_bar * C_bar ** (-gamma) / A
 
 
 def _pad_eval_state_inputs_to_3d(pc: Precompute, model: Any) -> dict[str, Any]:
@@ -185,6 +205,17 @@ class EulerBundleContext:
     pc_eval: Precompute
     first_solved_t: int
     last_solved_t: int
+    # Luxury-bequest shifter that the bundle was solved with. Read from
+    # metadata.run_config.delta_bequest if present (new bundles), falls back
+    # to module DELTA_BEQUEST for legacy bundles. EE diagnostics must use the
+    # bundle's delta to avoid spurious residuals from a solve-vs-eval mismatch.
+    delta_bequest: float = DELTA_BEQUEST
+    # Wealth-dynamics spec the bundle was solved under. Read from
+    # metadata["wealth_dynamics_spec"] (new tagged bundles) or
+    # metadata.run_config.solver_config.wealth_dynamics_spec; defaults to
+    # "simple_clamp" for legacy bundles. The diagnostic's R_p formula MUST
+    # mirror the solver — refusing to mix is enforced at bundle-load time.
+    use_ccv: bool = False
 
 
 def _coerce_tuple(value: Any, n: int) -> tuple[int, ...]:
@@ -444,6 +475,34 @@ def _load_bundle_context(bundle_path: Path,
     if pc_policy.n_w != pc_eval.n_w or pc_policy.n_z != pc_eval.n_z or pc_policy.N_state != pc_eval.N_state:
         raise ValueError("Evaluation precompute must preserve the policy bundle's grids.")
 
+    # Recover the bundle's delta_bequest from metadata when present (post-2026-05-04
+    # bundles record it under run_config.solver_config.delta_bequest, with the
+    # sentinel -1 still meaning "use module DELTA_BEQUEST"). Legacy bundles miss
+    # the field entirely; fall back to the module default in that case.
+    delta_bequest = DELTA_BEQUEST
+    rc = metadata.get("run_config", {}) if isinstance(metadata, dict) else {}
+    sc_meta = rc.get("solver_config", {}) if isinstance(rc, dict) else {}
+    delta_meta = sc_meta.get("delta_bequest") if isinstance(sc_meta, dict) else None
+    if delta_meta is not None:
+        try:
+            delta_meta_f = float(delta_meta)
+            if delta_meta_f >= 0.0:
+                delta_bequest = delta_meta_f
+            # else: sentinel; keep module DELTA_BEQUEST.
+        except (TypeError, ValueError):
+            pass
+
+    # Wealth-dynamics spec the bundle was solved under. Pulled from the
+    # top-level metadata field (added by policy_io.save_policy_bundle in PR1)
+    # or from run_config.solver_config.wealth_dynamics_spec. Legacy bundles
+    # have neither and default to "simple_clamp".
+    spec_str = "simple_clamp"
+    if isinstance(metadata, dict) and "wealth_dynamics_spec" in metadata:
+        spec_str = str(metadata["wealth_dynamics_spec"])
+    elif isinstance(sc_meta, dict) and "wealth_dynamics_spec" in sc_meta:
+        spec_str = str(sc_meta["wealth_dynamics_spec"])
+    use_ccv = (spec_str == "ccv_log")
+
     return EulerBundleContext(
         path=bundle_path,
         label=bundle_path.name,
@@ -461,6 +520,8 @@ def _load_bundle_context(bundle_path: Path,
         pc_eval=pc_eval,
         first_solved_t=int(solved_idx[0]),
         last_solved_t=int(solved_idx[-1]),
+        delta_bequest=delta_bequest,
+        use_ccv=use_ccv,
     )
 
 
@@ -660,12 +721,18 @@ def _compute_euler_sum_retirement_continuous(
     exp_ret_stock: np.ndarray,
     exp_ret_bond: np.ndarray,
     ret_weights: np.ndarray,
+    ret_nodes: np.ndarray,
+    sigma2_xr: float,
+    sigma2_xb: float,
+    sigma_xrxb: float,
+    use_ccv: bool,
     gamma: float,
     b_bar: int,
     annuity_factor_cur: float,
     min_wealth_inv: float = 1e-10,
     min_consumption: float = 1e-10,
     prob_skip: float = 1e-12,
+    delta: float = DELTA_BEQUEST,
 ) -> float:
     a_bill = 1.0 - alpha_s - alpha_b
     psi = _interp_z_row_value(z_cur, z_grid, survival_row)
@@ -689,25 +756,43 @@ def _compute_euler_sum_retirement_continuous(
         s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_cur[0] + Phi_11[1, 1] * state_cur[1] + Phi_11[1, 2] * state_cur[2] + v_nodes[k_v, 1]
         s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_cur[0] + Phi_11[2, 1] * state_cur[1] + Phi_11[2, 2] * state_cur[2] + v_nodes[k_v, 2]
 
-        exp_mu_bill = math.exp(base_mu_r_0 + M_v_nodes[k_v, 0])
-        exp_mu_s = math.exp(base_mu_r_1 + M_v_nodes[k_v, 1])
-        exp_mu_b = math.exp(base_mu_r_2 + M_v_nodes[k_v, 2])
+        mu_r_bill = base_mu_r_0 + M_v_nodes[k_v, 0]
+        mu_r_stock = base_mu_r_1 + M_v_nodes[k_v, 1]
+        mu_r_bond = base_mu_r_2 + M_v_nodes[k_v, 2]
+        exp_mu_bill = math.exp(mu_r_bill)
+        exp_mu_s = math.exp(mu_r_stock)
+        exp_mu_b = math.exp(mu_r_bond)
 
         for k_r in range(len(ret_weights)):
             weight = w_v * ret_weights[k_r]
             if weight < prob_skip:
                 continue
 
-            R_bill = exp_mu_bill * exp_ret_bill[k_r]
-            R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
-            R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
-            R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
-
-            sR_p = s_val * R_p
-            if sR_p > 0.0:
+            if use_ccv:
+                # Mirror the solver kernel R_p exactly (see compute_foc_jac_retirement_quad).
+                log_R_bill = mu_r_bill + ret_nodes[k_r, 0]
+                log_x_s = mu_r_stock + ret_nodes[k_r, 1]
+                log_x_b = mu_r_bond + ret_nodes[k_r, 2]
+                r_p = (log_R_bill
+                       + alpha_s * log_x_s + alpha_b * log_x_b
+                       + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
+                       - 0.5 * (alpha_s * alpha_s * sigma2_xr
+                                + 2.0 * alpha_s * alpha_b * sigma_xrxb
+                                + alpha_b * alpha_b * sigma2_xb))
+                R_p = math.exp(r_p)
+                sR_p = s_val * R_p
                 x_next = sR_p + pension_next
             else:
-                x_next = pension_next
+                R_bill = exp_mu_bill * exp_ret_bill[k_r]
+                R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
+                R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
+                R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
+
+                sR_p = s_val * R_p
+                if sR_p > 0.0:
+                    x_next = sR_p + pension_next
+                else:
+                    x_next = pension_next
 
             c_next, _mpc = _interp_continuation_c_mpc(
                 c_next_full,
@@ -732,8 +817,9 @@ def _compute_euler_sum_retirement_continuous(
 
             mu_alive = c_next ** (-gamma)
             if sR_p > 0.0:
-                w_A = sR_p / annuity_factor_cur
-                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
+                mu_bequest = _shifted_bequest_mu(
+                    sR_p, annuity_factor_cur, gamma, b_bar, delta
+                )
             else:
                 mu_bequest = 0.0
             mu_comb = psi * mu_alive + prob_death * mu_bequest
@@ -780,6 +866,11 @@ def _compute_euler_sum_working_continuous(
     exp_ret_stock: np.ndarray,
     exp_ret_bond: np.ndarray,
     ret_weights: np.ndarray,
+    ret_nodes: np.ndarray,
+    sigma2_xr: float,
+    sigma2_xb: float,
+    sigma_xrxb: float,
+    use_ccv: bool,
     gamma: float,
     b_bar: int,
     annuity_factor_cur: float,
@@ -787,6 +878,7 @@ def _compute_euler_sum_working_continuous(
     min_wealth_inv: float = 1e-10,
     min_consumption: float = 1e-10,
     prob_skip: float = 1e-12,
+    delta: float = DELTA_BEQUEST,
 ) -> float:
     a_bill = 1.0 - alpha_s - alpha_b
     psi = _interp_z_row_value(z_cur, z_grid, survival_row)
@@ -818,29 +910,52 @@ def _compute_euler_sum_working_continuous(
         s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_cur[0] + Phi_11[1, 1] * state_cur[1] + Phi_11[1, 2] * state_cur[2] + v_nodes[k_v, 1]
         s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_cur[0] + Phi_11[2, 1] * state_cur[1] + Phi_11[2, 2] * state_cur[2] + v_nodes[k_v, 2]
 
-        exp_mu_bill = math.exp(base_mu_r_0 + M_v_nodes[k_v, 0])
-        exp_mu_s = math.exp(base_mu_r_1 + M_v_nodes[k_v, 1])
-        exp_mu_b = math.exp(base_mu_r_2 + M_v_nodes[k_v, 2])
+        mu_r_bill = base_mu_r_0 + M_v_nodes[k_v, 0]
+        mu_r_stock = base_mu_r_1 + M_v_nodes[k_v, 1]
+        mu_r_bond = base_mu_r_2 + M_v_nodes[k_v, 2]
+        exp_mu_bill = math.exp(mu_r_bill)
+        exp_mu_s = math.exp(mu_r_stock)
+        exp_mu_b = math.exp(mu_r_bond)
 
         for k_r in range(len(ret_weights)):
             p_state_ret = w_v * ret_weights[k_r]
             if p_state_ret < prob_skip:
                 continue
 
-            R_bill = exp_mu_bill * exp_ret_bill[k_r]
-            R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
-            R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
-            R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
-
-            sR_p = s_val * R_p
-            if sR_p > 0.0:
+            if use_ccv:
+                # Mirror solver kernel R_p (compute_foc_jac_working_quad).
+                log_R_bill = mu_r_bill + ret_nodes[k_r, 0]
+                log_x_s = mu_r_stock + ret_nodes[k_r, 1]
+                log_x_b = mu_r_bond + ret_nodes[k_r, 2]
+                r_p = (log_R_bill
+                       + alpha_s * log_x_s + alpha_b * log_x_b
+                       + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
+                       - 0.5 * (alpha_s * alpha_s * sigma2_xr
+                                + 2.0 * alpha_s * alpha_b * sigma_xrxb
+                                + alpha_b * alpha_b * sigma2_xb))
+                R_p = math.exp(r_p)
+                sR_p = s_val * R_p
                 w_inv = sR_p
-                w_A = w_inv / annuity_factor_cur
-                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
+                mu_bequest = _shifted_bequest_mu(
+                    w_inv, annuity_factor_cur, gamma, b_bar, delta
+                )
                 euler_sum += p_state_ret * prob_death * mu_bequest * R_p
             else:
-                # Bankruptcy: heirs inherit nothing; alive branch uses w_inv = 0.
-                w_inv = 0.0
+                R_bill = exp_mu_bill * exp_ret_bill[k_r]
+                R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
+                R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
+                R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
+
+                sR_p = s_val * R_p
+                if sR_p > 0.0:
+                    w_inv = sR_p
+                    mu_bequest = _shifted_bequest_mu(
+                        w_inv, annuity_factor_cur, gamma, b_bar, delta
+                    )
+                    euler_sum += p_state_ret * prob_death * mu_bequest * R_p
+                else:
+                    # Bankruptcy: heirs inherit nothing; alive branch uses w_inv = 0.
+                    w_inv = 0.0
 
             for k_eta in range(len(eta_nodes)):
                 w_eta = eta_weights[k_eta]
@@ -936,11 +1051,17 @@ def _evaluate_age_errors(
     exp_ret_stock: np.ndarray,
     exp_ret_bond: np.ndarray,
     ret_weights: np.ndarray,
+    ret_nodes: np.ndarray,
+    sigma2_xr: float,
+    sigma2_xb: float,
+    sigma_xrxb: float,
+    use_ccv: bool,
     gamma: float,
     beta: float,
     b_bar: int,
     annuity_factors_age: np.ndarray,
     kink_tol: float,
+    delta: float = DELTA_BEQUEST,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(household_idx)
     ee = np.empty(n, dtype=np.float64)
@@ -998,9 +1119,15 @@ def _evaluate_age_errors(
                 exp_ret_stock,
                 exp_ret_bond,
                 ret_weights,
+                ret_nodes,
+                sigma2_xr,
+                sigma2_xb,
+                sigma_xrxb,
+                use_ccv,
                 gamma,
                 b_bar,
                 annuity_cur,
+                delta=delta,
             )
         else:
             e_sum = _compute_euler_sum_working_continuous(
@@ -1040,10 +1167,16 @@ def _evaluate_age_errors(
                 exp_ret_stock,
                 exp_ret_bond,
                 ret_weights,
+                ret_nodes,
+                sigma2_xr,
+                sigma2_xb,
+                sigma_xrxb,
+                use_ccv,
                 gamma,
                 b_bar,
                 annuity_cur,
                 use_pension_next,
+                delta=delta,
             )
 
         if beta * e_sum <= 0.0:
@@ -1218,6 +1351,10 @@ def _simulate_bundle_window(ctx: EulerBundleContext,
         const_r=np.ascontiguousarray(pc.const_r),
         A_r=state_inputs["A_r"],
         M_matrix=state_inputs["M_matrix"],
+        sigma2_xr=float(pc.sigma2_xr),
+        sigma2_xb=float(pc.sigma2_xb),
+        sigma_xrxb=float(pc.sigma_xrxb),
+        use_ccv=bool(ctx.use_ccv),
     )
 
     (
@@ -1305,6 +1442,7 @@ def _maybe_build_warm_start(ctx: EulerBundleContext, args: argparse.Namespace) -
         initial_state=args.initial_state,
         seed=args.seed,
         return_draw_mode=args.return_draw_mode,
+        wealth_dynamics_spec=("ccv_log" if ctx.use_ccv else "simple_clamp"),
         verbose=False,
     )
 
@@ -1606,11 +1744,17 @@ def run_euler_diagnostic(args: argparse.Namespace) -> tuple[EulerBundleContext, 
             np.ascontiguousarray(pc_eval.exp_ret_stock),
             np.ascontiguousarray(pc_eval.exp_ret_bond),
             np.ascontiguousarray(pc_eval.ret_weights),
+            np.ascontiguousarray(pc_eval.ret_nodes),
+            float(pc_eval.sigma2_xr),
+            float(pc_eval.sigma2_xb),
+            float(pc_eval.sigma_xrxb),
+            bool(ctx.use_ccv),
             float(model.gamma),
             float(model.beta),
             int(model.b_bar),
             annuity_factors_age,
             float(args.kink_tol),
+            delta=ctx.delta_bequest,
         )
 
         rows.append(_summarize_ee(

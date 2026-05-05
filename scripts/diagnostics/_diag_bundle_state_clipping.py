@@ -1,7 +1,7 @@
 """Bundle-level state-support / clipping diagnostic.
 
 Simulates a saved policy bundle over its solved age window and reports how often
-the continuous financial state lands outside the bundle's principal-grid support
+the continuous financial state lands outside the bundle's cholesky-grid support
 in transformed bracket coordinates.
 
 This is the direct diagnostic for "did widening state_n_stds actually reduce

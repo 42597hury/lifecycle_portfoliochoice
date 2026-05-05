@@ -62,7 +62,7 @@ v_nodes, v_weights = get_state_quadrature(mm, n_nodes=2)
 ret_nodes, ret_weights = get_return_quadrature(mm, n_nodes=(3, 5, 3))
 
 info = build_state_grid(N_vec=[5, 5, 5], mu_intercept=Phi_0_state,
-                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 state_indices = info['state_indices']
 

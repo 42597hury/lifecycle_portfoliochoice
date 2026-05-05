@@ -116,7 +116,7 @@ def _build_disc_config(raw: dict[str, Any]) -> DiscretizationConfig:
         savings_min=float(raw["savings_min"]),
         savings_max=raw.get("savings_max"),
         state_grid_sizes=tuple(int(v) for v in raw["state_grid_sizes"]),
-        state_grid_mode=raw.get("state_grid_mode", "principal"),
+        state_grid_mode=raw.get("state_grid_mode", "cholesky"),
         state_n_stds=_coerce_seq(raw.get("state_n_stds", 3.0)),
         n_z=int(raw["n_z"]),
         n_stds=float(raw.get("n_stds", 3.0)),

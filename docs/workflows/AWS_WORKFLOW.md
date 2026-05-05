@@ -377,7 +377,7 @@ This section covers the canonical-config workflow for production sweeps: a pre-l
 |---|---|---|
 | `state_grid_sizes` | Yes (N_state) | resume refuses, safe |
 | `n_z`, `n_wealth`, `n_savings` | Yes | resume refuses, safe |
-| `state_n_stds` | **No** (just relocates principal-mode grid) | **YES — silently loads incompatible policies** |
+| `state_n_stds` | **No** (just relocates cholesky-mode grid) | **YES — silently loads incompatible policies** |
 | `wealth_min`, `wealth_max` | No (only edits grid values) | **YES** |
 | `alpha_min`, `alpha_max` | No | **YES** |
 | All solver tuning (`max_iter_unconstrained`, `init_alpha_*`, `use_line_search`, etc.) | No | **YES** |

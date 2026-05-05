@@ -40,8 +40,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.diagnostics._diag_euler_errors import (
+    _annuity_factors_per_household,
     _evaluate_age_errors,
     _load_bundle_context,
+    _pad_eval_state_inputs_to_3d,
 )
 from scripts.diagnostics._diag_quadrature_cloud import (
     build_cloud,
@@ -68,8 +70,7 @@ def _scan_age(ctx, age_int, z_idx, state_idx, wealth_idx, kink_tol=1e-3):
     pension_row = np.ascontiguousarray(
         pc_eval.pension_after_tax[int(model.retire_age - model.start_age), :]
     )
-    N1 = len(pc_eval.state_bracket_grids[1])
-    N2 = len(pc_eval.state_bracket_grids[2])
+    eval_pad = _pad_eval_state_inputs_to_3d(pc_eval, model)
 
     n_probe = z_idx.size * state_idx.size * wealth_idx.size
     z_age = np.empty(n_probe, dtype=np.float64)
@@ -102,6 +103,7 @@ def _scan_age(ctx, age_int, z_idx, state_idx, wealth_idx, kink_tol=1e-3):
                 k += 1
 
     household_idx = np.arange(n_probe, dtype=np.int64)
+    annuity_factors_age = _annuity_factors_per_household(model, state_coords_age)
     ee, valid, is_constrained = _evaluate_age_errors(
         household_idx,
         z_age,
@@ -124,29 +126,34 @@ def _scan_age(ctx, age_int, z_idx, state_idx, wealth_idx, kink_tol=1e-3):
         np.ascontiguousarray(pc_eval.eta_weights),
         np.ascontiguousarray(pc_eval.eps_nodes),
         np.ascontiguousarray(pc_eval.eps_weights),
-        np.ascontiguousarray(pc_eval.v_nodes),
+        eval_pad["v_nodes"],
         np.ascontiguousarray(pc_eval.v_weights),
         np.ascontiguousarray(pc_eval.M_v_nodes),
         np.ascontiguousarray(pc_eval.const_r),
-        np.ascontiguousarray(pc_eval.A_r),
-        np.ascontiguousarray(model.Phi_0_state),
-        np.ascontiguousarray(model.Phi_11),
-        np.ascontiguousarray(pc_eval.state_bracket_shift),
-        np.ascontiguousarray(pc_eval.state_bracket_L_inv),
-        np.ascontiguousarray(pc_eval.state_bracket_grids[0]),
-        np.ascontiguousarray(pc_eval.state_bracket_grids[1]),
-        np.ascontiguousarray(pc_eval.state_bracket_grids[2]),
-        int(N1),
-        int(N2),
+        eval_pad["A_r"],
+        eval_pad["Phi_0_state"],
+        eval_pad["Phi_11"],
+        eval_pad["state_bracket_shift"],
+        eval_pad["state_bracket_L_inv"],
+        eval_pad["state_grids_0"],
+        eval_pad["state_grids_1"],
+        eval_pad["state_grids_2"],
+        int(eval_pad["N0"]),
+        int(eval_pad["N1"]),
+        int(eval_pad["N2"]),
         np.ascontiguousarray(pc_eval.exp_ret_bill),
         np.ascontiguousarray(pc_eval.exp_ret_stock),
         np.ascontiguousarray(pc_eval.exp_ret_bond),
         np.ascontiguousarray(pc_eval.ret_weights),
+        np.ascontiguousarray(pc_eval.ret_nodes),
+        float(pc_eval.sigma2_xr),
+        float(pc_eval.sigma2_xb),
+        float(pc_eval.sigma_xrxb),
+        bool(ctx.use_ccv),
         float(model.gamma),
         float(model.beta),
         int(model.b_bar),
-        int(model.y_1_index_in_state),
-        int(model.spr_index_in_state),
+        annuity_factors_age,
         float(kink_tol),
     )
 
@@ -393,16 +400,16 @@ def main(argv=None):
     # Mass beyond |s_i|>0.6 sigma in each axis (approx narrow-support boundary)
     # state coords are economic; we don't have sigma_z directly. Use pc.state_grid_sigma_z
     sigma_z = np.asarray(pc.state_grid_sigma_z)  # (n_state,) sigma per axis
-    # The state_grid coordinates ARE already sigma-scaled in 'principal' mode? No — they are economic.
-    # In principal mode, the bracket axes are unit-scaled; state_grid is the economic state.
+    # The state_grid coordinates ARE already sigma-scaled in 'cholesky' mode? No — they are economic.
+    # In cholesky mode, the bracket axes are unit-scaled; state_grid is the economic state.
     # Use the per-axis sd implied by the state grid extent (max-min)/(2*half_width).
     # Simpler: classify by axis-fraction = i / (sizes[axis]-1) on the index lattice.
     # axis index 0 -> i0/6; mid is 3. |i_axis - 3| / 3 gives normalized.
     # But user wanted "narrower support" comparison: clip to |s_i|>0.6 sigma_i etc.
-    # We can use principal coordinates. Build a per-state (b0, b1, b2) like _interp does:
-    # bracket_grids ARE the principal coordinates (linspace from -n_stds to +n_stds).
-    grids_p = pc.state_bracket_grids  # list of 3 1D arrays (the principal axis coords)
-    # mass on |b_axis| > thr (in principal coordinates)
+    # We can use cholesky coordinates. Build a per-state (b0, b1, b2) like _interp does:
+    # bracket_grids ARE the cholesky coordinates (linspace from -n_stds to +n_stds).
+    grids_p = pc.state_bracket_grids  # list of 3 1D arrays (the cholesky axis coords)
+    # mass on |b_axis| > thr (in cholesky coordinates)
     def mass_beyond(thr_per_axis):
         """thr_per_axis: tuple of 3 thresholds. Returns mass with |b_axis|>thr in any axis."""
         keep = np.zeros(pc.N_state, dtype=bool)
@@ -421,7 +428,7 @@ def main(argv=None):
     narrow = (0.6, 1.75, 2.0)
     mass_outside_narrow, n_outside_narrow = mass_beyond(narrow)
 
-    # mass in worst-corner regions (top corners' principal coords)
+    # mass in worst-corner regions (top corners' cholesky coords)
     # check whether they sit beyond the narrow envelope
     top_corner_outside_narrow = []
     for r in sharpe_rows:
@@ -489,7 +496,7 @@ def main(argv=None):
     print(f"  total stationary mass on top {args.top_k_corners} corners: {100*stat_total_top:.4f}%")
     print(f"  total stationary mass on all corners with >=1 invalid:    {100*stat_total_invalid_corners:.4f}%")
     print(f"  state_n_stds (this bundle): {n_stds_arr}")
-    print(f"  narrow-support thresholds (per-axis principal): {narrow}")
+    print(f"  narrow-support thresholds (per-axis cholesky): {narrow}")
     print(f"  states sitting OUTSIDE narrow envelope: {n_outside_narrow}/{pc.N_state}")
     print(f"  stationary mass OUTSIDE narrow envelope: {100*mass_outside_narrow:.4f}%")
     n_inv_corners_outside = sum(1 for tup in top_corner_outside_narrow if tup[3])
@@ -564,10 +571,10 @@ def main(argv=None):
 
         out.append(f"### Top {args.top_k_corners} state corners by invalid count")
         out.append("")
-        out.append("Principal coords are the (signed) bracket-axis coordinates used by the state-grid "
+        out.append("Cholesky coords are the (signed) bracket-axis coordinates used by the state-grid "
                    "tensor; positive/negative magnitudes >1 sit beyond +/-1σ in transformed space.")
         out.append("")
-        out.append("| rank | i_s | (i0,i1,i2) | (b0,b1,b2) principal | invalid/total | rate | stat_prob | outside narrow |")
+        out.append("| rank | i_s | (i0,i1,i2) | (b0,b1,b2) cholesky | invalid/total | rate | stat_prob | outside narrow |")
         out.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
         for rank, (i_s, nt, ni, rate) in enumerate(top_corners):
             tup = _state_index_to_tuple(i_s, sizes)
@@ -634,7 +641,7 @@ def main(argv=None):
                    f"`{100*stat_total_top:.4f}%`")
         out.append(f"- Stationary mass on all corners with >=1 invalid probe: "
                    f"`{100*stat_total_invalid_corners:.4f}%`")
-        out.append(f"- Stationary mass OUTSIDE narrow envelope `|s|>{narrow}` (principal coords): "
+        out.append(f"- Stationary mass OUTSIDE narrow envelope `|s|>{narrow}` (cholesky coords): "
                    f"`{100*mass_outside_narrow:.4f}%` "
                    f"({n_outside_narrow}/{pc.N_state} corners).")
         n_inv_corners_outside = sum(1 for tup in top_corner_outside_narrow if tup[3])
@@ -675,7 +682,7 @@ def main(argv=None):
                           f"never sees R_p<=0 so it commits to the cap-binding leveraged position.")
         diag_lines.append("")
         diag_lines.append(f"- **(c) State grid too coarse for the wider support.** "
-                          f"The top corners sit at principal-coordinate positions whose magnitudes "
+                          f"The top corners sit at cholesky-coordinate positions whose magnitudes "
                           f"({n_inv_corners_outside}/{len(top_corner_outside_narrow)} of the top corners "
                           f"are outside the narrow `{narrow}` envelope). This widening alone — without "
                           f"refining the per-axis state quadrature `(3,4,5)` — would let the solver "

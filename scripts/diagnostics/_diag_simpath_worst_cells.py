@@ -146,10 +146,16 @@ def main():
             np.ascontiguousarray(pc.exp_ret_stock),
             np.ascontiguousarray(pc.exp_ret_bond),
             np.ascontiguousarray(pc.ret_weights),
+            np.ascontiguousarray(pc.ret_nodes),
+            float(pc.sigma2_xr),
+            float(pc.sigma2_xb),
+            float(pc.sigma_xrxb),
+            bool(ctx.use_ccv),
             float(model.gamma), float(model.beta),
             int(model.b_bar),
             annuity_factors_age,
             float(1e-3),
+            delta=ctx.delta_bequest,
         )
 
         for j, h_idx in enumerate(idx_alive):

@@ -40,7 +40,7 @@ print("=" * 70)
 disc_tuple = DiscretizationConfig(
     n_wealth=20, n_savings=20,
     state_grid_sizes=(5, 5, 5),
-    state_grid_mode="principal",
+    state_grid_mode="cholesky",
     state_n_stds=(2.0, 1.25, 1.5),
     n_z=5, n_eps_nodes=2, n_eta_nodes=2,
     n_ret_nodes_1d=(3, 5, 3), n_state_quad_nodes=2,
@@ -79,7 +79,7 @@ print(f"    [{'PASS' if ok3 else 'FAIL'}]")
 disc_scalar = DiscretizationConfig(
     n_wealth=20, n_savings=20,
     state_grid_sizes=(5, 5, 5),
-    state_grid_mode="principal",
+    state_grid_mode="cholesky",
     state_n_stds=2.0,
     n_z=5, n_eps_nodes=2, n_eta_nodes=2,
     n_ret_nodes_1d=(3, 5, 3), n_state_quad_nodes=2,

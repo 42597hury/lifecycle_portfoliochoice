@@ -287,11 +287,17 @@ def run(args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
             np.ascontiguousarray(pc_eval.exp_ret_stock),
             np.ascontiguousarray(pc_eval.exp_ret_bond),
             np.ascontiguousarray(pc_eval.ret_weights),
+            np.ascontiguousarray(pc_eval.ret_nodes),
+            float(pc_eval.sigma2_xr),
+            float(pc_eval.sigma2_xb),
+            float(pc_eval.sigma_xrxb),
+            bool(ctx.use_ccv),
             float(model.gamma),
             float(model.beta),
             int(model.b_bar),
             annuity_factors_age,
             float(args.kink_tol),
+            delta=ctx.delta_bequest,
         )
 
         for j in range(n_probe):

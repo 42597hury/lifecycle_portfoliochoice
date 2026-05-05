@@ -36,7 +36,7 @@ Execution in the refactored codebase follows this sequence:
 3. Instantiate `Precompute(model, disc_config=DiscretizationConfig(...))` to create
    grids, transitions, lookup tables, and survival probabilities.
 4. Optionally inspect the assembled model with
-   `diagnostics.print_model_diagnostic_report(model, pc, periods_per_year=1)`.
+   `diagnostics.diagnose_all_pre(model, pc)`.
 5. Solve the lifecycle problem with
    `solver.run_lifecycle_solver(model, pc, solver_config=SolverConfig())`.
 
@@ -60,19 +60,30 @@ u(c) = log(c)                       for gamma = 1
 ```
 
 The agent discounts the future at rate `beta` and faces age- and income-dependent
-survival probability `psi_{t,z}`. Upon death, they leave a bequest. Following Catherine (2025),
+survival probability `psi_{t,z}`. Upon death, they leave a bequest. Following the
+luxury-bequest form of De Nardi (2004) with Catherine (2025) annuity normalisation,
 the bequest is valued as the utility of spreading wealth W over b_bar years of
-consumption via an annuity:
+consumption via an annuity, plus a small shift `delta` that bounds marginal
+utility at the bankruptcy boundary:
 
 ```
-b(W, y_1, spr) = b_bar * (W / A(y_1, spr))^(1-gamma) / (1-gamma)
+b(W, y_1, spr) = b_bar * (max(W,0) / A(y_1, spr) + delta)^(1-gamma) / (1-gamma)
 
 where:
-  C_bar      = W / A(y_1, spr)        flow-equivalent consumption
-  A(y_1,spr) = sum_{k=1}^{b_bar} (1 + y(k))^{-k}    annuity factor
-  y(k)       = y_1 + spr * min(k-1, 19) / 19          interpolated yield
-  b_bar      = 10                      bequest horizon in years
+  C_bar      = max(W,0) / A(y_1, spr) + delta     shifted flow-equivalent consumption
+  A(y_1,spr) = sum_{k=1}^{b_bar} (1 + y(k))^{-k}  annuity factor
+  y(k)       = y_1 + spr * min(k-1, 19) / 19      interpolated yield
+  b_bar      = 10                                  bequest horizon in years
+  delta      = DELTA_BEQUEST                       luxury shift (lifecycle/model.py)
 ```
+
+The shift `delta` removes the bankruptcy-boundary discontinuity in the unshifted
+CRRA-with-clamp specification: marginal bequest utility is capped at
+`mu_max = b_bar * delta^{-gamma} / A` rather than diverging as W -> 0+. The
+unshifted form is recovered as `delta -> 0` pointwise on `W > 0`. The
+realised estate clamp `max(W,0)` is preserved — bankrupt heirs inherit zero
+estate; the shift only changes the agent's preferences, not the realised
+estate at death.
 
 The annuity factor A prices a 10-year consumption stream using a linearly
 interpolated term structure between the 1-year yield y_1 and the 20-year AAA
@@ -81,7 +92,7 @@ k > 20, y(k) = y_20 (capped, no extrapolation). With b_bar=10, only yields
 up to k=10 matter. Uses discrete compounding (1+y)^{-k} to match the codebase
 convention.
 
-**Calibration:** `gamma = 5`, `beta = 0.96`, `b_bar = 10`.
+**Calibration:** `gamma = 5`, `beta = 0.96`, `b_bar = 10`, `delta = DELTA_BEQUEST`.
 
 ### 1.1b Earnings-Dependent Mortality
 
@@ -595,10 +606,10 @@ and Newton tuning are carried by separate configuration objects in `model.py`:
 ```python
 disc_config = DiscretizationConfig(
     state_grid_sizes=(5, 5, 5),
-    state_grid_mode="principal",   # "naive" | "lyapunov-axis" | "principal"
+    state_grid_mode="cholesky",    # "naive" | "lyapunov-axis" | "cholesky" (legacy alias: "principal")
     state_n_stds=2.0,              # scalar (broadcast) OR length-3 sequence for
                                    # per-axis half-width in standardized u-coords
-                                   # (principal mode) or physical sigma_stat units
+                                   # (cholesky mode) or physical sigma_stat units
                                    # (lyapunov-axis mode). Per-axis added 2026-04-30.
     n_z=11,
     n_eps_nodes=5,
@@ -634,14 +645,14 @@ def annuity_factor(y_1, spr, b_bar):
     Uses discrete compounding (1+y)^{-k}.
     """
 
-def bequest_utility(W, A, gamma, b_bar):
-    """b(W) = b_bar * (W/A)^(1-gamma) / (1-gamma)"""
+def bequest_utility(W, A, gamma, b_bar, delta=DELTA_BEQUEST):
+    """b(W) = b_bar * (max(W,0)/A + delta)^(1-gamma) / (1-gamma)"""
 
-def bequest_marginal(W, A, gamma, b_bar):
-    """db/dW = b_bar * (W/A)^(-gamma) / A"""
+def bequest_marginal(W, A, gamma, b_bar, delta=DELTA_BEQUEST):
+    """db/dW = b_bar * (W/A + delta)^(-gamma) / A   for W > 0; else 0"""
 
-def bequest_marginal_inv(mu, A, gamma, b_bar):
-    """Inverse of bequest_marginal: W = A * (mu*A/b_bar)^(-1/gamma)"""
+def bequest_marginal_inv(mu, A, gamma, b_bar, delta=DELTA_BEQUEST):
+    """W = A * max((mu*A/b_bar)^(-1/gamma) - delta, 0); clamps at mu_max."""
 ```
 
 ### 3.3 model.py and discretization.py -- Helper Functions
@@ -681,7 +692,7 @@ disc_config = DiscretizationConfig(
 pc = Precompute(model, disc_config=disc_config)
 
 # Step 4: Optional calibration report
-print_model_diagnostic_report(model, pc, periods_per_year=1)
+diagnose_all_pre(model, pc)
 
 # Step 5: Solve
 C_mat, S_mat, B_mat, diagnostics = run_lifecycle_solver(
@@ -760,18 +771,19 @@ grid is retained for policy function storage and interpolation.
 #### 3.5.2a build_state_grid (production entry point)
 
 ```python
-build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="principal")
+build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="cholesky")
     # Mode-aware financial-state interpolation grid. Returns a dict with
     # state_grid (joint physical-state lattice), state_bracket_grids
-    # (per-axis interpolation grids in standardized u-coords for principal
+    # (per-axis interpolation grids in standardized u-coords for cholesky
     # mode, or physical coords for lyapunov-axis), state_indices (multi-index
-    # into marginals), bracket_shift (mu_s in principal, zero elsewhere),
-    # bracket_L_inv (Cholesky inverse in principal, identity elsewhere),
-    # Pi_state, stationary_probs.
+    # into marginals), bracket_shift (mu_s in cholesky, zero elsewhere),
+    # bracket_L_inv (Cholesky inverse in cholesky mode, identity elsewhere),
+    # Pi_state, stationary_probs. The legacy alias mode="principal" is
+    # accepted and normalised to "cholesky".
     #
     # n_stds accepts a scalar (broadcast across axes) OR a length-3 sequence
     # for per-axis half-widths.
-    # - principal mode: n_stds[d] is the half-width of Cholesky direction d
+    # - cholesky mode: n_stds[d] is the half-width of Cholesky direction d
     #   in standardized u-coords. Cholesky directions mix physical state
     #   variables; under the default ordering (cy, spr, y_1) -- 2026-04-30:
     #     L[:, 0] = (+0.530,  0,       0)        # PURE cy (100%)
@@ -788,7 +800,7 @@ build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="princi
 
 This is the production entry point used by `Precompute`. The legacy
 `rouwenhorst_multivariate` block above describes the `mode="naive"` fallback;
-production runs use `mode="principal"` for joint covariance shape and
+production runs use `mode="cholesky"` for joint covariance shape and
 `state_bracket_*` artefacts that the solver and simulator consume directly.
 
 #### 3.5.3 Income Process Discretization
@@ -941,7 +953,7 @@ it calls `calibrate_earnings_dependent_mortality(...)` and stores the resulting
 `model` + `pc` pair for inspection and debugging:
 
 ```python
-print_model_diagnostic_report(model, pc, periods_per_year=1)
+diagnose_all_pre(model, pc)
 ```
 
 This pre-solve report checks calibration consistency, income grids, VAR structure,

@@ -142,6 +142,18 @@ def save_policy_bundle(
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
 
+    # Wealth-dynamics spec — drawn from run_config.solver_config if present;
+    # otherwise tagged "simple_clamp" (the legacy default). Storing this at
+    # the top of the metadata makes it cheap to verify at load time that the
+    # simulator/diagnostics are run under the same spec the solver used.
+    spec = "simple_clamp"
+    if run_config is not None:
+        sc = run_config.get("solver_config") if isinstance(run_config, dict) else None
+        if isinstance(sc, dict):
+            spec = sc.get("wealth_dynamics_spec", spec)
+        elif sc is not None and hasattr(sc, "wealth_dynamics_spec"):
+            spec = getattr(sc, "wealth_dynamics_spec", spec)
+
     metadata = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "array_file": arrays_path.name,
@@ -151,6 +163,7 @@ def save_policy_bundle(
         "dtype_S": str(S_mat.dtype),
         "dtype_B": str(B_mat.dtype),
         "compressed": bool(compress),
+        "wealth_dynamics_spec": str(spec),
     }
     if diagnostics is not None:
         metadata["diagnostics_summary"] = _to_jsonable(diagnostics)

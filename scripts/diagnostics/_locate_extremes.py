@@ -21,7 +21,7 @@ Sigma_ss = Omega[np.ix_([0, 1, 2], [0, 1, 2])]
 Phi_0_state = (np.eye(3) - Phi_11) @ z_bar[:3]
 
 info = build_state_grid(N_vec=[5, 5, 5], mu_intercept=Phi_0_state,
-                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 state_indices = info['state_indices']
 
@@ -71,9 +71,9 @@ for k in order[:10]:
 
 print()
 print("=" * 78)
-print("Distribution of |alpha_b| by state grid principal-coord index")
+print("Distribution of |alpha_b| by state grid cholesky-coord index")
 print("=" * 78)
-print("Histogram by min(any_principal_idx) and max(any_principal_idx)")
+print("Histogram by min(any_cholesky_idx) and max(any_cholesky_idx)")
 
 # alpha_b at age 22, all (z, w) for each state
 extremes = []

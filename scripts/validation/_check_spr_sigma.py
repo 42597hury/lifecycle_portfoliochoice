@@ -32,13 +32,13 @@ mu_s = z_bar[_state_idx]
 Sigma_z = stationary_covariance(Phi_11, Sigma_ss)
 sigma_stat = np.sqrt(np.diag(Sigma_z))
 
-# Cholesky used to build the principal grid
+# Cholesky used to build the cholesky-mode grid
 L = np.linalg.cholesky(Sigma_z)
 
 # Build the actual production grid
 info = build_state_grid(N_vec=[5,5,5], mu_intercept=Phi_0_state,
                        Phi=Phi_11, Sigma_innov=Sigma_ss,
-                       n_stds=2.0, mode='principal')
+                       n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 
 print("=" * 78)
@@ -56,13 +56,13 @@ print()
 
 # Cholesky structure relevant to spr corner
 print("=" * 78)
-print("CHOLESKY OF STATIONARY COV (principal mode uses this to project)")
+print("CHOLESKY OF STATIONARY COV (cholesky mode uses this to project)")
 print("=" * 78)
 print(f"L =\n{L}")
 print()
 print("L row for spr (axis 1):", L[1, :])
-print(f"  L[spr, 0] = {L[1,0]:+.5f}  (loading from principal axis 0)")
-print(f"  L[spr, 1] = {L[1,1]:+.5f}  (loading from principal axis 1)")
+print(f"  L[spr, 0] = {L[1,0]:+.5f}  (loading from cholesky axis 0)")
+print(f"  L[spr, 1] = {L[1,1]:+.5f}  (loading from cholesky axis 1)")
 print(f"  L[spr, 2] = {L[1,2]:+.5f}  (Cholesky is lower-tri, must be 0)")
 print()
 print(f"  sqrt(L[1,0]^2 + L[1,1]^2) = {np.sqrt(L[1,0]**2 + L[1,1]**2):.5f}  (= sigma_stat[spr] by construction)")
@@ -89,7 +89,7 @@ for d in range(3):
     print(f"  {names[d]:<6}  {smin:>+10.5f}  {smax:>+10.5f}  {dmin:>+9.5f}  {dmax:>+9.5f}  "
           f"{in_stat_min:>+6.2f} / {in_stat_max:<+6.2f}  {in_innov_min:>+6.2f} / {in_innov_max:<+6.2f}")
 print()
-print("=> The grid is built at +/- n_stds (=2.0) in stationary-standardized principal coords.")
+print("=> The grid is built at +/- n_stds (=2.0) in stationary-standardized cholesky coords.")
 print("=> 'sigma' on the right column means the per-period innovation sigma — same physical")
 print("   point looks like more sigmas because the innovation sigma is smaller than the")
 print("   stationary sigma (the latter accounts for persistence accumulation).")

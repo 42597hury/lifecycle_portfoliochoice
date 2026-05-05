@@ -52,7 +52,7 @@ print()
 # --- Markowitz alphas per state ---
 gamma = 3.0
 info = build_state_grid(N_vec=[5, 5, 5], mu_intercept=Phi_0_state,
-                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 
 # excess returns: indices 1 (xr) and 2 (xb) in [rtb, xr, xb]

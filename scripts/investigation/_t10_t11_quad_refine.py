@@ -62,10 +62,10 @@ eta_nodes, eta_weights = get_eta_quadrature_mixture(mm, n_nodes=3)
 eps_nodes, eps_weights = get_eps_quadrature_corrected(mm, n_nodes=3)
 
 info = build_state_grid(N_vec=[5, 5, 5], mu_intercept=Phi_0_state,
-                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']  # (125, 3) physical
-state_indices = info['state_indices']  # (125, 3) integer principal-coord indices
-state_bracket_grids = info['state_bracket_grids']  # 3 arrays of length 5, principal coord
+state_indices = info['state_indices']  # (125, 3) integer cholesky-coord indices
+state_bracket_grids = info['state_bracket_grids']  # 3 arrays of length 5, cholesky coord
 state_bracket_shift = info['bracket_shift']  # (3,)
 state_bracket_L_inv = info['bracket_L_inv']  # (3, 3)
 
@@ -75,7 +75,7 @@ for m in range(125):
     state_lookup_3d[state_indices[m, 0], state_indices[m, 1], state_indices[m, 2]] = m
 assert (state_lookup_3d >= 0).all()
 
-# Principal-coord grid is uniform: [-n_stds, +n_stds] linspace 5
+# Cholesky-coord grid is uniform: [-n_stds, +n_stds] linspace 5
 # So dx = (2*n_stds)/(N-1). For [-2, 2] with 5 points, dx = 1.
 n_stds = 2.0
 N_state_pts = 5
@@ -103,7 +103,7 @@ C_full = d['C_mat']  # (78, 9, 125, 150)
 def interp_c_batch(t_next, z_arr, s_arr, x_arr):
     """Vectorized lookup of saved C_mat at (z_next, s_next, x_next). Returns array."""
     N = z_arr.shape[0]
-    # Principal-coord state bracket
+    # Cholesky-coord state bracket
     coord = (s_arr - state_bracket_shift) @ state_bracket_L_inv.T  # (N, 3)
     raw_i = (coord - g0) / dx  # (N, 3)
     i_state = np.clip(np.floor(raw_i).astype(np.int64), 0, N_state_pts - 2)  # (N, 3)

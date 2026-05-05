@@ -496,6 +496,11 @@ def simulate_lifecycle_core(
     const_r: np.ndarray,
     A_r: np.ndarray,
     M_matrix: np.ndarray,
+    # --- CVC log-wealth scalars + dispatch ---
+    sigma2_xr: float,
+    sigma2_xb: float,
+    sigma_xrxb: float,
+    use_ccv: bool,
 ) -> tuple:
     """
     Numba-parallel core simulation loop over households.
@@ -753,18 +758,34 @@ def simulate_lifecycle_core(
                     rtb_res += ret_factor[0, k] * shock_k
                     xr_res += ret_factor[1, k] * shock_k
                     xb_res += ret_factor[2, k] * shock_k
-                R_bill = np.exp(mu_rtb + rtb_res)
-                R_stock = R_bill * np.exp(mu_xr + xr_res)
-                R_bond = R_bill * np.exp(mu_xb + xb_res)
+                log_R_bill = mu_rtb + rtb_res
+                log_x_s = mu_xr + xr_res
+                log_x_b = mu_xb + xb_res
             else:
                 ret_idx = draw_discrete(ret_weights, uniform_draws[i, t, 3])
-                R_bill = np.exp(mu_rtb + ret_nodes[ret_idx, 0])
-                R_stock = R_bill * np.exp(mu_xr + ret_nodes[ret_idx, 1])
-                R_bond = R_bill * np.exp(mu_xb + ret_nodes[ret_idx, 2])
+                log_R_bill = mu_rtb + ret_nodes[ret_idx, 0]
+                log_x_s = mu_xr + ret_nodes[ret_idx, 1]
+                log_x_b = mu_xb + ret_nodes[ret_idx, 2]
 
-            alpha_bill_t = 1.0 - alpha_s_t - alpha_b_t
-            R_port = alpha_s_t * R_stock + alpha_b_t * R_bond + alpha_bill_t * R_bill
-            estate_t = max(savings_t * R_port, 0.0)
+            R_bill = np.exp(log_R_bill)
+            R_stock = R_bill * np.exp(log_x_s)
+            R_bond = R_bill * np.exp(log_x_b)
+
+            if use_ccv:
+                # CVC log portfolio return — must agree node-by-node with
+                # solver kernel. wealth_dynamics_spec="ccv_log" => no clamp.
+                r_p = (log_R_bill
+                       + alpha_s_t * log_x_s + alpha_b_t * log_x_b
+                       + 0.5 * (alpha_s_t * sigma2_xr + alpha_b_t * sigma2_xb)
+                       - 0.5 * (alpha_s_t * alpha_s_t * sigma2_xr
+                                + 2.0 * alpha_s_t * alpha_b_t * sigma_xrxb
+                                + alpha_b_t * alpha_b_t * sigma2_xb))
+                R_port = np.exp(r_p)
+                estate_t = savings_t * R_port      # exp() > 0; no clamp
+            else:
+                alpha_bill_t = 1.0 - alpha_s_t - alpha_b_t
+                R_port = alpha_s_t * R_stock + alpha_b_t * R_bond + alpha_bill_t * R_bill
+                estate_t = max(savings_t * R_port, 0.0)
 
             sim_R_port[i, t] = R_port
             sim_estate[i, t] = estate_t
@@ -922,6 +943,7 @@ def simulate_lifecycle(C_mat: np.ndarray,
                        seed: int = 42,
                        return_draw_mode: str = "monte_carlo",
                        wealth_offgrid_warn_threshold: float = 0.05,
+                       wealth_dynamics_spec: str = "ccv_log",
                        verbose: bool = True) -> dict:
     """
     Simulate lifecycle paths using the solved consumption and portfolio policies.
@@ -1186,6 +1208,10 @@ def simulate_lifecycle(C_mat: np.ndarray,
         const_r=const_r_arr,
         A_r=state_inputs["A_r"],
         M_matrix=state_inputs["M_matrix"],
+        sigma2_xr=float(pc.sigma2_xr),
+        sigma2_xb=float(pc.sigma2_xb),
+        sigma_xrxb=float(pc.sigma_xrxb),
+        use_ccv=(wealth_dynamics_spec == "ccv_log"),
     )
 
     elapsed = time.perf_counter() - t_start

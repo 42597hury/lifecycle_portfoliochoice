@@ -53,7 +53,7 @@ def _build_small_problem():
         n_wealth=12,
         n_savings=12,
         state_grid_sizes=(3, 3, 3),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=2.0,
         n_z=3,
         n_stds=2.0,

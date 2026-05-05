@@ -14,12 +14,14 @@ Exports:
 See `docs/CONFIG.md` for the rationale behind every value.
 """
 
-from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.model import DiscretizationConfig, SolverConfig, SolveControl
 
 PREDICTABILITY_SYSTEM = "IV"
 
 
 # ── Economics ───────────────────────────────────────────────────────────────
+# NOTE: bequest spec is the shifted (luxury) form b̄·(W/A + δ)^{1-γ}/(1-γ);
+# the shift parameter DELTA_BEQUEST is defined in lifecycle/model.py.
 gamma, beta, b_bar = 5.0, 0.96, 10
 start_age, retire_age, terminal_age = 22, 67, 99
 b0, b1, b2, b3 = -6.142, 0.3040, -0.051, 0.002586
@@ -46,7 +48,7 @@ BASE_CONFIG = {
 
 
 # ── Discretization ──────────────────────────────────────────────────────────
-# state_n_stds: u-space half-width per axis in principal mode.
+# state_n_stds: u-space half-width per axis in cholesky mode.
 #   Per-axis coverage = 2*Phi(n_d) - 1; joint = product.
 #   Current value (2.0, 2.25, 2.25) -> per-axis (95.5%, 97.6%, 97.6%),
 #   joint ~91%. Earlier value (0.6, 1.75, 2.0) gave joint ~40% and
@@ -62,7 +64,7 @@ CANONICAL_DISC = DiscretizationConfig(
     wealth_max=750.0,
     n_savings=180,
     state_grid_sizes=(7, 7, 7),
-    state_grid_mode="principal",
+    state_grid_mode="cholesky",
     state_n_stds=(2.0, 2.25, 2.25),
     n_z=11,
     n_stds=3.0,
@@ -102,4 +104,16 @@ CANONICAL_SOLVER = SolverConfig(
     use_line_search=True,
     alpha_min=-6.0,
     alpha_max=6.0,
+    delta_bequest=0.001,
+)
+
+
+# ── Solve control ───────────────────────────────────────────────────────────
+# Canonical defaults for partial solves and crash recovery. Configs that need
+# to set youngest_age_to_solve should _replace() this rather than instantiate
+# SolveControl directly, so checkpointing stays on by default.
+CANONICAL_SOLVE_CONTROL = SolveControl(
+    checkpoint_every_n_ages=1,
+    save_on_interrupt=True,
+    return_partial_on_interrupt=True,
 )

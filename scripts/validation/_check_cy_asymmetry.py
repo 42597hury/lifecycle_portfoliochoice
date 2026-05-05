@@ -21,7 +21,7 @@ Phi_0_state = (np.eye(3) - Phi_11) @ z_bar[:3]
 Phi_0_ret = z_bar[3:] - Phi_21 @ z_bar[:3]
 
 info = build_state_grid(N_vec=[5,5,5], mu_intercept=Phi_0_state,
-                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                       Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 
 d = np.load('saved_runs/unconstrained_principal_grid5x5x5_nz9/policy_arrays.npz')

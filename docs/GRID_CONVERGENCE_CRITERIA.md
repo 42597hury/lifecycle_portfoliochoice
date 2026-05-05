@@ -105,7 +105,7 @@ Rouwenhorst's (1995) method matches all five for *any* `n` ≥ 2 (Kopecky-Suen 2
 
 These tests are essentially free — you compute them once at precompute time. They detect (a) bugs in the discretization code, (b) failure modes when grids are too coarse or too narrow.
 
-**For your VAR.** The 3-D state VAR is more delicate. Gospodinov-Lkhagvasuren (2014) provide a direct extension of Rouwenhorst to VARs with the same moment-matching property, but most papers (including Catherine 2025) just use a tensor-product principal-axis grid plus Gauss-Hermite quadrature for the innovations — what you do. The diagnostic that matters then is whether `Pi_state @ E[s] = E[s]` (stationary distribution recovers the unconditional mean) and `Σ̂_state - Σ_state_target` is small. Your `verify_discretization.ipynb` already does the second of these (§A.5); ensure the first is also reported.
+**For your VAR.** The 3-D state VAR is more delicate. Gospodinov-Lkhagvasuren (2014) provide a direct extension of Rouwenhorst to VARs with the same moment-matching property, but most papers (including Catherine 2025) just use a tensor-product cholesky-axis grid plus Gauss-Hermite quadrature for the innovations — what you do. The diagnostic that matters then is whether `Pi_state @ E[s] = E[s]` (stationary distribution recovers the unconditional mean) and `Σ̂_state - Σ_state_target` is small. Your `verify_discretization.ipynb` already does the second of these (§A.5); ensure the first is also reported.
 
 ### 1.5 Quadrature: polynomial exactness vs integrand curvature
 

@@ -205,7 +205,7 @@ def main():
         try:
             disc = DiscretizationConfig(
                 n_wealth=40, n_savings=40,
-                state_grid_sizes=gs, state_grid_mode="principal", state_n_stds=ns,
+                state_grid_sizes=gs, state_grid_mode="cholesky", state_n_stds=ns,
                 n_z=5, n_eps_nodes=3, n_eta_nodes=3,
                 n_ret_nodes_1d=kret, n_state_quad_nodes=kst,
             )

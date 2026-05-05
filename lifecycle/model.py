@@ -107,7 +107,7 @@ class DiscretizationConfig(NamedTuple):
 
     # Financial state VAR discretization
     state_grid_sizes: tuple = (5, 5, 5)
-    state_grid_mode: str = "naive"      # "naive" | "lyapunov-axis" | "principal"
+    state_grid_mode: str = "naive"      # "naive" | "lyapunov-axis" | "cholesky" (legacy alias: "principal")
     state_n_stds: Any = 3.0             # half-width in standardized state-grid units; scalar (broadcast) or length-3 sequence (per-axis bounds in pre-transform u-coords)
 
     # Income process
@@ -175,6 +175,26 @@ class SolverConfig(NamedTuple):
     alpha_min: float = -10.0                   # lower bound on alpha_s and alpha_b in the unconstrained Newton
     alpha_max: float = +10.0                   # upper bound on alpha_s and alpha_b in the unconstrained Newton
 
+    # --- Bequest regularization (luxury-bequest shifter; De Nardi 2004) ---
+    # Sentinel: any value < 0 means "use the module-level DELTA_BEQUEST". This
+    # preserves the legacy workflow where the canonical default lives at line
+    # ~273 of model.py and smoke tests can override by editing it. Override
+    # cleanly via SolverConfig._replace(delta_bequest=X) for sweep cells —
+    # values >= 0 take precedence over DELTA_BEQUEST. See scripts/_smoke_delta_zero.py
+    # for the legacy DELTA_BEQUEST-edit workflow.
+    delta_bequest: float = -1.0                # < 0 => use module DELTA_BEQUEST
+
+    # --- Wealth dynamics specification ---
+    # "ccv_log":      x_{t+1} = s * exp(r_p^CCV) + pi    (no clamp; r_p^CCV = log return,
+    #                 Campbell-Viceira 2002 / CCV w8566 eq.10 with Jensen + Ito corrections)
+    # "simple_clamp": x_{t+1} = max(s * (alpha_s R_s + alpha_b R_b + a_bill R_bill), 0) + pi
+    #                 (legacy spec; kept as a regression backstop)
+    # The portfolio FOC under "ccv_log" is the gradient of V (NOT the asset-pricing
+    # moment condition E[mu_comb*(R_j-R_bill)]); see docs/CCV_RETURNS.md.
+    # Solver and simulator MUST use the same value (otherwise sR_p disagrees and
+    # all Euler-residual diagnostics become meaningless).
+    wealth_dynamics_spec: str = "ccv_log"
+
 
 # =============================================================================
 # SOLVE CONTROL
@@ -220,7 +240,7 @@ def create_utility_functions(gamma):
 
 
 # =============================================================================
-# BEQUEST UTILITY FUNCTIONS  (Catherine 2025, equations 21-22)
+# BEQUEST UTILITY FUNCTIONS  (Catherine 2025 + De Nardi 2004 luxury shift)
 # =============================================================================
 
 def annuity_factor(y_1, spr, b_bar):
@@ -261,52 +281,67 @@ def annuity_factor(y_1, spr, b_bar):
     return A
 
 
-def bequest_utility(W, A, gamma, b_bar):
-    """
-    Bequest utility:  b(W, r_f) = b_bar * (W / A)^(1 - gamma) / (1 - gamma)
+# Annuity-normalised luxury-bequest shifter (De Nardi 2004).
+#
+# Bound on marginal bequest utility:  mu_max = b_bar * DELTA_BEQUEST**(-gamma) / A.
+# For (b_bar, gamma, A) = (10, 5, 4):
+#     DELTA = 0.005  ->  mu_max ~ 8e11   (vs. raw spike ~1e30 in the unshifted spec)
+#     DELTA = 0.01   ->  mu_max ~ 2.5e10
+#     DELTA = 0.02   ->  mu_max ~ 7.8e8
+# Sensitivity sweep gate: ship at 0.005 if optimal alpha is stable to ~5%
+# across {0.001, 0.005, 0.01, 0.02}.
+DELTA_BEQUEST = 0.005
 
-    where  A = annuity_factor(r_f, ...)  is precomputed for the relevant state
-    and    C_bar = W / A  is the flow-equivalent consumption implied by wealth W
-    spread over b_bar annuity periods.
+
+def bequest_utility(W, A, gamma, b_bar, delta=DELTA_BEQUEST):
+    """
+    Shifted (luxury) bequest utility (De Nardi 2004):
+        b(W, A) = b_bar * (max(W, 0)/A + delta)^(1-gamma) / (1-gamma)
+
+    The shift `delta` bounds marginal bequest utility at the bankruptcy
+    boundary, removing the unshifted CRRA-with-clamp `infty` discontinuity.
+    Convergence to pure CRRA: as delta -> 0 the shifted spec recovers the
+    original `b_bar * (W/A)**(1-gamma) / (1-gamma)` pointwise on W > 0.
 
     Parameters
     ----------
     W     : float or array  End-of-period wealth (bequest).
-    A     : float or array  Annuity factor A(r_f, b_bar) at current financial state.
+    A     : float or array  Annuity factor A(y_1, spr, b_bar) at current state.
     gamma : float           CRRA risk aversion.
     b_bar : int             Bequest weight / horizon (Catherine 2025: 10).
+    delta : float           Luxury shift (default DELTA_BEQUEST).
     """
-    C_bar = W / A
-    return b_bar * C_bar**(1.0 - gamma) / (1.0 - gamma)
+    C_bar = np.maximum(W, 0.0) / A + delta
+    return b_bar * C_bar ** (1.0 - gamma) / (1.0 - gamma)
 
 
-def bequest_marginal(W, A, gamma, b_bar):
+def bequest_marginal(W, A, gamma, b_bar, delta=DELTA_BEQUEST):
     """
-    Marginal bequest utility:  db/dW = b_bar * (W / A)^(-gamma) / A
+    Marginal shifted bequest utility:
+        db/dW = b_bar * (W/A + delta)^(-gamma) / A     for W > 0
+              = 0                                       for W <= 0
 
-    Parameters
-    ----------
-    W     : float or array  End-of-period wealth.
-    A     : float or array  Annuity factor at current financial state.
-    gamma : float           CRRA risk aversion.
-    b_bar : int             Bequest weight / horizon.
+    The bankruptcy clamp returns 0 on the dead branch (heirs inherit nothing
+    when realised estate is non-positive).
     """
-    C_bar = W / A
-    return b_bar * C_bar**(-gamma) / A
+    pos = W > 0.0
+    C_bar = np.where(pos, W / A + delta, 1.0)  # placeholder for W<=0 branch
+    mu = b_bar * C_bar ** (-gamma) / A
+    return np.where(pos, mu, 0.0)
 
 
-def bequest_marginal_inv(mu, A, gamma, b_bar):
+def bequest_marginal_inv(mu, A, gamma, b_bar, delta=DELTA_BEQUEST):
     """
-    Inverse of bequest_marginal: given  mu = db/dW,  solve for W.
+    Inverse marginal of the shifted bequest. Domain: mu in (0, mu_max] with
+    mu_max = b_bar * delta**(-gamma) / A. Above mu_max the wealth constraint
+    W = 0 binds and the inverse clamps to zero.
 
-    W = A * (mu * A / b_bar)^(-1/gamma)
-
-    Used in the EGM terminal condition: the period-T+1 "value" is bequest
-    utility, so the marginal value of wealth is bequest_marginal(W, A, ...).
-    Inverting gives the optimal terminal wealth as a function of the shadow
-    price mu.
+        W = A * max((mu * A / b_bar)^(-1/gamma) - delta, 0)
     """
-    return A * (mu * A / b_bar)**(-1.0 / gamma)
+    mu_max = b_bar * delta ** (-gamma) / A
+    mu_clamped = np.minimum(mu, mu_max)
+    inner = (mu_clamped * A / b_bar) ** (-1.0 / gamma) - delta
+    return A * np.maximum(inner, 0.0)
 
 
 # =============================================================================

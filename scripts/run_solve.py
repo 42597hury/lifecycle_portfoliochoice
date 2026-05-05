@@ -112,6 +112,16 @@ def main():
                              "(default: checkpoint to saved_runs/checkpoints/"
                              "<bundle>/ and resume from S3 if a checkpoint "
                              "exists there).")
+    parser.add_argument("--skip-diagnostics", action="store_true",
+                        help="Skip the post-solve EE diagnostic battery. "
+                             "Default behaviour (without this flag) runs the "
+                             "four headline diagnostics from "
+                             "docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md against "
+                             "the freshly-saved bundle and writes reports + "
+                             "diagnostics_summary.json into the bundle dir.")
+    parser.add_argument("--diagnostics-n-simulations", type=int, default=None,
+                        help="Override sim-path n_simulations for the "
+                             "post-solve diagnostic (default 5000).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -216,6 +226,28 @@ def main():
         overwrite=True,
     )
     print(f"[run_solve] saved bundle: {bundle_dir}")
+
+    # Post-solve diagnostic battery. Failure must NOT block S3 upload --
+    # the bundle is the expensive thing to recompute; diagnostics are
+    # always re-runnable locally.
+    if args.skip_diagnostics:
+        print("[run_solve] --skip-diagnostics set; skipping diagnostic battery")
+    else:
+        print("[run_solve] running post-solve diagnostic battery...")
+        try:
+            from scripts.run_diagnostics import run_diagnostics
+            overrides = {}
+            if args.diagnostics_n_simulations is not None:
+                overrides["n_simulations"] = args.diagnostics_n_simulations
+            t_diag = time.time()
+            run_diagnostics(bundle_dir, simpath_overrides=overrides)
+            print(f"[run_solve] diagnostics done in {time.time() - t_diag:.1f}s")
+        except Exception as exc:
+            # Diagnostics catch their own per-script failures; reaching here
+            # means infrastructure error (import / bundle load). Log and continue.
+            print(f"[run_solve] WARNING: diagnostic battery infra error: {exc}")
+            import traceback
+            traceback.print_exc()
 
     if args.no_upload:
         print("[run_solve] --no-upload set; skipping S3")

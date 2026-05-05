@@ -1,11 +1,11 @@
-"""State-grid coverage diagnostic for principal-mode lifecycle simulations.
+"""State-grid coverage diagnostic for cholesky-mode lifecycle simulations.
 
-Formalizes what `state_n_stds` actually controls in principal mode and reports
+Formalizes what `state_n_stds` actually controls in cholesky mode and reports
 the simulation-coverage fraction implied by a candidate setting.
 
 Background
 ----------
-In principal mode the financial-state grid is a parallelepiped in s-space:
+In cholesky mode the financial-state grid is a parallelepiped in s-space:
 
     state_grid = { mu_s + L u  :  |u_d| <= n_stds[d]  for d = 0, 1, 2 }
 
@@ -117,7 +117,7 @@ def main():
     sigma_z = np.sqrt(np.diag(Sigma_z))
 
     print("=" * 72)
-    print("Principal-mode coverage formalization")
+    print("Cholesky-mode coverage formalization")
     print("=" * 72)
     print(f"State ordering             : {state_names}")
     print(f"mu_s                       : {mu_s}")

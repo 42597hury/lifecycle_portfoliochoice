@@ -16,7 +16,7 @@ from math import comb
 
 import numpy as np
 from scipy.linalg import solve_discrete_lyapunov
-from scipy.special import eval_legendre, roots_hermite, roots_jacobi
+from scipy.special import roots_hermite
 from scipy.stats import norm
 import warnings
 
@@ -155,7 +155,7 @@ def _normalize_n_stds(n_stds, k):
     return arr
 
 
-def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="principal"):
+def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="cholesky"):
     """Build the financial-state interpolation grid.
 
     Parameters
@@ -171,11 +171,13 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     n_stds : float or sequence of length k
         Half-width of each interpolation axis in standardized units. A scalar
         broadcasts to all axes. A length-k sequence applies a per-axis bound.
-        In `principal` mode, axes are Cholesky directions (not physical state
+        In `cholesky` mode, axes are Cholesky directions (not physical state
         variables); in `lyapunov-axis` mode, axes correspond to the physical
         state variables.
-    mode : {"naive", "lyapunov-axis", "principal"}
-        Grid construction mode.
+    mode : {"naive", "lyapunov-axis", "cholesky"}
+        Grid construction mode. The legacy alias ``"principal"`` is accepted
+        and normalised to ``"cholesky"`` for backward compatibility with saved
+        bundle metadata.
 
     Returns
     -------
@@ -201,7 +203,9 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     if np.any(N_vec < 1):
         raise ValueError("Each state grid dimension must have at least 1 point")
 
-    if mode not in {"naive", "lyapunov-axis", "principal"}:
+    if mode == "principal":
+        mode = "cholesky"
+    if mode not in {"naive", "lyapunov-axis", "cholesky"}:
         raise ValueError(f"Unknown state grid mode: {mode!r}")
 
     n_stds_arr = _normalize_n_stds(n_stds, k)
@@ -215,7 +219,7 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="pr
     Pi_state, state_indices = _independence_rouwenhorst_pi(N_vec, Phi, Sigma_innov)
     n_total = int(np.prod(N_vec))
 
-    if mode == "principal":
+    if mode == "cholesky":
         state_bracket_grids = []
         for d in range(k):
             Nd = int(N_vec[d])
@@ -408,73 +412,6 @@ def _judd_mixture_quadrature(probs, mus, sigmas, n):
             f"(min = {weights.min():.3e}). Numerical conditioning failed; "
             "Theorem 3 guarantees positivity, so this is a float64 issue."
         )
-    return nodes, weights
-
-
-def _gauss_lobatto_1d(n, a=-1.0, b=1.0):
-    """1-D Gauss–Lobatto quadrature on [a, b] with unit weight.
-
-    Returns n nodes (with `a`, `b` as fixed endpoints) and n weights such
-    that the rule is exact for polynomials of degree ≤ 2n − 3 against
-    the unit weight on [a, b].
-
-    Construction
-    ------------
-    On [−1, 1]: endpoints fixed at ±1; the n − 2 interior nodes are roots
-    of P′_{n−1}(x), equivalently the roots of the Jacobi polynomial
-    P^{(1,1)}_{n−2}(x). Weights use the closed-form Lobatto formula
-    `w_i = 2 / (n(n−1) [P_{n−1}(x_i)]²)`. Linear scaling to [a, b]
-    multiplies nodes and weights by `(b − a)/2` and shifts nodes by
-    `(a + b)/2`.
-
-    Parameters
-    ----------
-    n : int
-        Total node count, n ≥ 2. The n = 2 case is the trapezoidal rule
-        on [a, b].
-    a, b : float
-        Interval endpoints with b > a.
-
-    Returns
-    -------
-    nodes : ndarray, shape (n,)
-        Sorted ascending; nodes[0] = a, nodes[-1] = b.
-    weights : ndarray, shape (n,)
-        All strictly positive; sum to (b − a).
-
-    Notes
-    -----
-    Polynomial exactness verified to machine precision for n ∈ {3..6} on
-    [−1, 1]: degrees 0..(2n−3) integrated to ≤ 1e-15; degree (2n−2) has
-    a non-zero residual (e.g. ≈ 0.27 for n = 3 at degree 4).
-
-    This is a primitive — to integrate against the standard-normal weight
-    φ(z) requires either a φ-reweight construction (truncate, multiply
-    weights by φ(z_k), renormalise) or a generalised Lobatto rule
-    constructed via moment-matching against the truncated Gaussian. The
-    correct choice for the lifecycle return / state quadrature is under
-    review; see `docs/handoff/HANDOFF_LOBATTO_QUADRATURE_REVIEW.md`.
-    """
-    if not isinstance(n, (int, np.integer)) or n < 2:
-        raise ValueError("Gauss–Lobatto requires integer n >= 2")
-    if not (b > a):
-        raise ValueError(f"require b > a; got a={a}, b={b}")
-
-    if n == 2:
-        nodes_std = np.array([-1.0, 1.0], dtype=float)
-        weights_std = np.array([1.0, 1.0], dtype=float)
-    else:
-        interior, _ = roots_jacobi(int(n) - 2, 1.0, 1.0)
-        nodes_std = np.concatenate(
-            [[-1.0], np.sort(np.asarray(interior, dtype=float)), [1.0]]
-        )
-        P_nm1 = eval_legendre(int(n) - 1, nodes_std)
-        weights_std = 2.0 / (int(n) * (int(n) - 1) * P_nm1 ** 2)
-
-    half_width = 0.5 * (b - a)
-    midpoint = 0.5 * (a + b)
-    nodes = half_width * nodes_std + midpoint
-    weights = half_width * weights_std
     return nodes, weights
 
 

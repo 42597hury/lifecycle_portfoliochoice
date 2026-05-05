@@ -53,80 +53,6 @@ def _print_progress_line_py(
 
 
 @njit
-def _smoke_call_inner_kernel(
-    wealth_grid,
-    savings_grid,
-    z_grid,
-    N_state,
-    c_next_full,
-    pension_1d,
-    annuity_factors,
-    state_grid,
-    grids_0,
-    grids_1,
-    grids_2,
-    state_bracket_shift,
-    state_bracket_L_inv,
-    v_nodes,
-    v_weights,
-    M_v_nodes,
-    const_r,
-    A_r,
-    Phi_0_state,
-    Phi_11,
-    exp_ret_bill,
-    exp_ret_stock,
-    exp_ret_bond,
-    ret_weights,
-    gamma,
-    psi_vec,
-    beta,
-    b_bar,
-    constrained,
-    solver_config,
-    out_c,
-    out_s,
-    out_b,
-):
-    _solve_retirement_step_quad_jit(
-        wealth_grid,
-        savings_grid,
-        z_grid,
-        N_state,
-        c_next_full,
-        pension_1d,
-        annuity_factors,
-        state_grid,
-        grids_0,
-        grids_1,
-        grids_2,
-        state_bracket_shift,
-        state_bracket_L_inv,
-        v_nodes,
-        v_weights,
-        M_v_nodes,
-        const_r,
-        A_r,
-        Phi_0_state,
-        Phi_11,
-        exp_ret_bill,
-        exp_ret_stock,
-        exp_ret_bond,
-        ret_weights,
-        gamma,
-        psi_vec,
-        beta,
-        b_bar,
-        constrained,
-        solver_config,
-        out_c,
-        out_s,
-        out_b,
-    )
-    return 0
-
-
-@njit
 def _count_diag_column(diag_int, column_idx):
     total = 0
     for i_s in range(diag_int.shape[0]):
@@ -616,12 +542,23 @@ def _compute_wealth_homogeneity(C, S, B, wealth_grid, trim_wealth_points):
 
 
 def _compute_stability_proxy(model, pc, solver_config: SolverConfig, S, B, trim_wealth_points):
+    """Bound the contraction-mapping proxy beta * E[R_p^{1-gamma}].
+
+    Branches on solver_config.wealth_dynamics_spec so the proxy is computed
+    against the same R_p formula the solver actually uses (otherwise the
+    bound is meaningless).
+    """
     if pc.n_w == 0:
         return float("nan")
 
     i_z = min(pc.n_z // 2, pc.n_z - 1)
     i_w = min(max(trim_wealth_points, pc.n_w // 2), pc.n_w - 1)
     max_proxy = 0.0
+
+    use_ccv = (solver_config.wealth_dynamics_spec == "ccv_log")
+    sigma2_xr = float(pc.sigma2_xr)
+    sigma2_xb = float(pc.sigma2_xb)
+    sigma_xrxb = float(pc.sigma_xrxb)
 
     for i_s in range(pc.N_state):
         s_i = pc.state_grid[i_s]
@@ -639,18 +576,28 @@ def _compute_stability_proxy(model, pc, solver_config: SolverConfig, S, B, trim_
             mu_r_bill = base_mu_r_i[0] + pc.M_v_nodes[k_v, 0]
             mu_r_stock = base_mu_r_i[1] + pc.M_v_nodes[k_v, 1]
             mu_r_bond = base_mu_r_i[2] + pc.M_v_nodes[k_v, 2]
-            exp_mu_bill = np.exp(mu_r_bill)
-            exp_mu_stock = np.exp(mu_r_stock)
-            exp_mu_bond = np.exp(mu_r_bond)
 
             for k_r, p_ret in enumerate(pc.ret_weights):
-                R_bill = exp_mu_bill * pc.exp_ret_bill[k_r]
-                R_stock = R_bill * exp_mu_stock * pc.exp_ret_stock[k_r]
-                R_bond = R_bill * exp_mu_bond * pc.exp_ret_bond[k_r]
-                R_p = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
-                if R_p <= 0.0:
-                    return float("inf")
-                expected_rpow += float(w_v) * float(p_ret) * (R_p ** (1.0 - model.gamma))
+                if use_ccv:
+                    log_R_bill = mu_r_bill + pc.ret_nodes[k_r, 0]
+                    log_x_s = mu_r_stock + pc.ret_nodes[k_r, 1]
+                    log_x_b = mu_r_bond + pc.ret_nodes[k_r, 2]
+                    r_p = (log_R_bill
+                           + alpha_s * log_x_s + alpha_b * log_x_b
+                           + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
+                           - 0.5 * (alpha_s * alpha_s * sigma2_xr
+                                    + 2.0 * alpha_s * alpha_b * sigma_xrxb
+                                    + alpha_b * alpha_b * sigma2_xb))
+                    # E[R_p^{1-gamma}] = E[exp((1-gamma)*r_p)] under CVC
+                    expected_rpow += float(w_v) * float(p_ret) * np.exp((1.0 - model.gamma) * r_p)
+                else:
+                    R_bill = np.exp(mu_r_bill) * pc.exp_ret_bill[k_r]
+                    R_stock = R_bill * np.exp(mu_r_stock) * pc.exp_ret_stock[k_r]
+                    R_bond = R_bill * np.exp(mu_r_bond) * pc.exp_ret_bond[k_r]
+                    R_p = alpha_s * R_stock + alpha_b * R_bond + alpha_bill * R_bill
+                    if R_p <= 0.0:
+                        return float("inf")
+                    expected_rpow += float(w_v) * float(p_ret) * (R_p ** (1.0 - model.gamma))
 
         proxy_i = float(model.beta) * expected_rpow
         if proxy_i > max_proxy:

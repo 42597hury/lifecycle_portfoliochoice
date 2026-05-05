@@ -54,7 +54,7 @@ def main():
         n_wealth=150,
         n_savings=150,
         state_grid_sizes=(5, 5, 5),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=(0.6, 1.75, 2.0),
         n_z=9,
         n_stds=3.0,

@@ -487,7 +487,7 @@ def main():
         )
     else:
         bullets.append(
-            f"T-Q1 ARB at {int((arb>1e-10).sum())} states. Refine K_xr (principal axis,\n"
+            f"T-Q1 ARB at {int((arb>1e-10).sum())} states. Refine K_xr (cholesky axis,\n"
             f"          per RETURNS.md §6.12) until n_arb_states = 0."
         )
 
@@ -514,7 +514,7 @@ def main():
         bullets.append(
             "T-Q3 LOPSIDED: the cloud is positively skewed in the stock dimension\n"
             "          across many states. Cure same as T-Q2 — more mass on the\n"
-            "          downside via principal-axis K refinement."
+            "          downside via cholesky-axis K refinement."
         )
 
     # T-Q4 & T-Q5

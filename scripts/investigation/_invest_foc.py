@@ -62,7 +62,7 @@ eta_nodes, eta_weights = get_eta_quadrature_mixture(mm, n_nodes=3)
 eps_nodes, eps_weights = get_eps_quadrature_corrected(mm, n_nodes=3)
 
 info = build_state_grid(N_vec=[5,5,5], mu_intercept=Phi_0_state,
-                         Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='principal')
+                         Phi=Phi_11, Sigma_innov=Sigma_ss, n_stds=2.0, mode='cholesky')
 state_grid = info['state_grid']
 state_indices = info['state_indices']
 state_bracket_grids = info['state_bracket_grids']
@@ -84,7 +84,7 @@ S = d['S_mat']
 B = d['B_mat']
 C = d['C_mat']
 
-# Build state_lookup: principal-coord index (i,j,k) -> flat index
+# Build state_lookup: cholesky-coord index (i,j,k) -> flat index
 state_lookup = {}
 for m in range(125):
     key = (int(state_indices[m, 0]), int(state_indices[m, 1]), int(state_indices[m, 2]))

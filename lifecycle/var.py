@@ -171,17 +171,6 @@ def _load_var_dataset(csv_path, columns):
     return data
 
 
-def _compute_r2_per_equation(y_true, y_hat, columns):
-    out = {}
-    for i, col in enumerate(columns):
-        resid = y_true[:, i] - y_hat[:, i]
-        sse = float(np.sum(resid ** 2))
-        centered = y_true[:, i] - np.mean(y_true[:, i])
-        sst = float(np.sum(centered ** 2))
-        out[col] = 1.0 - sse / max(sst, 1e-14)
-    return out
-
-
 def _safe_residual_correlation(resid):
     corr = np.corrcoef(resid, rowvar=False)
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)

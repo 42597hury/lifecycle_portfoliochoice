@@ -167,7 +167,7 @@ The canonical block plus the per-cell overrides in §3.4.
 
 | Key | Canonical baseline | Notes |
 |---|---|---|
-| `state_grid_mode` | `"principal"` | u-space half-width interpretation; see [STATE_SPACE.md](STATE_SPACE.md) |
+| `state_grid_mode` | `"cholesky"` | u-space half-width interpretation; see [STATE_SPACE.md](STATE_SPACE.md). Legacy alias `"principal"` is accepted for backward compat with old saved bundles. |
 | `state_grid_sizes` | `(7, 7, 7)` | **Swept** (§3.4) |
 | `state_n_stds` | `(2.0, 2.25, 2.25)` | u-space half-width per axis. Coverage = `2Φ(n_d)-1` per axis → `(95.5%, 97.6%, 97.6%)`, joint ≈ 91%. **Earlier value `(0.6, 1.75, 2.0)` gave joint ≈ 40% and produced unusable simulator moments — do not regress.** Production-grade 99% per-axis would need `(~2.93, ~2.93, ~2.93)`. |
 | `n_state_quad_nodes` | `(2, 2, 5)` | **Swept** (§3.4); axis-3 always 5 (volatility axis needs refinement) |

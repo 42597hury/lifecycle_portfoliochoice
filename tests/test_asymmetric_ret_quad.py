@@ -173,7 +173,7 @@ def run_precompute_integration_checks(model) -> None:
         n_wealth=20,
         n_savings=20,
         state_grid_sizes=(3, 3, 3),
-        state_grid_mode="principal",
+        state_grid_mode="cholesky",
         state_n_stds=3.0,
         n_z=5,
         n_eps_nodes=2,

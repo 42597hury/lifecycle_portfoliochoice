@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from lifecycle.model import DELTA_BEQUEST
 from lifecycle.precompute import Precompute
 from scripts.diagnostics._diag_euler_errors import (
     EulerBundleContext,
@@ -45,6 +46,7 @@ from scripts.diagnostics._diag_euler_errors import (
     _interp_z_row_value,
     _load_bundle_context,
     _pad_eval_state_inputs_to_3d,
+    _shifted_bequest_mu,
     _simulate_bundle_window,
 )
 
@@ -149,10 +151,16 @@ def find_worst_leveraged_cell(ctx: EulerBundleContext, n_simulations: int = 5000
             np.ascontiguousarray(pc.exp_ret_stock),
             np.ascontiguousarray(pc.exp_ret_bond),
             np.ascontiguousarray(pc.ret_weights),
+            np.ascontiguousarray(pc.ret_nodes),
+            float(pc.sigma2_xr),
+            float(pc.sigma2_xb),
+            float(pc.sigma_xrxb),
+            bool(ctx.use_ccv),
             float(model.gamma), float(model.beta),
             int(model.b_bar),
             annuity_factors_age,
             float(1e-3),
+            delta=ctx.delta_bequest,
         )
 
         for j in range(n_eval):
@@ -205,6 +213,7 @@ def _foc_and_decomp_kernel(
     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
     gamma, b_bar, annuity_factor_cur,
     min_consumption=1e-10, prob_skip=1e-12,
+    delta=DELTA_BEQUEST,
 ):
     a_bill = 1.0 - alpha_s - alpha_b
     psi = _interp_z_row_value(z_cur, z_grid, survival_row)
@@ -266,9 +275,13 @@ def _foc_and_decomp_kernel(
             mu_alive = c_next ** (-gamma)
             mup_alive = -gamma * mu_alive / c_next * mpc
             if sR_p > 0.0:
-                w_A = sR_p / annuity_factor_cur
-                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
-                mup_bequest = -gamma * mu_bequest / (w_A * annuity_factor_cur)
+                # Shifted bequest (De Nardi 2004) — mirrors solver's
+                # _shifted_bequest_mu_and_mup. Inlined here to avoid the import
+                # cycle (this file imports from _diag_euler_errors which already
+                # has its own copy).
+                C_bar = sR_p / annuity_factor_cur + delta
+                mu_bequest = b_bar * C_bar ** (-gamma) / annuity_factor_cur
+                mup_bequest = -gamma * mu_bequest / (annuity_factor_cur * C_bar)
             else:
                 mu_bequest = 0.0
                 mup_bequest = 0.0
@@ -294,8 +307,14 @@ def _foc_and_decomp_kernel(
     return e_sum, e_alive, e_bequest, foc_s, foc_b, J_ss, J_bb, J_sb
 
 
-def evaluate_at_cell(cell, ctx, pc, alpha_s, alpha_b):
-    """Evaluate kernel at one cell + one alpha under the supplied precompute pc."""
+def evaluate_at_cell(cell, ctx, pc, alpha_s, alpha_b, delta=None):
+    """Evaluate kernel at one cell + one alpha under the supplied precompute pc.
+
+    `delta` defaults to ctx.delta_bequest (the value the bundle was solved with);
+    pass an explicit float to override (e.g. for sensitivity analyses).
+    """
+    if delta is None:
+        delta = ctx.delta_bequest
     model = ctx.model
     pad = _pad_eval_state_inputs_to_3d(pc, model)
     pension_row = np.ascontiguousarray(
@@ -332,6 +351,7 @@ def evaluate_at_cell(cell, ctx, pc, alpha_s, alpha_b):
         np.ascontiguousarray(pc.ret_weights),
         float(model.gamma), int(model.b_bar),
         float(cell['annuity_factor']),
+        delta=float(delta),
     )
 
 
@@ -402,6 +422,7 @@ def _per_node_bequest_kernel(
     const_r, A_r, Phi_0_state, Phi_11,
     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights,
     gamma, b_bar, annuity_factor_cur,
+    delta=DELTA_BEQUEST,
 ):
     """Return an array shape (n_state_quad, n_ret_quad, 4) holding
     (weight, sR_p, mu_bequest, weight*mu_bequest*R_p) for every (k_v, k_r) node.
@@ -433,8 +454,9 @@ def _per_node_bequest_kernel(
             sR_p = s_val * R_p
 
             if sR_p > 0.0:
-                w_A = sR_p / annuity_factor_cur
-                mu_bequest = b_bar * w_A ** (-gamma) / annuity_factor_cur
+                mu_bequest = _shifted_bequest_mu(
+                    sR_p, annuity_factor_cur, gamma, b_bar, delta
+                )
             else:
                 mu_bequest = 0.0
             contrib = weight * prob_death * mu_bequest * R_p
@@ -445,7 +467,9 @@ def _per_node_bequest_kernel(
     return out
 
 
-def per_node_bequest(cell, ctx, pc, alpha_s, alpha_b):
+def per_node_bequest(cell, ctx, pc, alpha_s, alpha_b, delta=None):
+    if delta is None:
+        delta = ctx.delta_bequest
     model = ctx.model
     pad = _pad_eval_state_inputs_to_3d(pc, model)
     pension_row = np.ascontiguousarray(
@@ -471,6 +495,7 @@ def per_node_bequest(cell, ctx, pc, alpha_s, alpha_b):
         np.ascontiguousarray(pc.ret_weights),
         float(model.gamma), int(model.b_bar),
         float(cell['annuity_factor']),
+        delta=float(delta),
     )
 
 

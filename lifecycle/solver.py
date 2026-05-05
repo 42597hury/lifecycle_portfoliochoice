@@ -211,6 +211,24 @@ def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
     )
 
 
+def _materialize_policy_lists(C_list, S_list, B_list, shape, solved_age_mask):
+    """Stack a list[jnp.ndarray | None] into NumPy arrays of ``shape``.
+
+    Unsolved ages become NaN. This is the single materialization point that
+    moves device-resident policies back to host memory; all caller sites
+    (final return, checkpoint write) go through here.
+    """
+    C_np = np.full(shape, np.nan, dtype=np.float64)
+    S_np = np.full(shape, np.nan, dtype=np.float64)
+    B_np = np.full(shape, np.nan, dtype=np.float64)
+    for t in range(len(C_list)):
+        if solved_age_mask[t] and C_list[t] is not None:
+            C_np[t] = np.asarray(C_list[t])
+            S_np[t] = np.asarray(S_list[t])
+            B_np[t] = np.asarray(B_list[t])
+    return C_np, S_np, B_np
+
+
 # =============================================================================
 # Pure JAX helpers
 # =============================================================================
@@ -1173,8 +1191,9 @@ def _build_per_age_terminal_kernel(pcj, mp, sc, n_dev):
     def call(_unused_age_idx=None):
         c_pm, as_pm, ab_pm = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
 
+        # Stay on device — caller threads jnp arrays through to the next kernel.
         def collapse(a):
-            arr = np.asarray(a).reshape((pad_n,) + a.shape[2:])
+            arr = jnp.reshape(a, (pad_n,) + a.shape[2:])
             return arr[:N_state]
 
         return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
@@ -1228,9 +1247,10 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
     def call(c_next_jnp, pension_next_by_z, psi_per_z):
         c_pm, as_pm, ab_pm = per_dev_solve(z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z)
         # (n_dev, per_dev, n_w) -> (pad_n, n_w) -> (n_cells, n_w) -> (n_z, N_state, n_w)
+        # Stay on device.
         def collapse(a):
-            flat = np.asarray(a).reshape((pad_n,) + a.shape[2:])
-            return flat[:n_cells].reshape(n_z, N_state, -1)
+            flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
+            return jnp.reshape(flat[:n_cells], (n_z, N_state, -1))
         return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
 
     return call
@@ -1311,9 +1331,10 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
         c_pm, as_pm, ab_pm = per_dev_solve(
             z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z
         )
+        # Stay on device.
         def collapse(a):
-            flat = np.asarray(a).reshape((pad_n,) + a.shape[2:])
-            return flat[:n_cells].reshape(n_z, N_state, -1)
+            flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
+            return jnp.reshape(flat[:n_cells], (n_z, N_state, -1))
         return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
 
     return call
@@ -1398,10 +1419,14 @@ def run_lifecycle_solver(
     boundary_kernel = _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next=True)
 
     # ---- Output arrays ----
+    # Policies live on device as list[jnp.ndarray | None] across ages, so the
+    # backward induction never round-trips through host memory between ages.
+    # Materialised to NumPy at checkpoint/return boundaries via
+    # _materialize_policy_lists.
     shape = (n_age, n_z, N_state, n_w)
-    C_mat = np.zeros(shape)
-    S_mat = np.zeros(shape)
-    B_mat = np.zeros(shape)
+    C_list = [None] * n_age
+    S_list = [None] * n_age
+    B_list = [None] * n_age
     solved_age_mask = np.zeros(n_age, dtype=bool)
 
     # ---- Per-age diagnostics (post-hoc only) ----
@@ -1429,10 +1454,10 @@ def run_lifecycle_solver(
                     f"Found checkpoint at {ckpt_dir} but failed to load it: {exc}. "
                     "Delete the checkpoint or fix the bundle before retrying."
                 ) from exc
-            if Cc.shape != C_mat.shape:
+            if Cc.shape != shape:
                 raise RuntimeError(
                     f"Checkpoint shape mismatch at {ckpt_dir}: "
-                    f"got {Cc.shape}, expected {C_mat.shape}. "
+                    f"got {Cc.shape}, expected {shape}. "
                     "Different grid/quadrature/system — refuse to resume."
                 )
             ckpt_mask = None
@@ -1443,9 +1468,13 @@ def run_lifecycle_solver(
                     f"Checkpoint at {ckpt_dir} missing or malformed solved_age_mask."
                 )
             ckpt_mask = np.asarray(ckpt_mask, dtype=bool)
+            # Upload solved slabs to device once at resume; each remains
+            # device-resident for the rest of the solve.
             for t in range(n_age):
                 if ckpt_mask[t]:
-                    C_mat[t] = Cc[t]; S_mat[t] = Sc[t]; B_mat[t] = Bc[t]
+                    C_list[t] = jnp.asarray(Cc[t])
+                    S_list[t] = jnp.asarray(Sc[t])
+                    B_list[t] = jnp.asarray(Bc[t])
                     solved_age_mask[t] = True
             n_resumed = int(np.sum(solved_age_mask))
             if verbose >= 1 and n_resumed > 0:
@@ -1480,12 +1509,15 @@ def run_lifecycle_solver(
             print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
         c_T, s_T, b_T = terminal_kernel()
         # Broadcast across z (terminal policy is z-invariant — bequest only).
-        C_mat[-1] = np.broadcast_to(c_T[None, :, :], (n_z, N_state, n_w)).copy()
-        S_mat[-1] = np.broadcast_to(s_T[None, :, :], (n_z, N_state, n_w)).copy()
-        B_mat[-1] = np.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w)).copy()
+        # jnp.broadcast_to stays on device; the next kernel reads via pmap
+        # in_axes=None which materialises the broadcast lazily.
+        C_list[-1] = jnp.broadcast_to(c_T[None, :, :], (n_z, N_state, n_w))
+        S_list[-1] = jnp.broadcast_to(s_T[None, :, :], (n_z, N_state, n_w))
+        B_list[-1] = jnp.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w))
         solved_age_mask[-1] = True
         if verbose >= 1:
-            print(f"done  [c range: {c_T.min():.3f}-{c_T.max():.3f}]")
+            # Small reduction (~5KB transfer) for the print line; cheap.
+            print(f"done  [c range: {float(c_T.min()):.3f}-{float(c_T.max()):.3f}]")
     elif verbose >= 1:
         print(f"\n  Terminal condition (age {terminal_age}) ... loaded from checkpoint")
 
@@ -1516,7 +1548,8 @@ def run_lifecycle_solver(
                 continue
 
             psi_t = jnp.asarray(survival[t, :])
-            c_next_jnp = jnp.asarray(C_mat[t + 1])
+            # c_next_jnp is the previous age's policy, already on device.
+            c_next_jnp = C_list[t + 1]
 
             if age >= retire_age:
                 pension_next = jnp.asarray(pension_table[t + 1, :])
@@ -1534,17 +1567,24 @@ def run_lifecycle_solver(
                     c_t, s_t, b_t = working_kernel(c_next_jnp, income_table, pension_next, psi_t)
                 label = "WORK  "
 
-            C_mat[t] = c_t
-            S_mat[t] = s_t
-            B_mat[t] = b_t
+            # Store device arrays directly — no D->H round trip.
+            C_list[t] = c_t
+            S_list[t] = s_t
+            B_list[t] = b_t
             solved_age_mask[t] = True
 
             if verbose >= 1:
                 elapsed = time.time() - t_start
                 probe_w = float(progress_wealth_by_age[t])
-                probe_as = _interp_progress_policy_at_wealth(s_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
-                probe_ab = _interp_progress_policy_at_wealth(b_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
-                probe_c = _interp_progress_policy_at_wealth(c_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
+                # Materialise only the (n_w,) probe slice — ~1KB per array.
+                # Reading a tuple via JAX then numpy in one pass keeps the
+                # number of D->H syncs to one per array.
+                s_slice = np.asarray(s_t[i_z_med, i_s_med, :])
+                b_slice = np.asarray(b_t[i_z_med, i_s_med, :])
+                c_slice = np.asarray(c_t[i_z_med, i_s_med, :])
+                probe_as = _interp_progress_policy_at_wealth(s_slice, pc.wealth_grid, probe_w)
+                probe_ab = _interp_progress_policy_at_wealth(b_slice, pc.wealth_grid, probe_w)
+                probe_c = _interp_progress_policy_at_wealth(c_slice, pc.wealth_grid, probe_w)
                 probe_bill = 1.0 - probe_as - probe_ab
                 c_over_w = probe_c / probe_w if probe_w > 0 else 0.0
                 print(
@@ -1567,8 +1607,13 @@ def run_lifecycle_solver(
                         checkpoint_save_count=checkpoint_save_count,
                         checkpoint_path=checkpoint_path,
                     )
+                    # Materialise to NumPy at checkpoint boundary (single
+                    # D->H pass for the slabs solved so far).
+                    C_ckpt, S_ckpt, B_ckpt = _materialize_policy_lists(
+                        C_list, S_list, B_list, shape, solved_age_mask,
+                    )
                     last_saved_bundle_path = str(_save_policy_checkpoint(
-                        checkpoint_path, C_mat, S_mat, B_mat, diag,
+                        checkpoint_path, C_ckpt, S_ckpt, B_ckpt, diag,
                     ))
                     last_saved_nonterminal_count = solved_nonterminal_count
                     if verbose >= 1:
@@ -1605,6 +1650,13 @@ def run_lifecycle_solver(
     )
     diagnostics = _build_diagnostics(**diag_kwargs)
 
+    # Single materialisation point: device-resident policy list -> NumPy.
+    # All downstream consumers (final save, sanity check, return value) read
+    # from these arrays.
+    C_mat, S_mat, B_mat = _materialize_policy_lists(
+        C_list, S_list, B_list, shape, solved_age_mask,
+    )
+
     if final_save_needed:
         last_saved_bundle_path = str(_save_policy_checkpoint(
             checkpoint_path, C_mat, S_mat, B_mat, diagnostics,
@@ -1639,8 +1691,8 @@ def run_lifecycle_solver(
         print(f"  alpha_b range: [{B_eval.min():.3f}, {B_eval.max():.3f}]")
         print(f"{'='*100}\n")
 
-    if diagnostics["is_partial"]:
-        _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask)
+    # _materialize_policy_lists already filled unsolved ages with NaN, so
+    # _mask_unsolved_ages_in_place would be a no-op; skip it.
 
     if solve_status == "interrupted" and not return_partial_on_interrupt:
         raise KeyboardInterrupt

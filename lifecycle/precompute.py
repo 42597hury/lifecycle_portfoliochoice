@@ -297,10 +297,18 @@ def build_precompute(model, disc_config=None, verbose=True):
     exp_ret_stock = np.exp(ret_nodes[:, 1])
     exp_ret_bond = np.exp(ret_nodes[:, 2])
 
-    # --- CCV conditional-covariance scalars ---
-    sigma2_xr = float(model.Sigma_r_cond[1, 1])
-    sigma2_xb = float(model.Sigma_r_cond[2, 2])
-    sigma_xrxb = float(model.Sigma_r_cond[1, 2])
+    # --- CCV log-return covariance scalars ---
+    # CCV w8566 eq. (10) takes expectations over the FULL VAR innovation
+    # v_{t+1}, so the constants in r_p are sourced from the unconditional
+    # return-block covariance Sigma_rr — NOT the residual Sigma_r_cond used
+    # for the inner-quadrature Cholesky in discretization.get_return_quadrature.
+    # Sigma_r_cond differs from Sigma_rr by the M·Sigma_ss·M' projection term,
+    # which can be ~10–30x in this calibration; using the wrong matrix shrinks
+    # the Itô vol-drag and inflates converged alpha_s past sensible levels.
+    # Patched 2026-05-06 (Sigma_rr matches CCV Table 2 vols + Markowitz alpha).
+    sigma2_xr = float(model.Sigma_rr[1, 1])
+    sigma2_xb = float(model.Sigma_rr[2, 2])
+    sigma_xrxb = float(model.Sigma_rr[1, 2])
 
     # --- Bequest annuity factors ---
     y_1_idx = model.y_1_index_in_state

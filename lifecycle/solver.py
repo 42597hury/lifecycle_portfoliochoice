@@ -1,197 +1,70 @@
-"""
-solver.py — Backward induction solver with EGM + 2D Newton-Raphson.
+"""solver.py — JAX-pure lifecycle backward induction (EGM + 2D Newton).
 
-Three assets: Bills, Stocks, Nominal Bonds.
-Bequest motive: shifted (luxury) form following De Nardi (2004), with
-Catherine (2025) annuity normalisation:
-    b(W, A) = b_bar * (max(W,0)/A + delta)^(1-gamma) / (1-gamma)
-The `delta` shift bounds marginal utility at the bankruptcy boundary;
-the unshifted CRRA-with-clamp is recovered as delta -> 0. See
-lifecycle.model.DELTA_BEQUEST for the calibrated value.
+Canonical model only:
+  - Finite horizon, three assets (bills, stocks, nominal bonds).
+  - CCV log-wealth dynamics (``r_p`` per Campbell-Viceira w8566 eq.10).
+  - Shifted-bequest (luxury form, De Nardi 2004; Catherine 2025 normalisation).
+  - Unconstrained portfolio (no simplex projection, no leverage caps).
+  - Linear interpolation everywhere (no PCHIP).
+  - ``n_state == 3`` (3D state grid). Ablations with smaller state vectors
+    are deferred to a follow-up handoff.
 
-Contains:
-  - Diagnostic constants (DI_*, DF_*, EC_*)
-  - Interpolation utilities (fast_interp_1d, etc.)
-  - FOC + Jacobian functions (quadrature-based: retirement, working, terminal)
-  - Newton portfolio solvers (constrained + unconstrained, quadrature)
-  - Period solvers: solve_retirement_step_quad(), solve_working_age_step_quad()
-  - Terminal solver: solve_terminal_age()
-  - Master solver: run_lifecycle_solver()
-  - Post-solve diagnostic report
+Public entrypoint:
+    run_lifecycle_solver(model, pc, solver_config, n_s_points, verbose, solve_control)
+        -> (C_mat, S_mat, B_mat, diagnostics)
 
-Policy function output shapes:
-    C_mat[t, i_z, i_s, i_w]  -- optimal consumption        (n_age, n_z, N_state, n_w)
-    S_mat[t, i_z, i_s, i_w]  -- optimal stock share         (n_age, n_z, N_state, n_w)
-    B_mat[t, i_z, i_s, i_w]  -- optimal bond share          (n_age, n_z, N_state, n_w)
+Output policy shape: ``(n_age, n_z, N_state, n_w)`` as np.ndarray, matching
+the interface the simulator and downstream tooling already expect.
 
-Dependencies: numpy, numba, model (for SolverConfig)
+Module-level setup (jax x64 + virtual CPU device count) lives in
+``lifecycle/__init__.py`` so it runs before any jax import.
 """
 
-import numpy as np
-from numba import njit, prange
-from math import exp
+from __future__ import annotations
+
+import math
 import time
-import csv
-from functools import lru_cache
+from collections import namedtuple
+from functools import lru_cache, partial
 from pathlib import Path
+import csv
 
-from lifecycle.model import SolveControl, SolverConfig, scalar_disposable_income, DELTA_BEQUEST
-from lifecycle.numerics import _pchip_slope_uniform, _pchip_eval_with_basis
+import jax
+import jax.lax as lax
+import jax.numpy as jnp
+import numpy as np
+from jax import jit, pmap, vmap
+
+from lifecycle.model import DELTA_BEQUEST, SolveControl, SolverConfig
 
 # =============================================================================
-# DIAGNOSTIC CONSTANTS
+# Exit codes
 # =============================================================================
-# Integer counter indices -- diag_int[i_s, idx], shape (N_state, N_DIAG_INT)
-DI_CORNER_BILLS    = 0   # all-bills corner solution
-DI_CORNER_STOCKS   = 1   # all-stocks corner
-DI_CORNER_BONDS    = 2   # all-bonds corner
-DI_EDGE_SB         = 3   # stock + bill edge
-DI_EDGE_BB         = 4   # bond + bill edge
-DI_EDGE_STOCKBOND  = 5   # stock + bond edge (no bills)
-DI_INTERIOR        = 6   # interior Newton converged
-DI_NEWTON_FAIL     = 7   # Newton hit max_iter without converging
-DI_SINGULAR_JAC    = 8   # singular Jacobian event
-DI_TINY_SAVINGS    = 9   # s_val < threshold, trivial all-bills
-DI_TOTAL_CALLS     = 10  # total Newton calls
-DI_NEG_CONSUMPTION = 11  # negative euler (before clamping)
-DI_MONO_VIOLATIONS = 12  # EGM monotonicity violations
-DI_SUM_ITER        = 13  # total Newton outer-iterations summed over unconstrained calls
-DI_WARM_RESET      = 14  # times warm-start was reset to cold init after EC_NEWTON_FAIL
-N_DIAG_INT = 15
+EC_INTERIOR = 1
+EC_NEWTON_FAIL = 2
+EC_TINY_SAVINGS = 3
 
-# Float counter indices -- diag_float[i_s, idx], shape (N_state, N_DIAG_FLOAT)
-DF_WORST_MONO_DROP  = 0  # largest endogenous grid inversion
-DF_MAX_FOC_RESID    = 1  # worst FOC residual at Newton exit
-DF_SUM_FOC_RESID_SQ = 2  # sum of squared FOC residuals (for RMS)
-DF_MIN_ALPHA_S      = 3  # min stock share
-DF_MAX_ALPHA_S      = 4  # max stock share
-DF_MIN_ALPHA_B      = 5  # min bond share
-DF_MAX_ALPHA_B      = 6  # max bond share
-DF_SUM_ALPHA_S      = 7  # sum of stock shares (for mean)
-DF_SUM_ALPHA_B      = 8  # sum of bond shares (for mean)
-DF_MAX_NEWTON_ITER  = 9  # max outer iters in any single unconstrained Newton call
-N_DIAG_FLOAT = 10
 
-# Exit codes from Newton solvers
-EC_TINY_SAVINGS = 0
-EC_CORNER_BILLS = 1
-EC_CORNER_STOCKS = 2
-EC_CORNER_BONDS = 3
-EC_EDGE_SB = 4       # stock + bill
-EC_EDGE_BB = 5       # bond + bill
-EC_EDGE_STOCKBOND = 6 # stock + bond
-EC_INTERIOR = 7       # interior Newton converged
-EC_NEWTON_FAIL = 8    # Newton did not converge
-
-# Mapping from exit_code to diag_int index
-_EC_TO_DI = np.array([
-    DI_TINY_SAVINGS,    # EC=0
-    DI_CORNER_BILLS,    # EC=1
-    DI_CORNER_STOCKS,   # EC=2
-    DI_CORNER_BONDS,    # EC=3
-    DI_EDGE_SB,         # EC=4
-    DI_EDGE_BB,         # EC=5
-    DI_EDGE_STOCKBOND,  # EC=6
-    DI_INTERIOR,        # EC=7
-    DI_NEWTON_FAIL,     # EC=8
-], dtype=np.int64)
-
+# =============================================================================
+# SCF wealth-probe helpers (NumPy; used for the per-age progress line)
+# =============================================================================
 
 _AWI_2019_USD = 54_099.99
 _AWI_2019_KUSD = _AWI_2019_USD / 1_000.0
-_SCF_WEALTH_CSV = Path(__file__).resolve().parent.parent / "data" / "scf_net_worth_by_age_2022.csv"
+_SCF_WEALTH_CSV = (
+    Path(__file__).resolve().parent.parent / "data" / "scf_net_worth_by_age_2022.csv"
+)
 _PROGRESS_WEALTH_SOURCES = frozenset({"grid_midpoint", "scf_median", "scf_mean"})
-
-
-def _pad_state_solver_inputs_to_3d(
-    state_grid,
-    state_bracket_grids,
-    state_bracket_shift,
-    state_bracket_L_inv,
-    v_nodes,
-    Phi_0_state,
-    Phi_11,
-    A_r,
-):
-    """Pad 1D/2D state objects to the solver's 3-coordinate layout.
-
-    The hot JIT kernels are still written in a 3-coordinate style. For System I
-    and II/III we embed the lower-dimensional state into that layout with
-    singleton dummy axes. The omitted coordinates stay identically zero, so the
-    economic model is unchanged; this just preserves the existing kernel shape.
-    """
-    n_state = int(state_grid.shape[1])
-    if n_state == 3:
-        grids_0 = np.ascontiguousarray(state_bracket_grids[0], dtype=float)
-        grids_1 = np.ascontiguousarray(state_bracket_grids[1], dtype=float)
-        grids_2 = np.ascontiguousarray(state_bracket_grids[2], dtype=float)
-        return (
-            np.ascontiguousarray(state_grid, dtype=float),
-            grids_0,
-            grids_1,
-            grids_2,
-            np.ascontiguousarray(state_bracket_shift, dtype=float),
-            np.ascontiguousarray(state_bracket_L_inv, dtype=float),
-            np.ascontiguousarray(v_nodes, dtype=float),
-            np.ascontiguousarray(Phi_0_state, dtype=float),
-            np.ascontiguousarray(Phi_11, dtype=float),
-            np.ascontiguousarray(A_r, dtype=float),
-        )
-
-    state_grid_pad = np.zeros((state_grid.shape[0], 3), dtype=float)
-    state_grid_pad[:, :n_state] = np.asarray(state_grid, dtype=float)
-
-    grids = []
-    for d in range(3):
-        if d < n_state:
-            grids.append(np.ascontiguousarray(np.asarray(state_bracket_grids[d], dtype=float)))
-        else:
-            grids.append(np.zeros(1, dtype=float))
-
-    shift_pad = np.zeros(3, dtype=float)
-    shift_pad[:n_state] = np.asarray(state_bracket_shift, dtype=float)
-
-    L_inv_pad = np.zeros((3, 3), dtype=float)
-    L_inv_pad[:n_state, :n_state] = np.asarray(state_bracket_L_inv, dtype=float)
-
-    v_nodes_pad = np.zeros((v_nodes.shape[0], 3), dtype=float)
-    v_nodes_pad[:, :n_state] = np.asarray(v_nodes, dtype=float)
-
-    Phi_0_state_pad = np.zeros(3, dtype=float)
-    Phi_0_state_pad[:n_state] = np.asarray(Phi_0_state, dtype=float)
-
-    Phi_11_pad = np.zeros((3, 3), dtype=float)
-    Phi_11_pad[:n_state, :n_state] = np.asarray(Phi_11, dtype=float)
-
-    A_r_pad = np.zeros((A_r.shape[0], 3), dtype=float)
-    A_r_pad[:, :n_state] = np.asarray(A_r, dtype=float)
-
-    return (
-        np.ascontiguousarray(state_grid_pad),
-        grids[0],
-        grids[1],
-        grids[2],
-        np.ascontiguousarray(shift_pad),
-        np.ascontiguousarray(L_inv_pad),
-        np.ascontiguousarray(v_nodes_pad),
-        np.ascontiguousarray(Phi_0_state_pad),
-        np.ascontiguousarray(Phi_11_pad),
-        np.ascontiguousarray(A_r_pad),
-    )
 
 
 @lru_cache(maxsize=1)
 def _load_scf_wealth_age_table():
-    """Load SCF wealth-by-age targets once per process.
-
-    The source CSV stores wealth in thousands of 2022 USD. We keep those units
-    here and normalize to model units only when building the per-age probe
-    schedule.
+    """Load SCF wealth-by-age targets. Returns (age_mid, median_kusd, mean_kusd)
+    with wealth in thousands of 2022 USD.
     """
     age_mid = []
     med_kusd = []
     mean_kusd = []
-
     with _SCF_WEALTH_CSV.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(
             line for line in f
@@ -203,48 +76,24 @@ def _load_scf_wealth_age_table():
             age_mid.append(float(row["age_midpoint"]))
             med_kusd.append(float(row["median_2022_k2022usd"]))
             mean_kusd.append(float(row["mean_2022_k2022usd"]))
-
     if len(age_mid) == 0:
         raise ValueError(f"SCF wealth file {_SCF_WEALTH_CSV} is empty")
-
-    age_mid = np.asarray(age_mid, dtype=float)
-    med_kusd = np.asarray(med_kusd, dtype=float)
-    mean_kusd = np.asarray(mean_kusd, dtype=float)
-    valid = np.isfinite(age_mid) & np.isfinite(med_kusd) & np.isfinite(mean_kusd)
-    if not np.all(valid):
-        raise ValueError(f"SCF wealth file {_SCF_WEALTH_CSV} has no valid age rows")
-
-    return age_mid, med_kusd, mean_kusd
+    return np.array(age_mid), np.array(med_kusd), np.array(mean_kusd)
 
 
 def _build_progress_wealth_schedule(ages, w_grid, source):
-    """Return the per-age wealth probe used in verbose progress output."""
     source = str(source).strip().lower()
     w_grid = np.asarray(w_grid, dtype=float)
     ages = np.asarray(ages, dtype=float)
-
-    if w_grid.ndim != 1 or w_grid.size < 2:
-        raise ValueError("w_grid must be a 1D array with at least two points")
-
     if source == "grid_midpoint":
         probe_w = float(w_grid[len(w_grid) // 2])
         return np.full(ages.shape, probe_w, dtype=float), (
-            f"grid midpoint (legacy constant probe, W={probe_w:.3f})"
+            f"grid midpoint (W={probe_w:.3f})"
         )
-
     age_mid, med_kusd, mean_kusd = _load_scf_wealth_age_table()
-    if source == "scf_median":
-        wealth_kusd = med_kusd
-        label = "SCF median wealth by age (2022 $, linear age interp, AWI-normalized)"
-    elif source == "scf_mean":
-        wealth_kusd = mean_kusd
-        label = "SCF mean wealth by age (2022 $, linear age interp, AWI-normalized)"
-    else:
-        raise ValueError(
-            "progress_wealth_source must be one of "
-            f"{sorted(_PROGRESS_WEALTH_SOURCES)}, got {source!r}"
-        )
-
+    wealth_kusd = med_kusd if source == "scf_median" else mean_kusd
+    label = (f"SCF {'median' if source == 'scf_median' else 'mean'} "
+             "wealth by age (2022 $, linear age interp, AWI-normalized)")
     wealth_model_units = wealth_kusd / _AWI_2019_KUSD
     schedule = np.interp(ages, age_mid, wealth_model_units)
     schedule = np.clip(schedule, float(w_grid[0]), float(w_grid[-1]))
@@ -252,3300 +101,15 @@ def _build_progress_wealth_schedule(ages, w_grid, source):
 
 
 def _interp_progress_policy_at_wealth(policy_by_wealth, w_grid, wealth):
-    """Interpolate one 1D policy slice at the requested reporting wealth."""
-    return float(
-        np.interp(
-            float(wealth),
-            np.asarray(w_grid, dtype=float),
-            np.asarray(policy_by_wealth, dtype=float),
-        )
-    )
+    """Linear interp of one (n_w,) policy slice at scalar ``wealth``."""
+    return float(np.interp(wealth, w_grid, policy_by_wealth))
 
 
 # =============================================================================
-# SHIFTED-BEQUEST MARGINAL UTILITY (De Nardi 2004)
+# Solve-control / checkpoint helpers
 # =============================================================================
 
-
-@njit(fastmath=True, inline='always')
-def _shifted_bequest_mu_and_mup(W, A, gamma, b_bar, delta):
-    """Shifted-bequest marginal utility and its derivative w.r.t. W.
-
-    Caller must guard W > 0 (every FOC kernel call site lives inside
-    `if sR_p > 0:`). On the bankrupt branch the caller assigns
-    mu_bequest = mup_bequest = 0 directly.
-
-        mu  = b_bar * (W/A + delta)**(-gamma) / A
-        mup = -gamma * mu / (A * (W/A + delta))
-
-    Decorator matches the codebase convention (fastmath + always-inline)
-    so the helper folds into fastmath-compiled FOC kernels with no ABI
-    boundary or precision mismatch.
-    """
-    C_bar = W / A + delta
-    mu = b_bar * C_bar ** (-gamma) / A
-    mup = -gamma * mu / (A * C_bar)
-    return mu, mup
-
-
-# =============================================================================
-# HELPERS: INTERPOLATION AND SIMPLEX PROJECTION
-# =============================================================================
-
-
-@njit(fastmath=True)
-def fast_interp_1d(x, x_grid, y_grid):
-    """Linear interpolation on a sorted grid with binary search,
-    using LINEAR extrapolation beyond grid boundaries.
-
-    Solver-internal: the policy continuation values must remain smooth
-    at the wealth-grid edge so Newton-Raphson converges cleanly across
-    boundary cells. simulation.py has its own `fast_interp_1d` that uses
-    FLAT extrapolation; the two functions are deliberately divergent.
-    Do not "fix" either one to match the other.
-    """
-    n = len(x_grid)
-    if x <= x_grid[0]:
-        dx = x_grid[1] - x_grid[0] + 1e-30
-        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / dx
-    if x >= x_grid[n - 1]:
-        dx = x_grid[n - 1] - x_grid[n - 2] + 1e-30
-        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / dx
-    lo, hi = 0, n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if x_grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    x0, x1 = x_grid[lo], x_grid[hi]
-    y0, y1 = y_grid[lo], y_grid[hi]
-    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-
-
-@njit(fastmath=True)
-def fast_interp_1d_with_slope(x, x_grid, y_grid):
-    """Combined interpolation: returns (value, slope) from a single binary search."""
-    n = len(x_grid)
-    if n < 2:
-        return y_grid[0], 0.0
-    if x <= x_grid[0]:
-        dx = x_grid[1] - x_grid[0] + 1e-30
-        slope = (y_grid[1] - y_grid[0]) / dx
-        val = y_grid[0] + slope * (x - x_grid[0])
-        return val, slope
-    if x >= x_grid[n - 1]:
-        dx = x_grid[n - 1] - x_grid[n - 2] + 1e-30
-        slope = (y_grid[n-1] - y_grid[n-2]) / dx
-        val = y_grid[n - 1] + slope * (x - x_grid[n - 1])
-        return val, slope
-    lo, hi = 0, n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if x_grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    x0, x1 = x_grid[lo], x_grid[hi]
-    y0, y1 = y_grid[lo], y_grid[hi]
-    dx = x1 - x0
-    if dx < 1e-30:
-        return y0, 0.0
-    slope = (y1 - y0) / dx
-    val = y0 + slope * (x - x0)
-    return val, slope
-
-
-@njit(fastmath=True, inline='always')
-def _eval_linear_bracketed(y_grid, iw, dx_lo, inv_dw):
-    """Linear interp (val, slope) on a precomputed wealth bracket.
-
-    Caller obtains:
-        iw, _, inv_dw = find_bracket(x, x_grid)
-        dx_lo = x - x_grid[iw]
-    Then calls this for each y stencil — one binary search amortized over
-    many corner evaluations. Result matches fast_interp_1d_with_slope(x,
-    x_grid, y_grid) (find_bracket's lo/inv_dw are derived the same way,
-    including extrap clamping to lo=0 / lo=n-2 with off-segment frac).
-    """
-    y0 = y_grid[iw]
-    y1 = y_grid[iw + 1]
-    slope = (y1 - y0) * inv_dw
-    val = y0 + slope * dx_lo
-    return val, slope
-
-
-@njit(fastmath=True)
-def find_bracket(x, grid):
-    """Binary search for interpolation bracket on a sorted grid.
-
-    Returns (iw, frac_w, inv_dw) where:
-      iw is clamped to a valid segment index in [0, len(grid)-2]
-      frac_w = (x - grid[iw]) / dw on that segment
-      inv_dw = 1.0 / dw
-
-    For off-grid x, frac_w is allowed to lie outside [0, 1]. This keeps the
-    returned affine coordinate consistent with the last-segment slope used by
-    the working-age Jacobian.
-    """
-    n = len(grid)
-    if x <= grid[0]:
-        dw = grid[1] - grid[0] + 1e-30
-        return 0, (x - grid[0]) / dw, 1.0 / dw
-    if x >= grid[n - 1]:
-        dw = grid[n - 1] - grid[n - 2] + 1e-30
-        return n - 2, (x - grid[n - 2]) / dw, 1.0 / dw
-    lo = 0
-    hi = n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) >> 1
-        if grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    dw = grid[hi] - grid[lo]
-    if dw < 1e-30:
-        return lo, 0.0, 0.0
-    frac = (x - grid[lo]) / dw
-    return lo, frac, 1.0 / dw
-
-
-@njit(fastmath=True)
-def project_to_triangle(alpha_s, alpha_b):
-    """Project (alpha_s, alpha_b) onto feasible region: >=0, sum<=1."""
-    alpha_s = max(0.0, alpha_s)
-    alpha_b = max(0.0, alpha_b)
-    if alpha_s + alpha_b > 1.0:
-        excess = (alpha_s + alpha_b - 1.0) * 0.5
-        alpha_s = max(0.0, min(1.0, alpha_s - excess))
-        alpha_b = max(0.0, min(1.0, alpha_b - excess))
-    return alpha_s, alpha_b
-
-
-@njit
-def build_gross_return_arrays(mu_r_i, ret_nodes):
-    """Build exp(mu_r + residual_node) arrays for one current financial state.
-
-    Returns 3 arrays (bill, stock, bond) for n_ret=3 return dimensions.
-    """
-    n_state = mu_r_i.shape[0]
-    n_ret_quad = ret_nodes.shape[0]
-
-    rx_bill_next = np.empty((n_state, n_ret_quad))
-    rx_stock_next = np.empty((n_state, n_ret_quad))
-    rx_bond_next = np.empty((n_state, n_ret_quad))
-
-    for j_s in range(n_state):
-        mu_bill = mu_r_i[j_s, 0]
-        mu_stock = mu_r_i[j_s, 1]
-        mu_bond = mu_r_i[j_s, 2]
-        for k_r in range(n_ret_quad):
-            rx_bill_next[j_s, k_r] = exp(mu_bill + ret_nodes[k_r, 0])
-            rx_stock_next[j_s, k_r] = exp(mu_stock + ret_nodes[k_r, 1])
-            rx_bond_next[j_s, k_r] = exp(mu_bond + ret_nodes[k_r, 2])
-
-    return rx_bill_next, rx_stock_next, rx_bond_next
-
-
-@njit(fastmath=True)
-def bracket_state_3d(s0, s1, s2, grids_0, grids_1, grids_2):
-    """Bracket (s0,s1,s2) in the 3D state grid.
-
-    Returns (lo0, lo1, lo2, f0, f1, f2) where:
-      grids_d[lo_d] <= s_d < grids_d[lo_d + 1]
-      f_d = (s_d - grids_d[lo_d]) / (grids_d[lo_d+1] - grids_d[lo_d])
-    Clamped to valid range.
-    """
-    # Dimension 0
-    n0 = len(grids_0)
-    if n0 == 1:
-        lo0 = 0; f0 = 0.0
-    elif s0 <= grids_0[0]:
-        lo0 = 0; f0 = 0.0
-    elif s0 >= grids_0[n0 - 1]:
-        lo0 = n0 - 2; f0 = 1.0
-    else:
-        lo0 = 0
-        for ii in range(n0 - 1):
-            if grids_0[ii + 1] > s0:
-                lo0 = ii
-                break
-        dg = grids_0[lo0 + 1] - grids_0[lo0]
-        f0 = (s0 - grids_0[lo0]) / dg if dg > 1e-30 else 0.0
-        f0 = max(0.0, min(1.0, f0))
-
-    # Dimension 1
-    n1 = len(grids_1)
-    if n1 == 1:
-        lo1 = 0; f1 = 0.0
-    elif s1 <= grids_1[0]:
-        lo1 = 0; f1 = 0.0
-    elif s1 >= grids_1[n1 - 1]:
-        lo1 = n1 - 2; f1 = 1.0
-    else:
-        lo1 = 0
-        for ii in range(n1 - 1):
-            if grids_1[ii + 1] > s1:
-                lo1 = ii
-                break
-        dg = grids_1[lo1 + 1] - grids_1[lo1]
-        f1 = (s1 - grids_1[lo1]) / dg if dg > 1e-30 else 0.0
-        f1 = max(0.0, min(1.0, f1))
-
-    # Dimension 2
-    n2 = len(grids_2)
-    if n2 == 1:
-        lo2 = 0; f2 = 0.0
-    elif s2 <= grids_2[0]:
-        lo2 = 0; f2 = 0.0
-    elif s2 >= grids_2[n2 - 1]:
-        lo2 = n2 - 2; f2 = 1.0
-    else:
-        lo2 = 0
-        for ii in range(n2 - 1):
-            if grids_2[ii + 1] > s2:
-                lo2 = ii
-                break
-        dg = grids_2[lo2 + 1] - grids_2[lo2]
-        f2 = (s2 - grids_2[lo2]) / dg if dg > 1e-30 else 0.0
-        f2 = max(0.0, min(1.0, f2))
-
-    return lo0, lo1, lo2, f0, f1, f2
-
-
-@njit(fastmath=True)
-def transform_state_for_bracketing_3d(s0, s1, s2, bracket_shift, bracket_L_inv):
-    """Map an economic state into the coordinates used by state-grid bracketing."""
-    ds0 = s0 - bracket_shift[0]
-    ds1 = s1 - bracket_shift[1]
-    ds2 = s2 - bracket_shift[2]
-
-    u0 = bracket_L_inv[0, 0] * ds0 + bracket_L_inv[0, 1] * ds1 + bracket_L_inv[0, 2] * ds2
-    u1 = bracket_L_inv[1, 0] * ds0 + bracket_L_inv[1, 1] * ds1 + bracket_L_inv[1, 2] * ds2
-    u2 = bracket_L_inv[2, 0] * ds0 + bracket_L_inv[2, 1] * ds1 + bracket_L_inv[2, 2] * ds2
-    return u0, u1, u2
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_slope_nonuniform(d_left, d_right, h_left, h_right):
-    # Fritsch-Carlson slope at an interior node on a non-uniform grid.
-    # Returns 0 at sign changes (preserves monotonicity at extrema).
-    if d_left == 0.0 or d_right == 0.0:
-        return 0.0
-    if d_left * d_right <= 0.0:
-        return 0.0
-    w_left = 2.0 * h_right + h_left
-    w_right = h_right + 2.0 * h_left
-    return (w_left + w_right) / (w_left / d_left + w_right / d_right)
-
-
-@njit(fastmath=True, inline='always')
-def _pchip_endpoint_slope(d_near, d_far, h_near, h_far):
-    # Three-point one-sided slope at a grid boundary, with monotonicity clamp.
-    # Hyman / Fritsch-Butland formula.
-    m = ((2.0 * h_near + h_far) * d_near - h_near * d_far) / (h_near + h_far)
-    if m * d_near <= 0.0:
-        return 0.0
-    if abs(m) > 3.0 * abs(d_near):
-        return 3.0 * d_near
-    return m
-
-
-@njit(fastmath=True)
-def pchip_interp_1d(x, x_grid, y_grid):
-    """Monotonicity-preserving cubic Hermite interpolation on a non-uniform grid.
-
-    Linear extrapolation outside [x_grid[0], x_grid[-1]] to match
-    fast_interp_1d boundary semantics. Boundary-segment slopes use
-    three-point one-sided estimates with monotonicity clamping.
-    """
-    n = len(x_grid)
-    if n < 2:
-        return y_grid[0]
-
-    if x <= x_grid[0]:
-        h = x_grid[1] - x_grid[0] + 1e-30
-        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / h
-    if x >= x_grid[n - 1]:
-        h = x_grid[n - 1] - x_grid[n - 2] + 1e-30
-        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / h
-
-    lo, hi = 0, n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if x_grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    i = lo
-
-    h_i = x_grid[i + 1] - x_grid[i]
-    if h_i < 1e-30:
-        return y_grid[i]
-    d_i = (y_grid[i + 1] - y_grid[i]) / h_i
-
-    if i == 0:
-        h_next = x_grid[2] - x_grid[1] if n >= 3 else h_i
-        d_next = (y_grid[2] - y_grid[1]) / h_next if n >= 3 else d_i
-        m_left = _pchip_endpoint_slope(d_i, d_next, h_i, h_next)
-    else:
-        h_prev = x_grid[i] - x_grid[i - 1]
-        d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev
-        m_left = _pchip_slope_nonuniform(d_prev, d_i, h_prev, h_i)
-
-    if i == n - 2:
-        h_prev = x_grid[i] - x_grid[i - 1] if n >= 3 else h_i
-        d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev if n >= 3 else d_i
-        m_right = _pchip_endpoint_slope(d_i, d_prev, h_i, h_prev)
-    else:
-        h_next = x_grid[i + 2] - x_grid[i + 1]
-        d_next = (y_grid[i + 2] - y_grid[i + 1]) / h_next
-        m_right = _pchip_slope_nonuniform(d_i, d_next, h_i, h_next)
-
-    t = (x - x_grid[i]) / h_i
-    t2 = t * t
-    t3 = t2 * t
-    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
-    h10 = t3 - 2.0 * t2 + t
-    h01 = -2.0 * t3 + 3.0 * t2
-    h11 = t3 - t2
-
-    return (h00 * y_grid[i] + h10 * h_i * m_left
-            + h01 * y_grid[i + 1] + h11 * h_i * m_right)
-
-
-@njit(fastmath=True)
-def _pchip_precompute_slopes(x_grid, y_grid, m_left, m_right):
-    """Fill m_left, m_right (length n-1) with per-segment Hermite slopes
-    matching pchip_interp_1d. Lets callers reuse slopes across many x
-    queries on the same (x_grid, y_grid). Degenerate segments (h_i <
-    1e-30) get zero slopes; the eval helper short-circuits on those.
-    """
-    n = len(x_grid)
-    if n < 2:
-        return
-    n_seg = n - 1
-
-    for i in range(n_seg):
-        h_i = x_grid[i + 1] - x_grid[i]
-        if h_i < 1e-30:
-            m_left[i] = 0.0
-            m_right[i] = 0.0
-            continue
-        d_i = (y_grid[i + 1] - y_grid[i]) / h_i
-
-        if i == 0:
-            h_next = x_grid[2] - x_grid[1] if n >= 3 else h_i
-            d_next = (y_grid[2] - y_grid[1]) / h_next if n >= 3 else d_i
-            m_left[i] = _pchip_endpoint_slope(d_i, d_next, h_i, h_next)
-        else:
-            h_prev = x_grid[i] - x_grid[i - 1]
-            d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev
-            m_left[i] = _pchip_slope_nonuniform(d_prev, d_i, h_prev, h_i)
-
-        if i == n_seg - 1:
-            h_prev = x_grid[i] - x_grid[i - 1] if n >= 3 else h_i
-            d_prev = (y_grid[i] - y_grid[i - 1]) / h_prev if n >= 3 else d_i
-            m_right[i] = _pchip_endpoint_slope(d_i, d_prev, h_i, h_prev)
-        else:
-            h_next = x_grid[i + 2] - x_grid[i + 1]
-            d_next = (y_grid[i + 2] - y_grid[i + 1]) / h_next
-            m_right[i] = _pchip_slope_nonuniform(d_i, d_next, h_i, h_next)
-
-
-@njit(fastmath=True)
-def _pchip_eval_with_slopes(x, x_grid, y_grid, m_left, m_right):
-    """Evaluate PCHIP at x using slopes from _pchip_precompute_slopes.
-    Boundary and degenerate-segment behavior matches pchip_interp_1d."""
-    n = len(x_grid)
-    if n < 2:
-        return y_grid[0]
-
-    if x <= x_grid[0]:
-        h = x_grid[1] - x_grid[0] + 1e-30
-        return y_grid[0] + (y_grid[1] - y_grid[0]) * (x - x_grid[0]) / h
-    if x >= x_grid[n - 1]:
-        h = x_grid[n - 1] - x_grid[n - 2] + 1e-30
-        return y_grid[n - 1] + (y_grid[n - 1] - y_grid[n - 2]) * (x - x_grid[n - 1]) / h
-
-    lo, hi = 0, n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if x_grid[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    i = lo
-
-    h_i = x_grid[i + 1] - x_grid[i]
-    if h_i < 1e-30:
-        return y_grid[i]
-
-    t = (x - x_grid[i]) / h_i
-    t2 = t * t
-    t3 = t2 * t
-    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
-    h10 = t3 - 2.0 * t2 + t
-    h01 = -2.0 * t3 + 3.0 * t2
-    h11 = t3 - t2
-
-    return (h00 * y_grid[i] + h10 * h_i * m_left[i]
-            + h01 * y_grid[i + 1] + h11 * h_i * m_right[i])
-
-
-@njit(fastmath=True)
-def _interp_z_wealth(c_next_full, j_s, iz_lo, frac_z, iw, frac_w, inv_dw, n_z, use_cubic, min_c):
-    """Interpolate c_next and mpc at a single state-grid corner j_s.
-
-    Uses PCHIP (Fritsch-Carlson, monotonicity-preserving) cubic Hermite in z
-    on interior intervals and linear fallback on the first and last z
-    intervals. Wealth interpolation is linear on [iw, iw+1].
-
-    Interpolation order (cubic branch): wealth-blend the 4-point z stencil
-    FIRST, then apply PCHIP to the blended stencil. This preserves the
-    monotonicity-in-z property at off-grid wealth points -- the
-    "PCHIP-then-blend" alternative violates shape preservation because
-    Fritsch-Carlson is non-linear in stencil values, so it does not
-    commute with linear wealth blending.
-
-    `mpc` is the secant slope of c_val between iw and iw+1, computed as
-    (PCHIP(stencil_iw1) - PCHIP(stencil_iw)) / dw. At frac_w in {0, 1}
-    this matches the corresponding endpoint evaluation exactly. On the
-    interior, c_val under blend-then-PCHIP is non-linear in frac_w, so
-    mpc is the segment secant rather than the pointwise derivative.
-
-    `frac_w` is the affine wealth coordinate on the selected segment and
-    may be outside [0, 1] for linear extrapolation.
-    """
-    if use_cubic:
-        f2 = frac_z * frac_z
-        f3 = f2 * frac_z
-        h00 = 2.0 * f3 - 3.0 * f2 + 1.0
-        h10 = f3 - 2.0 * f2 + frac_z
-        h01 = -2.0 * f3 + 3.0 * f2
-        h11 = f3 - f2
-
-        # Read 4-point z stencil at both wealth corners.
-        p0 = c_next_full[iz_lo - 1, j_s, iw]
-        p1 = c_next_full[iz_lo,     j_s, iw]
-        p2 = c_next_full[iz_lo + 1, j_s, iw]
-        p3 = c_next_full[iz_lo + 2, j_s, iw]
-
-        q0 = c_next_full[iz_lo - 1, j_s, iw + 1]
-        q1 = c_next_full[iz_lo,     j_s, iw + 1]
-        q2 = c_next_full[iz_lo + 1, j_s, iw + 1]
-        q3 = c_next_full[iz_lo + 2, j_s, iw + 1]
-
-        # Blend-then-PCHIP for c_val: wealth-blend the 4 z stencil values,
-        # then run PCHIP once on the blended stencil. Shape-preserving in z
-        # at the actually-blended wealth slice.
-        one_minus_fw = 1.0 - frac_w
-        b0 = one_minus_fw * p0 + frac_w * q0
-        b1 = one_minus_fw * p1 + frac_w * q1
-        b2 = one_minus_fw * p2 + frac_w * q2
-        b3 = one_minus_fw * p3 + frac_w * q3
-        c_val = _pchip_eval_with_basis(b0, b1, b2, b3, h00, h10, h01, h11)
-        c_val = max(c_val, min_c)
-
-        # mpc = secant slope of c_val between fw=0 and fw=1.  At fw=0 the
-        # blended stencil equals the iw stencil, so PCHIP(b at fw=0) =
-        # PCHIP(p..) = c_iw; same logic at fw=1.  The secant slope is the
-        # diagonal Jacobian element of c_val w.r.t. x_next.
-        c_iw = _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11)
-        c_iw1 = _pchip_eval_with_basis(q0, q1, q2, q3, h00, h10, h01, h11)
-        mpc_val = (c_iw1 - c_iw) * inv_dw
-        mpc_val = max(0.0, min(1.0, mpc_val))
-    else:
-        c_lo = (1.0 - frac_w) * c_next_full[iz_lo,     j_s, iw] + frac_w * c_next_full[iz_lo,     j_s, iw + 1]
-        c_hi = (1.0 - frac_w) * c_next_full[iz_lo + 1, j_s, iw] + frac_w * c_next_full[iz_lo + 1, j_s, iw + 1]
-        c_val = (1.0 - frac_z) * c_lo + frac_z * c_hi
-        c_val = max(c_val, min_c)
-
-        mpc_lo = (c_next_full[iz_lo,     j_s, iw + 1] - c_next_full[iz_lo,     j_s, iw]) * inv_dw
-        mpc_hi = (c_next_full[iz_lo + 1, j_s, iw + 1] - c_next_full[iz_lo + 1, j_s, iw]) * inv_dw
-        mpc_val = (1.0 - frac_z) * mpc_lo + frac_z * mpc_hi
-        mpc_val = max(0.0, min(1.0, mpc_val))
-
-    return c_val, mpc_val
-
-
-@njit(fastmath=True)
-def _interp_z_wealth_pre(c_next_full, j_s, iz_lo, frac_z, h00, h10, h01, h11,
-                         iw, frac_w, inv_dw, use_cubic, min_c):
-    """Same as `_interp_z_wealth` but with the Hermite z-basis (h00..h11)
-    supplied by the caller. The basis depends only on `frac_z`, so when
-    this function is called many times for the same (iz_lo, frac_z) — once
-    per state-grid corner inside a (k_v, k_r) loop — hoisting the basis
-    saves redundant scalar work.
-
-    Bit-identical to `_interp_z_wealth` when called with matching inputs.
-    """
-    if use_cubic:
-        p0 = c_next_full[iz_lo - 1, j_s, iw]
-        p1 = c_next_full[iz_lo,     j_s, iw]
-        p2 = c_next_full[iz_lo + 1, j_s, iw]
-        p3 = c_next_full[iz_lo + 2, j_s, iw]
-
-        q0 = c_next_full[iz_lo - 1, j_s, iw + 1]
-        q1 = c_next_full[iz_lo,     j_s, iw + 1]
-        q2 = c_next_full[iz_lo + 1, j_s, iw + 1]
-        q3 = c_next_full[iz_lo + 2, j_s, iw + 1]
-
-        one_minus_fw = 1.0 - frac_w
-        b0 = one_minus_fw * p0 + frac_w * q0
-        b1 = one_minus_fw * p1 + frac_w * q1
-        b2 = one_minus_fw * p2 + frac_w * q2
-        b3 = one_minus_fw * p3 + frac_w * q3
-        c_val = _pchip_eval_with_basis(b0, b1, b2, b3, h00, h10, h01, h11)
-        c_val = max(c_val, min_c)
-
-        c_iw = _pchip_eval_with_basis(p0, p1, p2, p3, h00, h10, h01, h11)
-        c_iw1 = _pchip_eval_with_basis(q0, q1, q2, q3, h00, h10, h01, h11)
-        mpc_val = (c_iw1 - c_iw) * inv_dw
-        mpc_val = max(0.0, min(1.0, mpc_val))
-    else:
-        c_lo = (1.0 - frac_w) * c_next_full[iz_lo,     j_s, iw] + frac_w * c_next_full[iz_lo,     j_s, iw + 1]
-        c_hi = (1.0 - frac_w) * c_next_full[iz_lo + 1, j_s, iw] + frac_w * c_next_full[iz_lo + 1, j_s, iw + 1]
-        c_val = (1.0 - frac_z) * c_lo + frac_z * c_hi
-        c_val = max(c_val, min_c)
-
-        mpc_lo = (c_next_full[iz_lo,     j_s, iw + 1] - c_next_full[iz_lo,     j_s, iw]) * inv_dw
-        mpc_hi = (c_next_full[iz_lo + 1, j_s, iw + 1] - c_next_full[iz_lo + 1, j_s, iw]) * inv_dw
-        mpc_val = (1.0 - frac_z) * mpc_lo + frac_z * mpc_hi
-        mpc_val = max(0.0, min(1.0, mpc_val))
-
-    return c_val, mpc_val
-
-
-# =============================================================================
-# FOC AND JACOBIAN -- RETIREMENT (QUADRATURE)
-# =============================================================================
-
-
-@njit(fastmath=True)
-def compute_foc_jac_retirement_quad(
-    alpha_s, alpha_b, s_val, z_idx, i_s,
-    wealth_grid, c_next_full, pension_next_scalar,
-    annuity_factor_is,
-    # --- State quadrature arrays ---
-    v_nodes, v_weights, M_v_nodes,
-    base_mu_r_i,          # const_r + A_r @ s_i, precomputed per i_s
-    Phi_0_state, Phi_11, state_grid_i,  # for computing s_next
-    state_bracket_shift, state_bracket_L_inv,
-    grids_0, grids_1, grids_2,          # marginal grids for bracketing
-    N1, N2,                              # grid sizes dim 1, dim 2
-    # --- Return quadrature ---
-    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-    # --- CVC log-wealth scalars ---
-    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-    # --- Model parameters ---
-    gamma, psi, beta, b_bar,
-    min_wealth_inv=1e-10, min_consumption=1e-10,
-    prob_skip=1e-12,
-    delta=DELTA_BEQUEST,    # luxury-bequest shifter (default = module constant)
-):
-    """FOC and Jacobian for retirement portfolio with state innovation quadrature.
-
-    Two wealth-dynamics branches gated by use_ccv:
-
-    simple+clamp (use_ccv=False):
-        R_p = alpha_s*R_s + alpha_b*R_b + (1-alpha_s-alpha_b)*R_bill
-        x_next = max(s*R_p, 0) + pension_next; bequest = max(s*R_p, 0).
-        FOC: foc_j = E[mu_comb * (R_j - R_bill)]   (== gradient of V under simple)
-
-    ccv_log (use_ccv=True):
-        R_p = exp(r_p^CVC), r_p^CVC per Campbell-Viceira (CCV w8566 eq.10).
-        x_next = s*R_p + pension_next (no clamp; exp() > 0 strictly).
-        FOC: foc_j = E[mu_comb * R_p * dr_p/dalpha_j]   (gradient-of-V under CVC)
-        Hessian-of-V Jacobian, symmetric (Schwarz).
-
-    Policy lookups use trilinear interpolation across 8 state-grid corners
-    (unchanged across both branches).
-    """
-    a_bill = 1.0 - alpha_s - alpha_b
-    prob_death = 1.0 - psi
-    foc_s = 0.0; foc_b = 0.0
-    J_ss = 0.0; J_bb = 0.0; J_sb = 0.0
-    euler_sum = 0.0
-
-    n_state_quad = len(v_weights)
-    n_ret_quad = len(ret_weights)
-
-    for k_v in range(n_state_quad):
-        w_v = v_weights[k_v]
-        if w_v < prob_skip:
-            continue
-
-        # --- Continuous next state ---
-        s_next_0 = Phi_0_state[0] + Phi_11[0, 0] * state_grid_i[0] + Phi_11[0, 1] * state_grid_i[1] + Phi_11[0, 2] * state_grid_i[2] + v_nodes[k_v, 0]
-        s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_grid_i[0] + Phi_11[1, 1] * state_grid_i[1] + Phi_11[1, 2] * state_grid_i[2] + v_nodes[k_v, 1]
-        s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_grid_i[0] + Phi_11[2, 1] * state_grid_i[1] + Phi_11[2, 2] * state_grid_i[2] + v_nodes[k_v, 2]
-
-        b_next_0, b_next_1, b_next_2 = transform_state_for_bracketing_3d(
-            s_next_0, s_next_1, s_next_2, state_bracket_shift, state_bracket_L_inv
-        )
-
-        # --- Bracket transformed next state in 3D grid ---
-        lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
-            b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
-        )
-        hi0 = lo0 if len(grids_0) == 1 else lo0 + 1
-        hi1 = lo1 if len(grids_1) == 1 else lo1 + 1
-        hi2 = lo2 if len(grids_2) == 1 else lo2 + 1
-
-        # 8 trilinear weights
-        w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
-        w001 = (1.0 - f0) * (1.0 - f1) * f2
-        w010 = (1.0 - f0) * f1 * (1.0 - f2)
-        w011 = (1.0 - f0) * f1 * f2
-        w100 = f0 * (1.0 - f1) * (1.0 - f2)
-        w101 = f0 * (1.0 - f1) * f2
-        w110 = f0 * f1 * (1.0 - f2)
-        w111 = f0 * f1 * f2
-
-        # 8 flat indices into c_next_full's j_s dimension
-        j000 = lo0 * N1 * N2 + lo1 * N2 + lo2
-        j001 = lo0 * N1 * N2 + lo1 * N2 + hi2
-        j010 = lo0 * N1 * N2 + hi1 * N2 + lo2
-        j011 = lo0 * N1 * N2 + hi1 * N2 + hi2
-        j100 = hi0 * N1 * N2 + lo1 * N2 + lo2
-        j101 = hi0 * N1 * N2 + lo1 * N2 + hi2
-        j110 = hi0 * N1 * N2 + hi1 * N2 + lo2
-        j111 = hi0 * N1 * N2 + hi1 * N2 + hi2
-
-        # --- Conditional return mean (3 returns: rtb, xr, xb) ---
-        mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
-        mu_r_stock = base_mu_r_i[1] + M_v_nodes[k_v, 1]
-        mu_r_bond  = base_mu_r_i[2] + M_v_nodes[k_v, 2]
-        exp_mu_bill = exp(mu_r_bill)
-        exp_mu_s = exp(mu_r_stock)
-        exp_mu_b = exp(mu_r_bond)
-
-        for k_r in range(n_ret_quad):
-            p_ret = ret_weights[k_r]
-            weight = w_v * p_ret
-            if weight < prob_skip:
-                continue
-
-            if use_ccv:
-                # --- CVC: build log returns and r_p^CVC ---
-                # R_bill, R_s, R_b, Rex_s, Rex_b are unused on this branch
-                # (FOC uses dr_p/dalpha — see formula 2b/c in docs/CCV_RETURNS.md).
-                log_R_bill = mu_r_bill + ret_nodes[k_r, 0]
-                log_x_s = mu_r_stock + ret_nodes[k_r, 1]
-                log_x_b = mu_r_bond + ret_nodes[k_r, 2]
-                r_p = (log_R_bill
-                       + alpha_s * log_x_s + alpha_b * log_x_b
-                       + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
-                       - 0.5 * (alpha_s * alpha_s * sigma2_xr
-                                + 2.0 * alpha_s * alpha_b * sigma_xrxb
-                                + alpha_b * alpha_b * sigma2_xb))
-                R_p = exp(r_p)
-                Rex_s = 0.0
-                Rex_b = 0.0
-                sR_p = s_val * R_p
-                x_next = sR_p + pension_next_scalar
-            else:
-                R_bill = exp_mu_bill * exp_ret_bill[k_r]
-                R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
-                R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
-                R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
-                Rex_s = R_s - R_bill
-                Rex_b = R_b - R_bill
-                sR_p = s_val * R_p
-                if sR_p > 0.0:
-                    x_next = sR_p + pension_next_scalar
-                else:
-                    x_next = pension_next_scalar
-
-            # --- Trilinear interpolation of c_next and mpc ---
-            # Bracket x_next in wealth_grid once; all 8 state corners share it.
-            iw_x, _, inv_dw_x = find_bracket(x_next, wealth_grid)
-            dx_x = x_next - wealth_grid[iw_x]
-            c000, mpc000 = _eval_linear_bracketed(c_next_full[j000, :], iw_x, dx_x, inv_dw_x)
-            c001, mpc001 = _eval_linear_bracketed(c_next_full[j001, :], iw_x, dx_x, inv_dw_x)
-            c010, mpc010 = _eval_linear_bracketed(c_next_full[j010, :], iw_x, dx_x, inv_dw_x)
-            c011, mpc011 = _eval_linear_bracketed(c_next_full[j011, :], iw_x, dx_x, inv_dw_x)
-            c100, mpc100 = _eval_linear_bracketed(c_next_full[j100, :], iw_x, dx_x, inv_dw_x)
-            c101, mpc101 = _eval_linear_bracketed(c_next_full[j101, :], iw_x, dx_x, inv_dw_x)
-            c110, mpc110 = _eval_linear_bracketed(c_next_full[j110, :], iw_x, dx_x, inv_dw_x)
-            c111, mpc111 = _eval_linear_bracketed(c_next_full[j111, :], iw_x, dx_x, inv_dw_x)
-
-            c_next = (w000 * c000 + w001 * c001 + w010 * c010 + w011 * c011
-                      + w100 * c100 + w101 * c101 + w110 * c110 + w111 * c111)
-            c_next = max(c_next, min_consumption)
-
-            mpc = (w000 * mpc000 + w001 * mpc001 + w010 * mpc010 + w011 * mpc011
-                   + w100 * mpc100 + w101 * mpc101 + w110 * mpc110 + w111 * mpc111)
-            mpc = max(0.0, min(1.0, mpc))
-
-            # --- Marginal utilities ---
-            mu_alive = c_next ** (-gamma)
-            mup_alive = -gamma * mu_alive / c_next * mpc
-            if use_ccv:
-                # sR_p > 0 strictly under CVC
-                mu_bequest, mup_bequest = _shifted_bequest_mu_and_mup(
-                    sR_p, annuity_factor_is, gamma, b_bar, delta
-                )
-            else:
-                if sR_p > 0.0:
-                    mu_bequest, mup_bequest = _shifted_bequest_mu_and_mup(
-                        sR_p, annuity_factor_is, gamma, b_bar, delta
-                    )
-                else:
-                    mu_bequest = 0.0
-                    mup_bequest = 0.0
-            mu_comb = psi * mu_alive + prob_death * mu_bequest
-            mup_comb = psi * mup_alive + prob_death * mup_bequest
-
-            wmu = weight * mu_comb
-            wmup = weight * mup_comb
-
-            euler_sum += wmu * R_p
-
-            if use_ccv:
-                # Bellman gradient FOC + symmetric Hessian-of-V Jacobian.
-                # (corrected gradient: 1/2-vs-1 Jensen)
-                dr_da_s = log_x_s + sigma2_xr * (0.5 - alpha_s) - alpha_b * sigma_xrxb
-                dr_da_b = log_x_b + sigma2_xb * (0.5 - alpha_b) - alpha_s * sigma_xrxb
-                dRp_das = R_p * dr_da_s
-                dRp_dab = R_p * dr_da_b
-                foc_s += wmu * dRp_das
-                foc_b += wmu * dRp_dab
-                jac = wmup * s_val
-                J_ss += jac * dRp_das * dRp_das + wmu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
-                J_bb += jac * dRp_dab * dRp_dab + wmu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
-                J_sb += jac * dRp_das * dRp_dab + wmu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
-            else:
-                foc_s += wmu * Rex_s
-                foc_b += wmu * Rex_b
-                jac = wmup * s_val
-                J_ss += jac * Rex_s * Rex_s
-                J_bb += jac * Rex_b * Rex_b
-                J_sb += jac * Rex_s * Rex_b
-
-    return foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum
-
-
-# =============================================================================
-# FOC AND JACOBIAN -- WORKING AGE (QUADRATURE)
-# =============================================================================
-
-
-@njit(fastmath=True)
-def compute_foc_jac_working_quad(
-    alpha_s, alpha_b, s_val, z_idx, i_s,
-    wealth_grid, c_next_full, log_det_next,
-    annuity_factor_is,
-    z_grid, rho, eta_nodes, eta_weights, dz,
-    # --- State quadrature arrays ---
-    v_nodes, v_weights, M_v_nodes,
-    base_mu_r_i,
-    Phi_0_state, Phi_11, state_grid_i,
-    state_bracket_shift, state_bracket_L_inv,
-    grids_0, grids_1, grids_2,
-    N1, N2,
-    # --- Return quadrature ---
-    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-    # --- CVC log-wealth scalars ---
-    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-    eps_nodes, eps_weights,
-    # --- Model parameters ---
-    gamma, psi, beta, b_bar,
-    # --- Work-to-retirement transition (active only when t+1 == retire_age) ---
-    use_pension_next, pension_next_by_z,
-    min_wealth_inv=1e-10, min_consumption=1e-10,
-    prob_skip=1e-12,
-    delta=DELTA_BEQUEST,    # luxury-bequest shifter (default = module constant)
-):
-    """FOC and Jacobian for working-age portfolio with state innovation quadrature.
-
-    Same structure as retirement version but adds income quadrature loops
-    (eta for persistent, eps for transitory). Z-interpolation uses Catmull-Rom
-    cubic wrapped inside trilinear state interpolation.
-
-    At the work-to-retirement transition year (`t = retire_age - 1`), set
-    `use_pension_next=True` and pass `pension_next_by_z = pension_table[t+1, :]`.
-    The eps loop is preserved (eps_weights sum to 1) but next-period income is
-    replaced by linear z-interpolation of the next-period pension table.
-    """
-    a_bill = 1.0 - alpha_s - alpha_b
-    prob_death = 1.0 - psi
-
-    foc_s = 0.0; foc_b = 0.0
-    J_ss = 0.0; J_bb = 0.0; J_sb = 0.0
-    euler_sum = 0.0
-
-    n_state_quad = len(v_weights)
-    n_z = len(z_grid)
-    n_eta = len(eta_nodes)
-    n_eps = len(eps_nodes)
-    n_ret_quad = len(ret_weights)
-
-    # Precompute exp(eps) and exp(eta)
-    exp_eps = np.empty(n_eps)
-    for ie in range(n_eps):
-        exp_eps[ie] = exp(eps_nodes[ie])
-
-    exp_eta = np.empty(n_eta)
-    for ke in range(n_eta):
-        exp_eta[ke] = exp(eta_nodes[ke])
-
-    base_det_z = exp(log_det_next + rho * z_grid[z_idx])
-
-    # --- Hoist (k_eta, i_e)-only quantities out of the (k_v, k_r) loop ---
-    # All entries below depend solely on (z_idx, k_eta) or (z_idx, k_eta, i_e),
-    # so recomputing them inside the (k_v, k_r) loop is redundant. The Hermite
-    # z-basis (h00..h11) depends only on frac_z and is reused across all 8
-    # state-grid corners inside `_interp_z_wealth_pre`.
-    eta_iz_lo = np.empty(n_eta, dtype=np.int64)
-    eta_frac_z = np.empty(n_eta)
-    eta_use_cubic = np.empty(n_eta, dtype=np.uint8)
-    eta_h00 = np.empty(n_eta)
-    eta_h10 = np.empty(n_eta)
-    eta_h01 = np.empty(n_eta)
-    eta_h11 = np.empty(n_eta)
-    income_table = np.empty((n_eta, n_eps))
-
-    for k_eta in range(n_eta):
-        z_next = rho * z_grid[z_idx] + eta_nodes[k_eta]
-
-        iz_lo = int((z_next - z_grid[0]) / dz)
-        iz_lo = max(0, min(iz_lo, n_z - 2))
-        frac_z = (z_next - z_grid[iz_lo]) / dz
-        frac_z = max(0.0, min(1.0, frac_z))
-
-        eta_iz_lo[k_eta] = iz_lo
-        eta_frac_z[k_eta] = frac_z
-        eta_use_cubic[k_eta] = 1 if ((iz_lo >= 1) and (iz_lo + 2 < n_z)) else 0
-
-        f2 = frac_z * frac_z
-        f3 = f2 * frac_z
-        eta_h00[k_eta] = 2.0 * f3 - 3.0 * f2 + 1.0
-        eta_h10[k_eta] = f3 - 2.0 * f2 + frac_z
-        eta_h01[k_eta] = -2.0 * f3 + 3.0 * f2
-        eta_h11[k_eta] = f3 - f2
-
-        if use_pension_next:
-            income_const = (1.0 - frac_z) * pension_next_by_z[iz_lo] + frac_z * pension_next_by_z[iz_lo + 1]
-            for i_e in range(n_eps):
-                income_table[k_eta, i_e] = income_const
-        else:
-            det_z_eta = base_det_z * exp_eta[k_eta]
-            for i_e in range(n_eps):
-                y_gross_next = det_z_eta * exp_eps[i_e]
-                income_table[k_eta, i_e] = scalar_disposable_income(y_gross_next)
-
-    for k_v in range(n_state_quad):
-        w_v = v_weights[k_v]
-        if w_v < prob_skip:
-            continue
-
-        # --- Continuous next state ---
-        s_next_0 = Phi_0_state[0] + Phi_11[0, 0] * state_grid_i[0] + Phi_11[0, 1] * state_grid_i[1] + Phi_11[0, 2] * state_grid_i[2] + v_nodes[k_v, 0]
-        s_next_1 = Phi_0_state[1] + Phi_11[1, 0] * state_grid_i[0] + Phi_11[1, 1] * state_grid_i[1] + Phi_11[1, 2] * state_grid_i[2] + v_nodes[k_v, 1]
-        s_next_2 = Phi_0_state[2] + Phi_11[2, 0] * state_grid_i[0] + Phi_11[2, 1] * state_grid_i[1] + Phi_11[2, 2] * state_grid_i[2] + v_nodes[k_v, 2]
-
-        b_next_0, b_next_1, b_next_2 = transform_state_for_bracketing_3d(
-            s_next_0, s_next_1, s_next_2, state_bracket_shift, state_bracket_L_inv
-        )
-
-        # --- Bracket transformed next state in 3D grid ---
-        lo0, lo1, lo2, f0, f1, f2 = bracket_state_3d(
-            b_next_0, b_next_1, b_next_2, grids_0, grids_1, grids_2
-        )
-        hi0 = lo0 if len(grids_0) == 1 else lo0 + 1
-        hi1 = lo1 if len(grids_1) == 1 else lo1 + 1
-        hi2 = lo2 if len(grids_2) == 1 else lo2 + 1
-
-        # 8 trilinear weights
-        w000 = (1.0 - f0) * (1.0 - f1) * (1.0 - f2)
-        w001 = (1.0 - f0) * (1.0 - f1) * f2
-        w010 = (1.0 - f0) * f1 * (1.0 - f2)
-        w011 = (1.0 - f0) * f1 * f2
-        w100 = f0 * (1.0 - f1) * (1.0 - f2)
-        w101 = f0 * (1.0 - f1) * f2
-        w110 = f0 * f1 * (1.0 - f2)
-        w111 = f0 * f1 * f2
-
-        # 8 flat indices
-        j000 = lo0 * N1 * N2 + lo1 * N2 + lo2
-        j001 = lo0 * N1 * N2 + lo1 * N2 + hi2
-        j010 = lo0 * N1 * N2 + hi1 * N2 + lo2
-        j011 = lo0 * N1 * N2 + hi1 * N2 + hi2
-        j100 = hi0 * N1 * N2 + lo1 * N2 + lo2
-        j101 = hi0 * N1 * N2 + lo1 * N2 + hi2
-        j110 = hi0 * N1 * N2 + hi1 * N2 + lo2
-        j111 = hi0 * N1 * N2 + hi1 * N2 + hi2
-
-        # --- Conditional return mean (3 returns: rtb, xr, xb) ---
-        mu_r_bill  = base_mu_r_i[0] + M_v_nodes[k_v, 0]
-        mu_r_stock = base_mu_r_i[1] + M_v_nodes[k_v, 1]
-        mu_r_bond  = base_mu_r_i[2] + M_v_nodes[k_v, 2]
-        exp_mu_bill = exp(mu_r_bill)
-        exp_mu_s = exp(mu_r_stock)
-        exp_mu_b = exp(mu_r_bond)
-
-        for k_r in range(n_ret_quad):
-            p_ret = ret_weights[k_r]
-            p_state_ret = w_v * p_ret
-            if p_state_ret < prob_skip:
-                continue
-
-            if use_ccv:
-                # --- CVC: build log returns and r_p^CVC ---
-                # R_bill, R_s, R_b, Rex_s, Rex_b are unused on this branch
-                # (FOC uses dr_p/dalpha — see formula 2b/c in docs/CCV_RETURNS.md).
-                log_R_bill = mu_r_bill + ret_nodes[k_r, 0]
-                log_x_s = mu_r_stock + ret_nodes[k_r, 1]
-                log_x_b = mu_r_bond + ret_nodes[k_r, 2]
-                r_p = (log_R_bill
-                       + alpha_s * log_x_s + alpha_b * log_x_b
-                       + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
-                       - 0.5 * (alpha_s * alpha_s * sigma2_xr
-                                + 2.0 * alpha_s * alpha_b * sigma_xrxb
-                                + alpha_b * alpha_b * sigma2_xb))
-                R_p = exp(r_p)
-                Rex_s = 0.0
-                Rex_b = 0.0
-                sR_p = s_val * R_p
-                w_inv = sR_p          # no clamp; exp() > 0 strictly
-            else:
-                R_bill = exp_mu_bill * exp_ret_bill[k_r]
-                R_s = R_bill * exp_mu_s * exp_ret_stock[k_r]
-                R_b = R_bill * exp_mu_b * exp_ret_bond[k_r]
-                R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill
-                Rex_s = R_s - R_bill
-                Rex_b = R_b - R_bill
-                sR_p = s_val * R_p
-                w_inv = sR_p if sR_p > 0.0 else 0.0
-
-            if use_ccv:
-                # CVC: bequest always contributes (sR_p > 0)
-                mu_bequest, mup_bequest = _shifted_bequest_mu_and_mup(
-                    sR_p, annuity_factor_is, gamma, b_bar, delta
-                )
-                death_mu = p_state_ret * prob_death * mu_bequest
-                death_mup = p_state_ret * prob_death * mup_bequest
-                # Bellman gradient + Hessian-of-V Jacobian (corrected 1/2 Jensen)
-                dr_da_s = log_x_s + sigma2_xr * (0.5 - alpha_s) - alpha_b * sigma_xrxb
-                dr_da_b = log_x_b + sigma2_xb * (0.5 - alpha_b) - alpha_s * sigma_xrxb
-                dRp_das = R_p * dr_da_s
-                dRp_dab = R_p * dr_da_b
-                euler_sum += death_mu * R_p
-                foc_s += death_mu * dRp_das
-                foc_b += death_mu * dRp_dab
-                jac_b = death_mup * s_val
-                J_ss += jac_b * dRp_das * dRp_das + death_mu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
-                J_bb += jac_b * dRp_dab * dRp_dab + death_mu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
-                J_sb += jac_b * dRp_das * dRp_dab + death_mu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
-            else:
-                if sR_p > 0.0:
-                    mu_bequest, mup_bequest = _shifted_bequest_mu_and_mup(
-                        sR_p, annuity_factor_is, gamma, b_bar, delta
-                    )
-                    # Bequest contribution (once per (k_v, k_r), independent of income)
-                    death_mu = p_state_ret * prob_death * mu_bequest
-                    death_mup = p_state_ret * prob_death * mup_bequest
-
-                    euler_sum += death_mu * R_p
-                    foc_s += death_mu * Rex_s
-                    foc_b += death_mu * Rex_b
-
-                    jac_b = death_mup * s_val
-                    J_ss += jac_b * Rex_s * Rex_s
-                    J_bb += jac_b * Rex_b * Rex_b
-                    J_sb += jac_b * Rex_s * Rex_b
-                # else: bankrupt branch contributes zero to bequest part.
-
-            # Alive contribution: quadrature over persistent and transitory innovations
-            for k_eta in range(n_eta):
-                w_eta = eta_weights[k_eta]
-                if w_eta < prob_skip:
-                    continue
-
-                # Lookup hoisted (k_eta)-only quantities
-                iz_lo = eta_iz_lo[k_eta]
-                frac_z = eta_frac_z[k_eta]
-                use_cubic = eta_use_cubic[k_eta] != 0
-                h00 = eta_h00[k_eta]
-                h10 = eta_h10[k_eta]
-                h01 = eta_h01[k_eta]
-                h11 = eta_h11[k_eta]
-
-                p_out_base = p_state_ret * w_eta
-
-                for i_e in range(n_eps):
-                    weight = p_out_base * eps_weights[i_e]
-
-                    income_next = income_table[k_eta, i_e]
-                    x_next = w_inv + income_next
-
-                    iw, frac_w, inv_dw = find_bracket(x_next, wealth_grid)
-
-                    # Trilinear blend of z-wealth interpolated values at 8 corners
-                    c000, mpc000 = _interp_z_wealth_pre(c_next_full, j000, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c001, mpc001 = _interp_z_wealth_pre(c_next_full, j001, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c010, mpc010 = _interp_z_wealth_pre(c_next_full, j010, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c011, mpc011 = _interp_z_wealth_pre(c_next_full, j011, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c100, mpc100 = _interp_z_wealth_pre(c_next_full, j100, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c101, mpc101 = _interp_z_wealth_pre(c_next_full, j101, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c110, mpc110 = _interp_z_wealth_pre(c_next_full, j110, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-                    c111, mpc111 = _interp_z_wealth_pre(c_next_full, j111, iz_lo, frac_z, h00, h10, h01, h11, iw, frac_w, inv_dw, use_cubic, min_consumption)
-
-                    c_next = (w000 * c000 + w001 * c001 + w010 * c010 + w011 * c011
-                              + w100 * c100 + w101 * c101 + w110 * c110 + w111 * c111)
-                    c_next = max(c_next, min_consumption)
-
-                    mpc = (w000 * mpc000 + w001 * mpc001 + w010 * mpc010 + w011 * mpc011
-                           + w100 * mpc100 + w101 * mpc101 + w110 * mpc110 + w111 * mpc111)
-                    mpc = max(0.0, min(1.0, mpc))
-
-                    mu_alive = c_next ** (-gamma)
-                    mup_alive = -gamma * mu_alive / c_next * mpc
-
-                    wmu = weight * psi * mu_alive
-                    wmup = weight * psi * mup_alive
-
-                    euler_sum += wmu * R_p
-
-                    if use_ccv:
-                        foc_s += wmu * dRp_das
-                        foc_b += wmu * dRp_dab
-                        jac = wmup * s_val
-                        J_ss += jac * dRp_das * dRp_das + wmu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
-                        J_bb += jac * dRp_dab * dRp_dab + wmu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
-                        J_sb += jac * dRp_das * dRp_dab + wmu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
-                    else:
-                        foc_s += wmu * Rex_s
-                        foc_b += wmu * Rex_b
-                        jac = wmup * s_val
-                        J_ss += jac * Rex_s * Rex_s
-                        J_bb += jac * Rex_b * Rex_b
-                        J_sb += jac * Rex_s * Rex_b
-
-    return foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum
-
-
-def _terminal_prepare_scenarios(state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights):
-    """Scenario weights and gross returns for the exact terminal objective.
-
-    Parameters
-    ----------
-    state_weights : (n_scenarios,)  -- quadrature weights (v_weights) or Pi_state row
-    Rx_bill : (n_scenarios, n_ret_quad)  -- gross real bill returns
-    Rx_stock_mult : (n_scenarios, n_ret_quad)  -- exp(mu_xr + eps_xr), multiply by R_bill
-    Rx_bond_mult : (n_scenarios, n_ret_quad)  -- exp(mu_xb + eps_xb), multiply by R_bill
-    ret_weights : (n_ret_quad,)
-    """
-    scenario_weights = np.asarray(state_weights, dtype=float)[:, None] * np.asarray(ret_weights, dtype=float)[None, :]
-    R_bill = np.asarray(Rx_bill, dtype=float)
-    R_stock = R_bill * np.asarray(Rx_stock_mult, dtype=float)
-    R_bond = R_bill * np.asarray(Rx_bond_mult, dtype=float)
-    Rex_s = R_stock - R_bill
-    Rex_b = R_bond - R_bill
-    return scenario_weights, R_bill, R_stock, R_bond, Rex_s, Rex_b
-
-
-def _build_terminal_quad_returns(i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes):
-    """Build gross return scenario arrays using state quadrature.
-
-    For current financial state i_s, computes conditional return means at each
-    state innovation quadrature node, then expands with return residual nodes.
-
-    Returns
-    -------
-    Rx_bill : (n_state_quad, n_ret_quad)  -- exp(mu_rtb + eps_rtb)
-    Rx_stock_mult : (n_state_quad, n_ret_quad)  -- exp(mu_xr + eps_xr)
-    Rx_bond_mult : (n_state_quad, n_ret_quad)  -- exp(mu_xb + eps_xb)
-    """
-    n_state_quad = M_v_nodes.shape[0]
-    n_ret_quad = ret_nodes.shape[0]
-
-    # base conditional return mean: const_r + A_r @ s_i  (shape (3,))
-    base_mu_r = const_r + A_r @ state_grid[i_s]
-
-    Rx_bill = np.empty((n_state_quad, n_ret_quad))
-    Rx_stock_mult = np.empty((n_state_quad, n_ret_quad))
-    Rx_bond_mult = np.empty((n_state_quad, n_ret_quad))
-
-    for k_v in range(n_state_quad):
-        mu_r_k = base_mu_r + M_v_nodes[k_v]  # (3,): [mu_rtb, mu_xr, mu_xb]
-        for k_r in range(n_ret_quad):
-            Rx_bill[k_v, k_r] = np.exp(mu_r_k[0] + ret_nodes[k_r, 0])
-            Rx_stock_mult[k_v, k_r] = np.exp(mu_r_k[1] + ret_nodes[k_r, 1])
-            Rx_bond_mult[k_v, k_r] = np.exp(mu_r_k[2] + ret_nodes[k_r, 2])
-
-    return Rx_bill, Rx_stock_mult, Rx_bond_mult
-
-
-def _build_terminal_log_returns(i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes):
-    """Companion to `_build_terminal_quad_returns` returning the corresponding
-    log arrays (consumed by the CVC ccv_log kernel branch). Kept separate so
-    existing callers of the gross-return helper (tests, diagnostics) are not
-    forced to discard the extra outputs.
-
-    Returns
-    -------
-    log_R_bill : (n_state_quad, n_ret_quad)  -- mu_rtb + eps_rtb
-    log_x_s    : (n_state_quad, n_ret_quad)  -- mu_xr  + eps_xr
-    log_x_b    : (n_state_quad, n_ret_quad)  -- mu_xb  + eps_xb
-    """
-    n_state_quad = M_v_nodes.shape[0]
-    n_ret_quad = ret_nodes.shape[0]
-
-    base_mu_r = const_r + A_r @ state_grid[i_s]
-
-    log_R_bill = np.empty((n_state_quad, n_ret_quad))
-    log_x_s = np.empty((n_state_quad, n_ret_quad))
-    log_x_b = np.empty((n_state_quad, n_ret_quad))
-
-    for k_v in range(n_state_quad):
-        mu_r_k = base_mu_r + M_v_nodes[k_v]
-        for k_r in range(n_ret_quad):
-            log_R_bill[k_v, k_r] = mu_r_k[0] + ret_nodes[k_r, 0]
-            log_x_s[k_v, k_r] = mu_r_k[1] + ret_nodes[k_r, 1]
-            log_x_b[k_v, k_r] = mu_r_k[2] + ret_nodes[k_r, 2]
-
-    return log_R_bill, log_x_s, log_x_b
-
-
-
-# =============================================================================
-# TERMINAL AGE PORTFOLIO SOLVER
-# =============================================================================
-
-@njit(fastmath=True)
-def compute_terminal_portfolio_foc_jac(alpha_s, alpha_b,
-                                        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-                                        gamma,
-                                          min_return_power=1e-15,
-                                          prob_skip=1e-12):
-    """
-    FOC and Jacobian for the terminal-period portfolio problem.
-
-    Because the bequest b(a*R_port, A) = b_bar*(a*R_port/A)^{1-gamma}/(1-gamma)
-    is CRRA in terminal wealth, the portfolio FOC is proportional to a^{1-gamma}
-    and therefore independent of savings a (hence independent of W and c).
-
-    Uses state quadrature (v_weights) for scenario weighting, consistent with
-    the rest of the solver.
-
-    FOC_k = sum_{k_v,k_r} w_v * w_r * R_port^{-gamma} * (R_k - R_bill) = 0
-    J_kl  = sum_{k_v,k_r} w_v * w_r * (-gamma) * R_port^{-gamma-1} * Rex_k * Rex_l
-
-    Parameters
-    ----------
-    state_weights : (n_state_quad,) -- v_weights from state quadrature
-    Rx_bill : (n_state_quad, n_ret_quad) -- exp(mu_rtb + eps_rtb)
-    Rx_stock_mult : (n_state_quad, n_ret_quad) -- exp(mu_xr + eps_xr)
-    Rx_bond_mult : (n_state_quad, n_ret_quad) -- exp(mu_xb + eps_xb)
-    """
-    foc_s = 0.0;  foc_b = 0.0
-    J_ss  = 0.0;  J_bb  = 0.0;  J_sb  = 0.0
-    euler_sum = 0.0
-    a_bill = 1.0 - alpha_s - alpha_b
-
-    n_state_quad = len(state_weights)
-    n_ret_quad = len(ret_weights)
-    for k_v in range(n_state_quad):
-        w_v = state_weights[k_v]
-        if w_v < prob_skip:
-            continue
-        for k_r in range(n_ret_quad):
-            p_ret = ret_weights[k_r]
-            if p_ret < prob_skip:
-                continue
-            weight = w_v * p_ret
-            if weight < prob_skip:
-                continue
-
-            R_bill_kr = Rx_bill[k_v, k_r]
-            R_s   = R_bill_kr * Rx_stock_mult[k_v, k_r]
-            R_b   = R_bill_kr * Rx_bond_mult[k_v, k_r]
-            R_p   = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill_kr
-            Rex_s = R_s - R_bill_kr
-            Rex_b = R_b - R_bill_kr
-
-            Rp_mg  = max(R_p, min_return_power) ** (-gamma)
-            Rp_mg1 = max(R_p, min_return_power) ** (-gamma - 1.0)
-
-            foc_s += weight * Rp_mg * Rex_s
-            foc_b += weight * Rp_mg * Rex_b
-            euler_sum += weight * Rp_mg * R_p   # = weight * R_p^{1-gamma}
-
-            jac   = weight * (-gamma) * Rp_mg1
-            J_ss += jac * Rex_s * Rex_s
-            J_bb += jac * Rex_b * Rex_b
-            J_sb += jac * Rex_s * Rex_b
-
-    return foc_s, foc_b, J_ss, J_bb, J_sb, euler_sum
-
-
-# =============================================================================
-# CONSTRAINED TERMINAL PORTFOLIO SOLVER (NJIT)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_2d_terminal_constrained_njit(
-        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-        gamma,
-        init_s=0.1, init_b=0.4,
-        tol=1e-7, max_iter=20,
-        corner_tol=1e-8,
-        edge_max_iter=8, edge_accept_factor=10.0,
-        singular_det=1e-15, grad_step_size=0.05,
-        step_damp=0.2, grad_denom_eps=1e-10,
-        min_return_power=1e-15, prob_skip=1e-12):
-    """
-    Constrained 2D Newton for the terminal portfolio problem.
-
-    Mirrors solve_portfolio_2d_retirement_quad but without continuation value,
-    income, or state interpolation — only the bequest FOC matters.
-
-    Corner → edge → interior Newton with projection onto the simplex.
-
-    Returns: (alpha_s, alpha_b, euler_sum, exit_code, normalized_error)
-    """
-    # --- Helper: evaluate terminal FOC at (a_s, a_b) ---
-    def _foc(a_s, a_b):
-        return compute_terminal_portfolio_foc_jac(
-            a_s, a_b, state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult,
-            ret_weights, gamma, min_return_power, prob_skip)
-
-    # Corner: all bills
-    fs0, fb0, _, _, _, e0 = _foc(0.0, 0.0)
-    scale = max(abs(e0), 1.0)
-    if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
-        return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
-
-    # Corner: all stocks
-    fs1, fb1, _, _, _, e1 = _foc(1.0, 0.0)
-    if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
-        return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
-
-    # Corner: all bonds
-    fs2, fb2, _, _, _, e2 = _foc(0.0, 1.0)
-    if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
-        return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
-
-    # Edge: stocks + bills (alpha_b = 0)
-    if fs0 > 0.0 and fs1 < 0.0:
-        a_s = fs0 / (fs0 - fs1)
-        fs = fs0
-        for _ in range(edge_max_iter):
-            fs, fb, Jss, _, _, e = _foc(a_s, 0.0)
-            if abs(fs) < tol * scale:
-                break
-            if abs(Jss) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - fs / Jss))
-        if abs(fs) < tol * scale * edge_accept_factor and fb <= tol * scale:
-            return a_s, 0.0, e, EC_EDGE_SB, abs(fs) / scale
-
-    # Edge: bonds + bills (alpha_s = 0)
-    if fb0 > 0.0 and fb2 < 0.0:
-        a_b = fb0 / (fb0 - fb2)
-        fb = fb0
-        for _ in range(edge_max_iter):
-            fs, fb, _, Jbb, _, e = _foc(0.0, a_b)
-            if abs(fb) < tol * scale:
-                break
-            if abs(Jbb) < singular_det:
-                break
-            a_b = max(0.0, min(1.0, a_b - fb / Jbb))
-        if abs(fb) < tol * scale * edge_accept_factor and fs <= tol * scale:
-            return 0.0, a_b, e, EC_EDGE_BB, abs(fb) / scale
-
-    # Edge: stocks + bonds (alpha_bill = 0, alpha_s + alpha_b = 1)
-    g1 = fs1 - fb1
-    g2 = fs2 - fb2
-    if g1 * g2 < 0.0:
-        a_s = g2 / (g2 - g1)
-        g = g2
-        for _ in range(edge_max_iter):
-            a_b = 1.0 - a_s
-            fs, fb, Jss, Jbb, Jsb, e = _foc(a_s, a_b)
-            g = fs - fb
-            if abs(g) < tol * scale:
-                break
-            dg = Jss - 2.0 * Jsb + Jbb
-            if abs(dg) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - g / dg))
-        if abs(fs - fb) < tol * scale * edge_accept_factor and fs >= -tol * scale:
-            return a_s, 1.0 - a_s, e, EC_EDGE_STOCKBOND, abs(g) / scale
-
-    # Interior Newton with projection
-    a_s = init_s
-    a_b = init_b
-    e_last = 0.0
-    err = 1.0
-
-    for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = _foc(a_s, a_b)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc = step_damp / slen
-            step_s *= sc
-            step_b *= sc
-
-        a_s, a_b = project_to_triangle(a_s + step_s, a_b + step_b)
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
-
-
-# =============================================================================
-# UNCONSTRAINED TERMINAL PORTFOLIO SOLVER (NJIT)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_unconstrained_terminal_njit(
-        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-        gamma,
-        init_s=0.1, init_b=0.4,
-        tol=1e-7, max_iter=30,
-        singular_det=1e-15, grad_step_size=0.05,
-        step_damp=0.3, grad_denom_eps=1e-10,
-        min_return_power=1e-15, prob_skip=1e-12,
-        use_line_search=True, max_backtrack_iter=10,
-        line_search_max_step=2.0,
-        alpha_min=-1e30, alpha_max=+1e30):
-    """
-    Unconstrained 2D Newton for the terminal portfolio problem.
-
-    Mirrors solve_portfolio_unconstrained_retirement_quad but without
-    continuation value, income, or state interpolation.
-
-    Interior Newton with optional backtracking line search, no simplex
-    projection (allows leverage and short-selling).
-
-    Returns: (alpha_s, alpha_b, euler_sum, exit_code, normalized_error)
-    """
-    def _foc(a_s, a_b):
-        return compute_terminal_portfolio_foc_jac(
-            a_s, a_b, state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult,
-            ret_weights, gamma, min_return_power, prob_skip)
-
-    # Scale from all-bills evaluation
-    _, _, _, _, _, e0 = _foc(0.0, 0.0)
-    scale = max(abs(e0), 1.0)
-
-    a_s = init_s
-    a_b = init_b
-
-    fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
-    err = (fs * fs + fb * fb) ** 0.5
-
-    # n_iter = number of outer Newton iterations actually entered
-    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
-    for k in range(max_iter):
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        if use_line_search:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > line_search_max_step:
-                cap = line_search_max_step / slen
-                step_s *= cap
-                step_b *= cap
-
-            alpha = 1.0
-            found = False
-            for _bt in range(max_backtrack_iter):
-                a_s_t = a_s + alpha * step_s
-                a_b_t = a_b + alpha * step_b
-                if a_s_t < alpha_min: a_s_t = alpha_min
-                elif a_s_t > alpha_max: a_s_t = alpha_max
-                if a_b_t < alpha_min: a_b_t = alpha_min
-                elif a_b_t > alpha_max: a_b_t = alpha_max
-                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = _foc(a_s_t, a_b_t)
-                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
-                if err_t < err:
-                    fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
-                    e_last = e_t; err = err_t
-                    a_s = a_s_t; a_b = a_b_t
-                    found = True
-                    break
-                alpha *= 0.5
-            if not found:
-                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
-        else:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > step_damp:
-                cap = step_damp / slen
-                step_s *= cap
-                step_b *= cap
-            a_s += step_s
-            a_b += step_b
-            if a_s < alpha_min: a_s = alpha_min
-            elif a_s > alpha_max: a_s = alpha_max
-            if a_b < alpha_min: a_b = alpha_min
-            elif a_b > alpha_max: a_b = alpha_max
-            fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
-            err = (fs * fs + fb * fb) ** 0.5
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
-
-
-# =============================================================================
-# SHIFTED-BEQUEST TERMINAL FOC + JACOBIAN
-# =============================================================================
-
-@njit(fastmath=True)
-def compute_terminal_foc_jac_shifted(
-    alpha_s, alpha_b, s_val, A_is,
-    state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-    log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-    sigma2_xr, sigma2_xb, sigma_xrxb,
-    use_ccv,
-    gamma, b_bar, delta,
-    prob_skip=1e-12,
-):
-    """Terminal-period portfolio FOC and Jacobian under the shifted bequest.
-
-    Two wealth-dynamics specifications:
-
-    simple+clamp (use_ccv=False):
-        R_p = alpha_s*R_s + alpha_b*R_b + (1-alpha_s-alpha_b)*R_bill
-        foc_k = E[mu_bequest(sR_p) * (R_k - R_bill)] · 1{sR_p > 0}
-        Bankruptcy clamp: zero contribution on the bankrupt branch (mirrors the
-        working/retirement FOC kernels).
-
-    ccv_log (use_ccv=True):
-        R_p = exp(r_p^CVC), r_p^CVC per Campbell-Viceira (CCV w8566 eq.10):
-            r_p = log_R_bill + alpha_s*log_x_s + alpha_b*log_x_b
-                  + 0.5*(alpha_s*sigma2_xr + alpha_b*sigma2_xb)
-                  - 0.5*(alpha_s^2*sigma2_xr + 2*alpha_s*alpha_b*sigma_xrxb
-                         + alpha_b^2*sigma2_xb)
-        FOC is the gradient of V (NOT the asset-pricing moment condition):
-            foc_k = E[mu_bequest(sR_p) * R_p * dr_p/dalpha_k]
-        with dr_p/dalpha_s = log_x_s + sigma2_xr*(0.5 - alpha_s) - alpha_b*sigma_xrxb
-             dr_p/dalpha_b = log_x_b + sigma2_xb*(0.5 - alpha_b) - alpha_s*sigma_xrxb
-        sR_p > 0 always (exp() is strictly positive).
-
-    Also returns V_dot = E[mu_bequest * R_p] used by the consumption Euler
-    (form-invariant across both specs).
-
-    Returns: (foc_s, foc_b, J_ss, J_bb, J_sb, V_dot)
-    """
-    foc_s = 0.0; foc_b = 0.0
-    J_ss = 0.0; J_bb = 0.0; J_sb = 0.0
-    V_dot = 0.0
-    a_bill = 1.0 - alpha_s - alpha_b
-
-    n_state_quad = len(state_weights)
-    n_ret_quad = len(ret_weights)
-    for k_v in range(n_state_quad):
-        w_v = state_weights[k_v]
-        if w_v < prob_skip:
-            continue
-        for k_r in range(n_ret_quad):
-            weight = w_v * ret_weights[k_r]
-            if weight < prob_skip:
-                continue
-            if use_ccv:
-                # R_s, R_b, Rex_s, Rex_b unused on the CVC branch (FOC uses
-                # dr_p/dalpha). Skip the two multiplications.
-                lxs = log_x_s_arr[k_v, k_r]
-                lxb = log_x_b_arr[k_v, k_r]
-                # CVC log portfolio return
-                r_p = (log_R_bill_arr[k_v, k_r]
-                       + alpha_s * lxs + alpha_b * lxb
-                       + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
-                       - 0.5 * (alpha_s * alpha_s * sigma2_xr
-                                + 2.0 * alpha_s * alpha_b * sigma_xrxb
-                                + alpha_b * alpha_b * sigma2_xb))
-                R_p = exp(r_p)
-                sR_p = s_val * R_p
-                # sR_p > 0 strictly under CVC
-                mu_b, mup_b = _shifted_bequest_mu_and_mup(
-                    sR_p, A_is, gamma, b_bar, delta
-                )
-                wmu = weight * mu_b
-                wmup = weight * mup_b
-                # Gradient of r_p (with corrected 1/2-vs-1 Jensen term)
-                dr_da_s = lxs + sigma2_xr * (0.5 - alpha_s) - alpha_b * sigma_xrxb
-                dr_da_b = lxb + sigma2_xb * (0.5 - alpha_b) - alpha_s * sigma_xrxb
-                dRp_das = R_p * dr_da_s
-                dRp_dab = R_p * dr_da_b
-                foc_s += wmu * dRp_das
-                foc_b += wmu * dRp_dab
-                # Symmetric Hessian-of-V Jacobian:
-                #   J_jk = E[mup * s * dRp/da_j * dRp/da_k + mu * d2Rp/da_j da_k]
-                #   d2Rp/da_j da_k = R_p * (dr_p/da_j * dr_p/da_k - Sigma_jk)
-                jac = wmup * s_val
-                J_ss += jac * dRp_das * dRp_das + wmu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
-                J_bb += jac * dRp_dab * dRp_dab + wmu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
-                J_sb += jac * dRp_das * dRp_dab + wmu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
-                V_dot += wmu * R_p
-            else:
-                R_bill_kr = Rx_bill[k_v, k_r]
-                R_s = R_bill_kr * Rx_stock_mult[k_v, k_r]
-                R_b = R_bill_kr * Rx_bond_mult[k_v, k_r]
-                R_p = alpha_s * R_s + alpha_b * R_b + a_bill * R_bill_kr
-                Rex_s = R_s - R_bill_kr
-                Rex_b = R_b - R_bill_kr
-
-                sR_p = s_val * R_p
-                if sR_p > 0.0:
-                    mu_b, mup_b = _shifted_bequest_mu_and_mup(
-                        sR_p, A_is, gamma, b_bar, delta
-                    )
-                    wmu = weight * mu_b
-                    wmup = weight * mup_b
-                    foc_s += wmu * Rex_s
-                    foc_b += wmu * Rex_b
-                    jac = wmup * s_val
-                    J_ss += jac * Rex_s * Rex_s
-                    J_bb += jac * Rex_b * Rex_b
-                    J_sb += jac * Rex_s * Rex_b
-                    V_dot += wmu * R_p
-                # else: bankrupt branch contributes 0 to FOC/Jacobian/V_dot.
-
-    return foc_s, foc_b, J_ss, J_bb, J_sb, V_dot
-
-
-# =============================================================================
-# SHIFTED TERMINAL PORTFOLIO SOLVERS (per (i_s, j_s) Newton)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_terminal_portfolio_at_s_constrained_njit(
-        s_val, A_is,
-        fs0, fb0, e0, scale,
-        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-        log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, b_bar, delta,
-        init_s=0.1, init_b=0.4,
-        tol=1e-7, max_iter=20,
-        corner_tol=1e-8,
-        edge_max_iter=8, edge_accept_factor=10.0,
-        singular_det=1e-15, grad_step_size=0.05,
-        step_damp=0.2, grad_denom_eps=1e-10,
-        prob_skip=1e-12):
-    """Constrained 2D Newton for the shifted-bequest terminal portfolio at a
-    fixed savings level s_val. Mirrors solve_portfolio_2d_terminal_constrained_njit
-    but with s-dependence threaded through the FOC.
-
-    The corner FOC at (0,0) — fs0, fb0, e0 = V_dot at all-bills — and the
-    Newton scale = max(|e0|, 1.0) are computed once per (i_s, j_s) by the
-    caller (solve_terminal_age) and passed in, sparing one redundant 2D
-    quadrature pass per Newton call.
-
-    Returns: (alpha_s, alpha_b, V_dot, exit_code, normalized_error)
-    """
-    def _foc(a_s, a_b):
-        return compute_terminal_foc_jac_shifted(
-            a_s, a_b, s_val, A_is,
-            state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-            log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            gamma, b_bar, delta, prob_skip)
-
-    # Corner: all bills (use caller-supplied fs0/fb0/e0/scale).
-    if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
-        return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
-
-    # Corner: all stocks
-    fs1, fb1, _, _, _, e1 = _foc(1.0, 0.0)
-    if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
-        return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
-
-    # Corner: all bonds
-    fs2, fb2, _, _, _, e2 = _foc(0.0, 1.0)
-    if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
-        return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
-
-    # Edge: stocks + bills
-    if fs0 > 0.0 and fs1 < 0.0:
-        a_s = fs0 / (fs0 - fs1)
-        fs = fs0
-        fb = 0.0
-        e = e0
-        for _ in range(edge_max_iter):
-            fs, fb, Jss, _, _, e = _foc(a_s, 0.0)
-            if abs(fs) < tol * scale:
-                break
-            if abs(Jss) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - fs / Jss))
-        if abs(fs) < tol * scale * edge_accept_factor and fb <= tol * scale:
-            return a_s, 0.0, e, EC_EDGE_SB, abs(fs) / scale
-
-    # Edge: bonds + bills
-    if fb0 > 0.0 and fb2 < 0.0:
-        a_b = fb0 / (fb0 - fb2)
-        fs = 0.0
-        fb = fb0
-        e = e0
-        for _ in range(edge_max_iter):
-            fs, fb, _, Jbb, _, e = _foc(0.0, a_b)
-            if abs(fb) < tol * scale:
-                break
-            if abs(Jbb) < singular_det:
-                break
-            a_b = max(0.0, min(1.0, a_b - fb / Jbb))
-        if abs(fb) < tol * scale * edge_accept_factor and fs <= tol * scale:
-            return 0.0, a_b, e, EC_EDGE_BB, abs(fb) / scale
-
-    # Edge: stocks + bonds
-    g1 = fs1 - fb1
-    g2 = fs2 - fb2
-    if g1 * g2 < 0.0:
-        a_s = g2 / (g2 - g1)
-        g = g2
-        fs = 0.0
-        fb = 0.0
-        e = e0
-        for _ in range(edge_max_iter):
-            a_b = 1.0 - a_s
-            fs, fb, Jss, Jbb, Jsb, e = _foc(a_s, a_b)
-            g = fs - fb
-            if abs(g) < tol * scale:
-                break
-            dg = Jss - 2.0 * Jsb + Jbb
-            if abs(dg) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - g / dg))
-        if abs(fs - fb) < tol * scale * edge_accept_factor and fs >= -tol * scale:
-            return a_s, 1.0 - a_s, e, EC_EDGE_STOCKBOND, abs(g) / scale
-
-    # Interior Newton with simplex projection
-    a_s = init_s
-    a_b = init_b
-    e_last = 0.0
-    err = 1.0
-
-    for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = _foc(a_s, a_b)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc = step_damp / slen
-            step_s *= sc
-            step_b *= sc
-
-        a_s, a_b = project_to_triangle(a_s + step_s, a_b + step_b)
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
-
-
-@njit(fastmath=True)
-def solve_terminal_portfolio_at_s_unconstrained_njit(
-        s_val, A_is,
-        scale,
-        state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-        log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, b_bar, delta,
-        init_s=0.1, init_b=0.4,
-        tol=1e-7, max_iter=30,
-        singular_det=1e-15, grad_step_size=0.05,
-        step_damp=0.3, grad_denom_eps=1e-10,
-        prob_skip=1e-12,
-        use_line_search=True, max_backtrack_iter=10,
-        line_search_max_step=2.0,
-        alpha_min=-1e30, alpha_max=+1e30):
-    """Unconstrained 2D Newton for the shifted-bequest terminal portfolio at
-    a fixed savings level s_val. Mirrors solve_portfolio_unconstrained_terminal_njit.
-
-    `scale = max(|V_dot at all-bills|, 1.0)` is computed once per (i_s, j_s)
-    by the caller and passed in — eliminates the FOC-eval that the original
-    spec used solely to derive scale.
-
-    Returns: (alpha_s, alpha_b, V_dot, exit_code, normalized_error, n_iter)
-    """
-    def _foc(a_s, a_b):
-        return compute_terminal_foc_jac_shifted(
-            a_s, a_b, s_val, A_is,
-            state_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-            log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            gamma, b_bar, delta, prob_skip)
-
-    a_s = init_s
-    a_b = init_b
-
-    fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
-    err = (fs * fs + fb * fb) ** 0.5
-
-    for k in range(max_iter):
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        if use_line_search:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > line_search_max_step:
-                cap = line_search_max_step / slen
-                step_s *= cap
-                step_b *= cap
-
-            alpha = 1.0
-            found = False
-            for _bt in range(max_backtrack_iter):
-                a_s_t = a_s + alpha * step_s
-                a_b_t = a_b + alpha * step_b
-                if a_s_t < alpha_min: a_s_t = alpha_min
-                elif a_s_t > alpha_max: a_s_t = alpha_max
-                if a_b_t < alpha_min: a_b_t = alpha_min
-                elif a_b_t > alpha_max: a_b_t = alpha_max
-                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = _foc(a_s_t, a_b_t)
-                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
-                if err_t < err:
-                    fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
-                    e_last = e_t; err = err_t
-                    a_s = a_s_t; a_b = a_b_t
-                    found = True
-                    break
-                alpha *= 0.5
-            if not found:
-                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
-        else:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > step_damp:
-                cap = step_damp / slen
-                step_s *= cap
-                step_b *= cap
-            a_s += step_s
-            a_b += step_b
-            if a_s < alpha_min: a_s = alpha_min
-            elif a_s > alpha_max: a_s = alpha_max
-            if a_b < alpha_min: a_b = alpha_min
-            elif a_b > alpha_max: a_b = alpha_max
-            fs, fb, Jss, Jbb, Jsb, e_last = _foc(a_s, a_b)
-            err = (fs * fs + fb * fb) ** 0.5
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
-
-
-def solve_terminal_age(wealth_grid, savings_grid, annuity_factors,
-                       state_grid, const_r, A_r, M_v_nodes, v_weights,
-                       ret_nodes, ret_weights,
-                       gamma, beta, b_bar, N_state, n_z, constrained=True, solver_config=None,
-                       min_return_power=1e-15, min_consumption=1e-10,
-                       sigma2_xr=0.0, sigma2_xb=0.0, sigma_xrxb=0.0):
-    """Solve the terminal age via EGM on the savings grid under the shifted
-    (luxury) bequest of De Nardi (2004).
-
-    Pure-CRRA homogeneity (closed-form `c = W*ratio/(1+ratio)`) is invalid
-    once the bequest is shifted by `delta`. Instead, for each (i_s, j_s) we
-    solve the s-dependent portfolio FOC, invert the consumption Euler
-    `c = (beta*V_dot)^{-1/gamma}`, and compute implied wealth `W = c + s`.
-    Policies on the wealth grid are then obtained by interpolating the EGM
-    arrays.
-
-    The bequest depends only on (s, A_is) — not on z — so the policy is
-    z-invariant and broadcast across the z dimension (as in the original
-    closed-form).
-    """
-    if solver_config is None:
-        solver_config = SolverConfig()
-
-    n_w = len(wealth_grid)
-    n_s = len(savings_grid)
-    out_c = np.empty((n_z, N_state, n_w))
-    out_alpha_s = np.empty((n_z, N_state, n_w))
-    out_alpha_b = np.empty((n_z, N_state, n_w))
-    terminal_diag_int = np.zeros(N_state, dtype=np.int64)
-
-    # Sentinel resolution: SolverConfig.delta_bequest defaults to -1.0 ("use
-    # the module-level DELTA_BEQUEST"). Sweep configs override via _replace.
-    delta = (solver_config.delta_bequest
-             if solver_config.delta_bequest >= 0.0
-             else DELTA_BEQUEST)
-
-    use_ccv = (solver_config.wealth_dynamics_spec == "ccv_log")
-
-    for i_s in range(N_state):
-        A_is = annuity_factors[i_s]
-
-        # Build return scenario arrays from state quadrature.
-        Rx_bill, Rx_stock_mult, Rx_bond_mult = _build_terminal_quad_returns(
-            i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes
-        )
-        # Companion log arrays — only consumed by the CVC kernel branch but
-        # always built so the kernel signature is uniform.
-        log_R_bill_arr, log_x_s_arr, log_x_b_arr = _build_terminal_log_returns(
-            i_s, state_grid, const_r, A_r, M_v_nodes, ret_nodes
-        )
-
-        # EGM sweep: for each savings level, solve portfolio + invert Euler.
-        # Sweep largest -> smallest to keep the warm-started Newton smooth
-        # (policy is approximately continuous in s).
-        W_egm = np.empty(n_s)
-        c_egm = np.empty(n_s)
-        a_s_egm = np.empty(n_s)
-        a_b_egm = np.empty(n_s)
-
-        warm_s = solver_config.init_alpha_s
-        warm_b = solver_config.init_alpha_b
-        any_fail = False
-
-        # Threshold below which we skip Newton entirely: at s ~ 0 the FOC is
-        # trivially zero (s factor in J_kk) and the bequest contribution from
-        # invested savings is negligible, so the agent's policy degenerates to
-        # "consume the floor". Mirrors the working/retirement solvers' handling
-        # of `s_val < tiny_savings`.
-        tiny_s = solver_config.tiny_savings
-
-        for j_rev in range(n_s):
-            j_s = n_s - 1 - j_rev
-            s_val = float(savings_grid[j_s])
-
-            if s_val <= tiny_s:
-                # Degenerate: bequest contribution vanishes. Hold the warm-start
-                # policy (largest-s solution carried down by the sweep) and let
-                # the consumption Euler degenerate to c = min_consumption since
-                # V_dot ~ 0 at this end of the grid is dominated by floor logic.
-                opt_s = warm_s
-                opt_b = warm_b
-                V_dot = 0.0
-                c_star = min_consumption
-                c_egm[j_s] = c_star
-                a_s_egm[j_s] = opt_s
-                a_b_egm[j_s] = opt_b
-                W_egm[j_s] = c_star + s_val
-                continue
-
-            # Hoist corner FOC + scale out of the per-call Newton: one
-            # quadrature pass shared between the corner check (constrained)
-            # and the scale derivation (both branches), saving one full
-            # FOC-eval per j_s vs. the original handoff structure.
-            fs0, fb0, _Js0, _Jb0, _Jsb0, e0 = compute_terminal_foc_jac_shifted(
-                0.0, 0.0, s_val, A_is,
-                v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-                log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                gamma, b_bar, delta,
-                solver_config.prob_skip_threshold,
-            )
-            # NB: do NOT floor scale at 1.0. Under the shifted bequest
-            # V_dot = E[b'(s*R_p)*R_p] scales like s^{-gamma}, so the FOC
-            # magnitude varies by tens of orders of magnitude across the
-            # savings grid. A constant floor of 1.0 (the unshifted-CRRA
-            # convention) breaks the relative-tolerance check at large s:
-            # FOC_init at the warm-start can fall below tol*1.0 = tol while
-            # being far from the actual optimum. Tracking |e0| keeps tol
-            # truly relative across s.
-            scale = max(abs(e0), 1e-30)
-
-            if constrained:
-                opt_s, opt_b, V_dot, exit_code, _resid = (
-                    solve_terminal_portfolio_at_s_constrained_njit(
-                        s_val, A_is,
-                        fs0, fb0, e0, scale,
-                        v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-                        log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        gamma, b_bar, delta,
-                        init_s=warm_s,
-                        init_b=warm_b,
-                        tol=solver_config.tol,
-                        max_iter=solver_config.max_iter,
-                        corner_tol=solver_config.corner_tol,
-                        edge_max_iter=solver_config.edge_max_iter,
-                        edge_accept_factor=solver_config.edge_accept_factor,
-                        singular_det=solver_config.singular_det,
-                        grad_step_size=solver_config.grad_step_size,
-                        step_damp=solver_config.step_damp_constrained,
-                        grad_denom_eps=solver_config.grad_denom_eps,
-                        prob_skip=solver_config.prob_skip_threshold,
-                    )
-                )
-            else:
-                opt_s, opt_b, V_dot, exit_code, _resid, _n_iter = (
-                    solve_terminal_portfolio_at_s_unconstrained_njit(
-                        s_val, A_is,
-                        scale,
-                        v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, ret_weights,
-                        log_R_bill_arr, log_x_s_arr, log_x_b_arr,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        gamma, b_bar, delta,
-                        init_s=warm_s,
-                        init_b=warm_b,
-                        tol=solver_config.tol,
-                        max_iter=solver_config.max_iter_unconstrained,
-                        singular_det=solver_config.singular_det,
-                        grad_step_size=solver_config.grad_step_size,
-                        step_damp=solver_config.step_damp_unconstrained,
-                        grad_denom_eps=solver_config.grad_denom_eps,
-                        prob_skip=solver_config.prob_skip_threshold,
-                        use_line_search=solver_config.use_line_search,
-                        max_backtrack_iter=solver_config.max_backtrack_iter,
-                        line_search_max_step=solver_config.line_search_max_step,
-                        alpha_min=solver_config.alpha_min,
-                        alpha_max=solver_config.alpha_max,
-                    )
-                )
-
-            warm_s = opt_s
-            warm_b = opt_b
-            if exit_code == EC_NEWTON_FAIL:
-                any_fail = True
-
-            # Consumption Euler: u'(c) = beta * V_dot  =>  c = (beta*V_dot)^{-1/gamma}.
-            if np.isfinite(V_dot) and V_dot > solver_config.euler_inv_floor:
-                c_star = (beta * V_dot) ** (-1.0 / gamma)
-            else:
-                c_star = min_consumption
-            c_star = max(c_star, min_consumption)
-
-            c_egm[j_s] = c_star
-            a_s_egm[j_s] = opt_s
-            a_b_egm[j_s] = opt_b
-            W_egm[j_s] = c_star + s_val
-
-        terminal_diag_int[i_s] = EC_NEWTON_FAIL if any_fail else EC_INTERIOR
-
-        # Constrained-region floor and top-extrapolation anchor: use the
-        # j_s=0 and j_s=n_s-1 entries directly. Per the handoff "Set s =
-        # s_grid[0]" — the smallest savings level on the grid is the floor,
-        # regardless of whether W_egm sorted reordering puts it elsewhere.
-        s_floor = float(savings_grid[0])
-        W_floor = W_egm[0]
-        c_floor_pol = c_egm[0]
-        a_s_floor = a_s_egm[0]
-        a_b_floor = a_b_egm[0]
-
-        s_top = float(savings_grid[-1])
-        W_top = W_egm[-1]
-        a_s_top = a_s_egm[-1]
-        a_b_top = a_b_egm[-1]
-
-        # Sort by W_egm for middle-region interpolation. Under the expected
-        # monotone case (W_egm increasing in j_s), the sort is a no-op and
-        # W_sorted[0] == W_floor / W_sorted[-1] == W_top.
-        order = np.argsort(W_egm)
-        W_sorted = W_egm[order]
-        c_sorted = c_egm[order]
-        a_s_sorted = a_s_egm[order]
-        a_b_sorted = a_b_egm[order]
-
-        # Map to the wealth grid.
-        c_vec = np.empty(n_w)
-        a_s_vec = np.empty(n_w)
-        a_b_vec = np.empty(n_w)
-
-        for i_w in range(n_w):
-            W = wealth_grid[i_w]
-            if W <= W_floor:
-                # Constrained region: agent saves at the smallest grid point
-                # (s_grid[0]); consume the residual. Falls back to the j_s=0
-                # policy alphas. If W < s_floor the budget identity W = c+s
-                # cannot hold strictly — clamp c at min_consumption (same
-                # convention as the working/retirement solvers' c floor).
-                c_w = max(W - s_floor, min_consumption)
-                a_s_w = a_s_floor
-                a_b_w = a_b_floor
-            elif W >= W_top:
-                # Linear extrapolation in c using the top sorted segment;
-                # alphas held flat at the largest-s policy.
-                dW = W_sorted[-1] - W_sorted[-2]
-                if dW > 1e-30:
-                    slope_c = (c_sorted[-1] - c_sorted[-2]) / dW
-                    c_w = c_sorted[-1] + slope_c * (W - W_sorted[-1])
-                else:
-                    c_w = c_sorted[-1]
-                c_w = max(c_w, min_consumption)
-                a_s_w = a_s_top
-                a_b_w = a_b_top
-            else:
-                c_w = fast_interp_1d(W, W_sorted, c_sorted)
-                c_w = max(c_w, min_consumption)
-                a_s_w = fast_interp_1d(W, W_sorted, a_s_sorted)
-                a_b_w = fast_interp_1d(W, W_sorted, a_b_sorted)
-
-            c_vec[i_w] = c_w
-            a_s_vec[i_w] = a_s_w
-            a_b_vec[i_w] = a_b_w
-
-        # Bequest depends only on (s, A_is); broadcast across z.
-        out_c[:, i_s, :] = c_vec[None, :]
-        out_alpha_s[:, i_s, :] = a_s_vec[None, :]
-        out_alpha_b[:, i_s, :] = a_b_vec[None, :]
-
-    return out_c, out_alpha_s, out_alpha_b, terminal_diag_int
-
-
-
-# =============================================================================
-# NEWTON PORTFOLIO SOLVER -- RETIREMENT (QUADRATURE)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_2d_retirement_quad(s_val, z_idx, i_s,
-                                       wealth_grid, c_next_full, pension_next_scalar,
-                                       annuity_factor_is,
-                                       v_nodes, v_weights, M_v_nodes,
-                                       base_mu_r_i,
-                                       Phi_0_state, Phi_11, state_grid_i,
-                                       state_bracket_shift, state_bracket_L_inv,
-                                       grids_0, grids_1, grids_2, N1, N2,
-                                       exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                       sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                       gamma, psi, beta, b_bar,
-                                       init_s=0.1, init_b=0.4,
-                                       tol=1e-7, max_iter=20,
-                                       tiny_savings=1e-6, corner_tol=1e-8,
-                                       edge_max_iter=8, edge_accept_factor=10.0,
-                                       singular_det=1e-15, grad_step_size=0.05,
-                                       step_damp=0.2, grad_denom_eps=1e-10,
-                                       min_wealth_inv=1e-10, min_consumption=1e-10,
-                                       prob_skip=1e-12,
-                                       delta=DELTA_BEQUEST):
-    """2D Newton for retirement portfolio using state quadrature."""
-
-
-
-    if s_val < tiny_savings:
-        _, _, _, _, _, e = compute_foc_jac_retirement_quad(
-            0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
-
-    # Corner: all bills
-    fs0, fb0, _, _, _, e0 = compute_foc_jac_retirement_quad(
-        0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi, beta, b_bar,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    scale = max(abs(e0), 1.0)
-    if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
-        return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
-
-    # Corner: all stocks
-    fs1, fb1, _, _, _, e1 = compute_foc_jac_retirement_quad(
-        1.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi, beta, b_bar,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
-        return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
-
-    # Corner: all bonds
-    fs2, fb2, _, _, _, e2 = compute_foc_jac_retirement_quad(
-        0.0, 1.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi, beta, b_bar,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
-        return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
-
-    # Edge: stocks + bills
-    if fs0 > 0.0 and fs1 < 0.0:
-        a_s = fs0 / (fs0 - fs1)
-        fs = fs0
-        for _ in range(edge_max_iter):
-            fs, fb, Jss, _, _, e = compute_foc_jac_retirement_quad(
-                a_s, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            if abs(fs) < tol * scale:
-                break
-            if abs(Jss) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - fs / Jss))
-        if abs(fs) < tol * scale * edge_accept_factor and fb <= tol * scale:
-            return a_s, 0.0, e, EC_EDGE_SB, abs(fs) / scale
-
-    # Edge: bonds + bills
-    if fb0 > 0.0 and fb2 < 0.0:
-        a_b = fb0 / (fb0 - fb2)
-        fb = fb0
-        for _ in range(edge_max_iter):
-            fs, fb, _, Jbb, _, e = compute_foc_jac_retirement_quad(
-                0.0, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            if abs(fb) < tol * scale:
-                break
-            if abs(Jbb) < singular_det:
-                break
-            a_b = max(0.0, min(1.0, a_b - fb / Jbb))
-        if abs(fb) < tol * scale * edge_accept_factor and fs <= tol * scale:
-            return 0.0, a_b, e, EC_EDGE_BB, abs(fb) / scale
-
-    # Edge: stocks + bonds
-    g1 = fs1 - fb1
-    g2 = fs2 - fb2
-    if g1 * g2 < 0.0:
-        a_s = g2 / (g2 - g1)
-        g = g2
-        for _ in range(edge_max_iter):
-            a_b = 1.0 - a_s
-            fs, fb, Jss, Jbb, Jsb, e = compute_foc_jac_retirement_quad(
-                a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            g = fs - fb
-            if abs(g) < tol * scale:
-                break
-            dg = Jss - 2.0 * Jsb + Jbb
-            if abs(dg) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - g / dg))
-        if abs(fs - fb) < tol * scale * edge_accept_factor and fs >= -tol * scale:
-            return a_s, 1.0 - a_s, e, EC_EDGE_STOCKBOND, abs(g) / scale
-
-    # Interior Newton
-    a_s = init_s
-    a_b = init_b
-    e_last = 0.0
-    err = 1.0
-
-    for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_retirement_quad(
-            a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc = step_damp / slen
-            step_s *= sc
-            step_b *= sc
-
-        a_s, a_b = project_to_triangle(a_s + step_s, a_b + step_b)
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
-
-
-# =============================================================================
-# UNCONSTRAINED PORTFOLIO SOLVER -- RETIREMENT (QUADRATURE)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_unconstrained_retirement_quad(s_val, z_idx, i_s,
-                                                   wealth_grid, c_next_full, pension_next_scalar,
-                                                   annuity_factor_is,
-                                                   v_nodes, v_weights, M_v_nodes,
-                                                   base_mu_r_i,
-                                                   Phi_0_state, Phi_11, state_grid_i,
-                                                   state_bracket_shift, state_bracket_L_inv,
-                                                   grids_0, grids_1, grids_2, N1, N2,
-                                                   exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                                   sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                                   gamma, psi, beta, b_bar,
-                                                   init_s=0.1, init_b=0.4,
-                                                   tol=1e-7, max_iter=30,
-                                                   tiny_savings=1e-6,
-                                                   singular_det=1e-15, grad_step_size=0.05,
-                                                   step_damp=0.3, grad_denom_eps=1e-10,
-                                                   min_wealth_inv=1e-10, min_consumption=1e-10,
-                                                   prob_skip=1e-12,
-                                                   use_line_search=True, max_backtrack_iter=10,
-                                                   line_search_max_step=2.0,
-                                                   alpha_min=-1e30, alpha_max=+1e30,
-                                                   delta=DELTA_BEQUEST):
-    """Unconstrained Newton for retirement portfolio using state quadrature."""
-
-
-
-    if s_val < tiny_savings:
-        _, _, _, _, _, e = compute_foc_jac_retirement_quad(
-            0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            gamma, psi, beta, b_bar,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0, 0
-
-    _, _, _, _, _, e0 = compute_foc_jac_retirement_quad(
-        0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi, beta, b_bar,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    scale = max(abs(e0), 1.0)
-
-    a_s = init_s
-    a_b = init_b
-
-    fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement_quad(
-        a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi, beta, b_bar,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    err = (fs * fs + fb * fb) ** 0.5
-
-    # n_iter = number of outer Newton iterations actually entered
-    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
-    for k in range(max_iter):
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        if use_line_search:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > line_search_max_step:
-                cap = line_search_max_step / slen
-                step_s *= cap
-                step_b *= cap
-
-            alpha = 1.0
-            found = False
-            for _bt in range(max_backtrack_iter):
-                a_s_t = a_s + alpha * step_s
-                a_b_t = a_b + alpha * step_b
-                if a_s_t < alpha_min: a_s_t = alpha_min
-                elif a_s_t > alpha_max: a_s_t = alpha_max
-                if a_b_t < alpha_min: a_b_t = alpha_min
-                elif a_b_t > alpha_max: a_b_t = alpha_max
-                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_retirement_quad(
-                    a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-                    v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                    Phi_0_state, Phi_11, state_grid_i,
-                    state_bracket_shift, state_bracket_L_inv,
-                    grids_0, grids_1, grids_2, N1, N2,
-                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                    gamma, psi, beta, b_bar,
-                    min_wealth_inv, min_consumption, prob_skip, delta)
-                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
-                if err_t < err:
-                    fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
-                    e_last = e_t; err = err_t
-                    a_s = a_s_t; a_b = a_b_t
-                    found = True
-                    break
-                alpha *= 0.5
-            if not found:
-                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
-        else:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > step_damp:
-                cap = step_damp / slen
-                step_s *= cap
-                step_b *= cap
-            a_s += step_s
-            a_b += step_b
-            if a_s < alpha_min: a_s = alpha_min
-            elif a_s > alpha_max: a_s = alpha_max
-            if a_b < alpha_min: a_b = alpha_min
-            elif a_b > alpha_max: a_b = alpha_max
-            fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_retirement_quad(
-                a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, pension_next_scalar, annuity_factor_is,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                gamma, psi, beta, b_bar,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            err = (fs * fs + fb * fb) ** 0.5
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
-
-
-# =============================================================================
-# NEWTON PORTFOLIO SOLVER -- WORKING AGE (QUADRATURE)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_2d_working_quad(s_val, z_idx, i_s,
-                                     wealth_grid, c_next_full, log_det_next,
-                                     annuity_factor_is,
-                                     z_grid, rho, eta_nodes, eta_weights, dz,
-                                     v_nodes, v_weights, M_v_nodes,
-                                     base_mu_r_i,
-                                     Phi_0_state, Phi_11, state_grid_i,
-                                     state_bracket_shift, state_bracket_L_inv,
-                                     grids_0, grids_1, grids_2, N1, N2,
-                                     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                     sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                     eps_nodes, eps_weights,
-                                     gamma, psi, beta, b_bar,
-                                     use_pension_next, pension_next_by_z,
-                                     init_s=0.1, init_b=0.4,
-                                     tol=1e-7, max_iter=20,
-                                     tiny_savings=1e-6, corner_tol=1e-8,
-                                     edge_max_iter=8, edge_accept_factor=10.0,
-                                     singular_det=1e-15, grad_step_size=0.05,
-                                     step_damp=0.2, grad_denom_eps=1e-10,
-                                     min_wealth_inv=1e-10, min_consumption=1e-10,
-                                     prob_skip=1e-12,
-                                     delta=DELTA_BEQUEST):
-    """2D Newton for working-age portfolio using state quadrature."""
-
-
-
-    if s_val < tiny_savings:
-        _, _, _, _, _, e = compute_foc_jac_working_quad(
-            0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-            z_grid, rho, eta_nodes, eta_weights, dz,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            eps_nodes, eps_weights,
-            gamma, psi, beta, b_bar,
-            use_pension_next, pension_next_by_z,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0
-
-    fs0, fb0, _, _, _, e0 = compute_foc_jac_working_quad(
-        0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-        z_grid, rho, eta_nodes, eta_weights, dz,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    scale = max(abs(e0), 1.0)
-    if fs0 <= corner_tol * scale and fb0 <= corner_tol * scale:
-        return 0.0, 0.0, e0, EC_CORNER_BILLS, 0.0
-
-    fs1, fb1, _, _, _, e1 = compute_foc_jac_working_quad(
-        1.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-        z_grid, rho, eta_nodes, eta_weights, dz,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    if fs1 >= -corner_tol * scale and fb1 <= fs1 + corner_tol * scale:
-        return 1.0, 0.0, e1, EC_CORNER_STOCKS, 0.0
-
-    fs2, fb2, _, _, _, e2 = compute_foc_jac_working_quad(
-        0.0, 1.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-        z_grid, rho, eta_nodes, eta_weights, dz,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    if fb2 >= -corner_tol * scale and fs2 <= fb2 + corner_tol * scale:
-        return 0.0, 1.0, e2, EC_CORNER_BONDS, 0.0
-
-    # Edge: stocks + bills
-    if fs0 > 0.0 and fs1 < 0.0:
-        a_s = fs0 / (fs0 - fs1)
-        fs = fs0
-        for _ in range(edge_max_iter):
-            fs, fb, Jss, _, _, e = compute_foc_jac_working_quad(
-                a_s, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-                z_grid, rho, eta_nodes, eta_weights, dz,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                use_pension_next, pension_next_by_z,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            if abs(fs) < tol * scale:
-                break
-            if abs(Jss) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - fs / Jss))
-        if abs(fs) < tol * scale * edge_accept_factor and fb <= tol * scale:
-            return a_s, 0.0, e, EC_EDGE_SB, abs(fs) / scale
-
-    # Edge: bonds + bills
-    if fb0 > 0.0 and fb2 < 0.0:
-        a_b = fb0 / (fb0 - fb2)
-        fb = fb0
-        for _ in range(edge_max_iter):
-            fs, fb, _, Jbb, _, e = compute_foc_jac_working_quad(
-                0.0, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-                z_grid, rho, eta_nodes, eta_weights, dz,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                use_pension_next, pension_next_by_z,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            if abs(fb) < tol * scale:
-                break
-            if abs(Jbb) < singular_det:
-                break
-            a_b = max(0.0, min(1.0, a_b - fb / Jbb))
-        if abs(fb) < tol * scale * edge_accept_factor and fs <= tol * scale:
-            return 0.0, a_b, e, EC_EDGE_BB, abs(fb) / scale
-
-    # Edge: stocks + bonds
-    g1 = fs1 - fb1
-    g2 = fs2 - fb2
-    if g1 * g2 < 0.0:
-        a_s = g2 / (g2 - g1)
-        g = g2
-        for _ in range(edge_max_iter):
-            a_b = 1.0 - a_s
-            fs, fb, Jss, Jbb, Jsb, e = compute_foc_jac_working_quad(
-                a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-                z_grid, rho, eta_nodes, eta_weights, dz,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                use_pension_next, pension_next_by_z,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            g = fs - fb
-            if abs(g) < tol * scale:
-                break
-            dg = Jss - 2.0 * Jsb + Jbb
-            if abs(dg) < singular_det:
-                break
-            a_s = max(0.0, min(1.0, a_s - g / dg))
-        if abs(fs - fb) < tol * scale * edge_accept_factor and fs >= -tol * scale:
-            return a_s, 1.0 - a_s, e, EC_EDGE_STOCKBOND, abs(g) / scale
-
-    # Interior Newton
-    a_s = init_s
-    a_b = init_b
-    e_last = 0.0
-    err = 1.0
-
-    for _ in range(max_iter):
-        fs, fb, Jss, Jbb, Jsb, e_sum = compute_foc_jac_working_quad(
-            a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-            z_grid, rho, eta_nodes, eta_weights, dz,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            eps_nodes, eps_weights,
-            gamma, psi, beta, b_bar,
-            use_pension_next, pension_next_by_z,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        e_last = e_sum
-
-        err = (fs * fs + fb * fb) ** 0.5
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        slen = (step_s * step_s + step_b * step_b) ** 0.5
-        if slen > step_damp:
-            sc_f = step_damp / slen
-            step_s *= sc_f
-            step_b *= sc_f
-
-        a_s, a_b = project_to_triangle(a_s + step_s, a_b + step_b)
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale
-
-
-# =============================================================================
-# UNCONSTRAINED PORTFOLIO SOLVER -- WORKING AGE (QUADRATURE)
-# =============================================================================
-
-@njit(fastmath=True)
-def solve_portfolio_unconstrained_working_quad(s_val, z_idx, i_s,
-                                                wealth_grid, c_next_full, log_det_next,
-                                                annuity_factor_is,
-                                                z_grid, rho, eta_nodes, eta_weights, dz,
-                                                v_nodes, v_weights, M_v_nodes,
-                                                base_mu_r_i,
-                                                Phi_0_state, Phi_11, state_grid_i,
-                                                state_bracket_shift, state_bracket_L_inv,
-                                                grids_0, grids_1, grids_2, N1, N2,
-                                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                                eps_nodes, eps_weights,
-                                                gamma, psi, beta, b_bar,
-                                                use_pension_next, pension_next_by_z,
-                                                init_s=0.1, init_b=0.4,
-                                                tol=1e-7, max_iter=30,
-                                                tiny_savings=1e-6,
-                                                singular_det=1e-15, grad_step_size=0.05,
-                                                step_damp=0.3, grad_denom_eps=1e-10,
-                                                min_wealth_inv=1e-10, min_consumption=1e-10,
-                                                prob_skip=1e-12,
-                                                use_line_search=True, max_backtrack_iter=10,
-                                                line_search_max_step=2.0,
-                                                alpha_min=-1e30, alpha_max=+1e30,
-                                                delta=DELTA_BEQUEST):
-    """Unconstrained Newton for working-age portfolio using state quadrature."""
-
-    # Line search is the global default — it prevents Newton overshoots and now
-    # also applies cleanly at the work->retirement boundary because off-grid
-    # wealth lookups use a value/slope-consistent affine extrapolation.
-    eff_line_search = use_line_search
-
-    if s_val < tiny_savings:
-        _, _, _, _, _, e = compute_foc_jac_working_quad(
-            0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-            z_grid, rho, eta_nodes, eta_weights, dz,
-            v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-            Phi_0_state, Phi_11, state_grid_i,
-            state_bracket_shift, state_bracket_L_inv,
-            grids_0, grids_1, grids_2, N1, N2,
-            exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-            sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-            eps_nodes, eps_weights,
-            gamma, psi, beta, b_bar,
-            use_pension_next, pension_next_by_z,
-            min_wealth_inv, min_consumption, prob_skip, delta)
-        return 0.0, 0.0, e, EC_TINY_SAVINGS, 0.0, 0
-
-    _, _, _, _, _, e0 = compute_foc_jac_working_quad(
-        0.0, 0.0, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-        z_grid, rho, eta_nodes, eta_weights, dz,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    scale = max(abs(e0), 1.0)
-
-    a_s = init_s
-    a_b = init_b
-
-    fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working_quad(
-        a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-        z_grid, rho, eta_nodes, eta_weights, dz,
-        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-        Phi_0_state, Phi_11, state_grid_i,
-        state_bracket_shift, state_bracket_L_inv,
-        grids_0, grids_1, grids_2, N1, N2,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        min_wealth_inv, min_consumption, prob_skip, delta)
-    err = (fs * fs + fb * fb) ** 0.5
-
-    # n_iter = number of outer Newton iterations actually entered
-    # (= 0 if init was already inside tol, = max_iter on full exhaustion).
-    for k in range(max_iter):
-        if err < tol * scale:
-            return a_s, a_b, e_last, EC_INTERIOR, err / scale, k
-
-        det = Jss * Jbb - Jsb * Jsb
-        if abs(det) < singular_det:
-            step_s = grad_step_size * fs / (err + grad_denom_eps)
-            step_b = grad_step_size * fb / (err + grad_denom_eps)
-        else:
-            inv_d = 1.0 / det
-            step_s = -(Jbb * fs - Jsb * fb) * inv_d
-            step_b = -(-Jsb * fs + Jss * fb) * inv_d
-
-        if eff_line_search:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > line_search_max_step:
-                cap = line_search_max_step / slen
-                step_s *= cap
-                step_b *= cap
-
-            alpha = 1.0
-            found = False
-            for _bt in range(max_backtrack_iter):
-                a_s_t = a_s + alpha * step_s
-                a_b_t = a_b + alpha * step_b
-                if a_s_t < alpha_min: a_s_t = alpha_min
-                elif a_s_t > alpha_max: a_s_t = alpha_max
-                if a_b_t < alpha_min: a_b_t = alpha_min
-                elif a_b_t > alpha_max: a_b_t = alpha_max
-                fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = compute_foc_jac_working_quad(
-                    a_s_t, a_b_t, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-                    z_grid, rho, eta_nodes, eta_weights, dz,
-                    v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                    Phi_0_state, Phi_11, state_grid_i,
-                    state_bracket_shift, state_bracket_L_inv,
-                    grids_0, grids_1, grids_2, N1, N2,
-                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                    eps_nodes, eps_weights,
-                    gamma, psi, beta, b_bar,
-                    use_pension_next, pension_next_by_z,
-                    min_wealth_inv, min_consumption, prob_skip, delta)
-                err_t = (fs_t * fs_t + fb_t * fb_t) ** 0.5
-                if err_t < err:
-                    fs = fs_t; fb = fb_t; Jss = Jss_t; Jbb = Jbb_t; Jsb = Jsb_t
-                    e_last = e_t; err = err_t
-                    a_s = a_s_t; a_b = a_b_t
-                    found = True
-                    break
-                alpha *= 0.5
-            if not found:
-                return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, k + 1
-        else:
-            slen = (step_s * step_s + step_b * step_b) ** 0.5
-            if slen > step_damp:
-                cap = step_damp / slen
-                step_s *= cap
-                step_b *= cap
-            a_s += step_s
-            a_b += step_b
-            if a_s < alpha_min: a_s = alpha_min
-            elif a_s > alpha_max: a_s = alpha_max
-            if a_b < alpha_min: a_b = alpha_min
-            elif a_b > alpha_max: a_b = alpha_max
-            fs, fb, Jss, Jbb, Jsb, e_last = compute_foc_jac_working_quad(
-                a_s, a_b, s_val, z_idx, i_s, wealth_grid, c_next_full, log_det_next, annuity_factor_is,
-                z_grid, rho, eta_nodes, eta_weights, dz,
-                v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                Phi_0_state, Phi_11, state_grid_i,
-                state_bracket_shift, state_bracket_L_inv,
-                grids_0, grids_1, grids_2, N1, N2,
-                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                eps_nodes, eps_weights,
-                gamma, psi, beta, b_bar,
-                use_pension_next, pension_next_by_z,
-                min_wealth_inv, min_consumption, prob_skip, delta)
-            err = (fs * fs + fb * fb) ** 0.5
-
-    return a_s, a_b, e_last, EC_NEWTON_FAIL, err / scale, max_iter
-
-
-# =============================================================================
-# PERIOD SOLVER -- RETIREMENT (QUADRATURE)
-# =============================================================================
-
-@njit(parallel=True)
-def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
-                                     c_next_full, pension_1d,
-                                     annuity_factors,
-                                     state_grid, grids_0, grids_1, grids_2,
-                                     state_bracket_shift, state_bracket_L_inv,
-                                     v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                                     Phi_0_state, Phi_11,
-                                     exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                     sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                     gamma, psi_vec, beta, b_bar,
-                                     constrained, solver_config,
-                                     policy_c, policy_alpha_s, policy_alpha_b):
-    """Solve one retirement period using quadrature over state innovations."""
-
-    sc = solver_config
-    # Sentinel resolution: SolverConfig.delta_bequest defaults to -1.0, which
-    # means "use the module-level DELTA_BEQUEST". Sweep configs override via
-    # SolverConfig._replace(delta_bequest=X) — values >= 0 take precedence.
-    delta_bequest = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
-    n_z = len(z_grid)
-    n_savings = len(savings_grid)
-    n_wealth = len(wealth_grid)
-    N1 = len(grids_1)
-    N2 = len(grids_2)
-
-    # Slot conventions: see DI_*/DF_* constants at top of solver.py.
-    # Sizes are 14 (DI) and 10 (DF); slot 13 (DI_SUM_ITER) and slot 9 (DF_MAX_NEWTON_ITER)
-    # are populated only on the unconstrained branch.
-    diag_int = np.zeros((N_state, 15), dtype=np.int64)
-    diag_float = np.zeros((N_state, 10))
-
-    for i_s in prange(N_state):
-        annuity_factor_is = annuity_factors[i_s]
-
-        # Precompute base_mu_r_i for this state (3 returns: rtb, xr, xb)
-        s_i = state_grid[i_s]
-        base_mu_r_i = np.empty(3)
-        base_mu_r_i[0] = const_r[0] + A_r[0, 0] * s_i[0] + A_r[0, 1] * s_i[1] + A_r[0, 2] * s_i[2]
-        base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
-        base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
-
-        last_a_s = sc.init_alpha_s
-        last_a_b = sc.init_alpha_b
-
-        diag_float[i_s, 3] = 2.0
-        diag_float[i_s, 5] = 2.0
-
-        temp_x = np.empty(n_savings + 1)
-        temp_c = np.empty(n_savings + 1)
-        temp_s = np.empty(n_savings + 1)
-        temp_b = np.empty(n_savings + 1)
-        ml_c = np.empty(n_savings); mr_c = np.empty(n_savings)
-        ml_s = np.empty(n_savings); mr_s = np.empty(n_savings)
-        ml_b = np.empty(n_savings); mr_b = np.empty(n_savings)
-
-        for z_i in range(n_z):
-            psi = psi_vec[z_i]
-            c_next_slice = c_next_full[z_i, :, :]
-            pension_next = pension_1d[z_i]
-
-            temp_x[0] = sc.egm_anchor; temp_c[0] = sc.egm_anchor
-            temp_s[0] = 0.0; temp_b[0] = 0.0
-
-            for s_i_idx in range(n_savings):
-                s_val = savings_grid[s_i_idx]
-
-                if constrained:
-                    opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_2d_retirement_quad(
-                        s_val, z_i, i_s,
-                        wealth_grid, c_next_slice, pension_next,
-                        annuity_factor_is,
-                        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                        Phi_0_state, Phi_11, s_i,
-                        state_bracket_shift, state_bracket_L_inv,
-                        grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        gamma, psi, beta, b_bar,
-                        init_s=last_a_s, init_b=last_a_b,
-                        tol=sc.tol, max_iter=sc.max_iter,
-                        tiny_savings=sc.tiny_savings, corner_tol=sc.corner_tol,
-                        edge_max_iter=sc.edge_max_iter, edge_accept_factor=sc.edge_accept_factor,
-                        singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
-                        step_damp=sc.step_damp_constrained, grad_denom_eps=sc.grad_denom_eps,
-                        min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold,
-                        delta=delta_bequest)
-                    n_newton_iter = 0  # not tracked for constrained
-                else:
-                    opt_s, opt_b, euler, exit_code, foc_resid, n_newton_iter = solve_portfolio_unconstrained_retirement_quad(
-                        s_val, z_i, i_s,
-                        wealth_grid, c_next_slice, pension_next,
-                        annuity_factor_is,
-                        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                        Phi_0_state, Phi_11, s_i,
-                        state_bracket_shift, state_bracket_L_inv,
-                        grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        gamma, psi, beta, b_bar,
-                        init_s=last_a_s, init_b=last_a_b,
-                        tol=sc.tol, max_iter=sc.max_iter_unconstrained,
-                        tiny_savings=sc.tiny_savings,
-                        singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
-                        step_damp=sc.step_damp_unconstrained, grad_denom_eps=sc.grad_denom_eps,
-                        min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold,
-                        use_line_search=sc.use_line_search,
-                        max_backtrack_iter=sc.max_backtrack_iter,
-                        line_search_max_step=sc.line_search_max_step,
-                        alpha_min=sc.alpha_min, alpha_max=sc.alpha_max,
-                        delta=delta_bequest)
-
-                # Diagnostic tracking (same as original)
-                diag_int[i_s, 10] += 1
-                if exit_code == 0:    diag_int[i_s, 9] += 1
-                elif exit_code == 1:  diag_int[i_s, 0] += 1
-                elif exit_code == 2:  diag_int[i_s, 1] += 1
-                elif exit_code == 3:  diag_int[i_s, 2] += 1
-                elif exit_code == 4:  diag_int[i_s, 3] += 1
-                elif exit_code == 5:  diag_int[i_s, 4] += 1
-                elif exit_code == 6:  diag_int[i_s, 5] += 1
-                elif exit_code == 7:  diag_int[i_s, 6] += 1
-                elif exit_code == 8:  diag_int[i_s, 7] += 1
-
-                # Newton iter accounting (unconstrained only; constrained → 0)
-                diag_int[i_s, 13] += n_newton_iter
-                if n_newton_iter > diag_float[i_s, 9]:
-                    diag_float[i_s, 9] = float(n_newton_iter)
-
-                if foc_resid > diag_float[i_s, 1]:
-                    diag_float[i_s, 1] = foc_resid
-                diag_float[i_s, 2] += foc_resid * foc_resid
-
-                diag_float[i_s, 7] += opt_s
-                diag_float[i_s, 8] += opt_b
-                if opt_s < diag_float[i_s, 3]: diag_float[i_s, 3] = opt_s
-                if opt_s > diag_float[i_s, 4]: diag_float[i_s, 4] = opt_s
-                if opt_b < diag_float[i_s, 5]: diag_float[i_s, 5] = opt_b
-                if opt_b > diag_float[i_s, 6]: diag_float[i_s, 6] = opt_b
-
-                if beta * euler <= 0.0:
-                    diag_int[i_s, 11] += 1
-                c_opt = max(beta * euler, sc.euler_inv_floor) ** (-1.0 / gamma)
-
-                temp_x[s_i_idx + 1] = c_opt + s_val
-                temp_c[s_i_idx + 1] = c_opt
-                temp_s[s_i_idx + 1] = opt_s
-                temp_b[s_i_idx + 1] = opt_b
-
-                # Warm-start update: on unconstrained Newton failure, the returned
-                # (opt_s, opt_b) is the last interior iterate before max_iter or
-                # stagnation — can be wildly off (e.g. (1.5, -2.0)) and poisons
-                # subsequent solves in the s_val/z_i chain. Reset to cold init.
-                # Constrained failures keep the simplex-projected iterate which
-                # is bounded to [0,1]^2 and remains usable.
-                if (not constrained) and exit_code == EC_NEWTON_FAIL:
-                    last_a_s = sc.init_alpha_s
-                    last_a_b = sc.init_alpha_b
-                    diag_int[i_s, 14] += 1   # DI_WARM_RESET
-                else:
-                    last_a_s = opt_s
-                    last_a_b = opt_b
-
-            for s_i_idx in range(n_savings):
-                if temp_x[s_i_idx + 1] <= temp_x[s_i_idx]:
-                    diag_int[i_s, 12] += 1
-                    drop = temp_x[s_i_idx] - temp_x[s_i_idx + 1]
-                    if drop > diag_float[i_s, 0]:
-                        diag_float[i_s, 0] = drop
-
-            _pchip_precompute_slopes(temp_x, temp_c, ml_c, mr_c)
-            _pchip_precompute_slopes(temp_x, temp_s, ml_s, mr_s)
-            _pchip_precompute_slopes(temp_x, temp_b, ml_b, mr_b)
-            for w_i in range(n_wealth):
-                w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_c, ml_c, mr_c)
-                policy_alpha_s[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_s, ml_s, mr_s)
-                policy_alpha_b[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_b, ml_b, mr_b)
-
-    return diag_int, diag_float
-
-
-def solve_retirement_step_quad(wealth_grid, savings_grid, z_grid, N_state,
-                               c_next_full, pension_1d,
-                               annuity_factors,
-                               state_grid, grids_0, grids_1, grids_2,
-                               state_bracket_shift, state_bracket_L_inv,
-                               v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                               Phi_0_state, Phi_11,
-                               exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                               sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                               gamma, psi_vec, beta, b_bar,
-                               constrained=True, solver_config=None,
-                               out_c=None, out_s=None, out_b=None):
-    if solver_config is None:
-        solver_config = SolverConfig()
-    n_z = len(z_grid)
-    n_w = len(wealth_grid)
-    if out_c is None:
-        out_c = np.empty((n_z, N_state, n_w))
-    if out_s is None:
-        out_s = np.empty((n_z, N_state, n_w))
-    if out_b is None:
-        out_b = np.empty((n_z, N_state, n_w))
-    _di, _df = _solve_retirement_step_quad_jit(
-        wealth_grid, savings_grid, z_grid, N_state,
-        c_next_full, pension_1d,
-        annuity_factors,
-        state_grid, grids_0, grids_1, grids_2,
-        state_bracket_shift, state_bracket_L_inv,
-        v_nodes, v_weights, M_v_nodes, const_r, A_r,
-        Phi_0_state, Phi_11,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        gamma, psi_vec, beta, b_bar,
-        constrained, solver_config,
-        out_c, out_s, out_b)
-    return out_c, out_s, out_b, _di, _df
-
-
-# =============================================================================
-# PERIOD SOLVER -- WORKING AGE (QUADRATURE)
-# =============================================================================
-
-@njit(parallel=True)
-def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
-                                      c_next_full, log_det_next,
-                                      annuity_factors, rho, eta_nodes, eta_weights, dz,
-                                      state_grid, grids_0, grids_1, grids_2,
-                                      state_bracket_shift, state_bracket_L_inv,
-                                      v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                                      Phi_0_state, Phi_11,
-                                      exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                      sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                      eps_nodes, eps_weights,
-                                      gamma, psi_vec, beta, b_bar,
-                                      use_pension_next, pension_next_by_z,
-                                      constrained, solver_config,
-                                      policy_c, policy_alpha_s, policy_alpha_b):
-    """Solve one working-age period using quadrature over state innovations."""
-
-    sc = solver_config
-    # Sentinel resolution: see retirement period solver for context.
-    delta_bequest = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
-    n_z = len(z_grid)
-    n_savings = len(savings_grid)
-    n_wealth = len(wealth_grid)
-    N1 = len(grids_1)
-    N2 = len(grids_2)
-
-    # Slot conventions: see DI_*/DF_* constants at top of solver.py.
-    # Sizes are 14 (DI) and 10 (DF); slot 13 (DI_SUM_ITER) and slot 9 (DF_MAX_NEWTON_ITER)
-    # are populated only on the unconstrained branch.
-    diag_int = np.zeros((N_state, 15), dtype=np.int64)
-    diag_float = np.zeros((N_state, 10))
-
-    for i_s in prange(N_state):
-        annuity_factor_is = annuity_factors[i_s]
-
-        # Precompute base_mu_r_i for this state (3 returns: rtb, xr, xb)
-        s_i = state_grid[i_s]
-        base_mu_r_i = np.empty(3)
-        base_mu_r_i[0] = const_r[0] + A_r[0, 0] * s_i[0] + A_r[0, 1] * s_i[1] + A_r[0, 2] * s_i[2]
-        base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
-        base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
-
-        last_a_s = sc.init_alpha_s
-        last_a_b = sc.init_alpha_b
-
-        diag_float[i_s, 3] = 2.0
-        diag_float[i_s, 5] = 2.0
-
-        temp_x = np.empty(n_savings + 1)
-        temp_c = np.empty(n_savings + 1)
-        temp_s = np.empty(n_savings + 1)
-        temp_b = np.empty(n_savings + 1)
-        ml_c = np.empty(n_savings); mr_c = np.empty(n_savings)
-        ml_s = np.empty(n_savings); mr_s = np.empty(n_savings)
-        ml_b = np.empty(n_savings); mr_b = np.empty(n_savings)
-
-        for z_i in range(n_z):
-            psi = psi_vec[z_i]
-
-            temp_x[0] = sc.egm_anchor; temp_c[0] = sc.egm_anchor
-            temp_s[0] = 0.0; temp_b[0] = 0.0
-
-            for s_i_idx in range(n_savings):
-                s_val = savings_grid[s_i_idx]
-
-                if constrained:
-                    opt_s, opt_b, euler, exit_code, foc_resid = solve_portfolio_2d_working_quad(
-                        s_val, z_i, i_s,
-                        wealth_grid, c_next_full, log_det_next,
-                        annuity_factor_is,
-                        z_grid, rho, eta_nodes, eta_weights, dz,
-                        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                        Phi_0_state, Phi_11, s_i,
-                        state_bracket_shift, state_bracket_L_inv,
-                        grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        eps_nodes, eps_weights,
-                        gamma, psi, beta, b_bar,
-                        use_pension_next, pension_next_by_z,
-                        init_s=last_a_s, init_b=last_a_b,
-                        tol=sc.tol, max_iter=sc.max_iter,
-                        tiny_savings=sc.tiny_savings, corner_tol=sc.corner_tol,
-                        edge_max_iter=sc.edge_max_iter, edge_accept_factor=sc.edge_accept_factor,
-                        singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
-                        step_damp=sc.step_damp_constrained, grad_denom_eps=sc.grad_denom_eps,
-                        min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold,
-                        delta=delta_bequest)
-                    n_newton_iter = 0  # not tracked for constrained
-                else:
-                    opt_s, opt_b, euler, exit_code, foc_resid, n_newton_iter = solve_portfolio_unconstrained_working_quad(
-                        s_val, z_i, i_s,
-                        wealth_grid, c_next_full, log_det_next,
-                        annuity_factor_is,
-                        z_grid, rho, eta_nodes, eta_weights, dz,
-                        v_nodes, v_weights, M_v_nodes, base_mu_r_i,
-                        Phi_0_state, Phi_11, s_i,
-                        state_bracket_shift, state_bracket_L_inv,
-                        grids_0, grids_1, grids_2, N1, N2,
-                        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                        eps_nodes, eps_weights,
-                        gamma, psi, beta, b_bar,
-                        use_pension_next, pension_next_by_z,
-                        init_s=last_a_s, init_b=last_a_b,
-                        tol=sc.tol, max_iter=sc.max_iter_unconstrained,
-                        tiny_savings=sc.tiny_savings,
-                        singular_det=sc.singular_det, grad_step_size=sc.grad_step_size,
-                        step_damp=sc.step_damp_unconstrained, grad_denom_eps=sc.grad_denom_eps,
-                        min_wealth_inv=sc.min_wealth_inv, min_consumption=sc.min_consumption,
-                        prob_skip=sc.prob_skip_threshold,
-                        use_line_search=sc.use_line_search,
-                        max_backtrack_iter=sc.max_backtrack_iter,
-                        line_search_max_step=sc.line_search_max_step,
-                        alpha_min=sc.alpha_min, alpha_max=sc.alpha_max,
-                        delta=delta_bequest)
-
-                diag_int[i_s, 10] += 1
-                if exit_code == 0:    diag_int[i_s, 9] += 1
-                elif exit_code == 1:  diag_int[i_s, 0] += 1
-                elif exit_code == 2:  diag_int[i_s, 1] += 1
-                elif exit_code == 3:  diag_int[i_s, 2] += 1
-                elif exit_code == 4:  diag_int[i_s, 3] += 1
-                elif exit_code == 5:  diag_int[i_s, 4] += 1
-                elif exit_code == 6:  diag_int[i_s, 5] += 1
-                elif exit_code == 7:  diag_int[i_s, 6] += 1
-                elif exit_code == 8:  diag_int[i_s, 7] += 1
-
-                # Newton iter accounting (unconstrained only; constrained → 0)
-                diag_int[i_s, 13] += n_newton_iter
-                if n_newton_iter > diag_float[i_s, 9]:
-                    diag_float[i_s, 9] = float(n_newton_iter)
-
-                if foc_resid > diag_float[i_s, 1]:
-                    diag_float[i_s, 1] = foc_resid
-                diag_float[i_s, 2] += foc_resid * foc_resid
-
-                diag_float[i_s, 7] += opt_s
-                diag_float[i_s, 8] += opt_b
-                if opt_s < diag_float[i_s, 3]: diag_float[i_s, 3] = opt_s
-                if opt_s > diag_float[i_s, 4]: diag_float[i_s, 4] = opt_s
-                if opt_b < diag_float[i_s, 5]: diag_float[i_s, 5] = opt_b
-                if opt_b > diag_float[i_s, 6]: diag_float[i_s, 6] = opt_b
-
-                if beta * euler <= 0.0:
-                    diag_int[i_s, 11] += 1
-
-                c_opt = max(beta * euler, sc.euler_inv_floor) ** (-1.0 / gamma)
-
-                temp_x[s_i_idx + 1] = c_opt + s_val
-                temp_c[s_i_idx + 1] = c_opt
-                temp_s[s_i_idx + 1] = opt_s
-                temp_b[s_i_idx + 1] = opt_b
-
-                # Warm-start update: on unconstrained Newton failure, the returned
-                # (opt_s, opt_b) is the last interior iterate before max_iter or
-                # stagnation — can be wildly off (e.g. (1.5, -2.0)) and poisons
-                # subsequent solves in the s_val/z_i chain. Reset to cold init.
-                # Constrained failures keep the simplex-projected iterate which
-                # is bounded to [0,1]^2 and remains usable.
-                if (not constrained) and exit_code == EC_NEWTON_FAIL:
-                    last_a_s = sc.init_alpha_s
-                    last_a_b = sc.init_alpha_b
-                    diag_int[i_s, 14] += 1   # DI_WARM_RESET
-                else:
-                    last_a_s = opt_s
-                    last_a_b = opt_b
-
-            for s_i_idx in range(n_savings):
-                if temp_x[s_i_idx + 1] <= temp_x[s_i_idx]:
-                    diag_int[i_s, 12] += 1
-                    drop = temp_x[s_i_idx] - temp_x[s_i_idx + 1]
-                    if drop > diag_float[i_s, 0]:
-                        diag_float[i_s, 0] = drop
-
-            _pchip_precompute_slopes(temp_x, temp_c, ml_c, mr_c)
-            _pchip_precompute_slopes(temp_x, temp_s, ml_s, mr_s)
-            _pchip_precompute_slopes(temp_x, temp_b, ml_b, mr_b)
-            for w_i in range(n_wealth):
-                w = wealth_grid[w_i]
-                policy_c[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_c, ml_c, mr_c)
-                policy_alpha_s[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_s, ml_s, mr_s)
-                policy_alpha_b[z_i, i_s, w_i] = _pchip_eval_with_slopes(w, temp_x, temp_b, ml_b, mr_b)
-
-    return diag_int, diag_float
-
-
-def solve_working_age_step_quad(wealth_grid, savings_grid, z_grid, N_state,
-                                c_next_full, log_det_next,
-                                annuity_factors, rho, eta_nodes, eta_weights, dz,
-                                state_grid, grids_0, grids_1, grids_2,
-                                state_bracket_shift, state_bracket_L_inv,
-                                v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                                Phi_0_state, Phi_11,
-                                exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                                sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                                eps_nodes, eps_weights,
-                                gamma, psi_vec, beta, b_bar,
-                                use_pension_next, pension_next_by_z,
-                                constrained=True, solver_config=None,
-                                out_c=None, out_s=None, out_b=None):
-    if solver_config is None:
-        solver_config = SolverConfig()
-    n_z = len(z_grid)
-    n_w = len(wealth_grid)
-    if out_c is None:
-        out_c = np.empty((n_z, N_state, n_w))
-    if out_s is None:
-        out_s = np.empty((n_z, N_state, n_w))
-    if out_b is None:
-        out_b = np.empty((n_z, N_state, n_w))
-    _di, _df = _solve_working_age_step_quad_jit(
-        wealth_grid, savings_grid, z_grid, N_state,
-        c_next_full, log_det_next,
-        annuity_factors, rho, eta_nodes, eta_weights, dz,
-        state_grid, grids_0, grids_1, grids_2,
-        state_bracket_shift, state_bracket_L_inv,
-        v_nodes, v_weights, M_v_nodes, const_r, A_r,
-        Phi_0_state, Phi_11,
-        exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-        sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-        eps_nodes, eps_weights,
-        gamma, psi_vec, beta, b_bar,
-        use_pension_next, pension_next_by_z,
-        constrained, solver_config,
-        out_c, out_s, out_b)
-    return out_c, out_s, out_b, _di, _df
-
-
-# =============================================================================
-# MASTER SOLVER
-# =============================================================================
-
-def _reduce_diag(diag_int, diag_float):
-    """Reduce per-i_s diagnostic arrays to totals."""
-    ti = diag_int.sum(axis=0)
-    tf_sum = diag_float.sum(axis=0)
-    tf_max = diag_float.max(axis=0)
-    tf_min = diag_float.min(axis=0)
-    return ti, tf_sum, tf_max, tf_min
-
-
-def _format_pct(count, total):
-    if total == 0:
-        return "  0%"
-    return f"{100.0 * count / total:3.0f}%"
-
-
-def _default_checkpoint_path(model, disc_config, youngest_age_to_solve):
-    """Build a natural default bundle path for partial-solve checkpoints."""
-    label = "constrained" if model.constrained else "unconstrained"
+def _default_checkpoint_path(_model, disc_config, youngest_age_to_solve):
     grid_sizes = "x".join(str(v) for v in disc_config.state_grid_sizes)
     age_suffix = (
         f"_to_age{int(youngest_age_to_solve)}"
@@ -3553,22 +117,16 @@ def _default_checkpoint_path(model, disc_config, youngest_age_to_solve):
         else "_partial"
     )
     name = (
-        f"{label}_{disc_config.state_grid_mode}"
+        f"jax_{disc_config.state_grid_mode}"
         f"_grid{grid_sizes}_nz{disc_config.n_z}{age_suffix}"
     )
     return str(Path("saved_runs") / "checkpoints" / name)
 
 
 def _normalize_solve_control(model, pc, solve_control):
-    """Validate and normalize SolveControl inputs."""
     if solve_control is None:
         return SolveControl(), False
     if not isinstance(solve_control, SolveControl):
-        # In notebook workflows with autoreload, NamedTuple classes can be
-        # redefined, so a SolveControl instance created from the reloaded
-        # `model` module may fail `isinstance(..., SolveControl)` here even
-        # though it has the correct fields. Normalize any solve-control-shaped
-        # object into the local SolveControl class before validating values.
         try:
             defaults = SolveControl()._asdict()
             solve_control = SolveControl(
@@ -3624,293 +182,1166 @@ def _normalize_solve_control(model, pc, solve_control):
     ), True
 
 
-def _build_solver_diagnostics(
-    *,
-    age_diag_int,
-    age_diag_fsum,
-    age_diag_fmax,
-    age_diag_fmin,
-    solved_age_mask,
-    ages,
-    retire_age,
-    solver_config,
-    disc_config,
-    constrained,
-    solve_control,
-    solve_status,
-    wall_time_sec,
-    checkpoint_save_count,
-    checkpoint_path,
-):
-    """Aggregate per-age diagnostics, respecting partially solved outputs."""
-    solved_idx = np.flatnonzero(solved_age_mask)
-    solved_nonterminal_mask = solved_age_mask.copy()
-    if len(solved_nonterminal_mask) > 0:
-        solved_nonterminal_mask[-1] = False
-    solved_nonterminal_idx = np.flatnonzero(solved_nonterminal_mask)
-
-    if solved_nonterminal_idx.size > 0:
-        all_int = age_diag_int[solved_nonterminal_idx].sum(axis=0)
-        all_fsum = age_diag_fsum[solved_nonterminal_idx].sum(axis=0)
-        all_fmax = age_diag_fmax[solved_nonterminal_idx].max(axis=0)
-        all_fmin = age_diag_fmin[solved_nonterminal_idx].min(axis=0)
-    else:
-        all_int = np.zeros(N_DIAG_INT, dtype=np.int64)
-        all_fsum = np.zeros(N_DIAG_FLOAT)
-        all_fmax = np.zeros(N_DIAG_FLOAT)
-        all_fmin = np.zeros(N_DIAG_FLOAT)
-
-    total_calls = int(all_int[DI_TOTAL_CALLS])
-    total_fail = int(all_int[DI_NEWTON_FAIL])
-    total_mono = int(all_int[DI_MONO_VIOLATIONS])
-    worst_mono = float(all_fmax[DF_WORST_MONO_DROP])
-    worst_foc = float(all_fmax[DF_MAX_FOC_RESID])
-    rms_foc = (all_fsum[DF_SUM_FOC_RESID_SQ] / max(total_calls, 1)) ** 0.5
-
-    total_iter = int(all_int[DI_SUM_ITER])
-    max_iter_used = int(all_fmax[DF_MAX_NEWTON_ITER])
-    avg_iter = total_iter / max(total_calls, 1)
-    total_warm_reset = int(all_int[DI_WARM_RESET])
-
-    solved_ages = ages[solved_idx] if solved_idx.size > 0 else np.array([], dtype=np.int64)
-    youngest_solved_age = int(solved_ages.min()) if solved_ages.size > 0 else None
-    oldest_solved_age = int(solved_ages.max()) if solved_ages.size > 0 else None
-    is_partial = solve_status != "complete" or solved_idx.size != len(ages)
-
-    return {
-        "age_diag_int": age_diag_int,
-        "age_diag_fsum": age_diag_fsum,
-        "age_diag_fmax": age_diag_fmax,
-        "age_diag_fmin": age_diag_fmin,
-        "aggregate_int": all_int,
-        "aggregate_fsum": all_fsum,
-        "aggregate_fmax": all_fmax,
-        "aggregate_fmin": all_fmin,
-        "total_mono_violations": total_mono,
-        "worst_mono_drop": worst_mono,
-        "total_newton_failures": total_fail,
-        "worst_foc_resid": worst_foc,
-        "total_calls": total_calls,
-        "total_newton_iter": total_iter,
-        "avg_newton_iter": avg_iter,
-        "max_newton_iter": max_iter_used,
-        "total_warm_reset": total_warm_reset,
-        "constrained": constrained,
-        "solver_config": solver_config,
-        "disc_config": disc_config,
-        "solve_control": solve_control,
-        "solve_status": solve_status,
-        "is_partial": is_partial,
-        "solved_age_mask": solved_age_mask.copy(),
-        "solved_age_indices": solved_idx.copy(),
-        "youngest_solved_age": youngest_solved_age,
-        "oldest_solved_age": oldest_solved_age,
-        "n_ages_solved": int(solved_idx.size),
-        "n_nonterminal_ages_solved": int(solved_nonterminal_idx.size),
-        "wall_time_sec": float(wall_time_sec),
-        "checkpoint_save_count": int(checkpoint_save_count),
-        "checkpoint_path": checkpoint_path,
-    }
-
-
 def _prepare_policy_snapshot(C_mat, S_mat, B_mat, solved_age_mask):
-    """Return arrays suitable for saving, masking unsolved ages with NaN."""
     if np.all(solved_age_mask):
         return C_mat, S_mat, B_mat
-
-    unsolved_mask = ~solved_age_mask
-    C_save = C_mat.copy()
-    S_save = S_mat.copy()
-    B_save = B_mat.copy()
-    C_save[unsolved_mask] = np.nan
-    S_save[unsolved_mask] = np.nan
-    B_save[unsolved_mask] = np.nan
-    return C_save, S_save, B_save
+    unsolved = ~solved_age_mask
+    Cs = C_mat.copy(); Ss = S_mat.copy(); Bs = B_mat.copy()
+    Cs[unsolved] = np.nan; Ss[unsolved] = np.nan; Bs[unsolved] = np.nan
+    return Cs, Ss, Bs
 
 
 def _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask):
-    """Mask unsolved age slices before returning partial results."""
     if np.all(solved_age_mask):
         return
-    unsolved_mask = ~solved_age_mask
-    C_mat[unsolved_mask] = np.nan
-    S_mat[unsolved_mask] = np.nan
-    B_mat[unsolved_mask] = np.nan
+    unsolved = ~solved_age_mask
+    C_mat[unsolved] = np.nan
+    S_mat[unsolved] = np.nan
+    B_mat[unsolved] = np.nan
 
 
 def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
-    """Persist a solver checkpoint bundle."""
     from lifecycle.policy_io import save_policy_bundle
-
-    C_save, S_save, B_save = _prepare_policy_snapshot(
+    Cs, Ss, Bs = _prepare_policy_snapshot(
         C_mat, S_mat, B_mat, diagnostics["solved_age_mask"]
     )
     return save_policy_bundle(
-        checkpoint_path,
-        C_save,
-        S_save,
-        B_save,
-        diagnostics=diagnostics,
-        overwrite=True,
+        checkpoint_path, Cs, Ss, Bs,
+        diagnostics=diagnostics, overwrite=True,
     )
 
 
-def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose=1, solve_control=None):
+# =============================================================================
+# Pure JAX helpers
+# =============================================================================
+
+def interp_1d_lin_extrap(x, x_grid, y_grid):
+    """Linear interp on a sorted grid with linear extrapolation outside."""
+    n = x_grid.shape[0]
+    iw = jnp.clip(jnp.searchsorted(x_grid, x, side="right") - 1, 0, n - 2)
+    x0 = x_grid[iw]
+    x1 = x_grid[iw + 1]
+    y0 = y_grid[iw]
+    y1 = y_grid[iw + 1]
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+def interp_1d_lin_with_slope(x, x_grid, y_grid):
+    """Linear interp returning ``(y, dy/dx)`` from one bracket."""
+    n = x_grid.shape[0]
+    iw = jnp.clip(jnp.searchsorted(x_grid, x, side="right") - 1, 0, n - 2)
+    x0 = x_grid[iw]
+    x1 = x_grid[iw + 1]
+    y0 = y_grid[iw]
+    y1 = y_grid[iw + 1]
+    slope = (y1 - y0) / (x1 - x0)
+    return y0 + slope * (x - x0), slope
+
+
+def bracket_uniform(z, z_lo, dz, n_z):
+    """Bracket ``z`` in a uniform grid starting at ``z_lo`` with spacing ``dz``."""
+    iz = jnp.clip(((z - z_lo) / dz).astype(jnp.int32), 0, n_z - 2)
+    z0 = z_lo + dz * iz
+    frac = jnp.clip((z - z0) / dz, 0.0, 1.0)
+    return iz, frac
+
+
+def bracket_state_3d_jax(s, grids_0, grids_1, grids_2, shift, L_inv):
+    """Transform ``s`` to bracket coords and bracket on three axis grids.
+
+    Canonical (n_state == 3) only. Each axis grid must have at least 2 points.
     """
-    Lifecycle backward induction solver.
+    b = L_inv @ (s - shift)
+
+    def _bracket_axis(grid, val):
+        n = grid.shape[0]
+        lo = jnp.clip(jnp.searchsorted(grid, val, side="right") - 1, 0, n - 2)
+        denom = grid[lo + 1] - grid[lo]
+        frac = jnp.clip((val - grid[lo]) / denom, 0.0, 1.0)
+        return lo, frac
+
+    lo0, f0 = _bracket_axis(grids_0, b[0])
+    lo1, f1 = _bracket_axis(grids_1, b[1])
+    lo2, f2 = _bracket_axis(grids_2, b[2])
+    return jnp.array([lo0, lo1, lo2]), jnp.array([f0, f1, f2])
+
+
+def bequest_mu_and_mup(W, A, gamma, b_bar, delta):
+    """Shifted-bequest marginal utility and its W-derivative.
+
+    Under CCV log-wealth dynamics ``W = s * exp(r_p)`` is strictly positive,
+    so we compute through without a bankruptcy clamp. The Numba reference at
+    canonical (CCV) settings takes the same unguarded path.
+    """
+    C_bar = W / A + delta
+    mu = b_bar * C_bar ** (-gamma) / A
+    mup = -gamma * mu / (A * C_bar)
+    return mu, mup
+
+
+# =============================================================================
+# 2D Newton with backtracking line search
+# =============================================================================
+
+def newton_2d_with_line_search(
+    foc_fn,
+    init_a_s,
+    init_a_b,
+    scale,
+    tol,
+    max_iter,
+    max_backtrack_iter,
+    line_search_max_step,
+    singular_det,
+    grad_step_size,
+    grad_denom_eps,
+):
+    """2D Newton on (alpha_s, alpha_b) with backtracking line search.
+
+    ``foc_fn(a_s, a_b) -> (fs, fb, Jss, Jbb, Jsb, e)``. Returns
+    ``(a_s, a_b, e, exit_code, err_norm, n_iter)``.
+    """
+    fs0, fb0, Jss0, Jbb0, Jsb0, e0 = foc_fn(init_a_s, init_a_b)
+    err0 = jnp.sqrt(fs0 * fs0 + fb0 * fb0)
+
+    init_state = (
+        init_a_s, init_a_b,
+        fs0, fb0, Jss0, Jbb0, Jsb0,
+        e0, err0,
+        jnp.int32(0),
+        err0 < tol * scale,
+    )
+
+    def cond_fn(state):
+        *_, k, done = state
+        return jnp.logical_and(jnp.logical_not(done), k < max_iter)
+
+    def body_fn(state):
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, _ = state
+
+        det = Jss * Jbb - Jsb * Jsb
+        is_singular = jnp.abs(det) < singular_det
+
+        grad_norm = err + grad_denom_eps
+        step_s_grad = grad_step_size * fs / grad_norm
+        step_b_grad = grad_step_size * fb / grad_norm
+
+        inv_d = 1.0 / jnp.where(is_singular, 1.0, det)
+        step_s_newton = -(Jbb * fs - Jsb * fb) * inv_d
+        step_b_newton = -(-Jsb * fs + Jss * fb) * inv_d
+
+        step_s = jnp.where(is_singular, step_s_grad, step_s_newton)
+        step_b = jnp.where(is_singular, step_b_grad, step_b_newton)
+
+        slen = jnp.sqrt(step_s * step_s + step_b * step_b)
+        cap = jnp.minimum(1.0, line_search_max_step / jnp.where(slen > 0.0, slen, 1.0))
+        step_s = step_s * cap
+        step_b = step_b * cap
+
+        # Try alpha = 1 first.
+        a_s_full = a_s + step_s
+        a_b_full = a_b + step_b
+        fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f = foc_fn(a_s_full, a_b_full)
+        err_f = jnp.sqrt(fs_f * fs_f + fb_f * fb_f)
+        full_improves = err_f < err
+
+        bt_init = (
+            jnp.int32(0),
+            jnp.float64(1.0),
+            jnp.where(full_improves, a_s_full, a_s),
+            jnp.where(full_improves, a_b_full, a_b),
+            jnp.where(full_improves, fs_f, fs),
+            jnp.where(full_improves, fb_f, fb),
+            jnp.where(full_improves, Jss_f, Jss),
+            jnp.where(full_improves, Jbb_f, Jbb),
+            jnp.where(full_improves, Jsb_f, Jsb),
+            jnp.where(full_improves, e_f, e),
+            jnp.where(full_improves, err_f, err),
+            full_improves,
+        )
+
+        def bt_cond(bt_state):
+            k_bt, *_, found = bt_state
+            return jnp.logical_and(jnp.logical_not(found), k_bt < max_backtrack_iter)
+
+        def bt_body(bt_state):
+            (k_bt, alpha_t, _a_s, _a_b, _fs, _fb, _Jss, _Jbb, _Jsb, _e, _err, _found) = bt_state
+            new_alpha = alpha_t * 0.5
+            a_s_t = a_s + new_alpha * step_s
+            a_b_t = a_b + new_alpha * step_b
+            fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = foc_fn(a_s_t, a_b_t)
+            err_t = jnp.sqrt(fs_t * fs_t + fb_t * fb_t)
+            improved = err_t < err
+            return (
+                k_bt + 1, new_alpha,
+                jnp.where(improved, a_s_t, _a_s),
+                jnp.where(improved, a_b_t, _a_b),
+                jnp.where(improved, fs_t, _fs),
+                jnp.where(improved, fb_t, _fb),
+                jnp.where(improved, Jss_t, _Jss),
+                jnp.where(improved, Jbb_t, _Jbb),
+                jnp.where(improved, Jsb_t, _Jsb),
+                jnp.where(improved, e_t, _e),
+                jnp.where(improved, err_t, _err),
+                improved,
+            )
+
+        bt_final = lax.while_loop(bt_cond, bt_body, bt_init)
+        (_k_bt, _alpha, new_a_s, new_a_b, new_fs, new_fb,
+         new_Jss, new_Jbb, new_Jsb, new_e, new_err, found_any) = bt_final
+
+        new_done = jnp.logical_or(
+            new_err < tol * scale,
+            jnp.logical_not(found_any),
+        )
+        return (
+            new_a_s, new_a_b, new_fs, new_fb,
+            new_Jss, new_Jbb, new_Jsb,
+            new_e, new_err, k + 1, new_done,
+        )
+
+    final = lax.while_loop(cond_fn, body_fn, init_state)
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, _done = final
+    exit_code = jnp.where(err < tol * scale, EC_INTERIOR, EC_NEWTON_FAIL)
+    return a_s, a_b, e, exit_code, err / scale, k
+
+
+# =============================================================================
+# CCV log-return arithmetic shared across kernels
+# =============================================================================
+
+def _ccv_log_return_and_grad(alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
+                              sigma2_xr, sigma2_xb, sigma_xrxb):
+    """Return ``(R_p, dr/da_s, dr/da_b)`` for CCV log-wealth dynamics.
+
+    ``r_p = log_R_bill + a_s*log_x_s + a_b*log_x_b
+            + 0.5*(a_s*sigma2_xr + a_b*sigma2_xb)
+            - 0.5*(a_s^2*sigma2_xr + 2*a_s*a_b*sigma_xrxb + a_b^2*sigma2_xb)``
+    """
+    r_p = (
+        log_R_bill
+        + alpha_s * log_x_s
+        + alpha_b * log_x_b
+        + 0.5 * (alpha_s * sigma2_xr + alpha_b * sigma2_xb)
+        - 0.5 * (
+            alpha_s * alpha_s * sigma2_xr
+            + 2.0 * alpha_s * alpha_b * sigma_xrxb
+            + alpha_b * alpha_b * sigma2_xb
+        )
+    )
+    R_p = jnp.exp(r_p)
+    dr_da_s = log_x_s + sigma2_xr * (0.5 - alpha_s) - alpha_b * sigma_xrxb
+    dr_da_b = log_x_b + sigma2_xb * (0.5 - alpha_b) - alpha_s * sigma_xrxb
+    return R_p, dr_da_s, dr_da_b
+
+
+# =============================================================================
+# Terminal-age FOC (CCV)
+# =============================================================================
+
+def terminal_foc_jac_ccv(
+    alpha_s, alpha_b, s_val, A_is,
+    log_R_bill, log_x_s, log_x_b,        # (n_state_quad, n_ret_quad)
+    weight_kv_kr,                          # (n_state_quad, n_ret_quad)
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    gamma, b_bar, delta,
+):
+    """Terminal-period FOC + Hessian + ``V_dot = E[mu_bequest * R_p]``."""
+    R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
+        alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
+        sigma2_xr, sigma2_xb, sigma_xrxb,
+    )
+    sR_p = s_val * R_p
+    mu, mup = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
+
+    dRp_das = R_p * dr_da_s
+    dRp_dab = R_p * dr_da_b
+
+    wmu = weight_kv_kr * mu
+    wmup = weight_kv_kr * mup
+
+    foc_s = jnp.sum(wmu * dRp_das)
+    foc_b = jnp.sum(wmu * dRp_dab)
+    V_dot = jnp.sum(wmu * R_p)
+
+    jac_lin = wmup * s_val
+    extra_ss = wmu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
+    extra_bb = wmu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
+    extra_sb = wmu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
+
+    J_ss = jnp.sum(jac_lin * dRp_das * dRp_das + extra_ss)
+    J_bb = jnp.sum(jac_lin * dRp_dab * dRp_dab + extra_bb)
+    J_sb = jnp.sum(jac_lin * dRp_das * dRp_dab + extra_sb)
+    return foc_s, foc_b, J_ss, J_bb, J_sb, V_dot
+
+
+# =============================================================================
+# Per-cell EGM scan (one (z, i_s) cell, sequential over savings grid)
+# =============================================================================
+
+def _build_step_log_returns(state_grid_i, M_v_nodes, ret_nodes, const_r, A_r):
+    """Per-i_s log-return scenario tensors of shape ``(n_state_quad, n_ret_quad)``.
+
+    Same arithmetic as Numba ``_build_terminal_log_returns`` but for one i_s.
+    """
+    base_mu_r = const_r + A_r @ state_grid_i              # (n_ret,)
+    mu_r_per = base_mu_r[None, :] + M_v_nodes              # (n_state_quad, n_ret)
+    mu_bill = mu_r_per[:, 0]
+    mu_xs = mu_r_per[:, 1]
+    mu_xb = mu_r_per[:, 2]
+    res_bill = ret_nodes[:, 0]
+    res_xs = ret_nodes[:, 1]
+    res_xb = ret_nodes[:, 2]
+    log_R_bill = mu_bill[:, None] + res_bill[None, :]
+    log_x_s = mu_xs[:, None] + res_xs[None, :]
+    log_x_b = mu_xb[:, None] + res_xb[None, :]
+    return log_R_bill, log_x_s, log_x_b
+
+
+def _build_step_state_brackets(state_grid_i, Phi_0_state, Phi_11, v_nodes,
+                                grids_0, grids_1, grids_2, shift, L_inv):
+    """Per-i_s state bracketing. Returns ``(j_corners, w_corners)`` tensors of
+    shape ``(n_state_quad, 8)``.
+
+    Each ``j_corners[k_v, c]`` is a flat index into the joint state grid
+    (``i_s in [0, N_state)``) and ``w_corners[k_v, c]`` is the trilinear
+    weight of that corner.
+    """
+    # s_next: (n_state_quad, n_state)
+    s_next = Phi_0_state[None, :] + state_grid_i @ Phi_11.T + v_nodes
+
+    def per_kv(s_next_kv):
+        lo, frac = bracket_state_3d_jax(s_next_kv, grids_0, grids_1, grids_2, shift, L_inv)
+        f0, f1, f2 = frac[0], frac[1], frac[2]
+        w = jnp.array([
+            (1 - f0) * (1 - f1) * (1 - f2),
+            (1 - f0) * (1 - f1) * f2,
+            (1 - f0) * f1 * (1 - f2),
+            (1 - f0) * f1 * f2,
+            f0 * (1 - f1) * (1 - f2),
+            f0 * (1 - f1) * f2,
+            f0 * f1 * (1 - f2),
+            f0 * f1 * f2,
+        ])
+        # 8 flat indices into the joint state grid (n_state == 3 layout).
+        N1 = grids_1.shape[0]
+        N2 = grids_2.shape[0]
+        lo0, lo1, lo2 = lo[0], lo[1], lo[2]
+        hi0, hi1, hi2 = lo0 + 1, lo1 + 1, lo2 + 1
+        j = jnp.array([
+            lo0 * N1 * N2 + lo1 * N2 + lo2,
+            lo0 * N1 * N2 + lo1 * N2 + hi2,
+            lo0 * N1 * N2 + hi1 * N2 + lo2,
+            lo0 * N1 * N2 + hi1 * N2 + hi2,
+            hi0 * N1 * N2 + lo1 * N2 + lo2,
+            hi0 * N1 * N2 + lo1 * N2 + hi2,
+            hi0 * N1 * N2 + hi1 * N2 + lo2,
+            hi0 * N1 * N2 + hi1 * N2 + hi2,
+        ])
+        return j, w
+
+    j_corners, w_corners = vmap(per_kv)(s_next)
+    return j_corners, w_corners
+
+
+def _interp_c_and_mpc_at_cell(c_next, j_corners_kv, w_corners_kv,
+                               iz_lo, frac_z, x_next_scalar, wealth_grid,
+                               min_consumption):
+    """Trilinear-state × bilinear-z × linear-wealth interp of c_next and
+    the marginal propensity to consume out of wealth (slope dc/dx).
+    """
+    def per_corner(j, w):
+        c_lo, slope_lo = interp_1d_lin_with_slope(
+            x_next_scalar, wealth_grid, c_next[iz_lo, j, :]
+        )
+        c_hi, slope_hi = interp_1d_lin_with_slope(
+            x_next_scalar, wealth_grid, c_next[iz_lo + 1, j, :]
+        )
+        c_corner = (1.0 - frac_z) * c_lo + frac_z * c_hi
+        slope_corner = (1.0 - frac_z) * slope_lo + frac_z * slope_hi
+        return w * c_corner, w * slope_corner
+
+    c_per, slope_per = vmap(per_corner)(j_corners_kv, w_corners_kv)
+    c = jnp.maximum(jnp.sum(c_per), min_consumption)
+    mpc = jnp.clip(jnp.sum(slope_per), 0.0, 1.0)
+    return c, mpc
+
+
+# -----------------------------------------------------------------------------
+# Retirement-age FOC (CCV)
+# -----------------------------------------------------------------------------
+
+def retirement_foc_jac_ccv(
+    alpha_s, alpha_b, s_val, z_idx, psi_z,
+    log_R_bill, log_x_s, log_x_b, weight_kv_kr,   # (n_state_quad, n_ret_quad)
+    j_corners, w_corners,                          # (n_state_quad, 8)
+    c_next, wealth_grid,                           # (n_z, N_state, n_w), (n_w,)
+    pension_next_z,                                # scalar at z_idx
+    A_is,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    gamma, b_bar, delta, min_consumption,
+):
+    """Retirement FOC sums over ``(k_v, k_r)``: bequest + alive contributions.
+
+    ``z`` is frozen at retirement (no eta/eps), so income_next = pension(z)
+    is a scalar and c_next is gathered at exactly ``iz = z_idx`` (frac_z = 0).
+    """
+    R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
+        alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
+        sigma2_xr, sigma2_xb, sigma_xrxb,
+    )                                              # (n_state_quad, n_ret_quad)
+    sR_p = s_val * R_p
+    x_next = sR_p + pension_next_z                 # (n_state_quad, n_ret_quad)
+
+    mu_bq, mup_bq = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
+
+    # Trilinear-state × linear-wealth at every (k_v, k_r).
+    # iz=z_idx exact, frac_z=0 → c_next gathered at one z slice only.
+    def per_kv_kr(x_scalar, j_kv, w_kv):
+        # 8 corners for this k_v.
+        def per_corner(j, w):
+            c, slope = interp_1d_lin_with_slope(
+                x_scalar, wealth_grid, c_next[z_idx, j, :]
+            )
+            return w * c, w * slope
+        c_per, slope_per = vmap(per_corner)(j_kv, w_kv)
+        c = jnp.maximum(jnp.sum(c_per), min_consumption)
+        mpc = jnp.clip(jnp.sum(slope_per), 0.0, 1.0)
+        return c, mpc
+
+    # Vmap over k_v (j_kv, w_kv vary), then over k_r (x_scalar varies).
+    # Shape: (n_state_quad, n_ret_quad)
+    c_at_xn, mpc_at_xn = vmap(
+        lambda j_kv, w_kv, x_row: vmap(per_kv_kr, in_axes=(0, None, None))(
+            x_row, j_kv, w_kv
+        ),
+        in_axes=(0, 0, 0),
+    )(j_corners, w_corners, x_next)
+
+    mu_alive = c_at_xn ** (-gamma)
+    mup_alive = -gamma * mu_alive / c_at_xn * mpc_at_xn
+
+    prob_death = 1.0 - psi_z
+    mu_comb = psi_z * mu_alive + prob_death * mu_bq
+    mup_comb = psi_z * mup_alive + prob_death * mup_bq
+
+    wmu = weight_kv_kr * mu_comb
+    wmup = weight_kv_kr * mup_comb
+
+    dRp_das = R_p * dr_da_s
+    dRp_dab = R_p * dr_da_b
+
+    foc_s = jnp.sum(wmu * dRp_das)
+    foc_b = jnp.sum(wmu * dRp_dab)
+    e_sum = jnp.sum(wmu * R_p)
+
+    jac_lin = wmup * s_val
+    extra_ss = wmu * R_p * (dr_da_s * dr_da_s - sigma2_xr)
+    extra_bb = wmu * R_p * (dr_da_b * dr_da_b - sigma2_xb)
+    extra_sb = wmu * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
+
+    J_ss = jnp.sum(jac_lin * dRp_das * dRp_das + extra_ss)
+    J_bb = jnp.sum(jac_lin * dRp_dab * dRp_dab + extra_bb)
+    J_sb = jnp.sum(jac_lin * dRp_das * dRp_dab + extra_sb)
+    return foc_s, foc_b, J_ss, J_bb, J_sb, e_sum
+
+
+# -----------------------------------------------------------------------------
+# Working-age FOC (CCV) — the main 4-axis broadcast
+# -----------------------------------------------------------------------------
+
+def working_foc_jac_ccv(
+    alpha_s, alpha_b, s_val, z_idx, psi_z,
+    log_R_bill, log_x_s, log_x_b, weight_kv_kr,    # (n_state_quad, n_ret_quad)
+    j_corners, w_corners,                           # (n_state_quad, 8)
+    c_next, wealth_grid,                            # (n_z, N_state, n_w), (n_w,)
+    income_next_table,                              # (n_eta, n_eps) at this z_idx, t_idx
+    eta_iz_lo, eta_frac_z,                          # (n_eta,) z-bracket per eta
+    eta_weights, eps_weights,                       # (n_eta,), (n_eps,)
+    A_is,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    gamma, b_bar, delta, min_consumption,
+):
+    """Working-age FOC. Bequest summed over ``(k_v, k_r)``; alive summed over
+    ``(k_v, k_r, k_eta, i_e)``. Caller supplies the income_next gather table.
+    """
+    R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
+        alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
+        sigma2_xr, sigma2_xb, sigma_xrxb,
+    )                                                # (n_state_quad, n_ret_quad)
+    sR_p = s_val * R_p
+
+    # ---- Bequest contribution (no eta/eps dependence) ----
+    mu_bq, mup_bq = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
+    prob_death = 1.0 - psi_z
+
+    bequest_factor = weight_kv_kr * prob_death
+    dRp_das = R_p * dr_da_s
+    dRp_dab = R_p * dr_da_b
+    foc_s_bq = jnp.sum(bequest_factor * mu_bq * dRp_das)
+    foc_b_bq = jnp.sum(bequest_factor * mu_bq * dRp_dab)
+    e_bq = jnp.sum(bequest_factor * mu_bq * R_p)
+    jac_lin_bq = bequest_factor * mup_bq * s_val
+    extra_ss = bequest_factor * mu_bq * R_p * (dr_da_s * dr_da_s - sigma2_xr)
+    extra_bb = bequest_factor * mu_bq * R_p * (dr_da_b * dr_da_b - sigma2_xb)
+    extra_sb = bequest_factor * mu_bq * R_p * (dr_da_s * dr_da_b - sigma_xrxb)
+    J_ss_bq = jnp.sum(jac_lin_bq * dRp_das * dRp_das + extra_ss)
+    J_bb_bq = jnp.sum(jac_lin_bq * dRp_dab * dRp_dab + extra_bb)
+    J_sb_bq = jnp.sum(jac_lin_bq * dRp_das * dRp_dab + extra_sb)
+
+    # ---- Alive contribution ----
+    # x_next: (n_state_quad, n_ret_quad, n_eta, n_eps)
+    x_next = sR_p[:, :, None, None] + income_next_table[None, None, :, :]
+
+    # c_next interp: trilinear-state × bilinear-z × linear-wealth at every
+    # (k_v, k_r, k_eta, i_e). Structured as nested vmaps.
+    def at_eta_eps(x_scalar, iz, fz, j_kv, w_kv):
+        return _interp_c_and_mpc_at_cell(
+            c_next, j_kv, w_kv, iz, fz, x_scalar, wealth_grid, min_consumption,
+        )
+
+    # Innermost vmap: over i_e (n_eps); x_scalar varies.
+    # Next vmap: over k_eta (n_eta); iz, fz vary, x_row varies along eps axis.
+    # Next vmap: over k_r (n_ret_quad); x_block varies along (eta, eps).
+    # Outer vmap: over k_v (n_state_quad); j_kv, w_kv, x_block vary.
+    def per_kv(j_kv, w_kv, x_kv):
+        # x_kv: (n_ret_quad, n_eta, n_eps)
+        def per_kr(x_kr):
+            # x_kr: (n_eta, n_eps)
+            def per_keta(x_row, iz, fz):
+                # x_row: (n_eps,)
+                return vmap(at_eta_eps, in_axes=(0, None, None, None, None))(
+                    x_row, iz, fz, j_kv, w_kv
+                )
+            return vmap(per_keta, in_axes=(0, 0, 0))(x_kr, eta_iz_lo, eta_frac_z)
+        return vmap(per_kr)(x_kv)
+
+    c_at_xn, mpc_at_xn = vmap(per_kv)(j_corners, w_corners, x_next)
+    # Both: (n_state_quad, n_ret_quad, n_eta, n_eps)
+
+    mu_alive = c_at_xn ** (-gamma)
+    mup_alive = -gamma * mu_alive / c_at_xn * mpc_at_xn
+
+    weight_full = (
+        weight_kv_kr[:, :, None, None]
+        * eta_weights[None, None, :, None]
+        * eps_weights[None, None, None, :]
+    )
+    alive_factor = weight_full * psi_z
+
+    foc_s_al = jnp.sum(alive_factor * mu_alive * dRp_das[:, :, None, None])
+    foc_b_al = jnp.sum(alive_factor * mu_alive * dRp_dab[:, :, None, None])
+    e_al = jnp.sum(alive_factor * mu_alive * R_p[:, :, None, None])
+
+    jac_lin_al = alive_factor * mup_alive * s_val
+    dRp_das_b = dRp_das[:, :, None, None]
+    dRp_dab_b = dRp_dab[:, :, None, None]
+    R_p_b = R_p[:, :, None, None]
+    dr_da_s_b = dr_da_s[:, :, None, None]
+    dr_da_b_b = dr_da_b[:, :, None, None]
+
+    extra_ss_al = alive_factor * mu_alive * R_p_b * (dr_da_s_b * dr_da_s_b - sigma2_xr)
+    extra_bb_al = alive_factor * mu_alive * R_p_b * (dr_da_b_b * dr_da_b_b - sigma2_xb)
+    extra_sb_al = alive_factor * mu_alive * R_p_b * (dr_da_s_b * dr_da_b_b - sigma_xrxb)
+
+    J_ss_al = jnp.sum(jac_lin_al * dRp_das_b * dRp_das_b + extra_ss_al)
+    J_bb_al = jnp.sum(jac_lin_al * dRp_dab_b * dRp_dab_b + extra_bb_al)
+    J_sb_al = jnp.sum(jac_lin_al * dRp_das_b * dRp_dab_b + extra_sb_al)
+
+    return (
+        foc_s_bq + foc_s_al,
+        foc_b_bq + foc_b_al,
+        J_ss_bq + J_ss_al,
+        J_bb_bq + J_bb_al,
+        J_sb_bq + J_sb_al,
+        e_bq + e_al,
+    )
+
+
+# =============================================================================
+# Per-cell EGM scan (one (z_idx, i_s)) — shared across kernels
+# =============================================================================
+
+def _egm_scan_cell(
+    foc_factory,                # callable: foc_factory(s_val) -> foc_fn closure
+    s_grid, init_a_s, init_a_b,
+    gamma, beta,
+    tol, max_iter, max_backtrack_iter,
+    line_search_max_step, singular_det,
+    grad_step_size, grad_denom_eps,
+    tiny_savings, euler_inv_floor,
+    min_consumption, egm_anchor,
+):
+    """Sweep ``s_grid`` (largest -> smallest) with warm-started Newton.
+
+    Returns (x_egm, c_egm, a_s_egm, a_b_egm) each shape ``(n_savings + 1,)``,
+    with the first entry being the egm_anchor at s = 0.
+    """
+    s_grid_rev = s_grid[::-1]
+
+    def step(carry, s_val):
+        warm_a_s, warm_a_b = carry
+        foc_fn = foc_factory(s_val)
+        _, _, _, _, _, e0 = foc_fn(0.0, 0.0)
+        scale = jnp.maximum(jnp.abs(e0), 1e-30)
+
+        a_s_opt, a_b_opt, V_dot, _exit_code, _err, _n_iter = newton_2d_with_line_search(
+            foc_fn, warm_a_s, warm_a_b, scale,
+            tol, max_iter, max_backtrack_iter,
+            line_search_max_step, singular_det,
+            grad_step_size, grad_denom_eps,
+        )
+        beta_e = jnp.maximum(beta * V_dot, euler_inv_floor)
+        c_opt = jnp.maximum(beta_e ** (-1.0 / gamma), min_consumption)
+
+        tiny = s_val <= tiny_savings
+        c_out = jnp.where(tiny, min_consumption, c_opt)
+        a_s_out = jnp.where(tiny, warm_a_s, a_s_opt)
+        a_b_out = jnp.where(tiny, warm_a_b, a_b_opt)
+        x_out = c_out + s_val
+        return (a_s_out, a_b_out), (x_out, c_out, a_s_out, a_b_out)
+
+    init_carry = (init_a_s, init_a_b)
+    _, (x_rev, c_rev, a_s_rev, a_b_rev) = lax.scan(step, init_carry, s_grid_rev)
+
+    x_arr = x_rev[::-1]
+    c_arr = c_rev[::-1]
+    a_s_arr = a_s_rev[::-1]
+    a_b_arr = a_b_rev[::-1]
+
+    x_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=x_arr.dtype), x_arr])
+    c_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=c_arr.dtype), c_arr])
+    a_s_egm = jnp.concatenate([jnp.array([0.0], dtype=a_s_arr.dtype), a_s_arr])
+    a_b_egm = jnp.concatenate([jnp.array([0.0], dtype=a_b_arr.dtype), a_b_arr])
+    return x_egm, c_egm, a_s_egm, a_b_egm
+
+
+def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid):
+    """Linear interp from EGM endogenous grid to fixed wealth grid."""
+    order = jnp.argsort(x_egm)
+    x_sorted = x_egm[order]
+    c_sorted = c_egm[order]
+    a_s_sorted = a_s_egm[order]
+    a_b_sorted = a_b_egm[order]
+    c_w = jnp.interp(wealth_grid, x_sorted, c_sorted)
+    a_s_w = jnp.interp(wealth_grid, x_sorted, a_s_sorted)
+    a_b_w = jnp.interp(wealth_grid, x_sorted, a_b_sorted)
+    return c_w, a_s_w, a_b_w
+
+
+# =============================================================================
+# Per-cell solve drivers (one cell, one age)
+# =============================================================================
+
+def _solve_terminal_at_i_s(
+    log_R_bill_i, log_x_s_i, log_x_b_i, weight_kv_kr,
+    A_is, s_grid, wealth_grid,
+    init_a_s, init_a_b,
+    gamma, beta, b_bar, delta,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    tol, max_iter, max_backtrack_iter,
+    line_search_max_step, singular_det,
+    grad_step_size, grad_denom_eps,
+    tiny_savings, euler_inv_floor,
+    min_consumption, egm_anchor,
+):
+    def foc_factory(s_val):
+        def foc_fn(a_s, a_b):
+            return terminal_foc_jac_ccv(
+                a_s, a_b, s_val, A_is,
+                log_R_bill_i, log_x_s_i, log_x_b_i, weight_kv_kr,
+                sigma2_xr, sigma2_xb, sigma_xrxb,
+                gamma, b_bar, delta,
+            )
+        return foc_fn
+
+    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+        foc_factory, s_grid, init_a_s, init_a_b,
+        gamma, beta,
+        tol, max_iter, max_backtrack_iter,
+        line_search_max_step, singular_det,
+        grad_step_size, grad_denom_eps,
+        tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+    )
+    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+
+
+def _solve_retirement_at_cell(
+    z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+    state_grid, M_v_nodes, ret_nodes, const_r, A_r,
+    Phi_0_state, Phi_11, v_nodes,
+    grids_0, grids_1, grids_2, shift, L_inv,
+    weight_kv_kr, A_per_state,
+    s_grid, wealth_grid,
+    init_a_s, init_a_b,
+    gamma, beta, b_bar, delta,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    tol, max_iter, max_backtrack_iter,
+    line_search_max_step, singular_det,
+    grad_step_size, grad_denom_eps,
+    tiny_savings, euler_inv_floor,
+    min_consumption, egm_anchor,
+):
+    state_grid_i = state_grid[i_s]
+    log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
+        state_grid_i, M_v_nodes, ret_nodes, const_r, A_r
+    )
+    j_corners, w_corners = _build_step_state_brackets(
+        state_grid_i, Phi_0_state, Phi_11, v_nodes,
+        grids_0, grids_1, grids_2, shift, L_inv,
+    )
+    A_is = A_per_state[i_s]
+    psi_z = psi_per_z[z_idx]
+    pension_next_z = pension_next_by_z[z_idx]
+
+    def foc_factory(s_val):
+        def foc_fn(a_s, a_b):
+            return retirement_foc_jac_ccv(
+                a_s, a_b, s_val, z_idx, psi_z,
+                log_R_bill, log_x_s, log_x_b, weight_kv_kr,
+                j_corners, w_corners,
+                c_next, wealth_grid,
+                pension_next_z, A_is,
+                sigma2_xr, sigma2_xb, sigma_xrxb,
+                gamma, b_bar, delta, min_consumption,
+            )
+        return foc_fn
+
+    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+        foc_factory, s_grid, init_a_s, init_a_b,
+        gamma, beta,
+        tol, max_iter, max_backtrack_iter,
+        line_search_max_step, singular_det,
+        grad_step_size, grad_denom_eps,
+        tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+    )
+    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+
+
+def _solve_working_at_cell(
+    z_idx, i_s, c_next,
+    income_next_at_z,                  # (n_eta, n_eps) at this z_idx
+    eta_iz_lo, eta_frac_z,             # (n_eta,) bracket at z_next[k_eta]
+    eta_weights, eps_weights,
+    psi_per_z,
+    state_grid, M_v_nodes, ret_nodes, const_r, A_r,
+    Phi_0_state, Phi_11, v_nodes,
+    grids_0, grids_1, grids_2, shift, L_inv,
+    weight_kv_kr, A_per_state,
+    s_grid, wealth_grid,
+    init_a_s, init_a_b,
+    gamma, beta, b_bar, delta,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
+    tol, max_iter, max_backtrack_iter,
+    line_search_max_step, singular_det,
+    grad_step_size, grad_denom_eps,
+    tiny_savings, euler_inv_floor,
+    min_consumption, egm_anchor,
+):
+    state_grid_i = state_grid[i_s]
+    log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
+        state_grid_i, M_v_nodes, ret_nodes, const_r, A_r
+    )
+    j_corners, w_corners = _build_step_state_brackets(
+        state_grid_i, Phi_0_state, Phi_11, v_nodes,
+        grids_0, grids_1, grids_2, shift, L_inv,
+    )
+    A_is = A_per_state[i_s]
+    psi_z = psi_per_z[z_idx]
+
+    def foc_factory(s_val):
+        def foc_fn(a_s, a_b):
+            return working_foc_jac_ccv(
+                a_s, a_b, s_val, z_idx, psi_z,
+                log_R_bill, log_x_s, log_x_b, weight_kv_kr,
+                j_corners, w_corners,
+                c_next, wealth_grid,
+                income_next_at_z,
+                eta_iz_lo, eta_frac_z,
+                eta_weights, eps_weights,
+                A_is,
+                sigma2_xr, sigma2_xb, sigma_xrxb,
+                gamma, b_bar, delta, min_consumption,
+            )
+        return foc_fn
+
+    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+        foc_factory, s_grid, init_a_s, init_a_b,
+        gamma, beta,
+        tol, max_iter, max_backtrack_iter,
+        line_search_max_step, singular_det,
+        grad_step_size, grad_denom_eps,
+        tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+    )
+    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+
+
+# =============================================================================
+# Per-age JIT kernels (vmap over cells; pmap over devices)
+# =============================================================================
+
+# A pytree of jnp arrays + static scalars, threaded through the per-age kernels.
+# Static scalars are bound by closure at kernel-build time (the orchestrator
+# builds the kernel once per solve so the arrays are baked into the trace).
+
+PCJax = namedtuple("PCJax", [
+    "wealth_grid", "s_grid", "z_grid", "dz",
+    "state_grid", "grids_0", "grids_1", "grids_2",
+    "state_bracket_shift", "state_bracket_L_inv",
+    "v_nodes", "v_weights", "M_v_nodes",
+    "const_r", "A_r", "Phi_0_state", "Phi_11",
+    "ret_nodes", "ret_weights",
+    "eta_nodes", "eta_weights", "eps_weights",
+    "annuity_factors",
+    "sigma2_xr", "sigma2_xb", "sigma_xrxb",
+    "weight_kv_kr",
+])
+
+ModelParams = namedtuple("ModelParams", [
+    "gamma", "beta", "b_bar", "delta", "rho",
+])
+
+
+def _pc_to_jnp(pc, delta):
+    """Pack the precompute arrays the JAX kernels need into a PCJax pytree."""
+    grids = list(pc.state_bracket_grids)
+    if len(grids) != 3:
+        raise NotImplementedError(
+            f"JAX solver supports n_state == 3 only (got {len(grids)}). "
+            "Smaller-state ablations land in a follow-up handoff."
+        )
+    weight_kv_kr = jnp.asarray(pc.v_weights)[:, None] * jnp.asarray(pc.ret_weights)[None, :]
+    return PCJax(
+        wealth_grid=jnp.asarray(pc.wealth_grid),
+        s_grid=jnp.asarray(pc.s_grid),
+        z_grid=jnp.asarray(pc.z_grid),
+        dz=jnp.asarray(pc.dz),
+        state_grid=jnp.asarray(pc.state_grid),
+        grids_0=jnp.asarray(grids[0]),
+        grids_1=jnp.asarray(grids[1]),
+        grids_2=jnp.asarray(grids[2]),
+        state_bracket_shift=jnp.asarray(pc.state_bracket_shift),
+        state_bracket_L_inv=jnp.asarray(pc.state_bracket_L_inv),
+        v_nodes=jnp.asarray(pc.v_nodes),
+        v_weights=jnp.asarray(pc.v_weights),
+        M_v_nodes=jnp.asarray(pc.M_v_nodes),
+        const_r=jnp.asarray(pc.const_r),
+        A_r=jnp.asarray(pc.A_r),
+        ret_nodes=jnp.asarray(pc.ret_nodes),
+        ret_weights=jnp.asarray(pc.ret_weights),
+        eta_nodes=jnp.asarray(pc.eta_nodes),
+        eta_weights=jnp.asarray(pc.eta_weights),
+        eps_weights=jnp.asarray(pc.eps_weights),
+        annuity_factors=jnp.asarray(pc.annuity_factors),
+        sigma2_xr=jnp.float64(pc.sigma2_xr),
+        sigma2_xb=jnp.float64(pc.sigma2_xb),
+        sigma_xrxb=jnp.float64(pc.sigma_xrxb),
+        Phi_0_state=jnp.asarray(np.asarray(pc.model.Phi_0_state, dtype=np.float64)),
+        Phi_11=jnp.asarray(np.asarray(pc.model.Phi_11, dtype=np.float64)),
+        weight_kv_kr=weight_kv_kr,
+    )
+
+
+def _build_per_age_terminal_kernel(pcj, mp, sc, n_dev):
+    """Build a pmap'd terminal kernel that returns ``(N_state_padded, n_w)``
+    arrays. Padding is invisible at the call site — caller slices to
+    ``[:N_state]`` after gather.
+    """
+    init_a_s = jnp.float64(sc.init_alpha_s)
+    init_a_b = jnp.float64(sc.init_alpha_b)
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor)
+
+    # Pre-build per-i_s log-return tensors (NumPy → jnp) once.
+    state_grid_np = np.asarray(pcj.state_grid)
+    const_r_np = np.asarray(pcj.const_r)
+    A_r_np = np.asarray(pcj.A_r)
+    M_v_nodes_np = np.asarray(pcj.M_v_nodes)
+    ret_nodes_np = np.asarray(pcj.ret_nodes)
+    base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T   # (N_state, n_ret)
+    mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]  # (N_state, n_state_quad, n_ret)
+    res_bill = ret_nodes_np[:, 0]
+    res_xs = ret_nodes_np[:, 1]
+    res_xb = ret_nodes_np[:, 2]
+    log_R_bill = mu_r_per[:, :, 0:1] + res_bill[None, None, :]   # (N_state, n_state_quad, n_ret_quad)
+    log_x_s = mu_r_per[:, :, 1:2] + res_xs[None, None, :]
+    log_x_b = mu_r_per[:, :, 2:3] + res_xb[None, None, :]
+    # Squeeze the singleton n_ret slice.
+    log_R_bill = log_R_bill.reshape(log_R_bill.shape[0], log_R_bill.shape[1], -1)
+    log_x_s = log_x_s.reshape(log_x_s.shape[0], log_x_s.shape[1], -1)
+    log_x_b = log_x_b.reshape(log_x_b.shape[0], log_x_b.shape[1], -1)
+
+    N_state = state_grid_np.shape[0]
+    pad_n = math.ceil(N_state / n_dev) * n_dev
+
+    def pad0(arr, target_n):
+        if arr.shape[0] == target_n:
+            return arr
+        last = arr[-1:]
+        extra = target_n - arr.shape[0]
+        return np.concatenate([arr] + [last] * extra, axis=0)
+
+    log_R_bill_p = pad0(log_R_bill, pad_n)
+    log_x_s_p = pad0(log_x_s, pad_n)
+    log_x_b_p = pad0(log_x_b, pad_n)
+    ann_p = pad0(np.asarray(pcj.annuity_factors), pad_n)
+
+    per_dev = pad_n // n_dev
+
+    def reshape_for_pmap(arr):
+        return arr.reshape((n_dev, per_dev) + arr.shape[1:])
+
+    log_R_bill_pm = jnp.asarray(reshape_for_pmap(log_R_bill_p))
+    log_x_s_pm = jnp.asarray(reshape_for_pmap(log_x_s_p))
+    log_x_b_pm = jnp.asarray(reshape_for_pmap(log_x_b_p))
+    ann_pm = jnp.asarray(reshape_for_pmap(ann_p))
+
+    @pmap
+    def per_dev_solve(log_Rb_block, lxs_block, lxb_block, ann_block):
+        def per_i_s(log_Rb, lxs, lxb, A):
+            return _solve_terminal_at_i_s(
+                log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s, init_a_b,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+        return vmap(per_i_s)(log_Rb_block, lxs_block, lxb_block, ann_block)
+
+    def call(_unused_age_idx=None):
+        c_pm, as_pm, ab_pm = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
+
+        def collapse(a):
+            arr = np.asarray(a).reshape((pad_n,) + a.shape[2:])
+            return arr[:N_state]
+
+        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+
+    return call
+
+
+def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
+    """Build a pmap'd retirement kernel. Returns a callable
+    ``call(c_next, pension_next_by_z, psi_per_z) -> (n_z, N_state, n_w)``.
+    """
+    init_a_s = jnp.float64(sc.init_alpha_s)
+    init_a_b = jnp.float64(sc.init_alpha_b)
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor)
+
+    n_cells = n_z * N_state
+    pad_n = math.ceil(n_cells / n_dev) * n_dev
+    per_dev = pad_n // n_dev
+
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
+    z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
+    is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
+    z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
+    is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+
+    @partial(pmap, in_axes=(0, 0, None, None, None))
+    def per_dev_solve(z_block, is_block, c_next, pension_next_by_z, psi_per_z):
+        def per_cell(z_idx, i_s):
+            return _solve_retirement_at_cell(
+                z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+                pcj.state_grid, pcj.M_v_nodes, pcj.ret_nodes, pcj.const_r, pcj.A_r,
+                pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
+                pcj.grids_0, pcj.grids_1, pcj.grids_2,
+                pcj.state_bracket_shift, pcj.state_bracket_L_inv,
+                pcj.weight_kv_kr, pcj.annuity_factors,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s, init_a_b,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+        return vmap(per_cell)(z_block, is_block)
+
+    def call(c_next_jnp, pension_next_by_z, psi_per_z):
+        c_pm, as_pm, ab_pm = per_dev_solve(z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z)
+        # (n_dev, per_dev, n_w) -> (pad_n, n_w) -> (n_cells, n_w) -> (n_z, N_state, n_w)
+        def collapse(a):
+            flat = np.asarray(a).reshape((pad_n,) + a.shape[2:])
+            return flat[:n_cells].reshape(n_z, N_state, -1)
+        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+
+    return call
+
+
+def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next):
+    """Build a pmap'd working-age kernel. The boundary case
+    (work -> retirement, ``use_pension_next == True``) is a separate trace
+    selected by the orchestrator.
+    """
+    init_a_s = jnp.float64(sc.init_alpha_s)
+    init_a_b = jnp.float64(sc.init_alpha_b)
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor)
+
+    n_cells = n_z * N_state
+    pad_n = math.ceil(n_cells / n_dev) * n_dev
+    per_dev = pad_n // n_dev
+
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
+    z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
+    is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
+    z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
+    is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+
+    @partial(pmap, in_axes=(0, 0, None, None, None, None))
+    def per_dev_solve(
+        z_block, is_block, c_next,
+        income_next_table_z, pension_next_by_z, psi_per_z,
+    ):
+        def per_cell(z_idx, i_s):
+            # z_next = rho * z + eta_nodes  ->  (n_eta,)
+            z_now = pcj.z_grid[z_idx]
+            z_next = mp.rho * z_now + pcj.eta_nodes
+            iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
+                z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
+            )
+
+            if use_pension_next:
+                # Work->retirement boundary: income_next is the pension at
+                # bracketed z_next; broadcast across i_e.
+                pension_at_eta = (
+                    (1.0 - frac_z) * pension_next_by_z[iz_lo]
+                    + frac_z * pension_next_by_z[iz_lo + 1]
+                )
+                income_table = pension_at_eta[:, None] * jnp.ones_like(pcj.eps_weights)[None, :]
+            else:
+                # Working: gather the precomputed table at z_idx (shape (n_eta, n_eps)).
+                income_table = income_next_table_z[z_idx]
+
+            return _solve_working_at_cell(
+                z_idx, i_s, c_next,
+                income_table,
+                iz_lo, frac_z,
+                pcj.eta_weights, pcj.eps_weights,
+                psi_per_z,
+                pcj.state_grid, pcj.M_v_nodes, pcj.ret_nodes, pcj.const_r, pcj.A_r,
+                pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
+                pcj.grids_0, pcj.grids_1, pcj.grids_2,
+                pcj.state_bracket_shift, pcj.state_bracket_L_inv,
+                pcj.weight_kv_kr, pcj.annuity_factors,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s, init_a_b,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+
+        return vmap(per_cell)(z_block, is_block)
+
+    def call(c_next_jnp, income_next_table, pension_next_by_z, psi_per_z):
+        c_pm, as_pm, ab_pm = per_dev_solve(
+            z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z
+        )
+        def collapse(a):
+            flat = np.asarray(a).reshape((pad_n,) + a.shape[2:])
+            return flat[:n_cells].reshape(n_z, N_state, -1)
+        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+
+    return call
+
+
+# =============================================================================
+# Top-level orchestrator
+# =============================================================================
+
+def run_lifecycle_solver(
+    model, pc, solver_config=None, n_s_points=None,
+    verbose=1, solve_control=None,
+):
+    """Lifecycle backward induction solver — JAX implementation.
 
     Parameters
     ----------
     model : LifecyclePortfolioModel
-    pc    : Precompute
-    n_s_points : int, optional  -- override savings grid size
-    verbose : int  -- 0=silent, 1=per-age table + post-solve report (default)
+    pc    : Precompute (NamedTuple from build_precompute)
+    solver_config : SolverConfig | None
+    n_s_points : int | None
+        Override savings grid size (uses ``pc.regenerate_savings_grid``).
+    verbose : int  -- 0 silent, 1 per-age progress + post-solve summary
     solve_control : SolveControl | None
-        Optional non-numerical controls for partial solves and checkpoints.
 
     Returns
     -------
     C_mat, S_mat, B_mat : np.ndarray, shape (n_age, n_z, N_state, n_w)
-        Optimal consumption, stock share, and bond share.
     diagnostics : dict
-        Diagnostic summary from the solve.
     """
     if solver_config is None:
         solver_config = SolverConfig()
+    sc = solver_config
+
+    if sc.wealth_dynamics_spec != "ccv_log":
+        raise NotImplementedError(
+            "JAX solver implements the canonical ccv_log wealth dynamics only. "
+            f"Got wealth_dynamics_spec={sc.wealth_dynamics_spec!r}."
+        )
+    delta = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
+
     solve_control, control_active = _normalize_solve_control(model, pc, solve_control)
 
     if verbose >= 1:
         print(f"\n{'='*70}")
-        print(f"LIFECYCLE PORTFOLIO SOLVER  (EGM + 2D Newton)")
-        mode_str = "CONSTRAINED" if model.constrained else "UNCONSTRAINED"
-        print(f"  Mode: {mode_str} | STATE_QUADRATURE")
+        print(f"LIFECYCLE PORTFOLIO SOLVER  (JAX, EGM + 2D Newton)")
+        print(f"  Devices: {jax.devices()}")
         print(f"  Solver: {solver_config}")
         print(f"  Discretization: {pc.disc_config}")
         if control_active:
             print(f"  Solve control: {solve_control}")
         print(f"{'='*70}")
 
-    # ---- Grids ----
-    w_grid = pc.wealth_grid
-    s_grid = pc.s_grid if n_s_points is None else pc.regenerate_savings_grid(n_s_points)
-    z_grid = pc.z_grid
-    ages   = pc.ages
+    # Override savings grid if requested.
+    if n_s_points is not None:
+        pc = pc._replace(s_grid=jnp.asarray(pc.regenerate_savings_grid(n_s_points)),
+                         n_s=int(n_s_points))
 
-    n_w     = len(w_grid)
-    n_z     = pc.n_z
+    n_age = pc.n_age
+    n_z = pc.n_z
     N_state = pc.N_state
-    n_age   = pc.n_age
+    n_w = pc.n_w
+    ages = np.asarray(pc.ages)
+    retire_age = model.retire_age
+    terminal_age = model.terminal_age
 
-    # ---- Transitions and returns ----
-    rho             = model.rho
-    eta_nodes       = pc.eta_nodes
-    eta_weights     = pc.eta_weights
-    dz              = pc.dz
-    ret_nodes       = pc.ret_nodes
-    ret_weights     = pc.ret_weights
-    annuity_factors = pc.annuity_factors
-
-    # ---- State quadrature arrays ----
-    v_nodes         = pc.v_nodes
-    v_weights       = pc.v_weights
-    M_v_nodes       = pc.M_v_nodes
-    const_r         = pc.const_r
-    A_r             = pc.A_r
-    (state_grid,
-     grids_0,
-     grids_1,
-     grids_2,
-     state_bracket_shift,
-     state_bracket_L_inv,
-     v_nodes_solver,
-     Phi_0_state_solver,
-     Phi_11_solver,
-     A_r_solver) = _pad_state_solver_inputs_to_3d(
-        pc.state_grid,
-        pc.state_bracket_grids,
-        pc.state_bracket_shift,
-        pc.state_bracket_L_inv,
-        pc.v_nodes,
-        model.Phi_0_state,
-        model.Phi_11,
-        pc.A_r,
+    # ---- Pack arrays for the JAX kernels ----
+    pcj = _pc_to_jnp(pc, delta)
+    mp = ModelParams(
+        gamma=jnp.float64(model.gamma),
+        beta=jnp.float64(model.beta),
+        b_bar=jnp.float64(model.b_bar),
+        delta=jnp.float64(delta),
+        rho=jnp.float64(model.rho),
     )
-    exp_ret_bill    = pc.exp_ret_bill
-    exp_ret_stock   = pc.exp_ret_stock
-    exp_ret_bond    = pc.exp_ret_bond
-    Phi_0_state     = Phi_0_state_solver
-    Phi_11          = Phi_11_solver
-    v_nodes         = v_nodes_solver
-    A_r             = A_r_solver
 
-    # ---- CVC log-wealth scalars (used only when wealth_dynamics_spec="ccv_log") ----
-    sigma2_xr       = pc.sigma2_xr
-    sigma2_xb       = pc.sigma2_xb
-    sigma_xrxb      = pc.sigma_xrxb
-    use_ccv         = (solver_config.wealth_dynamics_spec == "ccv_log")
+    # Build per-age kernels once (per-(z, i_s) pmap layout is fixed for a run).
+    n_dev = len(jax.devices())
+    terminal_kernel = _build_per_age_terminal_kernel(pcj, mp, sc, n_dev)
+    retirement_kernel = _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state)
+    working_kernel = _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next=False)
+    boundary_kernel = _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next=True)
 
-    # ---- Income tables ----
-    pension_table        = pc.pension_after_tax      # (n_age, n_z)
-    # working_income_table: retained in pc for simulation/diagnostics, not used here
-    log_det_profile      = pc.log_det_profile        # (n_age,)
-    eps_nodes   = pc.eps_nodes
-    eps_weights = pc.eps_weights
-
-    # ---- Model parameters ----
-    gamma          = model.gamma
-    beta           = model.beta
-    b_bar          = model.b_bar
-    survival_probs = pc.survival_probs_2d   # (n_age, n_z)
-    retire_age     = model.retire_age
-    start_age      = model.start_age
-    terminal_age   = model.terminal_age
-    constrained    = model.constrained
-
-    if verbose >= 1:
-        n_v_q = len(v_weights)
-        n_r_q = len(ret_weights)
-        n_eta_q = len(eta_nodes)
-        n_eps_q = len(eps_nodes)
-        print(f"  Ages {start_age}\u2013{terminal_age}  ({n_age} periods)")
-        print(f"  Grids: n_w={n_w}, n_s={len(s_grid)}, n_z={n_z}, N_state={N_state}")
-        print(f"  gamma={gamma}, beta={beta}, b_bar={b_bar}")
-        print(f"  States per period: {n_z} \u00d7 {N_state} = {n_z * N_state:,}")
-        print(f"  Quadrature nodes: state-innov={n_v_q}, return-resid={n_r_q}, "
-              f"labor eta={n_eta_q}, labor eps={n_eps_q}  "
-              f"(FOC evals/call: retire={n_v_q*n_r_q:,}, work={n_v_q*n_r_q*(1+n_eta_q*n_eps_q):,})")
-
-    # ---- Representative state for per-age summary ----
-    i_z_med = n_z // 2
-    i_s_med = N_state // 2
-    progress_wealth_source = solve_control.progress_wealth_source
-    progress_wealth_by_age = None
-    progress_wealth_label = None
-
-    if verbose >= 1:
-        try:
-            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
-                ages=ages,
-                w_grid=w_grid,
-                source=progress_wealth_source,
-            )
-        except Exception as exc:
-            progress_wealth_source = "grid_midpoint"
-            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
-                ages=ages,
-                w_grid=w_grid,
-                source=progress_wealth_source,
-            )
-            print(
-                "  WARNING: could not build SCF wealth probe "
-                f"({exc}); falling back to {progress_wealth_label}."
-            )
-
-    # ---- Policy arrays ----
+    # ---- Output arrays ----
     shape = (n_age, n_z, N_state, n_w)
     C_mat = np.zeros(shape)
     S_mat = np.zeros(shape)
     B_mat = np.zeros(shape)
     solved_age_mask = np.zeros(n_age, dtype=bool)
+
+    # ---- Per-age diagnostics (post-hoc only) ----
+    age_max_foc = np.zeros(n_age)
+    age_newton_fail = np.zeros(n_age, dtype=np.int64)
 
     checkpoint_path = solve_control.checkpoint_path
     youngest_age_to_solve = solve_control.youngest_age_to_solve
@@ -3919,18 +1350,9 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
     return_partial_on_interrupt = solve_control.return_partial_on_interrupt
     checkpoint_save_count = 0
     last_saved_nonterminal_count = -1
-
-    # ---- Per-age diagnostic accumulators ----
-    age_diag_int     = np.zeros((n_age, N_DIAG_INT), dtype=np.int64)
-    age_diag_fsum    = np.zeros((n_age, N_DIAG_FLOAT))
-    age_diag_fmax    = np.zeros((n_age, N_DIAG_FLOAT))
-    age_diag_fmin    = np.full((n_age, N_DIAG_FLOAT), np.inf)
+    last_saved_bundle_path = None
 
     # ---- Optional resume from checkpoint ----
-    # If `checkpoint_path` exists on disk and contains a valid bundle whose
-    # arrays match the current shape, pre-fill C/S/B and solved_age_mask from
-    # it so the loop below skips already-solved ages. Mismatched checkpoints
-    # are refused loudly to avoid silently mixing incompatible policies.
     if checkpoint_path is not None:
         ckpt_dir = Path(checkpoint_path)
         if (ckpt_dir / "policy_arrays.npz").exists():
@@ -3951,30 +1373,15 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             ckpt_mask = None
             if ckpt_diag is not None:
                 ckpt_mask = ckpt_diag.get("solved_age_mask")
-                ckpt_age_int = ckpt_diag.get("age_diag_int")
-                ckpt_age_fsum = ckpt_diag.get("age_diag_fsum")
-                ckpt_age_fmax = ckpt_diag.get("age_diag_fmax")
-                ckpt_age_fmin = ckpt_diag.get("age_diag_fmin")
             if ckpt_mask is None or len(ckpt_mask) != n_age:
                 raise RuntimeError(
-                    f"Checkpoint at {ckpt_dir} missing or malformed "
-                    "solved_age_mask in diagnostics — refuse to resume."
+                    f"Checkpoint at {ckpt_dir} missing or malformed solved_age_mask."
                 )
             ckpt_mask = np.asarray(ckpt_mask, dtype=bool)
             for t in range(n_age):
                 if ckpt_mask[t]:
-                    C_mat[t] = Cc[t]
-                    S_mat[t] = Sc[t]
-                    B_mat[t] = Bc[t]
+                    C_mat[t] = Cc[t]; S_mat[t] = Sc[t]; B_mat[t] = Bc[t]
                     solved_age_mask[t] = True
-            if ckpt_age_int is not None and np.shape(ckpt_age_int) == age_diag_int.shape:
-                age_diag_int[:] = ckpt_age_int
-            if ckpt_age_fsum is not None and np.shape(ckpt_age_fsum) == age_diag_fsum.shape:
-                age_diag_fsum[:] = ckpt_age_fsum
-            if ckpt_age_fmax is not None and np.shape(ckpt_age_fmax) == age_diag_fmax.shape:
-                age_diag_fmax[:] = ckpt_age_fmax
-            if ckpt_age_fmin is not None and np.shape(ckpt_age_fmin) == age_diag_fmin.shape:
-                age_diag_fmin[:] = ckpt_age_fmin
             n_resumed = int(np.sum(solved_age_mask))
             if verbose >= 1 and n_resumed > 0:
                 resumed_ages = ages[np.flatnonzero(solved_age_mask)]
@@ -3984,61 +1391,55 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                     f"(ages {int(resumed_ages.min())}-{int(resumed_ages.max())})"
                 )
 
-    # ---- Terminal condition ----
+    # ---- Per-age progress wealth ----
+    progress_wealth_source = solve_control.progress_wealth_source
+    progress_wealth_by_age = None
+    progress_wealth_label = None
+    if verbose >= 1:
+        try:
+            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
+                ages=ages, w_grid=pc.wealth_grid, source=progress_wealth_source,
+            )
+        except Exception as exc:
+            progress_wealth_by_age, progress_wealth_label = _build_progress_wealth_schedule(
+                ages=ages, w_grid=pc.wealth_grid, source="grid_midpoint",
+            )
+            print(f"  WARNING: SCF wealth probe unavailable ({exc}); using grid midpoint.")
+
+    i_z_med = n_z // 2
+    i_s_med = N_state // 2
+
+    # ---- Terminal age ----
     if not solved_age_mask[-1]:
         if verbose >= 1:
             print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
-        c_T, a_s_T, a_b_T, term_diag = solve_terminal_age(
-            w_grid, s_grid, annuity_factors,
-            state_grid, const_r, A_r, M_v_nodes, v_weights,
-            ret_nodes, ret_weights,
-            gamma, beta, b_bar, N_state, n_z, constrained=constrained, solver_config=solver_config,
-            sigma2_xr=pc.sigma2_xr, sigma2_xb=pc.sigma2_xb, sigma_xrxb=pc.sigma_xrxb)
-        C_mat[-1] = c_T
-        S_mat[-1] = a_s_T
-        B_mat[-1] = a_b_T
+        c_T, s_T, b_T = terminal_kernel()
+        # Broadcast across z (terminal policy is z-invariant — bequest only).
+        C_mat[-1] = np.broadcast_to(c_T[None, :, :], (n_z, N_state, n_w)).copy()
+        S_mat[-1] = np.broadcast_to(s_T[None, :, :], (n_z, N_state, n_w)).copy()
+        B_mat[-1] = np.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w)).copy()
         solved_age_mask[-1] = True
-    else:
-        # Skip terminal solve; it was loaded from the checkpoint. Use the
-        # loaded slice for downstream summary so subsequent prints are sane.
-        c_T = C_mat[-1]
-        a_s_T = S_mat[-1]
-        a_b_T = B_mat[-1]
-        term_diag = np.full((n_z, N_state), EC_INTERIOR, dtype=np.int8)
         if verbose >= 1:
-            print(f"\n  Terminal condition (age {terminal_age}) ... loaded from checkpoint", end="", flush=True)
-    if verbose >= 1:
-        n_term_interior = int(np.sum(term_diag == EC_INTERIOR))
-        n_term_fail = int(np.sum(term_diag == EC_NEWTON_FAIL))
-        print(f"done  [c range: {c_T.min():.3f}\u2013{c_T.max():.3f}]  "
-              f"[portfolio: {n_term_interior} interior, {N_state - n_term_interior - n_term_fail} corner/edge"
-              f"{f', {n_term_fail} FAIL' if n_term_fail > 0 else ''}]")
+            print(f"done  [c range: {c_T.min():.3f}-{c_T.max():.3f}]")
+    elif verbose >= 1:
+        print(f"\n  Terminal condition (age {terminal_age}) ... loaded from checkpoint")
 
-    # ---- Backward induction ----
+    # ---- Backward induction header ----
     if verbose >= 1:
-        print(f"\n{'='*120}")
-        print(
-            "  Live policy probe: "
-            f"z=z_grid[{i_z_med}], state midpoint, wealth={progress_wealth_label}"
-        )
-        print("  W column reports the probe wealth in model units.")
-        # avg_it / max_it columns are only meaningful for unconstrained
-        # (constrained Newton iter counts are not tracked → always 0).
-        iter_hdr = f"  {'avg_it':>6} {'max_it':>6}" if not constrained else ""
-        hdr = (f" {'Age':>3}  {'Phase':<6} {'Time':>5}  {'Newt%':>5} {'Fail':>6}"
-               f"  {'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'W':>6}  {'c/W':>5}"
-               f"  {'%int':>4}  {'%edge':>5}  {'%corn':>5}  {'mono':>4}"
-               f"{iter_hdr}")
+        print(f"\n{'='*100}")
+        print(f"  Live policy probe: z=z_grid[{i_z_med}], state midpoint, wealth={progress_wealth_label}")
+        hdr = (f" {'Age':>3}  {'Phase':<6} {'Time':>6}  "
+               f"{'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'W':>6}  {'c/W':>5}")
         print(hdr)
-        print(f"{'='*120}")
+        print(f"{'='*100}")
 
     t_start = time.time()
     solve_status = "complete"
-    last_saved_bundle_path = None
 
-    # Dummy pension array for working ages where t+1 is also working (the
-    # working FOC ignores it; numba still needs a real float64[n_z] array).
+    pension_table = np.asarray(pc.pension_after_tax)
     pension_dummy_z = np.zeros(n_z, dtype=np.float64)
+    survival = np.asarray(pc.survival_probs_2d)
+    working_income_next_full = np.asarray(pc.working_income_next)  # (n_age, n_z, n_eta, n_eps)
 
     try:
         for t in reversed(range(n_age - 1)):
@@ -4047,132 +1448,62 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
                 solve_status = "stopped_early"
                 break
             if solved_age_mask[t]:
-                # Already loaded from checkpoint — skip the solve for this age.
                 continue
-            psi = survival_probs[t, :]      # (n_z,) -- z-dependent survival
-            c_next = C_mat[t + 1]
 
-            # Output buffers - JIT writes directly into C_mat/S_mat/B_mat slices
-            out_c = C_mat[t]
-            out_s = S_mat[t]
-            out_b = B_mat[t]
+            psi_t = jnp.asarray(survival[t, :])
+            c_next_jnp = jnp.asarray(C_mat[t + 1])
 
             if age >= retire_age:
-                _, _, _, _di, _df = solve_retirement_step_quad(
-                    w_grid, s_grid, z_grid, N_state,
-                    c_next, pension_table[t + 1, :],
-                    annuity_factors,
-                    state_grid, grids_0, grids_1, grids_2,
-                    state_bracket_shift, state_bracket_L_inv,
-                    v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                    Phi_0_state, Phi_11,
-                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                    gamma, psi, beta, b_bar, constrained=constrained, solver_config=solver_config,
-                    out_c=out_c, out_s=out_s, out_b=out_b)
+                pension_next = jnp.asarray(pension_table[t + 1, :])
+                c_t, s_t, b_t = retirement_kernel(c_next_jnp, pension_next, psi_t)
                 label = "RETIRE"
             else:
-                # Work-to-retirement boundary: at age = retire_age - 1, next-period
-                # income is pension(z_next), not the labor-income polynomial.
-                use_pension_next = (age == retire_age - 1)
-                pension_next_by_z = pension_table[t + 1, :] if use_pension_next else pension_dummy_z
-                _, _, _, _di, _df = solve_working_age_step_quad(
-                    w_grid, s_grid, z_grid, N_state,
-                    c_next, log_det_profile[t + 1],
-                    annuity_factors, rho, eta_nodes, eta_weights, dz,
-                    state_grid, grids_0, grids_1, grids_2,
-                    state_bracket_shift, state_bracket_L_inv,
-                    v_nodes, v_weights, M_v_nodes, const_r, A_r,
-                    Phi_0_state, Phi_11,
-                    exp_ret_bill, exp_ret_stock, exp_ret_bond, ret_weights, ret_nodes,
-                    sigma2_xr, sigma2_xb, sigma_xrxb, use_ccv,
-                    eps_nodes, eps_weights,
-                    gamma, psi, beta, b_bar,
-                    use_pension_next, pension_next_by_z,
-                    constrained=constrained, solver_config=solver_config,
-                    out_c=out_c, out_s=out_s, out_b=out_b)
+                use_pen = (age == retire_age - 1)
+                if use_pen:
+                    pension_next = jnp.asarray(pension_table[t + 1, :])
+                    income_table = jnp.zeros((n_z, pc.n_eta, pc.n_eps))   # ignored on this branch
+                    c_t, s_t, b_t = boundary_kernel(c_next_jnp, income_table, pension_next, psi_t)
+                else:
+                    pension_next = jnp.asarray(pension_dummy_z)
+                    income_table = jnp.asarray(working_income_next_full[t + 1])  # (n_z, n_eta, n_eps)
+                    c_t, s_t, b_t = working_kernel(c_next_jnp, income_table, pension_next, psi_t)
                 label = "WORK  "
 
-            # No copy needed - JIT wrote directly into C_mat[t], S_mat[t], B_mat[t]
-
-            # Reduce diagnostics for this age
-            ti, tf_sum, tf_max, tf_min = _reduce_diag(_di, _df)
-            age_diag_int[t] = ti
-            age_diag_fsum[t] = tf_sum
-            age_diag_fmax[t] = tf_max
-            age_diag_fmin[t] = tf_min
+            C_mat[t] = c_t
+            S_mat[t] = s_t
+            B_mat[t] = b_t
             solved_age_mask[t] = True
 
-            # Per-age one-line summary
             if verbose >= 1:
                 elapsed = time.time() - t_start
-                total_calls = int(ti[DI_TOTAL_CALLS])
-                n_fail = int(ti[DI_NEWTON_FAIL])
-                newton_pct = 100.0 * (total_calls - n_fail) / max(total_calls, 1)
-
-                n_interior = int(ti[DI_INTERIOR])
-                n_edge = int(ti[DI_EDGE_SB] + ti[DI_EDGE_BB] + ti[DI_EDGE_STOCKBOND])
-                n_corner = int(ti[DI_CORNER_BILLS] + ti[DI_CORNER_STOCKS] + ti[DI_CORNER_BONDS]
-                               + ti[DI_TINY_SAVINGS])
-                mono_v = int(ti[DI_MONO_VIOLATIONS])
-
-                # Representative-state policy values at the chosen age-specific
-                # wealth probe. This stays outside the hot JIT kernels.
                 probe_w = float(progress_wealth_by_age[t])
-                probe_as = _interp_progress_policy_at_wealth(
-                    out_s[i_z_med, i_s_med, :], w_grid, probe_w
-                )
-                probe_ab = _interp_progress_policy_at_wealth(
-                    out_b[i_z_med, i_s_med, :], w_grid, probe_w
-                )
+                probe_as = _interp_progress_policy_at_wealth(s_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
+                probe_ab = _interp_progress_policy_at_wealth(b_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
+                probe_c = _interp_progress_policy_at_wealth(c_t[i_z_med, i_s_med, :], pc.wealth_grid, probe_w)
                 probe_bill = 1.0 - probe_as - probe_ab
-                probe_c = _interp_progress_policy_at_wealth(
-                    out_c[i_z_med, i_s_med, :], w_grid, probe_w
-                )
                 c_over_w = probe_c / probe_w if probe_w > 0 else 0.0
-
-                mono_str = f"{mono_v:4d}"
-
-                # Iter columns: only printed when unconstrained
-                if not constrained:
-                    sum_it = int(ti[DI_SUM_ITER])
-                    max_it = int(tf_max[DF_MAX_NEWTON_ITER])
-                    avg_it = sum_it / max(total_calls, 1)
-                    iter_str = f"  {avg_it:6.1f} {max_it:6d}"
-                else:
-                    iter_str = ""
-
-                print(f" {age:3d}  {label:<6} {elapsed:5.1f}s  {newton_pct:5.1f}% {n_fail:>6}"
-                      f"  {probe_as:7.3f}  {probe_ab:7.3f}  {probe_bill:7.3f}"
-                      f"  {probe_w:6.2f}  {c_over_w:5.3f}"
-                      f"  {_format_pct(n_interior, total_calls)}"
-                      f"  {_format_pct(n_edge, total_calls)}"
-                      f"  {_format_pct(n_corner, total_calls)}"
-                      f"  {mono_str}{iter_str}", flush=True)
+                print(
+                    f" {age:3d}  {label:<6} {elapsed:6.1f}s  "
+                    f"{probe_as:7.3f}  {probe_ab:7.3f}  {probe_bill:7.3f}  "
+                    f"{probe_w:6.2f}  {c_over_w:5.3f}",
+                    flush=True,
+                )
 
             if checkpoint_every_n_ages is not None and checkpoint_path is not None:
                 solved_nonterminal_count = int(np.sum(solved_age_mask[:-1]))
                 if solved_nonterminal_count - last_saved_nonterminal_count >= checkpoint_every_n_ages:
                     checkpoint_save_count += 1
-                    checkpoint_diag = _build_solver_diagnostics(
-                        age_diag_int=age_diag_int,
-                        age_diag_fsum=age_diag_fsum,
-                        age_diag_fmax=age_diag_fmax,
-                        age_diag_fmin=age_diag_fmin,
-                        solved_age_mask=solved_age_mask,
-                        ages=ages,
-                        retire_age=retire_age,
-                        solver_config=solver_config,
-                        disc_config=pc.disc_config,
-                        constrained=constrained,
-                        solve_control=solve_control,
-                        solve_status="checkpoint",
+                    diag = _build_diagnostics(
+                        solved_age_mask=solved_age_mask, ages=ages,
+                        age_max_foc=age_max_foc, age_newton_fail=age_newton_fail,
+                        solver_config=solver_config, disc_config=pc.disc_config,
+                        solve_control=solve_control, solve_status="checkpoint",
                         wall_time_sec=time.time() - t_start,
                         checkpoint_save_count=checkpoint_save_count,
                         checkpoint_path=checkpoint_path,
                     )
                     last_saved_bundle_path = str(_save_policy_checkpoint(
-                        checkpoint_path, C_mat, S_mat, B_mat, checkpoint_diag
+                        checkpoint_path, C_mat, S_mat, B_mat, diag,
                     ))
                     last_saved_nonterminal_count = solved_nonterminal_count
                     if verbose >= 1:
@@ -4192,201 +1523,40 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
             or (solve_status == "interrupted" and save_on_interrupt)
             or (
                 solve_status == "complete"
-                and
-                checkpoint_every_n_ages is not None
+                and checkpoint_every_n_ages is not None
                 and solved_nonterminal_count != last_saved_nonterminal_count
             )
         )
     )
 
+    diag_kwargs = dict(
+        solved_age_mask=solved_age_mask, ages=ages,
+        age_max_foc=age_max_foc, age_newton_fail=age_newton_fail,
+        solver_config=solver_config, disc_config=pc.disc_config,
+        solve_control=solve_control, solve_status=solve_status,
+        wall_time_sec=total,
+        checkpoint_save_count=checkpoint_save_count + (1 if final_save_needed else 0),
+        checkpoint_path=checkpoint_path,
+    )
+    diagnostics = _build_diagnostics(**diag_kwargs)
+
     if final_save_needed:
-        next_save_count = checkpoint_save_count + 1
-        diagnostics = _build_solver_diagnostics(
-            age_diag_int=age_diag_int,
-            age_diag_fsum=age_diag_fsum,
-            age_diag_fmax=age_diag_fmax,
-            age_diag_fmin=age_diag_fmin,
-            solved_age_mask=solved_age_mask,
-            ages=ages,
-            retire_age=retire_age,
-            solver_config=solver_config,
-            disc_config=pc.disc_config,
-            constrained=constrained,
-            solve_control=solve_control,
-            solve_status=solve_status,
-            wall_time_sec=total,
-            checkpoint_save_count=next_save_count,
-            checkpoint_path=checkpoint_path,
-        )
         last_saved_bundle_path = str(_save_policy_checkpoint(
-            checkpoint_path, C_mat, S_mat, B_mat, diagnostics
+            checkpoint_path, C_mat, S_mat, B_mat, diagnostics,
         ))
-        checkpoint_save_count = next_save_count
-    else:
-        diagnostics = _build_solver_diagnostics(
-            age_diag_int=age_diag_int,
-            age_diag_fsum=age_diag_fsum,
-            age_diag_fmax=age_diag_fmax,
-            age_diag_fmin=age_diag_fmin,
-            solved_age_mask=solved_age_mask,
-            ages=ages,
-            retire_age=retire_age,
-            solver_config=solver_config,
-            disc_config=pc.disc_config,
-            constrained=constrained,
-            solve_control=solve_control,
-            solve_status=solve_status,
-            wall_time_sec=total,
-            checkpoint_save_count=checkpoint_save_count,
-            checkpoint_path=checkpoint_path,
-        )
+        checkpoint_save_count += 1
 
     diagnostics["checkpoint_save_count"] = checkpoint_save_count
     diagnostics["last_saved_bundle_path"] = last_saved_bundle_path
 
-    all_int = diagnostics["aggregate_int"]
-    all_fsum = diagnostics["aggregate_fsum"]
-    all_fmax = diagnostics["aggregate_fmax"]
-    all_fmin = diagnostics["aggregate_fmin"]
-    total_calls = diagnostics["total_calls"]
-    total_fail = diagnostics["total_newton_failures"]
-    total_mono = diagnostics["total_mono_violations"]
-    worst_mono = diagnostics["worst_mono_drop"]
-    worst_foc = diagnostics["worst_foc_resid"]
-    rms_foc = (all_fsum[DF_SUM_FOC_RESID_SQ] / max(total_calls, 1)) ** 0.5
-    total_iter = diagnostics["total_newton_iter"]
-    max_iter_used = diagnostics["max_newton_iter"]
-    avg_iter = diagnostics["avg_newton_iter"]
-    total_warm_reset = diagnostics["total_warm_reset"]
-    n_nonterminal_ages_solved = diagnostics["n_nonterminal_ages_solved"]
-    is_partial = diagnostics["is_partial"]
-
     if verbose >= 1:
-        print(f"\n{'='*120}")
-        print(f"  DONE in {total / 60:.2f} min  (avg {total / max(n_nonterminal_ages_solved, 1):.2f}s per age)")
-        print(f"{'='*120}")
-
-        # --- Section 1: Newton Convergence ---
-        print(f"\n{'='*70}")
-        print(f"  POST-SOLVE DIAGNOSTICS")
-        print(f"{'='*70}")
-        if is_partial:
-            print(
-                f"\n  Solve status: {diagnostics['solve_status']}  "
-                f"(solved ages {diagnostics['youngest_solved_age']} to "
-                f"{diagnostics['oldest_solved_age']})"
-            )
-            if last_saved_bundle_path is not None:
-                print(f"  Saved partial bundle: {last_saved_bundle_path}")
-
-        print(f"\n  1. NEWTON CONVERGENCE")
-        print(f"     Total calls:  {total_calls:>12,}")
-        print(f"     Converged:    {total_calls - total_fail:>12,}  ({100.0 * (total_calls - total_fail) / max(total_calls, 1):.3f}%)")
-        print(f"     Failed:       {total_fail:>12,}  ({100.0 * total_fail / max(total_calls, 1):.3f}%)")
-        print(f"     Worst FOC:    {worst_foc:>12.2e}")
-        print(f"     RMS FOC:      {rms_foc:>12.2e}")
-        if total_fail > 0:
-            print(f"\n     Ages with failures:")
-            for t in range(n_age - 1):
-                nf = int(age_diag_int[t, DI_NEWTON_FAIL])
-                if nf > 0:
-                    age = ages[t]
-                    lbl = "RETIRE" if age >= retire_age else "WORK"
-                    mfoc = float(age_diag_fmax[t, DF_MAX_FOC_RESID])
-                    print(f"       Age {age:3d} {lbl:>6}: {nf:4d} failures  (max resid {mfoc:.2e})")
-
-        # --- Section 1b: Newton iteration counts (unconstrained only) ---
-        if not constrained and total_calls > 0:
-            print(f"\n  1b. NEWTON ITERATIONS  (unconstrained Newton only)")
-            print(f"     Total iters:  {total_iter:>12,}  (across {total_calls:,} calls)")
-            print(f"     Avg iters:    {avg_iter:>12.2f}  per call")
-            print(f"     Max iters:    {max_iter_used:>12,}  in any single call"
-                  f"  (max_iter_unconstrained={solver_config.max_iter_unconstrained})")
-            print(f"     Warm resets:  {total_warm_reset:>12,}  "
-                  f"(times init_alpha_* fell back after EC_NEWTON_FAIL)")
-            n_at_cap = int(np.sum(age_diag_fmax[:-1, DF_MAX_NEWTON_ITER]
-                                  >= solver_config.max_iter_unconstrained))
-            if max_iter_used >= solver_config.max_iter_unconstrained:
-                print(f"     WARNING: at least one call hit max_iter_unconstrained "
-                      f"({n_at_cap}/{n_age-1} ages saw the cap reached)")
-            # Per-age top offenders by avg iter
-            age_avg = []
-            for t in range(n_age - 1):
-                tc = int(age_diag_int[t, DI_TOTAL_CALLS])
-                if tc == 0:
-                    continue
-                ai = age_diag_int[t, DI_SUM_ITER] / tc
-                mi = int(age_diag_fmax[t, DF_MAX_NEWTON_ITER])
-                age_avg.append((ages[t], ai, mi, tc))
-            age_avg.sort(key=lambda r: -r[1])
-            top_k = age_avg[:5]
-            if top_k:
-                print(f"\n     Top 5 ages by avg iters:")
-                print(f"       {'Age':>3}  {'Phase':<6}  {'avg_iter':>8}  {'max_iter':>8}  {'calls':>8}")
-                for age_t, ai, mi, tc in top_k:
-                    lbl = "RETIRE" if age_t >= retire_age else "WORK"
-                    print(f"       {age_t:3d}  {lbl:<6}  {ai:>8.2f}  {mi:>8}  {tc:>8,}")
-
-        # --- Section 2: Portfolio Regime Breakdown ---
-        print(f"\n  2. PORTFOLIO REGIME BREAKDOWN")
-        retire_mask = np.array([ages[t] >= retire_age for t in range(n_age - 1)])
-        work_mask   = ~retire_mask
-
-        def _regime_row(mask, label):
-            sel = age_diag_int[:-1][mask].sum(axis=0) if mask.any() else np.zeros(N_DIAG_INT, dtype=np.int64)
-            tot = int(sel[DI_TOTAL_CALLS])
-            if tot == 0:
-                return
-            bills  = int(sel[DI_CORNER_BILLS] + sel[DI_TINY_SAVINGS])
-            stocks = int(sel[DI_CORNER_STOCKS])
-            bonds  = int(sel[DI_CORNER_BONDS])
-            sb     = int(sel[DI_EDGE_SB])
-            bb     = int(sel[DI_EDGE_BB])
-            sB     = int(sel[DI_EDGE_STOCKBOND])
-            intr   = int(sel[DI_INTERIOR])
-            fail   = int(sel[DI_NEWTON_FAIL])
-            print(f"     {label:<12}"
-                  f"  {100*bills/tot:5.1f}%"
-                  f"  {100*stocks/tot:5.1f}%"
-                  f"  {100*bonds/tot:5.1f}%"
-                  f"  {100*sb/tot:5.1f}%"
-                  f"  {100*bb/tot:5.1f}%"
-                  f"  {100*sB/tot:5.1f}%"
-                  f"  {100*intr/tot:5.1f}%"
-                  f"  {100*fail/tot:5.1f}%")
-
-        print(f"     {'':12}  {'Bills':>6}  {'Stocks':>6}  {'Bonds':>6}"
-              f"  {'S+Bill':>6}  {'B+Bill':>6}  {'S+Bond':>6}  {'Inter.':>6}  {'Fail':>6}")
-        _regime_row(retire_mask, "Retirement:")
-        _regime_row(work_mask,   "Working:")
-        _regime_row(np.ones(n_age - 1, dtype=bool), "Overall:")
-
-        # --- Section 3: Portfolio Share Ranges ---
-        print(f"\n  3. PORTFOLIO SHARE RANGES")
-        mean_as = all_fsum[DF_SUM_ALPHA_S] / max(total_calls, 1)
-        mean_ab = all_fsum[DF_SUM_ALPHA_B] / max(total_calls, 1)
-        print(f"     Stock:  [{all_fmin[DF_MIN_ALPHA_S]:.3f}, {all_fmax[DF_MAX_ALPHA_S]:.3f}]  mean={mean_as:.3f}")
-        print(f"     Bond:   [{all_fmin[DF_MIN_ALPHA_B]:.3f}, {all_fmax[DF_MAX_ALPHA_B]:.3f}]  mean={mean_ab:.3f}")
-        print(f"     Bill:   mean={1.0 - mean_as - mean_ab:.3f}  (inferred: 1-s-b)")
-
-        # --- Section 4: EGM Monotonicity ---
-        print(f"\n  4. EGM MONOTONICITY")
-        if total_mono > 0:
-            n_affected_ages = int(np.sum(age_diag_int[:-1, DI_MONO_VIOLATIONS] > 0))
-            print(f"     WARNING: {total_mono} total violations across {n_affected_ages}/{max(n_nonterminal_ages_solved, 1)} ages")
-            print(f"     Worst drop: {worst_mono:.2e}")
-            for t in range(n_age - 1):
-                mv = int(age_diag_int[t, DI_MONO_VIOLATIONS])
-                if mv > 0:
-                    age = ages[t]
-                    lbl = "RETIRE" if age >= retire_age else "WORK"
-                    wd = float(age_diag_fmax[t, DF_WORST_MONO_DROP])
-                    print(f"       Age {age:3d} {lbl:>6}: {mv:4d} violations, worst drop {wd:.2e}")
-        else:
-            print(f"     PASS")
-
-        # --- Section 5: Policy Function Sanity ---
-        print(f"\n  5. POLICY FUNCTION SANITY")
+        print(f"\n{'='*100}")
+        n_solved = int(np.sum(solved_age_mask))
+        print(f"  DONE in {total / 60:.2f} min  (avg {total / max(n_solved - 1, 1):.2f}s per age)")
+        print(f"  Status: {diagnostics['solve_status']}  ({n_solved}/{n_age} ages solved)")
+        if last_saved_bundle_path is not None:
+            print(f"  Saved bundle: {last_saved_bundle_path}")
+        # Lightweight policy sanity check.
         C_eval = C_mat[solved_age_mask]
         S_eval = S_mat[solved_age_mask]
         B_eval = B_mat[solved_age_mask]
@@ -4396,32 +1566,13 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         inf_c = int(np.isinf(C_eval).sum())
         inf_s = int(np.isinf(S_eval).sum())
         inf_b = int(np.isinf(B_eval).sum())
-        neg_c = int((C_eval < 0).sum())
-        neg_euler = int(all_int[DI_NEG_CONSUMPTION])
-        alpha_s_neg = int((S_eval < -1e-6).sum())
-        alpha_b_neg = int((B_eval < -1e-6).sum())
-        alpha_sum_viol = int(((S_eval + B_eval) > 1.0 + 1e-6).sum())
-        total_el = C_eval.size + S_eval.size + B_eval.size
-
-        if constrained:
-            all_ok = (nan_c + nan_s + nan_b + inf_c + inf_s + inf_b
-                      + neg_c + alpha_s_neg + alpha_b_neg + alpha_sum_viol + neg_euler == 0)
+        if nan_c + nan_s + nan_b + inf_c + inf_s + inf_b == 0:
+            print(f"  Policy sanity: PASS  (no NaN/Inf in solved ages)")
         else:
-            # Unconstrained: negative alphas and sum > 1 are expected
-            all_ok = (nan_c + nan_s + nan_b + inf_c + inf_s + inf_b
-                      + neg_c + neg_euler == 0)
-        if all_ok:
-            print(f"     PASS  ({total_el:,} elements checked)")
-        else:
-            print(f"     NaN count:       C={nan_c}  S={nan_s}  B={nan_b}")
-            print(f"     Inf count:       C={inf_c}  S={inf_s}  B={inf_b}")
-            print(f"     C < 0:           {neg_c}")
-            print(f"     Neg euler:       {neg_euler}")
-            print(f"     alpha_s < -1e-6: {alpha_s_neg}")
-            print(f"     alpha_b < -1e-6: {alpha_b_neg}")
-            print(f"     alpha_s+b > 1:   {alpha_sum_viol}")
-
-        print(f"{'='*70}\n")
+            print(f"  Policy sanity: NaN(C={nan_c} S={nan_s} B={nan_b}) Inf(C={inf_c} S={inf_s} B={inf_b})")
+        print(f"  alpha_s range: [{S_eval.min():.3f}, {S_eval.max():.3f}]")
+        print(f"  alpha_b range: [{B_eval.min():.3f}, {B_eval.max():.3f}]")
+        print(f"{'='*100}\n")
 
     if diagnostics["is_partial"]:
         _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask)
@@ -4430,3 +1581,35 @@ def run_lifecycle_solver(model, pc, solver_config=None, n_s_points=None, verbose
         raise KeyboardInterrupt
 
     return C_mat, S_mat, B_mat, diagnostics
+
+
+def _build_diagnostics(
+    *, solved_age_mask, ages, age_max_foc, age_newton_fail,
+    solver_config, disc_config, solve_control,
+    solve_status, wall_time_sec, checkpoint_save_count, checkpoint_path,
+):
+    solved_idx = np.flatnonzero(solved_age_mask)
+    solved_ages = ages[solved_idx] if solved_idx.size > 0 else np.array([], dtype=np.int64)
+    youngest_solved_age = int(solved_ages.min()) if solved_ages.size > 0 else None
+    oldest_solved_age = int(solved_ages.max()) if solved_ages.size > 0 else None
+    is_partial = solve_status != "complete" or solved_idx.size != len(ages)
+
+    return {
+        "age_max_foc": age_max_foc.copy(),
+        "age_newton_fail": age_newton_fail.copy(),
+        "total_newton_failures": int(age_newton_fail.sum()),
+        "worst_foc_resid": float(age_max_foc.max()) if age_max_foc.size else 0.0,
+        "solver_config": solver_config,
+        "disc_config": disc_config,
+        "solve_control": solve_control,
+        "solve_status": solve_status,
+        "is_partial": is_partial,
+        "solved_age_mask": solved_age_mask.copy(),
+        "solved_age_indices": solved_idx.copy(),
+        "youngest_solved_age": youngest_solved_age,
+        "oldest_solved_age": oldest_solved_age,
+        "n_ages_solved": int(solved_idx.size),
+        "wall_time_sec": float(wall_time_sec),
+        "checkpoint_save_count": int(checkpoint_save_count),
+        "checkpoint_path": checkpoint_path,
+    }

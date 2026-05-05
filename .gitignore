@@ -20,6 +20,10 @@ diagnostics_reports/
 # Already excluded from AWS tarballs (see scripts/launch_run.py TARBALL_EXCLUDES).
 _t9_min_rport_map.npz
 
+# ── JAX migration verification outputs ───────────────────────────────────────
+# Large binary policy + simulation panels produced by verify_*.py smoke scripts.
+verify_*.npz
+
 # ── Temporary / scratch files ────────────────────────────────────────────────
 tmp_*
 *.log

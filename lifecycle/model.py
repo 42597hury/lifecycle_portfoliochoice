@@ -14,9 +14,7 @@ Dependencies: numpy, scipy (no project imports)
 """
 
 import numpy as np
-from numba import njit
-from scipy.stats import norm
-from typing import NamedTuple, Callable, Any
+from typing import NamedTuple, Any
 
 
 # =============================================================================
@@ -27,9 +25,6 @@ class LifecyclePortfolioModel(NamedTuple):
     """Model specification with generic state-return partition."""
 
     # Preferences
-    u: Callable
-    u_prime: Callable
-    u_prime_inv: Callable
     beta: float
     gamma: float
 
@@ -84,9 +79,6 @@ class LifecyclePortfolioModel(NamedTuple):
     y_1_scalar_fallback: float | None   # Required iff y_1_index_in_state is None; sample mean of y_1 used by the bequest annuity factor
     spr_scalar_fallback: float | None   # Required iff spr_index_in_state is None; sample mean of spread used by the bequest annuity factor
 
-    # Portfolio constraints
-    constrained: bool            # True = no short-selling/leverage, False = unconstrained
-
 
 # =============================================================================
 # DISCRETIZATION CONFIG
@@ -132,67 +124,55 @@ class DiscretizationConfig(NamedTuple):
 # =============================================================================
 
 class SolverConfig(NamedTuple):
-    """Newton solver numerical choices. Passed to run_lifecycle_solver."""
+    """Newton solver numerical choices. Passed to run_lifecycle_solver.
+
+    Canonical (unconstrained, JAX, CCV log-wealth) only. The constrained
+    Newton, alpha leverage caps, edge/corner solvers, and the simple_clamp
+    wealth-dynamics branch were removed in the JAX rewrite (handoff 2).
+    Surviving fields configure the JAX 2D Newton + line search + EGM scan.
+    """
 
     # --- Newton iteration ---
-    tol: float = 1e-7                         # FOC convergence tolerance
-    max_iter: int = 20                         # max Newton iterations (constrained)
-    max_iter_unconstrained: int = 5000         # max Newton iterations (unconstrained)
-    edge_max_iter: int = 8                     # max iterations for 1D edge Newton
+    tol: float = 1e-7                          # FOC convergence tolerance
+    max_iter: int = 5000                       # max Newton outer iterations
+    # Legacy alias: pre-rewrite this was ``max_iter_unconstrained``. The JAX
+    # solver's run_lifecycle_solver still reads ``max_iter_unconstrained`` for
+    # backwards compatibility with old configs; new code should use ``max_iter``.
+    max_iter_unconstrained: int = 5000
 
     # --- Initial guess ---
     init_alpha_s: float = 0.1                  # initial stock weight guess
     init_alpha_b: float = 0.4                  # initial bond weight guess
 
     # --- Step control ---
-    step_damp_constrained: float = 0.2         # max Newton step length (constrained)
-    step_damp_unconstrained: float = 0.3       # max Newton step length (unconstrained, line search off)
+    step_damp_unconstrained: float = 0.3       # legacy; line search supersedes this
     grad_step_size: float = 0.05               # gradient descent step when Jacobian singular
 
-    # --- Backtracking line search (unconstrained solver only) ---
-    use_line_search: bool = True               # enable backtracking line search
-    max_backtrack_iter: int = 10               # max halvings: alpha_min = 1/2^10 ≈ 0.001
-    line_search_max_step: float = 2.0          # raw step cap before backtracking (replaces step_damp when on)
+    # --- Backtracking line search ---
+    use_line_search: bool = True               # always True post-rewrite
+    max_backtrack_iter: int = 10               # max halvings
+    line_search_max_step: float = 2.0          # raw Newton step cap
 
     # --- Thresholds ---
-    tiny_savings: float = 1e-6                 # below this, skip solver (all-bills)
-    corner_tol: float = 1e-8                   # KKT tolerance multiplier for corner acceptance
-    edge_accept_factor: float = 10.0           # edge acceptance = tol * scale * this factor
+    tiny_savings: float = 1e-6                 # below this, hold warm-start alphas, c -> floor
     singular_det: float = 1e-15                # Jacobian determinant singularity threshold
     grad_denom_eps: float = 1e-10              # epsilon in gradient fallback denominator
 
     # --- Safety clamps ---
-    min_wealth_inv: float = 1e-10              # floor for max(s_val * R_p, ...)
-    min_consumption: float = 1e-10             # floor for max(c_next, ...)
-    min_return_power: float = 1e-15            # floor for max(R_p, ...) before power
+    min_consumption: float = 1e-10             # floor for c_next interpolation
 
-    # --- Probability / EGM / Euler ---
-    prob_skip_threshold: float = 1e-12         # skip states with prob below this
-    euler_inv_floor: float = 1e-20             # floor for beta*euler before inversion
+    # --- EGM / Euler ---
+    euler_inv_floor: float = 1e-20             # floor for beta*V_dot before inversion
     egm_anchor: float = 1e-10                  # anchor value for EGM grid at zero savings
 
-    # --- Numerical leverage cap (unconstrained branch only) ---
-    alpha_min: float = -10.0                   # lower bound on alpha_s and alpha_b in the unconstrained Newton
-    alpha_max: float = +10.0                   # upper bound on alpha_s and alpha_b in the unconstrained Newton
-
     # --- Bequest regularization (luxury-bequest shifter; De Nardi 2004) ---
-    # Sentinel: any value < 0 means "use the module-level DELTA_BEQUEST". This
-    # preserves the legacy workflow where the canonical default lives at line
-    # ~273 of model.py and smoke tests can override by editing it. Override
-    # cleanly via SolverConfig._replace(delta_bequest=X) for sweep cells —
-    # values >= 0 take precedence over DELTA_BEQUEST. See scripts/_smoke_delta_zero.py
-    # for the legacy DELTA_BEQUEST-edit workflow.
-    delta_bequest: float = -1.0                # < 0 => use module DELTA_BEQUEST
+    # Sentinel: any value < 0 means "use the module-level DELTA_BEQUEST".
+    delta_bequest: float = -1.0
 
     # --- Wealth dynamics specification ---
-    # "ccv_log":      x_{t+1} = s * exp(r_p^CCV) + pi    (no clamp; r_p^CCV = log return,
-    #                 Campbell-Viceira 2002 / CCV w8566 eq.10 with Jensen + Ito corrections)
-    # "simple_clamp": x_{t+1} = max(s * (alpha_s R_s + alpha_b R_b + a_bill R_bill), 0) + pi
-    #                 (legacy spec; kept as a regression backstop)
-    # The portfolio FOC under "ccv_log" is the gradient of V (NOT the asset-pricing
-    # moment condition E[mu_comb*(R_j-R_bill)]); see docs/CCV_RETURNS.md.
-    # Solver and simulator MUST use the same value (otherwise sR_p disagrees and
-    # all Euler-residual diagnostics become meaningless).
+    # The JAX solver implements ``ccv_log`` only. The constant is kept for
+    # config-print compatibility; setting it to anything else raises in
+    # run_lifecycle_solver.
     wealth_dynamics_spec: str = "ccv_log"
 
 
@@ -215,8 +195,26 @@ class SolveControl(NamedTuple):
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def crra_u(c, gamma):
+    if gamma == 1.0:
+        return np.log(c)
+    return c ** (1.0 - gamma) / (1.0 - gamma)
+
+
+def crra_uprime(c, gamma):
+    return c ** (-gamma) if gamma != 1.0 else 1.0 / c
+
+
+def crra_uprime_inv(mu, gamma):
+    return mu ** (-1.0 / gamma) if gamma != 1.0 else 1.0 / mu
+
+
 def create_utility_functions(gamma):
-    """Create CRRA utility functions for given risk aversion."""
+    """Legacy CRRA factory; superseded by module-level crra_u/crra_uprime/crra_uprime_inv.
+
+    Kept only so any external caller importing this name does not break.
+    No production code in this package calls it.
+    """
     if gamma == 1.0:
         def u(c):
             return np.log(c)
@@ -372,44 +370,6 @@ def disposable_income_working(y_gross):
     tax[m] = 2.8085 + (taxable_income[m] - 9.32) * 0.37
 
     return taxable_income - tax
-
-
-@njit(fastmath=True)
-def scalar_disposable_income(y_gross):
-    """After-tax labor income for a single scalar gross income value.
-
-    Identical tax schedule to disposable_income_working() but operates
-    on a single float for use inside Numba-compiled solver loops.
-
-    Parameters
-    ----------
-    y_gross : float
-        Gross labor income in model units.
-
-    Returns
-    -------
-    float
-        Disposable (after-tax, after-payroll) income.
-    """
-    payroll_tax = 0.106 * min(y_gross, 2.5)
-    taxable = max(0.0, y_gross - payroll_tax)
-
-    if taxable <= 0.18:
-        tax = taxable * 0.10
-    elif taxable <= 0.72:
-        tax = 0.018 + (taxable - 0.18) * 0.12
-    elif taxable <= 1.54:
-        tax = 0.0828 + (taxable - 0.72) * 0.22
-    elif taxable <= 2.94:
-        tax = 0.2632 + (taxable - 1.54) * 0.24
-    elif taxable <= 3.73:
-        tax = 0.5992 + (taxable - 2.94) * 0.32
-    elif taxable <= 9.32:
-        tax = 0.8520 + (taxable - 3.73) * 0.35
-    else:
-        tax = 2.8085 + (taxable - 9.32) * 0.37
-
-    return taxable - tax
 
 
 def compute_pension_after_tax(z_grid, avg_det):

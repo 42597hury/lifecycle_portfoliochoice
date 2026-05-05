@@ -43,7 +43,6 @@ BASE_CONFIG = {
     "pe": pe,
     "mu_eps1": mu_eps1, "sigma_eps1": sigma_eps1,
     "mu_eps2": mu_eps2, "sigma_eps2": sigma_eps2,
-    "constrained": False,
 }
 
 
@@ -95,15 +94,11 @@ CANONICAL_DISC = DiscretizationConfig(
 #   cells surface as EC_NEWTON_FAIL in diagnostics['total_newton_failures'].
 CANONICAL_SOLVER = SolverConfig(
     tol=1e-7,
-    max_iter=20,
-    max_iter_unconstrained=8000,
+    max_iter=8000,
     init_alpha_s=0.85,
     init_alpha_b=0.44,
-    step_damp_constrained=0.2,
     step_damp_unconstrained=0.3,
     use_line_search=True,
-    alpha_min=-6.0,
-    alpha_max=6.0,
     delta_bequest=0.001,
 )
 

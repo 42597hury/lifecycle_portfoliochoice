@@ -19,19 +19,11 @@ Dependencies: numpy, numba, model, solver
 
 import numpy as np
 from collections import namedtuple
-from numba import njit
-from math import exp
 
 from lifecycle.model import SolverConfig, disposable_income_working, compute_pension_after_tax
 from lifecycle.solver import (
-    compute_terminal_portfolio_foc_jac,
-    solve_portfolio_2d_terminal_constrained_njit,
-    solve_portfolio_unconstrained_terminal_njit,
-    _terminal_prepare_scenarios,
-    _build_terminal_quad_returns,
-    EC_NEWTON_FAIL, EC_INTERIOR,
-    EC_CORNER_BILLS, EC_CORNER_STOCKS, EC_CORNER_BONDS,
-    EC_EDGE_SB, EC_EDGE_BB, EC_EDGE_STOCKBOND,
+    terminal_foc_jac_ccv,
+    EC_INTERIOR, EC_NEWTON_FAIL,
 )
 
 
@@ -1140,12 +1132,6 @@ def diagnose_all_pre(model, pc):
 # =============================================================================
 
 _TERMINAL_EXIT_LABELS = {
-    EC_CORNER_BILLS: "corner_bills",
-    EC_CORNER_STOCKS: "corner_stocks",
-    EC_CORNER_BONDS: "corner_bonds",
-    EC_EDGE_SB: "edge_stock_bill",
-    EC_EDGE_BB: "edge_bond_bill",
-    EC_EDGE_STOCKBOND: "edge_stock_bond",
     EC_INTERIOR: "interior",
     EC_NEWTON_FAIL: "fail",
 }
@@ -1207,12 +1193,83 @@ def _probe_terminal_directions(alpha_s, alpha_b, base_moment,
     return best_label, best_step, best_delta, rel_delta
 
 
-def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
+def _build_arithmetic_returns_at_i_s(i_s, pc):
+    """Reconstruct ``(scenario_weights, R_bill, R_stock, R_bond)`` for state ``i_s``
+    in arithmetic form. Used by ``_probe_terminal_directions`` to evaluate the
+    exact terminal objective ``E[R_port^{1-gamma}]`` under the simulated economy
+    (the solver itself uses CCV log-returns internally).
+
+    Mirrors the old solver's ``_terminal_prepare_scenarios`` +
+    ``_build_terminal_quad_returns`` combined.
+    """
+    state_grid = np.asarray(pc.state_grid, dtype=float)
+    const_r = np.asarray(pc.const_r, dtype=float)
+    A_r = np.asarray(pc.A_r, dtype=float)
+    M_v_nodes = np.asarray(pc.M_v_nodes, dtype=float)
+    ret_nodes = np.asarray(pc.ret_nodes, dtype=float)
+    v_weights = np.asarray(pc.v_weights, dtype=float)
+    ret_weights = np.asarray(pc.ret_weights, dtype=float)
+
+    base_mu_r = const_r + A_r @ state_grid[i_s]            # (n_ret,)
+    mu_r_per = base_mu_r[None, :] + M_v_nodes              # (n_state_quad, n_ret)
+    log_R_bill = mu_r_per[:, 0:1] + ret_nodes[None, :, 0]   # (n_state_quad, n_ret_quad)
+    log_x_s    = mu_r_per[:, 1:2] + ret_nodes[None, :, 1]
+    log_x_b    = mu_r_per[:, 2:3] + ret_nodes[None, :, 2]
+
+    R_bill = np.exp(log_R_bill)
+    R_stock = R_bill * np.exp(log_x_s)
+    R_bond = R_bill * np.exp(log_x_b)
+
+    scenario_weights = v_weights[:, None] * ret_weights[None, :]   # (n_state_quad, n_ret_quad)
+    return scenario_weights, R_bill, R_stock, R_bond
+
+
+def _evaluate_terminal_foc_at_policy(i_s, alpha_s, alpha_b, s_val,
+                                      pcj, model, delta):
+    """Evaluate ``terminal_foc_jac_ccv`` at the solved policy iterate.
+
+    Uses the same machinery the JAX solver used to compute the FOC, so the
+    residual reported here is interpretable in the same units as the solver's
+    internal convergence check. Under the shifted (luxury) bequest the FOC
+    depends on ``s_val`` through the bequest argument — caller passes the
+    savings level corresponding to the sampled (alpha_s, alpha_b) iterate.
+    """
+    import jax.numpy as jnp
+    state_grid_i = pcj.state_grid[i_s]
+    base_mu_r = pcj.const_r + pcj.A_r @ state_grid_i
+    mu_r_per = base_mu_r[None, :] + pcj.M_v_nodes
+    log_R_bill = mu_r_per[:, 0, None] + pcj.ret_nodes[None, :, 0]
+    log_x_s    = mu_r_per[:, 1, None] + pcj.ret_nodes[None, :, 1]
+    log_x_b    = mu_r_per[:, 2, None] + pcj.ret_nodes[None, :, 2]
+
+    A_is = pcj.annuity_factors[i_s]
+    fs, fb, J_ss, J_bb, J_sb, V_dot = terminal_foc_jac_ccv(
+        jnp.float64(alpha_s), jnp.float64(alpha_b),
+        jnp.float64(s_val), A_is,
+        log_R_bill, log_x_s, log_x_b, pcj.weight_kv_kr,
+        pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+        jnp.float64(model.gamma),
+        jnp.float64(model.b_bar),
+        jnp.float64(delta),
+    )
+    return float(fs), float(fb), float(J_ss), float(J_bb), float(J_sb), float(V_dot)
+
+
+def diagnose_terminal_portfolio_states(model, pc, C_mat, S_mat, B_mat,
+                                       solver_config=None,
                                        max_fail_rows=12,
                                        probe_steps=(0.25, 0.5, 1.0, 2.0, 5.0),
                                        print_report=True):
-    """
-    Re-solve the terminal portfolio problem state-by-state and report diagnostics.
+    """Re-evaluate the terminal-age FOC at the solved JAX policy.
+
+    The terminal policy returned by the JAX solver is z- and W-invariant
+    (the bequest depends on (s, A_is) only), so any (z, w) slot is
+    representative — we sample at ``[-1, 0, i_s, 0]`` per state.
+
+    Parameters
+    ----------
+    C_mat, S_mat, B_mat : (n_age, n_z, N_state, n_w) arrays from
+        ``run_lifecycle_solver``. Only the terminal slice is used.
 
     Returns
     -------
@@ -1222,41 +1279,30 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
     if solver_config is None:
         solver_config = SolverConfig()
 
-    mode = "CONSTRAINED" if model.constrained else "UNCONSTRAINED"
+    # Lazy import to avoid pulling JAX into pre-solve diagnostic scripts.
+    from lifecycle.solver import _pc_to_jnp
+    from lifecycle.model import DELTA_BEQUEST
+    delta = solver_config.delta_bequest if solver_config.delta_bequest >= 0.0 else DELTA_BEQUEST
+    pcj = _pc_to_jnp(pc, delta)
+
+    mode = "UNCONSTRAINED"
     rows = []
 
+    # Sample at a mid-grid wealth point so the implied savings level is in
+    # interior territory (not the EGM anchor floor at i_w=0).
+    w_slot = int(pc.n_w // 2)
+    wealth_at_slot = float(pc.wealth_grid[w_slot])
+
     for i_s in range(pc.N_state):
-        Rx_bill, Rx_stock_mult, Rx_bond_mult = _build_terminal_quad_returns(
-            i_s, pc.state_grid, pc.const_r, pc.A_r, pc.M_v_nodes, pc.ret_nodes
-        )
+        opt_s = float(S_mat[-1, 0, i_s, w_slot])
+        opt_b = float(B_mat[-1, 0, i_s, w_slot])
+        opt_c = float(C_mat[-1, 0, i_s, w_slot])
+        s_val = max(wealth_at_slot - opt_c, 1e-12)
 
-        if model.constrained:
-            opt_s, opt_b, euler_sum, exit_code, foc_resid = solve_portfolio_2d_terminal_constrained_njit(
-                pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma,
-                init_s=solver_config.init_alpha_s,
-                init_b=solver_config.init_alpha_b,
-                tol=solver_config.tol,
-                max_iter=solver_config.max_iter,
-            )
-        else:
-            # Unconstrained returns 6-tuple now (last element is n_newton_iter); discarded.
-            opt_s, opt_b, euler_sum, exit_code, foc_resid, _ = solve_portfolio_unconstrained_terminal_njit(
-                pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights, model.gamma,
-                init_s=solver_config.init_alpha_s,
-                init_b=solver_config.init_alpha_b,
-                tol=solver_config.tol,
-                max_iter=solver_config.max_iter,
-            )
-
-        scenario_weights, R_bill_arr, R_stock, R_bond, _, _ = _terminal_prepare_scenarios(
-            pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights
+        foc_s, foc_b, J_ss, J_bb, J_sb, V_dot = _evaluate_terminal_foc_at_policy(
+            i_s, opt_s, opt_b, s_val, pcj, model, delta,
         )
-        moment = float(euler_sum)
-
-        foc_s, foc_b, J_ss, J_bb, J_sb, _ = compute_terminal_portfolio_foc_jac(
-            opt_s, opt_b, pc.v_weights, Rx_bill, Rx_stock_mult, Rx_bond_mult, pc.ret_weights,
-            model.gamma, solver_config.min_return_power, solver_config.prob_skip_threshold
-        )
+        moment = V_dot
         foc_norm = float(np.hypot(foc_s, foc_b))
         jac = np.array([[J_ss, J_sb], [J_sb, J_bb]], dtype=float)
         eigvals = np.linalg.eigvalsh(jac)
@@ -1265,16 +1311,31 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
                       if abs_eigs.min() > 1e-14 else float("inf"))
         det_jac = float(J_ss * J_bb - J_sb * J_sb)
 
+        # Reconstruct arithmetic returns for the exact-objective probe.
+        scenario_weights, R_bill_arr, R_stock, R_bond = _build_arithmetic_returns_at_i_s(i_s, pc)
+
         a_bill = 1.0 - opt_s - opt_b
         R_port = opt_s * R_stock + opt_b * R_bond + a_bill * R_bill_arr
         positive_mask = scenario_weights > 0.0
         min_r_port = float(np.min(R_port[positive_mask])) if np.any(positive_mask) else float("nan")
         max_r_port = float(np.max(R_port[positive_mask])) if np.any(positive_mask) else float("nan")
 
+        # Exact terminal moment under arithmetic returns: E[R_port^{1-gamma}]
+        # — used as the baseline for _probe_terminal_directions.
+        if np.any((scenario_weights > 0.0) & (R_port <= 0.0)):
+            base_moment = float("nan")
+        else:
+            base_moment = float(np.sum(scenario_weights * np.power(R_port, 1.0 - model.gamma)))
+
         push_hint, push_score = _terminal_push_hint(foc_s, foc_b, tol=solver_config.tol)
         probe_label, probe_step, probe_delta, probe_rel = _probe_terminal_directions(
-            opt_s, opt_b, moment, R_bill_arr, scenario_weights, R_stock, R_bond, model.gamma, probe_steps
+            opt_s, opt_b, base_moment,
+            R_bill_arr, scenario_weights, R_stock, R_bond, model.gamma, probe_steps,
         )
+
+        # Exit code is now derived from the residual at the policy iterate.
+        # ``foc_norm`` should be near zero (~tol*scale) for a converged solver.
+        exit_code = EC_INTERIOR if foc_norm <= max(solver_config.tol, 1e-6) else EC_NEWTON_FAIL
 
         row = {
             "i_s": int(i_s),
@@ -1285,7 +1346,7 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
             "moment": float(moment),
             "exit_code": int(exit_code),
             "exit_label": _TERMINAL_EXIT_LABELS.get(int(exit_code), f"ec_{int(exit_code)}"),
-            "solver_resid": float(foc_resid),
+            "solver_resid": foc_norm,
             "foc_s": float(foc_s),
             "foc_b": float(foc_b),
             "foc_norm": foc_norm,
@@ -1312,13 +1373,6 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
         "mode": mode,
         "n_states": int(pc.N_state),
         "n_interior": int(sum(row["exit_code"] == EC_INTERIOR for row in rows)),
-        "n_corner_edge": int(sum(
-            row["exit_code"] in {
-                EC_CORNER_BILLS, EC_CORNER_STOCKS, EC_CORNER_BONDS,
-                EC_EDGE_SB, EC_EDGE_BB, EC_EDGE_STOCKBOND,
-            }
-            for row in rows
-        )),
         "n_fail": int(len(fail_rows)),
         "resid_min": float(np.min(solver_resids)) if len(rows) else float("nan"),
         "resid_median": float(np.median(solver_resids)) if len(rows) else float("nan"),
@@ -1335,8 +1389,8 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
         print("=" * width)
         print(f"Mode: {mode}")
         print(f"States: {summary['n_states']}  interior={summary['n_interior']}  "
-              f"corner/edge={summary['n_corner_edge']}  fail={summary['n_fail']}")
-        print(f"Solver residuals: min={summary['resid_min']:.3e}  "
+              f"fail={summary['n_fail']}")
+        print(f"FOC residuals at policy: min={summary['resid_min']:.3e}  "
               f"median={summary['resid_median']:.3e}  max={summary['resid_max']:.3e}")
 
         if summary["n_fail"] == 0:
@@ -1344,9 +1398,8 @@ def diagnose_terminal_portfolio_states(model, pc, solver_config=None,
         else:
             print(f"Fail residuals: min={summary['fail_resid_min']:.3e}  "
                   f"median={summary['fail_resid_median']:.3e}  max={summary['fail_resid_max']:.3e}")
-            if not model.constrained:
-                print("Interpretation guide: positive FOC_s / FOC_b means the terminal objective still")
-                print("wants more stock / more bond at the reported failed iterate.")
+            print("Interpretation guide: positive FOC_s / FOC_b means the terminal objective still")
+            print("wants more stock / more bond at the reported iterate.")
 
             print()
             print(f"{'i_s':>4} {'alpha_s':>9} {'alpha_b':>9} {'a_bill':>9} "

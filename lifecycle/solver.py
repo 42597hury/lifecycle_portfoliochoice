@@ -544,26 +544,50 @@ def _build_step_state_brackets(state_grid_i, Phi_0_state, Phi_11, v_nodes,
     return j_corners, w_corners
 
 
-def _interp_c_and_mpc_at_cell(c_next, j_corners_kv, w_corners_kv,
+def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
                                iz_lo, frac_z, x_next_scalar, wealth_grid,
                                min_consumption):
     """Trilinear-state × bilinear-z × linear-wealth interp of c_next and
     the marginal propensity to consume out of wealth (slope dc/dx).
-    """
-    def per_corner(j, w):
-        c_lo, slope_lo = interp_1d_lin_with_slope(
-            x_next_scalar, wealth_grid, c_next[iz_lo, j, :]
-        )
-        c_hi, slope_hi = interp_1d_lin_with_slope(
-            x_next_scalar, wealth_grid, c_next[iz_lo + 1, j, :]
-        )
-        c_corner = (1.0 - frac_z) * c_lo + frac_z * c_hi
-        slope_corner = (1.0 - frac_z) * slope_lo + frac_z * slope_hi
-        return w * c_corner, w * slope_corner
 
-    c_per, slope_per = vmap(per_corner)(j_corners_kv, w_corners_kv)
-    c = jnp.maximum(jnp.sum(c_per), min_consumption)
-    mpc = jnp.clip(jnp.sum(slope_per), 0.0, 1.0)
+    Caller pre-gathers c_corners_kv = c_next[:, j_corners[k_v], :] once per
+    cell, so the inner FOC reads from c_corners_kv with scalar (iz, iw)
+    indices and a single full slice on the corner axis — this lowers to
+    dynamic_slice instead of an advanced gather (verified via jaxpr).
+    """
+    n_w = wealth_grid.shape[0]
+    iw = jnp.clip(jnp.searchsorted(wealth_grid, x_next_scalar, side="right") - 1, 0, n_w - 2)
+    iw_hi = iw + 1
+    iz_hi = iz_lo + 1
+    x0 = wealth_grid[iw]
+    x1 = wealth_grid[iw_hi]
+    inv_dw = 1.0 / (x1 - x0)
+    fw = (x_next_scalar - x0) * inv_dw
+
+    # c_corners_kv: (n_z, 8, n_w). Scalar (iz_*, iw_*) on axes 0 and 2 with a
+    # full slice on axis 1 lowers to dynamic_slice — no advanced indexing in
+    # the Newton hot loop.
+    c_zlo_w0 = c_corners_kv[iz_lo, :, iw]
+    c_zlo_w1 = c_corners_kv[iz_lo, :, iw_hi]
+    c_zhi_w0 = c_corners_kv[iz_hi, :, iw]
+    c_zhi_w1 = c_corners_kv[iz_hi, :, iw_hi]
+
+    # Linear in wealth at each (z, state corner). Shape: (8,).
+    c_zlo = c_zlo_w0 + (c_zlo_w1 - c_zlo_w0) * fw
+    c_zhi = c_zhi_w0 + (c_zhi_w1 - c_zhi_w0) * fw
+    slope_zlo = (c_zlo_w1 - c_zlo_w0) * inv_dw
+    slope_zhi = (c_zhi_w1 - c_zhi_w0) * inv_dw
+
+    # Linear in z at each state corner. Shape: (8,).
+    c_per_corner = (1.0 - frac_z) * c_zlo + frac_z * c_zhi
+    slope_per_corner = (1.0 - frac_z) * slope_zlo + frac_z * slope_zhi
+
+    # Trilinear in state. Scalars.
+    c = jnp.sum(w_corners_kv * c_per_corner)
+    mpc = jnp.sum(w_corners_kv * slope_per_corner)
+
+    c = jnp.maximum(c, min_consumption)
+    mpc = jnp.clip(mpc, 0.0, 1.0)
     return c, mpc
 
 
@@ -572,10 +596,10 @@ def _interp_c_and_mpc_at_cell(c_next, j_corners_kv, w_corners_kv,
 # -----------------------------------------------------------------------------
 
 def retirement_foc_jac_ccv(
-    alpha_s, alpha_b, s_val, z_idx, psi_z,
+    alpha_s, alpha_b, s_val, psi_z,
     log_R_bill, log_x_s, log_x_b, weight_kv_kr,   # (n_state_quad, n_ret_quad)
-    j_corners, w_corners,                          # (n_state_quad, 8)
-    c_next, wealth_grid,                           # (n_z, N_state, n_w), (n_w,)
+    w_corners,                                     # (n_state_quad, 8)
+    c_corners_at_z, wealth_grid,                   # (n_state_quad, 8, n_w), (n_w,)
     pension_next_z,                                # scalar at z_idx
     A_is,
     sigma2_xr, sigma2_xb, sigma_xrxb,
@@ -584,7 +608,8 @@ def retirement_foc_jac_ccv(
     """Retirement FOC sums over ``(k_v, k_r)``: bequest + alive contributions.
 
     ``z`` is frozen at retirement (no eta/eps), so income_next = pension(z)
-    is a scalar and c_next is gathered at exactly ``iz = z_idx`` (frac_z = 0).
+    is a scalar and the caller pre-slices c_next at z_idx → c_corners_at_z
+    has shape (n_state_quad, 8, n_w) and the inner gather is a dynamic_slice.
     """
     R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
         alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
@@ -595,28 +620,35 @@ def retirement_foc_jac_ccv(
 
     mu_bq, mup_bq = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
 
-    # Trilinear-state × linear-wealth at every (k_v, k_r).
-    # iz=z_idx exact, frac_z=0 → c_next gathered at one z slice only.
-    def per_kv_kr(x_scalar, j_kv, w_kv):
-        # 8 corners for this k_v.
-        def per_corner(j, w):
-            c, slope = interp_1d_lin_with_slope(
-                x_scalar, wealth_grid, c_next[z_idx, j, :]
-            )
-            return w * c, w * slope
-        c_per, slope_per = vmap(per_corner)(j_kv, w_kv)
-        c = jnp.maximum(jnp.sum(c_per), min_consumption)
-        mpc = jnp.clip(jnp.sum(slope_per), 0.0, 1.0)
+    n_w = wealth_grid.shape[0]
+    def per_kv_kr(x_scalar, c_kv, w_kv):
+        # c_kv: (8, n_w), w_kv: (8,). Scalar iw → dynamic_slice on axis 1.
+        iw = jnp.clip(jnp.searchsorted(wealth_grid, x_scalar, side="right") - 1, 0, n_w - 2)
+        iw_hi = iw + 1
+        x0 = wealth_grid[iw]
+        x1 = wealth_grid[iw_hi]
+        inv_dw = 1.0 / (x1 - x0)
+        fw = (x_scalar - x0) * inv_dw
+
+        c_w0 = c_kv[:, iw]                  # (8,)
+        c_w1 = c_kv[:, iw_hi]
+        c_per_corner = c_w0 + (c_w1 - c_w0) * fw
+        slope_per_corner = (c_w1 - c_w0) * inv_dw
+
+        c = jnp.sum(w_kv * c_per_corner)
+        mpc = jnp.sum(w_kv * slope_per_corner)
+        c = jnp.maximum(c, min_consumption)
+        mpc = jnp.clip(mpc, 0.0, 1.0)
         return c, mpc
 
-    # Vmap over k_v (j_kv, w_kv vary), then over k_r (x_scalar varies).
+    # Vmap over k_v (c_kv, w_kv vary), then over k_r (x_scalar varies).
     # Shape: (n_state_quad, n_ret_quad)
     c_at_xn, mpc_at_xn = vmap(
-        lambda j_kv, w_kv, x_row: vmap(per_kv_kr, in_axes=(0, None, None))(
-            x_row, j_kv, w_kv
+        lambda c_kv, w_kv, x_row: vmap(per_kv_kr, in_axes=(0, None, None))(
+            x_row, c_kv, w_kv
         ),
         in_axes=(0, 0, 0),
-    )(j_corners, w_corners, x_next)
+    )(c_corners_at_z, w_corners, x_next)
 
     mu_alive = c_at_xn ** (-gamma)
     mup_alive = -gamma * mu_alive / c_at_xn * mpc_at_xn
@@ -651,10 +683,10 @@ def retirement_foc_jac_ccv(
 # -----------------------------------------------------------------------------
 
 def working_foc_jac_ccv(
-    alpha_s, alpha_b, s_val, z_idx, psi_z,
+    alpha_s, alpha_b, s_val, psi_z,
     log_R_bill, log_x_s, log_x_b, weight_kv_kr,    # (n_state_quad, n_ret_quad)
-    j_corners, w_corners,                           # (n_state_quad, 8)
-    c_next, wealth_grid,                            # (n_z, N_state, n_w), (n_w,)
+    w_corners,                                      # (n_state_quad, 8)
+    c_corners_T, wealth_grid,                       # (n_state_quad, n_z, 8, n_w), (n_w,)
     income_next_table,                              # (n_eta, n_eps) at this z_idx, t_idx
     eta_iz_lo, eta_frac_z,                          # (n_eta,) z-bracket per eta
     eta_weights, eps_weights,                       # (n_eta,), (n_eps,)
@@ -663,7 +695,9 @@ def working_foc_jac_ccv(
     gamma, b_bar, delta, min_consumption,
 ):
     """Working-age FOC. Bequest summed over ``(k_v, k_r)``; alive summed over
-    ``(k_v, k_r, k_eta, i_e)``. Caller supplies the income_next gather table.
+    ``(k_v, k_r, k_eta, i_e)``. Caller supplies the income_next gather table
+    and pre-gathers c_next at trilinear-state corners → c_corners_T has k_v
+    leading so the outer vmap consumes its leading axis.
     """
     R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
         alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
@@ -694,29 +728,28 @@ def working_foc_jac_ccv(
     x_next = sR_p[:, :, None, None] + income_next_table[None, None, :, :]
 
     # c_next interp: trilinear-state × bilinear-z × linear-wealth at every
-    # (k_v, k_r, k_eta, i_e). Structured as nested vmaps.
-    def at_eta_eps(x_scalar, iz, fz, j_kv, w_kv):
-        return _interp_c_and_mpc_at_cell(
-            c_next, j_kv, w_kv, iz, fz, x_scalar, wealth_grid, min_consumption,
-        )
-
+    # (k_v, k_r, k_eta, i_e). c_corners_T is pre-gathered at j_corners[k_v] so
+    # the inner reads use scalar (iz, iw) → dynamic_slice (no advanced gather).
     # Innermost vmap: over i_e (n_eps); x_scalar varies.
     # Next vmap: over k_eta (n_eta); iz, fz vary, x_row varies along eps axis.
     # Next vmap: over k_r (n_ret_quad); x_block varies along (eta, eps).
-    # Outer vmap: over k_v (n_state_quad); j_kv, w_kv, x_block vary.
-    def per_kv(j_kv, w_kv, x_kv):
-        # x_kv: (n_ret_quad, n_eta, n_eps)
+    # Outer vmap: over k_v (n_state_quad); c_kv, w_kv, x_block vary.
+    def per_kv(c_kv, w_kv, x_kv):
+        # c_kv: (n_z, 8, n_w); w_kv: (8,); x_kv: (n_ret_quad, n_eta, n_eps)
+        def at_eta_eps(x_scalar, iz, fz):
+            return _interp_c_and_mpc_at_cell(
+                c_kv, w_kv, iz, fz, x_scalar, wealth_grid, min_consumption,
+            )
+
         def per_kr(x_kr):
             # x_kr: (n_eta, n_eps)
             def per_keta(x_row, iz, fz):
                 # x_row: (n_eps,)
-                return vmap(at_eta_eps, in_axes=(0, None, None, None, None))(
-                    x_row, iz, fz, j_kv, w_kv
-                )
+                return vmap(at_eta_eps, in_axes=(0, None, None))(x_row, iz, fz)
             return vmap(per_keta, in_axes=(0, 0, 0))(x_kr, eta_iz_lo, eta_frac_z)
         return vmap(per_kr)(x_kv)
 
-    c_at_xn, mpc_at_xn = vmap(per_kv)(j_corners, w_corners, x_next)
+    c_at_xn, mpc_at_xn = vmap(per_kv)(c_corners_T, w_corners, x_next)
     # Both: (n_state_quad, n_ret_quad, n_eta, n_eps)
 
     mu_alive = c_at_xn ** (-gamma)
@@ -868,9 +901,8 @@ def _solve_terminal_at_i_s(
 
 def _solve_retirement_at_cell(
     z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
-    state_grid, M_v_nodes, ret_nodes, const_r, A_r,
-    Phi_0_state, Phi_11, v_nodes,
-    grids_0, grids_1, grids_2, shift, L_inv,
+    log_R_bill_i, log_x_s_i, log_x_b_i,    # (n_state_quad, n_ret_quad) — pre-gathered for this i_s
+    j_corners_i, w_corners_i,               # (n_state_quad, 8) — pre-gathered for this i_s
     weight_kv_kr, A_per_state,
     s_grid, wealth_grid,
     init_a_s, init_a_b,
@@ -882,25 +914,22 @@ def _solve_retirement_at_cell(
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
 ):
-    state_grid_i = state_grid[i_s]
-    log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
-        state_grid_i, M_v_nodes, ret_nodes, const_r, A_r
-    )
-    j_corners, w_corners = _build_step_state_brackets(
-        state_grid_i, Phi_0_state, Phi_11, v_nodes,
-        grids_0, grids_1, grids_2, shift, L_inv,
-    )
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
     pension_next_z = pension_next_by_z[z_idx]
 
+    # Pre-gather c_next at trilinear-state corners for this (z_idx, i_s).
+    # Hoisted out of the FOC so the Newton inner loop sees only dynamic_slice
+    # reads instead of a 4-axis advanced gather. j_corners_i: (n_state_quad, 8).
+    c_corners_at_z = c_next[z_idx, j_corners_i, :]   # (n_state_quad, 8, n_w)
+
     def foc_factory(s_val):
         def foc_fn(a_s, a_b):
             return retirement_foc_jac_ccv(
-                a_s, a_b, s_val, z_idx, psi_z,
-                log_R_bill, log_x_s, log_x_b, weight_kv_kr,
-                j_corners, w_corners,
-                c_next, wealth_grid,
+                a_s, a_b, s_val, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, weight_kv_kr,
+                w_corners_i,
+                c_corners_at_z, wealth_grid,
                 pension_next_z, A_is,
                 sigma2_xr, sigma2_xb, sigma_xrxb,
                 gamma, b_bar, delta, min_consumption,
@@ -924,9 +953,8 @@ def _solve_working_at_cell(
     eta_iz_lo, eta_frac_z,             # (n_eta,) bracket at z_next[k_eta]
     eta_weights, eps_weights,
     psi_per_z,
-    state_grid, M_v_nodes, ret_nodes, const_r, A_r,
-    Phi_0_state, Phi_11, v_nodes,
-    grids_0, grids_1, grids_2, shift, L_inv,
+    log_R_bill_i, log_x_s_i, log_x_b_i,    # (n_state_quad, n_ret_quad) — pre-gathered for this i_s
+    j_corners_i, w_corners_i,               # (n_state_quad, 8) — pre-gathered for this i_s
     weight_kv_kr, A_per_state,
     s_grid, wealth_grid,
     init_a_s, init_a_b,
@@ -938,24 +966,24 @@ def _solve_working_at_cell(
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
 ):
-    state_grid_i = state_grid[i_s]
-    log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
-        state_grid_i, M_v_nodes, ret_nodes, const_r, A_r
-    )
-    j_corners, w_corners = _build_step_state_brackets(
-        state_grid_i, Phi_0_state, Phi_11, v_nodes,
-        grids_0, grids_1, grids_2, shift, L_inv,
-    )
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
+
+    # Pre-gather c_next at trilinear-state corners for this i_s, transposed so
+    # k_v leads (matches the outer vmap in working_foc_jac_ccv). The Newton
+    # inner loop reads via dynamic_slice instead of a 4-axis advanced gather.
+    # Memory: per-cell (n_z, n_state_quad, 8, n_w); under vmap this batches to
+    # (n_cells, ...). Verified small enough at canonical sizes (~3MB/cell).
+    c_corners = c_next[:, j_corners_i, :]                 # (n_z, n_state_quad, 8, n_w)
+    c_corners_T = jnp.transpose(c_corners, (1, 0, 2, 3))  # (n_state_quad, n_z, 8, n_w)
 
     def foc_factory(s_val):
         def foc_fn(a_s, a_b):
             return working_foc_jac_ccv(
-                a_s, a_b, s_val, z_idx, psi_z,
-                log_R_bill, log_x_s, log_x_b, weight_kv_kr,
-                j_corners, w_corners,
-                c_next, wealth_grid,
+                a_s, a_b, s_val, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, weight_kv_kr,
+                w_corners_i,
+                c_corners_T, wealth_grid,
                 income_next_at_z,
                 eta_iz_lo, eta_frac_z,
                 eta_weights, eps_weights,
@@ -974,6 +1002,37 @@ def _solve_working_at_cell(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
     )
     return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+
+
+def _precompute_per_is_tensors(pcj):
+    """Pre-build per-i_s log-return scenario tensors and trilinear-state corners.
+
+    These depend only on ``pc.state_grid[i_s]`` (independent of z), so computing
+    them once per i_s instead of once per (z, i_s) cell saves n_z-fold redundant
+    work in the kernel builder.
+
+    Returns:
+      log_R_bill_all : (N_state, n_state_quad, n_ret_quad)
+      log_x_s_all    : (N_state, n_state_quad, n_ret_quad)
+      log_x_b_all    : (N_state, n_state_quad, n_ret_quad)
+      j_corners_all  : (N_state, n_state_quad, 8) int
+      w_corners_all  : (N_state, n_state_quad, 8) float
+    """
+    def per_is_log_returns(s_i):
+        return _build_step_log_returns(s_i, pcj.M_v_nodes, pcj.ret_nodes,
+                                        pcj.const_r, pcj.A_r)
+
+    def per_is_state_brackets(s_i):
+        return _build_step_state_brackets(
+            s_i, pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
+            pcj.grids_0, pcj.grids_1, pcj.grids_2,
+            pcj.state_bracket_shift, pcj.state_bracket_L_inv,
+        )
+
+    log_R_bill_all, log_x_s_all, log_x_b_all = vmap(per_is_log_returns)(pcj.state_grid)
+    j_corners_all, w_corners_all = vmap(per_is_state_brackets)(pcj.state_grid)
+    return (log_R_bill_all, log_x_s_all, log_x_b_all,
+            j_corners_all, w_corners_all)
 
 
 # =============================================================================
@@ -1134,6 +1193,11 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor)
 
+    # Hoist per-i_s precompute out of the cell vmap (independent of z).
+    log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
+        _precompute_per_is_tensors(pcj)
+    )
+
     n_cells = n_z * N_state
     pad_n = math.ceil(n_cells / n_dev) * n_dev
     per_dev = pad_n // n_dev
@@ -1150,10 +1214,8 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
         def per_cell(z_idx, i_s):
             return _solve_retirement_at_cell(
                 z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
-                pcj.state_grid, pcj.M_v_nodes, pcj.ret_nodes, pcj.const_r, pcj.A_r,
-                pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
-                pcj.grids_0, pcj.grids_1, pcj.grids_2,
-                pcj.state_bracket_shift, pcj.state_bracket_L_inv,
+                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+                j_corners_all[i_s], w_corners_all[i_s],
                 pcj.weight_kv_kr, pcj.annuity_factors,
                 pcj.s_grid, pcj.wealth_grid,
                 init_a_s, init_a_b,
@@ -1185,6 +1247,11 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor)
+
+    # Hoist per-i_s precompute out of the cell vmap (independent of z).
+    log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
+        _precompute_per_is_tensors(pcj)
+    )
 
     n_cells = n_z * N_state
     pad_n = math.ceil(n_cells / n_dev) * n_dev
@@ -1228,10 +1295,8 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
                 iz_lo, frac_z,
                 pcj.eta_weights, pcj.eps_weights,
                 psi_per_z,
-                pcj.state_grid, pcj.M_v_nodes, pcj.ret_nodes, pcj.const_r, pcj.A_r,
-                pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
-                pcj.grids_0, pcj.grids_1, pcj.grids_2,
-                pcj.state_bracket_shift, pcj.state_bracket_L_inv,
+                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+                j_corners_all[i_s], w_corners_all[i_s],
                 pcj.weight_kv_kr, pcj.annuity_factors,
                 pcj.s_grid, pcj.wealth_grid,
                 init_a_s, init_a_b,

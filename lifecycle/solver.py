@@ -6,8 +6,9 @@ Canonical model only:
   - Shifted-bequest (luxury form, De Nardi 2004; Catherine 2025 normalisation).
   - Unconstrained portfolio (no simplex projection, no leverage caps).
   - Linear interpolation everywhere (no PCHIP).
-  - ``n_state == 3`` (3D state grid). Ablations with smaller state vectors
-    are deferred to a follow-up handoff.
+  - ``n_state in {1, 2, 3, 4}`` post rtb-as-state migration. Realised
+    log_R_bill ( = rtb_{t+1}) is read from the next-period state vector at
+    ``model.rtb_index_in_state``; the return block is (xr, xb).
 
 Public entrypoint:
     run_lifecycle_solver(model, pc, solver_config, n_s_points, verbose, solve_control)
@@ -264,24 +265,59 @@ def bracket_uniform(z, z_lo, dz, n_z):
     return iz, frac
 
 
-def bracket_state_3d_jax(s, grids_0, grids_1, grids_2, shift, L_inv):
-    """Transform ``s`` to bracket coords and bracket on three axis grids.
+def _bracket_axis(grid, val):
+    """Bracket ``val`` in a sorted axis grid. Each axis must have >= 2 points."""
+    n = grid.shape[0]
+    lo = jnp.clip(jnp.searchsorted(grid, val, side="right") - 1, 0, n - 2)
+    denom = grid[lo + 1] - grid[lo]
+    frac = jnp.clip((val - grid[lo]) / denom, 0.0, 1.0)
+    return lo, frac
 
-    Canonical (n_state == 3) only. Each axis grid must have at least 2 points.
+
+def bracket_state_jax(s, axis_grids, shift, L_inv):
+    """Transform ``s`` to bracket coords and bracket along k axes.
+
+    Returns ``(lo, frac)`` arrays of shape ``(k,)`` where k = len(axis_grids).
+    Generic over k in {1, 2, 3, 4}.
     """
     b = L_inv @ (s - shift)
+    los = []
+    fracs = []
+    for d, grid in enumerate(axis_grids):
+        lo_d, f_d = _bracket_axis(grid, b[d])
+        los.append(lo_d)
+        fracs.append(f_d)
+    return jnp.stack(los), jnp.stack(fracs)
 
-    def _bracket_axis(grid, val):
-        n = grid.shape[0]
-        lo = jnp.clip(jnp.searchsorted(grid, val, side="right") - 1, 0, n - 2)
-        denom = grid[lo + 1] - grid[lo]
-        frac = jnp.clip((val - grid[lo]) / denom, 0.0, 1.0)
-        return lo, frac
 
-    lo0, f0 = _bracket_axis(grids_0, b[0])
-    lo1, f1 = _bracket_axis(grids_1, b[1])
-    lo2, f2 = _bracket_axis(grids_2, b[2])
-    return jnp.array([lo0, lo1, lo2]), jnp.array([f0, f1, f2])
+def _corner_offsets(k):
+    """All 2^k binary offset vectors as a NumPy array of shape (2^k, k).
+
+    Used to build static per-corner index/weight arithmetic. k is fixed at
+    trace-build time (n_state of the current model), so this stays a constant.
+    """
+    n_corners = 1 << int(k)
+    out = np.zeros((n_corners, k), dtype=np.int32)
+    for c in range(n_corners):
+        for d in range(k):
+            out[c, d] = (c >> (k - 1 - d)) & 1
+    return out
+
+
+def _grid_strides(axis_sizes):
+    """Row-major flat-index strides for a k-D grid with the given per-axis sizes.
+
+    Last axis stride = 1; others are products of trailing sizes. The simulator
+    and solver use the same row-major convention, so stride math here matches
+    discretization.build_state_grid's flat-index ordering.
+    """
+    k = len(axis_sizes)
+    strides = np.empty(k, dtype=np.int32)
+    s = 1
+    for d in range(k - 1, -1, -1):
+        strides[d] = s
+        s *= int(axis_sizes[d])
+    return strides
 
 
 def bequest_mu_and_mup(W, A, gamma, b_bar, delta):
@@ -687,69 +723,68 @@ def terminal_foc_jac_ccv(
 # Per-cell EGM scan (one (z, i_s) cell, sequential over savings grid)
 # =============================================================================
 
-def _build_step_log_returns(state_grid_i, M_v_nodes, ret_nodes, const_r, A_r):
+def _build_step_log_returns(state_grid_i, M_v_nodes, ret_nodes,
+                             const_r, A_r, s_next, rtb_idx, xr_pos, xb_pos):
     """Per-i_s log-return scenario tensors of shape ``(n_state_quad, n_ret_quad)``.
 
-    Same arithmetic as Numba ``_build_terminal_log_returns`` but for one i_s.
+    Post rtb-as-state migration:
+      - ``log_R_bill`` is read from the next-period state vector at
+        ``rtb_idx``: shape ``(n_state_quad,)``, broadcast to
+        ``(n_state_quad, n_ret_quad)`` via ``[:, None]`` so the FOC kernel
+        signatures stay unchanged.
+      - ``mu_r`` covers only the return block (xr, xb); ``xr_pos`` and
+        ``xb_pos`` index into ``ret_names``.
+
+    ``s_next`` shape: ``(n_state_quad, n_state)`` — passed in (computed once
+    per i_s in ``_build_step_state_brackets``).
     """
     base_mu_r = const_r + A_r @ state_grid_i              # (n_ret,)
     mu_r_per = base_mu_r[None, :] + M_v_nodes              # (n_state_quad, n_ret)
-    mu_bill = mu_r_per[:, 0]
-    mu_xs = mu_r_per[:, 1]
-    mu_xb = mu_r_per[:, 2]
-    res_bill = ret_nodes[:, 0]
-    res_xs = ret_nodes[:, 1]
-    res_xb = ret_nodes[:, 2]
-    log_R_bill = mu_bill[:, None] + res_bill[None, :]
+    mu_xs = mu_r_per[:, xr_pos]
+    mu_xb = mu_r_per[:, xb_pos]
+    res_xs = ret_nodes[:, xr_pos]
+    res_xb = ret_nodes[:, xb_pos]
+    # rtb is in the state vector — read its realisation at each k_v.
+    log_R_bill_kv = s_next[:, rtb_idx]                     # (n_state_quad,)
+    n_ret_quad = ret_nodes.shape[0]
+    log_R_bill = jnp.broadcast_to(log_R_bill_kv[:, None],
+                                   (log_R_bill_kv.shape[0], n_ret_quad))
     log_x_s = mu_xs[:, None] + res_xs[None, :]
     log_x_b = mu_xb[:, None] + res_xb[None, :]
     return log_R_bill, log_x_s, log_x_b
 
 
 def _build_step_state_brackets(state_grid_i, Phi_0_state, Phi_11, v_nodes,
-                                grids_0, grids_1, grids_2, shift, L_inv):
-    """Per-i_s state bracketing. Returns ``(j_corners, w_corners)`` tensors of
-    shape ``(n_state_quad, 8)``.
+                                axis_grids, axis_sizes, corner_offsets,
+                                strides, shift, L_inv):
+    """Per-i_s state bracketing. Returns ``(s_next, j_corners, w_corners)``.
 
-    Each ``j_corners[k_v, c]`` is a flat index into the joint state grid
-    (``i_s in [0, N_state)``) and ``w_corners[k_v, c]`` is the trilinear
-    weight of that corner.
+    - ``s_next``: (n_state_quad, n_state)
+    - ``j_corners``: (n_state_quad, 2^n_state) flat indices into joint state grid
+    - ``w_corners``: (n_state_quad, 2^n_state) multilinear weights
+
+    Generic over n_state via the static ``corner_offsets`` table (shape
+    (2^k, k)) and the static row-major ``strides`` (shape (k,)) — both are
+    NumPy arrays computed once at trace-build time from the precompute layout.
     """
-    # s_next: (n_state_quad, n_state)
     s_next = Phi_0_state[None, :] + state_grid_i @ Phi_11.T + v_nodes
 
+    corner_offsets_j = jnp.asarray(corner_offsets)
+    strides_j = jnp.asarray(strides)
+
     def per_kv(s_next_kv):
-        lo, frac = bracket_state_3d_jax(s_next_kv, grids_0, grids_1, grids_2, shift, L_inv)
-        f0, f1, f2 = frac[0], frac[1], frac[2]
-        w = jnp.array([
-            (1 - f0) * (1 - f1) * (1 - f2),
-            (1 - f0) * (1 - f1) * f2,
-            (1 - f0) * f1 * (1 - f2),
-            (1 - f0) * f1 * f2,
-            f0 * (1 - f1) * (1 - f2),
-            f0 * (1 - f1) * f2,
-            f0 * f1 * (1 - f2),
-            f0 * f1 * f2,
-        ])
-        # 8 flat indices into the joint state grid (n_state == 3 layout).
-        N1 = grids_1.shape[0]
-        N2 = grids_2.shape[0]
-        lo0, lo1, lo2 = lo[0], lo[1], lo[2]
-        hi0, hi1, hi2 = lo0 + 1, lo1 + 1, lo2 + 1
-        j = jnp.array([
-            lo0 * N1 * N2 + lo1 * N2 + lo2,
-            lo0 * N1 * N2 + lo1 * N2 + hi2,
-            lo0 * N1 * N2 + hi1 * N2 + lo2,
-            lo0 * N1 * N2 + hi1 * N2 + hi2,
-            hi0 * N1 * N2 + lo1 * N2 + lo2,
-            hi0 * N1 * N2 + lo1 * N2 + hi2,
-            hi0 * N1 * N2 + hi1 * N2 + lo2,
-            hi0 * N1 * N2 + hi1 * N2 + hi2,
-        ])
+        lo, frac = bracket_state_jax(s_next_kv, axis_grids, shift, L_inv)
+        # Multilinear weights: w[c] = prod_d (frac[d] if offset[c,d] else 1-frac[d])
+        # corner_offsets shape (2^k, k); broadcast frac to match
+        per_axis = jnp.where(corner_offsets_j > 0, frac[None, :], 1.0 - frac[None, :])
+        w = jnp.prod(per_axis, axis=1)                    # (2^k,)
+        # Flat indices: j[c] = sum_d (lo[d] + offset[c,d]) * stride[d]
+        idx_per_axis = lo[None, :] + corner_offsets_j     # (2^k, k)
+        j = jnp.sum(idx_per_axis * strides_j[None, :], axis=1).astype(jnp.int32)
         return j, w
 
     j_corners, w_corners = vmap(per_kv)(s_next)
-    return j_corners, w_corners
+    return s_next, j_corners, w_corners
 
 
 def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
@@ -1223,8 +1258,51 @@ def _solve_working_at_cell(
     return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
 
 
+def _all_is_log_returns_numpy(pcj):
+    """Build (log_R_bill, log_x_s, log_x_b) for all i_s at once on host (NumPy).
+
+    Used by the terminal-age kernel builders that pad/reshape on host before
+    shipping to devices. Mirrors `_build_step_log_returns` but vectorised over
+    all source states.
+
+    Post rtb-as-state: log_R_bill[i_s, k_v, :] = state_next[i_s, k_v, rtb_idx]
+    broadcast across the k_r axis (shape (N_state, n_state_quad, n_ret_quad)).
+    """
+    state_grid_np = np.asarray(pcj.state_grid, dtype=float)
+    const_r_np = np.asarray(pcj.const_r, dtype=float)
+    A_r_np = np.asarray(pcj.A_r, dtype=float)
+    M_v_nodes_np = np.asarray(pcj.M_v_nodes, dtype=float)
+    ret_nodes_np = np.asarray(pcj.ret_nodes, dtype=float)
+    Phi_0_np = np.asarray(pcj.Phi_0_state, dtype=float)
+    Phi_11_np = np.asarray(pcj.Phi_11, dtype=float)
+    v_nodes_np = np.asarray(pcj.v_nodes, dtype=float)
+
+    base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T   # (N_state, n_ret)
+    mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]  # (N_state, n_state_quad, n_ret)
+
+    # s_next[i_s, k_v, :] = Phi_0_state + Phi_11 @ s_t + v[k_v]
+    s_next = (Phi_0_np[None, None, :]
+              + state_grid_np[:, None, :] @ Phi_11_np.T[None, :, :]
+              + v_nodes_np[None, :, :])
+    log_R_bill_kv = s_next[:, :, pcj.rtb_idx]                    # (N_state, n_state_quad)
+
+    n_ret_quad = ret_nodes_np.shape[0]
+    log_R_bill = np.broadcast_to(log_R_bill_kv[:, :, None],
+                                  log_R_bill_kv.shape + (n_ret_quad,))
+
+    res_xs = ret_nodes_np[:, pcj.xr_pos]                         # (n_ret_quad,)
+    res_xb = ret_nodes_np[:, pcj.xb_pos]
+    log_x_s = mu_r_per[:, :, pcj.xr_pos:pcj.xr_pos + 1] + res_xs[None, None, :]
+    log_x_b = mu_r_per[:, :, pcj.xb_pos:pcj.xb_pos + 1] + res_xb[None, None, :]
+    log_x_s = log_x_s.reshape(log_x_s.shape[0], log_x_s.shape[1], -1)
+    log_x_b = log_x_b.reshape(log_x_b.shape[0], log_x_b.shape[1], -1)
+
+    # ascontiguousarray so downstream pad0/reshape don't trip on broadcast strides
+    return np.ascontiguousarray(log_R_bill), log_x_s, log_x_b
+
+
 def _precompute_per_is_tensors(pcj):
-    """Pre-build per-i_s log-return scenario tensors and trilinear-state corners.
+    """Pre-build per-i_s log-return scenario tensors and multilinear-state corners.
 
     These depend only on ``pc.state_grid[i_s]`` (independent of z), so computing
     them once per i_s instead of once per (z, i_s) cell saves n_z-fold redundant
@@ -1234,22 +1312,26 @@ def _precompute_per_is_tensors(pcj):
       log_R_bill_all : (N_state, n_state_quad, n_ret_quad)
       log_x_s_all    : (N_state, n_state_quad, n_ret_quad)
       log_x_b_all    : (N_state, n_state_quad, n_ret_quad)
-      j_corners_all  : (N_state, n_state_quad, 8) int
-      w_corners_all  : (N_state, n_state_quad, 8) float
+      j_corners_all  : (N_state, n_state_quad, 2^n_state) int
+      w_corners_all  : (N_state, n_state_quad, 2^n_state) float
     """
-    def per_is_log_returns(s_i):
-        return _build_step_log_returns(s_i, pcj.M_v_nodes, pcj.ret_nodes,
-                                        pcj.const_r, pcj.A_r)
-
-    def per_is_state_brackets(s_i):
-        return _build_step_state_brackets(
+    def per_is_state_and_returns(s_i):
+        s_next, j_corners, w_corners = _build_step_state_brackets(
             s_i, pcj.Phi_0_state, pcj.Phi_11, pcj.v_nodes,
-            pcj.grids_0, pcj.grids_1, pcj.grids_2,
+            pcj.axis_grids, pcj.axis_sizes,
+            pcj.corner_offsets, pcj.strides,
             pcj.state_bracket_shift, pcj.state_bracket_L_inv,
         )
+        log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
+            s_i, pcj.M_v_nodes, pcj.ret_nodes,
+            pcj.const_r, pcj.A_r, s_next,
+            pcj.rtb_idx, pcj.xr_pos, pcj.xb_pos,
+        )
+        return log_R_bill, log_x_s, log_x_b, j_corners, w_corners
 
-    log_R_bill_all, log_x_s_all, log_x_b_all = vmap(per_is_log_returns)(pcj.state_grid)
-    j_corners_all, w_corners_all = vmap(per_is_state_brackets)(pcj.state_grid)
+    log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
+        vmap(per_is_state_and_returns)(pcj.state_grid)
+    )
     return (log_R_bill_all, log_x_s_all, log_x_b_all,
             j_corners_all, w_corners_all)
 
@@ -1275,7 +1357,11 @@ def _precompute_per_is_tensors(pcj):
 
 PCJax = namedtuple("PCJax", [
     "wealth_grid", "s_grid", "z_grid", "dz",
-    "state_grid", "grids_0", "grids_1", "grids_2",
+    "state_grid",
+    # axis_grids is a tuple of jnp arrays (length n_state); axis_sizes a tuple
+    # of Python ints (static, used to compute corner offsets and strides at
+    # trace-build time).
+    "axis_grids", "axis_sizes", "corner_offsets", "strides",
     "state_bracket_shift", "state_bracket_L_inv",
     "v_nodes", "v_weights", "M_v_nodes",
     "const_r", "A_r", "Phi_0_state", "Phi_11",
@@ -1284,6 +1370,8 @@ PCJax = namedtuple("PCJax", [
     "annuity_factors",
     "sigma2_xr", "sigma2_xb", "sigma_xrxb",
     "weight_kv_kr",
+    # rtb-as-state metadata (static ints; used by _build_step_log_returns)
+    "rtb_idx", "xr_pos", "xb_pos",
 ])
 
 ModelParams = namedtuple("ModelParams", [
@@ -1294,21 +1382,32 @@ ModelParams = namedtuple("ModelParams", [
 def _pc_to_jnp(pc, delta):
     """Pack the precompute arrays the JAX kernels need into a PCJax pytree."""
     grids = list(pc.state_bracket_grids)
-    if len(grids) != 3:
+    n_state = len(grids)
+    if n_state < 1 or n_state > 4:
         raise NotImplementedError(
-            f"JAX solver supports n_state == 3 only (got {len(grids)}). "
-            "Smaller-state ablations land in a follow-up handoff."
+            f"JAX solver supports n_state in {{1, 2, 3, 4}} (got {n_state})."
         )
+    axis_grids = tuple(jnp.asarray(g) for g in grids)
+    axis_sizes = tuple(int(g.shape[0]) for g in grids)
+    corner_offsets = _corner_offsets(n_state)            # (2^k, k) int32
+    strides = _grid_strides(axis_sizes)                  # (k,) int32
+
     weight_kv_kr = jnp.asarray(pc.v_weights)[:, None] * jnp.asarray(pc.ret_weights)[None, :]
+
+    ret_names = pc.model.ret_names
+    xr_pos = ret_names.index("xr")
+    xb_pos = ret_names.index("xb")
+
     return PCJax(
         wealth_grid=jnp.asarray(pc.wealth_grid),
         s_grid=jnp.asarray(pc.s_grid),
         z_grid=jnp.asarray(pc.z_grid),
         dz=jnp.asarray(pc.dz),
         state_grid=jnp.asarray(pc.state_grid),
-        grids_0=jnp.asarray(grids[0]),
-        grids_1=jnp.asarray(grids[1]),
-        grids_2=jnp.asarray(grids[2]),
+        axis_grids=axis_grids,
+        axis_sizes=axis_sizes,
+        corner_offsets=corner_offsets,
+        strides=strides,
         state_bracket_shift=jnp.asarray(pc.state_bracket_shift),
         state_bracket_L_inv=jnp.asarray(pc.state_bracket_L_inv),
         v_nodes=jnp.asarray(pc.v_nodes),
@@ -1328,6 +1427,9 @@ def _pc_to_jnp(pc, delta):
         Phi_0_state=jnp.asarray(np.asarray(pc.model.Phi_0_state, dtype=np.float64)),
         Phi_11=jnp.asarray(np.asarray(pc.model.Phi_11, dtype=np.float64)),
         weight_kv_kr=weight_kv_kr,
+        rtb_idx=int(pc.model.rtb_index_in_state),
+        xr_pos=int(xr_pos),
+        xb_pos=int(xb_pos),
     )
 
 
@@ -1351,25 +1453,8 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
               sc.min_consumption, sc.egm_anchor,
               bool(sc.use_fori_newton))
 
-    # Pre-build per-i_s log-return tensors (NumPy → jnp) once.
+    log_R_bill, log_x_s, log_x_b = _all_is_log_returns_numpy(pcj)
     state_grid_np = np.asarray(pcj.state_grid)
-    const_r_np = np.asarray(pcj.const_r)
-    A_r_np = np.asarray(pcj.A_r)
-    M_v_nodes_np = np.asarray(pcj.M_v_nodes)
-    ret_nodes_np = np.asarray(pcj.ret_nodes)
-    base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T   # (N_state, n_ret)
-    mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]  # (N_state, n_state_quad, n_ret)
-    res_bill = ret_nodes_np[:, 0]
-    res_xs = ret_nodes_np[:, 1]
-    res_xb = ret_nodes_np[:, 2]
-    log_R_bill = mu_r_per[:, :, 0:1] + res_bill[None, None, :]   # (N_state, n_state_quad, n_ret_quad)
-    log_x_s = mu_r_per[:, :, 1:2] + res_xs[None, None, :]
-    log_x_b = mu_r_per[:, :, 2:3] + res_xb[None, None, :]
-    # Squeeze the singleton n_ret slice.
-    log_R_bill = log_R_bill.reshape(log_R_bill.shape[0], log_R_bill.shape[1], -1)
-    log_x_s = log_x_s.reshape(log_x_s.shape[0], log_x_s.shape[1], -1)
-    log_x_b = log_x_b.reshape(log_x_b.shape[0], log_x_b.shape[1], -1)
-
     N_state = state_grid_np.shape[0]
     pad_n = math.ceil(N_state / n_dev) * n_dev
 
@@ -1433,24 +1518,9 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
               sc.min_consumption, sc.egm_anchor,
               bool(sc.use_fori_newton))
 
-    # Pre-build per-i_s log-return tensors (NumPy → jnp) once. Same prep as the
-    # pmap path; only the padding/reshape-for-pmap step is dropped.
-    state_grid_np = np.asarray(pcj.state_grid)
-    const_r_np = np.asarray(pcj.const_r)
-    A_r_np = np.asarray(pcj.A_r)
-    M_v_nodes_np = np.asarray(pcj.M_v_nodes)
-    ret_nodes_np = np.asarray(pcj.ret_nodes)
-    base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T
-    mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]
-    res_bill = ret_nodes_np[:, 0]
-    res_xs = ret_nodes_np[:, 1]
-    res_xb = ret_nodes_np[:, 2]
-    log_R_bill = mu_r_per[:, :, 0:1] + res_bill[None, None, :]
-    log_x_s = mu_r_per[:, :, 1:2] + res_xs[None, None, :]
-    log_x_b = mu_r_per[:, :, 2:3] + res_xb[None, None, :]
-    log_R_bill = log_R_bill.reshape(log_R_bill.shape[0], log_R_bill.shape[1], -1)
-    log_x_s = log_x_s.reshape(log_x_s.shape[0], log_x_s.shape[1], -1)
-    log_x_b = log_x_b.reshape(log_x_b.shape[0], log_x_b.shape[1], -1)
+    # Pre-build per-i_s log-return tensors (NumPy → jnp) once. Same prep as
+    # the pmap path; only the padding/reshape-for-pmap step is dropped.
+    log_R_bill, log_x_s, log_x_b = _all_is_log_returns_numpy(pcj)
 
     log_R_bill_jnp = jnp.asarray(log_R_bill)
     log_x_s_jnp = jnp.asarray(log_x_s)

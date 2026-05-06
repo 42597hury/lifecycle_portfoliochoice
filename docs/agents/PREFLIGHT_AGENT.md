@@ -351,23 +351,83 @@ The user is your upstream reader; they read the summary line.
 
 ---
 
-## 9. References
+## 9. Post-bundle health checks (sibling protocol, runs after a bundle is saved)
+
+This section sits **outside** the preflight phases above. Preflight (§4) runs
+on a *config*, before any solve. The checks below run on a *saved bundle*,
+after the cloud runner (or local solve) has produced one. Different agent,
+different inputs, different decision — but they share this doc because the
+operator needs the same kind of unambiguous pass/fail signal in both places.
+
+**Hard rule:** any agent or human about to consume a bundle for downstream
+analysis (plotting, simulation, EE deep-dive, thesis figures) MUST run all
+three checks below and confirm PASS on each. Skipping is not allowed; the
+checks are cheap (≤ 15 min combined on a laptop) and silent failures
+downstream are expensive.
+
+```bash
+# 1. Cheap NumPy scan: NaN/Inf, extreme alphas, tiny-savings fallback.
+python verify_invalid_cells.py <bundle-name-or-path>
+
+# 2. Quadrature spurious-arbitrage at the solved policy (CCV, 4-D state,
+#    rtb-as-state). Pass = max gap < 1e-6 globally; concerning in
+#    [1e-6, 1e-4] (consider Lobatto); fail above 1e-4 (Lobatto required,
+#    re-solve before consuming).
+python verify_arbitrage.py <bundle-name-or-path>
+
+# 3. Euler-equation residual at every solved (z, state, w) cell. Pass per
+#    HANDOFF_PORT_EE_DIAGNOSTIC.md §7 thresholds.
+python verify_ee_residuals.py <bundle-name-or-path> --use-relative
+```
+
+Each writes a JSON summary into the bundle directory — `invalid_cells.json`,
+`arbitrage.json`, `ee_residuals.json` — with a `verdict` field readable by
+downstream automation.
+
+**If any check fails:** investigate before consuming. Do NOT proceed to
+plotting, simulation, or thesis-figure work. The likely remediations:
+
+- `verify_invalid_cells.py` fails ⇒ bundle is structurally broken
+  (NaN policies, extreme alphas at solved cells). Investigate the solve,
+  do not re-use the bundle.
+- `verify_arbitrage.py` fails ⇒ the discrete quadrature certifies a "free
+  lunch" the continuous model doesn't admit. Re-solve with
+  `ret_lobatto_Z` / `state_lobatto_Z` configured (see
+  `lifecycle/quadrature_with_tails.py` and the standing rule in
+  `docs/notes/LOBATTO_CONFIG_TRACKER.md` §6).
+- `verify_ee_residuals.py` fails ⇒ the solver did not converge at some
+  cells. Investigate Newton iter counts, tolerance, and grid coverage.
+
+**Wall budget on a laptop:** ≤ 1 s for invalid-cells; ~80 s for arbitrage
+on a 5⁴ × n_z=11 retirement-only bundle (scales linearly with cell count);
+~5-15 min for EE residuals depending on grid size. Free; run unconditionally.
+
+**Why this lives in PREFLIGHT_AGENT.md and not its own doc:** the same
+agents that pre-flight a config also gate downstream consumption of the
+resulting bundle, and a single doc keeps the protocol contiguous.
+
+---
+
+## 10. References
 
 - [BUNDLE_CREATION_CHECKLIST_2026-05-06.md](../scans/BUNDLE_CREATION_CHECKLIST_2026-05-06.md)
   — full check inventory, severity field for every test.
 - [COMPLEXITY_WALL_TIME_2026-05-06.md](../scans/COMPLEXITY_WALL_TIME_2026-05-06.md)
   — wall-time estimator used in Phase F.
-- [EE_DIAGNOSTIC_WORKFLOW.md](EE_DIAGNOSTIC_WORKFLOW.md) — post-solve EE
-  diagnostic gates (out of preflight scope; the cloud runner runs these
-  after the bundle is saved).
+- [EE_DIAGNOSTIC_WORKFLOW.md](EE_DIAGNOSTIC_WORKFLOW.md) — historical EE
+  diagnostic battery from the Numba era. The current post-bundle gate is
+  the three-script protocol in §9 above, which supersedes it for new
+  bundles. The legacy doc remains useful for interpreting older bundles
+  whose `diagnostics_reports/` artefacts were produced by the now-deleted
+  `scripts/diagnostics/_diag_*.py` scripts.
 - [AWS_TRIAL_JAX.md](AWS_TRIAL_JAX.md) — what the cloud-runner agent does
   with your sentinel.
 - [docs/notes/LOBATTO_CONFIG_TRACKER.md](../notes/LOBATTO_CONFIG_TRACKER.md)
-  §6 — the standing operating rule for the arbitrage check (Phase D).
+  §6 — the standing operating rule for the arbitrage check (Phase D and §9).
 
 ---
 
-## 10. Maintenance
+## 11. Maintenance
 
 If a check is added to or removed from the checklist, update Phase A–F
 above and bump `preflight_version` in §5. Do not version-pin individual

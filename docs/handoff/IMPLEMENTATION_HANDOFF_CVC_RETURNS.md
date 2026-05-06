@@ -55,16 +55,16 @@ The codebase uses 3 return variables (`rtb, xr, xb`) where:
 
 Confirm at `var.py:386,400-402`. **This is already the CCV/Campbell-Viceira form.** No change to the VAR or to the return decomposition is needed.
 
-The conditional-on-state covariance of `(rtb, xr, xb)` after projecting out state innovations is `Sigma_r_cond` in `model.py:80`, computed in `var.py:75` as `Sigma_rr - M @ Sigma_sr`. Define:
+The full innovation covariance of `(rtb, xr, xb)` is `Sigma_rr` in `model.py:80`, the (r,r) block of the joint VAR innovation covariance `Sigma_v` (see CCV w8566 eq. 5). Define (CORRECTED 2026-05; see §6.1 for the previous mistake):
 
 ```
-Σ_xx ≡ Sigma_r_cond[1:, 1:]      # 2x2 conditional covariance of (xr, xb)
-σ²_xr ≡ Sigma_r_cond[1, 1]       # conditional variance of log excess stock return
-σ²_xb ≡ Sigma_r_cond[2, 2]       # conditional variance of log excess bond return
-σ_xrxb ≡ Sigma_r_cond[1, 2]      # conditional covariance
+Σ_xx ≡ Sigma_rr[1:, 1:]      # 2x2 unconditional innovation covariance of (xr, xb)
+σ²_xr ≡ Sigma_rr[1, 1]       # innovation variance of log excess stock return
+σ²_xb ≡ Sigma_rr[2, 2]       # innovation variance of log excess bond return
+σ_xrxb ≡ Sigma_rr[1, 2]      # innovation covariance
 ```
 
-These are state-INDEPENDENT (the VAR has homoskedastic residuals).
+These are state-INDEPENDENT (the VAR has homoskedastic residuals). Do **not** use `Sigma_r_cond` here — that matrix is the residual covariance of `eps_r = v_r − M·v_s`, used as the Cholesky factor for the inner-quadrature integration over `eps_r` conditional on `v_s`. It is *not* the eq.-(10) Σ_xx.
 
 ### 3.2 The CCV log portfolio return
 
@@ -221,7 +221,7 @@ r_p = r_bill + 3·xb + 0.5·(3·σ²_xb) − 0.5·(9·σ²_xb)
 
 So at high bond leverage the vol-drag dominates. With σ²_xb ≈ 0.01, the drag is −3% on annual log return. This is a meaningful penalty and is exactly the CCV mechanism that "prevents bankruptcy at leveraged positions" by curving down expected log return at high |α|. Confirm.
 
-**Check 4.4 — Σ_xx is the bottom-right 2×2 block of Sigma_r_cond.** Print `pc.Sigma_r_cond` and confirm row/column ordering matches `(rtb, xr, xb)`. Σ_xx for the CVC formula is `Sigma_r_cond[1:, 1:]`; σ²_xr is `Sigma_r_cond[1, 1]`; σ²_xb is `Sigma_r_cond[2, 2]`; σ_xrxb is `Sigma_r_cond[1, 2]`. Do not confuse with `Sigma_rr` (unconditional) — CCV uses the conditional covariance.
+**Check 4.4 — Σ_xx is the bottom-right 2×2 block of Sigma_rr** (CORRECTED 2026-05; see §6.1). Print `model.Sigma_rr` and confirm row/column ordering matches `(rtb, xr, xb)`. Σ_xx for the CCV formula is `Sigma_rr[1:, 1:]`; σ²_xr is `Sigma_rr[1, 1]`; σ²_xb is `Sigma_rr[2, 2]`; σ_xrxb is `Sigma_rr[1, 2]`. Sanity check against CCV Table 2: `sqrt(sigma²_xr)` should be ~7-8% per quarter (~15-16% per year). Do not use `Sigma_r_cond` here — that matrix is the residual cov of `eps_r` after partialling out `v_s`, used as the inner-quadrature Cholesky factor.
 
 If any of 4.1–4.4 do not hold, stop and re-derive. Do not proceed to implementation.
 
@@ -237,7 +237,7 @@ Tagged by file, with line-level pointers.
 
 `DELTA_BEQUEST` (line 282) — keep at 0.005. Under CVC the δ shift is no longer mission-critical for boundedness because R_p > 0 means sR_p > 0 means b' is always finite. But δ remains useful to bound b' away from infinity at extreme small-sR_p outliers. Document the change in role: δ was *required* under simple+clamp (without it the marginal at the boundary spikes to ∞); under CVC δ is *defensive*. Run the existing δ ∈ {0.001, 0.005, 0.01, 0.02} sensitivity sweep again under CVC to confirm policy stability.
 
-No structural change to `LifecyclePortfolioModel`. `Sigma_r_cond` is already on the model; you do **not** need new fields. The CVC corrections are computed from existing `Sigma_r_cond`.
+No structural change to `LifecyclePortfolioModel`. `Sigma_rr` is already on the model; you do **not** need new fields. The CVC corrections are computed from existing `Sigma_rr` (CORRECTED 2026-05; previously read `Sigma_r_cond` — see §6.1).
 
 ### 5.2 `solver.py` — major edits, the core of the change
 
@@ -320,7 +320,7 @@ R_port = np.exp(r_p)
 estate_t = savings_t * R_port    # no clamp
 ```
 
-The `sigma2_xr`, `sigma2_xb`, `sigma_xrxb` scalars must be threaded into the simulator the same way they are threaded into the solver kernel. Source them from `pc.Sigma_r_cond` once at simulator-entry and pass into the inner loop. They are constants, not state-dependent.
+The `sigma2_xr`, `sigma2_xb`, `sigma_xrxb` scalars must be threaded into the simulator the same way they are threaded into the solver kernel. Source them from `pc.sigma2_xr / pc.sigma2_xb / pc.sigma_xrxb` (which now read from `model.Sigma_rr` — see §6.1) once at simulator-entry and pass into the inner loop. They are constants, not state-dependent.
 
 The `mu_rtb`, `mu_xr`, `mu_xb` quantities at `simulation.py:743-745` already include the M-coupling state-conditional means; they don't change.
 
@@ -330,12 +330,12 @@ Subtle: `simulation.py:1347-1351` computes statistics on `sim_R_port`. Under CVC
 
 ### 5.5 `precompute.py`
 
-You should not need to compute new quantities. `Sigma_r_cond` is already populated at `precompute.py:589`. Two small additions for kernel efficiency:
+You should not need to compute new quantities. `Sigma_rr` is already populated on the model. Two small additions for kernel efficiency (CORRECTED 2026-05; previously read `Sigma_r_cond` — see §6.1):
 
-1. Add three scalars to `Precompute`: `sigma2_xr`, `sigma2_xb`, `sigma_xrxb`, populated at construction from `Sigma_r_cond[1, 1]`, `Sigma_r_cond[2, 2]`, `Sigma_r_cond[1, 2]`. This avoids indexing into Sigma_r_cond inside the inner kernel loop.
+1. Add three scalars to `Precompute`: `sigma2_xr`, `sigma2_xb`, `sigma_xrxb`, populated at construction from `Sigma_rr[1, 1]`, `Sigma_rr[2, 2]`, `Sigma_rr[1, 2]`. This avoids indexing into Sigma_rr inside the inner kernel loop.
 2. Optionally precompute the diagonal vector `sigma2_x = (sigma2_xr, sigma2_xb)` for easy passing.
 
-No change to quadrature setup. The shock distribution is unchanged (it's still N(0, Sigma_r_cond) per the VAR); only the integrand changes.
+No change to quadrature setup. The inner shock distribution for return residuals is `eps_r ~ N(0, Sigma_r_cond)` per the VAR partition (used as the Cholesky factor in `discretization.py`); only the integrand's constants change.
 
 ### 5.6 `predictability_ablation.py`
 
@@ -400,9 +400,17 @@ For the regression-test corpus, regenerate all reference bundles under CVC. Docu
 
 ## 6. Important subtleties and gotchas
 
-### 6.1 Σ_xx is the CONDITIONAL covariance, not the unconditional
+### 6.1 Σ_xx is the UNCONDITIONAL innovation covariance — CORRECTED 2026-05
 
-`Sigma_rr` (line 70 of var.py) is the *unconditional* covariance of (rtb, xr, xb). `Sigma_r_cond` is the *conditional* covariance after projecting out the state innovations. CCV's Σ_xx in equation (10) is the conditional one. **Use `Sigma_r_cond[1:, 1:]`, not `Sigma_rr[1:, 1:]`.** The two differ by ~30-50% in this VAR (because state predictability explains a meaningful share of return variance), which is a 30-50% error in the Itô vol-drag term — large enough to materially shift the converged policy.
+**This section originally instructed the implementer to use `Sigma_r_cond`. That was a misreading of CCV w8566. The corrected reading is below; the code in `precompute.py:235-237` was patched on 2026-05-06 to match.**
+
+`Sigma_rr` (line 70 of var.py) is the unconditional innovation covariance of (rtb, xr, xb) — i.e., the (r,r) block of `Sigma_v` in CCV w8566 eq. (5). `Sigma_r_cond = Sigma_rr - M·Sigma_sr` is the residual covariance after partialling out the state innovation `v_s`. CCV's Σ_xx in eq. (10) is the unconditional one — eq. (10) approximates the realized log portfolio return *per draw*, with σ² entering as a constant offset in the per-realization Itô correction; the expectation in the derivation is taken over the entire innovation `v_{t+1}`, not over a sub-decomposition. **Use `Sigma_rr[1:, 1:]`, not `Sigma_r_cond[1:, 1:]`.**
+
+**Numerical clincher**: CCV Table 2 reports `sigma_xr ≈ 7.75%/quarter ≈ 15.5%/yr`. Our `Sigma_rr[1,1]^0.5 ≈ 15.9%/yr` (matches CCV within 3%). Our `Sigma_r_cond[1,1]^0.5 ≈ 3.1%/yr` (off by ~5×). The partial-out into `(v_s, eps_r)` is an internal step in the *quadrature* (the nested integration uses `Sigma_r_cond` as the Cholesky factor for `eps_r` conditional on `v_s` — see `discretization.py`), not a redefinition of the eq. (10) constants.
+
+The previous text below is preserved for historical reference, but its conclusion is wrong:
+
+> ~~Use `Sigma_r_cond[1:, 1:]`, not `Sigma_rr[1:, 1:]`. The two differ by ~30-50% ...~~
 
 ### 6.2 The bill is risky in this model — does CVC still apply?
 
@@ -508,7 +516,7 @@ Do these in order. Do not skip ahead.
 2. **Run §4 sanity checks** on a scratch script. Verify your formulas before touching production code.
 3. **Run §7.1 pre-commitment test** under the existing simple+clamp code path, then build a one-off side-by-side that runs the same problem with a hand-coded CVC R_p. This is a 1-day experiment with no kernel rewrite.
 4. **If §7.1 passes**, proceed. If it fails, escalate.
-5. **Add `Sigma_r_cond` accessors** to `Precompute` (§5.5).
+5. **Add `Sigma_rr` accessors** to `Precompute` (§5.5).
 6. **Update one FOC kernel first** — start with the **shifted-bequest terminal kernel** (`solver.py:1513-1569`). It's the smallest, the bankrupt branch is the cleanest indicator example, and it has no EGM coupling. Verify §7.2 unit tests on this kernel.
 7. **Update the retirement FOC kernel** (`solver.py:826-928`). Run the retirement portion of the lifecycle solver in isolation. Compare policies at constrained baseline to step 3's hand-coded CVC.
 8. **Update the working-age FOC kernel** (`solver.py:935-1152`). Run the full lifecycle solve. Verify §7.4 (hypothesis-relevant tests).
@@ -554,9 +562,9 @@ When you open the PR, the description must include:
 ## Appendix A — Formula reference card
 
 ```
-σ²_xr  = pc.Sigma_r_cond[1, 1]
-σ²_xb  = pc.Sigma_r_cond[2, 2]
-σ_xrxb = pc.Sigma_r_cond[1, 2]
+σ²_xr  = pc.sigma2_xr   = model.Sigma_rr[1, 1]   # full innovation cov, CCV w8566 eq. 5
+σ²_xb  = pc.sigma2_xb   = model.Sigma_rr[2, 2]
+σ_xrxb = pc.sigma_xrxb  = model.Sigma_rr[1, 2]
 
 # At quadrature node (k_v, k_r), state-conditional means already computed:
 log_R_bill = mu_r_bill   + ret_nodes[k_r, 0]

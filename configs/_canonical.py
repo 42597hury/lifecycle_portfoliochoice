@@ -50,37 +50,45 @@ BASE_CONFIG = {
 # ── Discretization ──────────────────────────────────────────────────────────
 # state_n_stds: u-space half-width per axis in cholesky mode.
 #   Per-axis coverage = 2*Phi(n_d) - 1; joint = product.
-#   Current value (2.0, 2.25, 2.25) -> per-axis (95.5%, 97.6%, 97.6%),
-#   joint ~91%. Earlier value (0.6, 1.75, 2.0) gave joint ~40% and
-#   produced unusable simulator moments — do not regress to it.
-#   Production-grade 99% per-axis would need (~2.93, ~2.93, ~2.93).
-# wealth_min: explicit so it can never silently inherit a stale model.py
-#   default. Raised to 0.05 on 2026-05-03 to skip the EGM constrained
-#   region (see docs/STATE_SPACE.md §wealth_min and
-#   docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md). precompute.py reads this directly.
+#   Canonical (2.93, 2.93, 2.93) -> per-axis 99.66%, joint ~99% coverage of
+#   the stationary state distribution. Adopted 2026-05-05 with the move to
+#   ccv_log wealth dynamics (which removes the bankruptcy-boundary kink that
+#   made narrow grids necessary under simple_clamp).
+#   Earlier (0.6, 1.75, 2.0) gave joint ~40% and produced unusable simulator
+#   moments — do not regress to it.
+# state_grid_sizes: 9x9x9. With n_stds=2.93 this gives u-space cell spacing
+#   2*2.93/(9-1) = 0.733 sigma, matching the body resolution of earlier 7x7x7
+#   narrow-envelope configs (which had spacing 0.75 sigma). 9x9x9 at 99%
+#   coverage strictly Pareto-improves on 7x7x7 at 91% coverage under CCV.
+#   See ccv_wide9_gh_k4 outcome in LOBATTO_CONFIG_TRACKER.md for the pivot.
+# Lobatto OFF on all axes: under wealth_dynamics_spec="ccv_log" there is no
+#   bankruptcy boundary, so the integrand is smooth jointly in (state, return)
+#   and pure Gauss-Hermite is optimal (polynomial-exactness 2K-1 vs Lobatto's
+#   2K-3). See LOBATTO_CONFIG_TRACKER.md §3.7 / §11 for the empirical case.
+# n_state_quad_nodes=(3, 4, 4): K=4 GH on the bond-loaded axes 1 and 2
+#   (polynomial-exactness 7) was empirically nearly identical to K=5 (degree
+#   9) under CCV, at 36% lower compute cost. K=3 on axis 0 (cy) is sufficient
+#   because M[xb,0]=-0.005 is negligible.
+# wealth_min: 0.05. precompute.py reads this directly. Below min(pension)~0.0015
+#   for very-low-z agents (~0.5% of stationary mass) — those agents land in
+#   wealth-grid extrapolation territory; same constraint under simple_clamp
+#   and ccv_log (see CCV_RETURNS.md).
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
-    wealth_min=0.13,
+    wealth_min=0.05,
     wealth_max=750.0,
     n_savings=180,
-    state_grid_sizes=(7, 7, 7),
+    state_grid_sizes=(9, 9, 9),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.25),
+    state_n_stds=(2.93, 2.93, 2.93),
     n_z=11,
     n_stds=3.0,
     n_eps_nodes=4,
     n_eta_nodes=4,
-    # Lobatto on stock/bond return-residual axes (ret[1], ret[2]) and on the
-    # spr/y_1 state-innovation axes (state[1], state[2]). These are the four
-    # axes where the empirical bond-tail discrete-free-lunch lives. See
-    # diagnostics_reports/diagnostics_quadrature_arbitrage_nz11_v3.md and
-    # scripts/diagnostics/_diag_per_axis_tail.py for the per-axis evidence.
-    # Z=7 (sigma units of the standardised orthogonalised axis) puts the
-    # explicit tail node at +/-7 sigma => +/-17% R_bond surprise on ret[2].
     n_ret_nodes_1d=(3, 5, 5),
-    ret_lobatto_Z=(None, 7.0, 7.0),
-    n_state_quad_nodes=(3, 5, 5),
-    state_lobatto_Z=(None, 7.0, 7.0),
+    ret_lobatto_Z=None,
+    n_state_quad_nodes=(3, 4, 4),
+    state_lobatto_Z=None,
 )
 
 
@@ -92,7 +100,19 @@ CANONICAL_DISC = DiscretizationConfig(
 #   Box projection (alpha_s, alpha_b) in [alpha_min, alpha_max]^2 inside the
 #   unconstrained Newton. Canonical ±6 is a real cap (prior production hit
 #   max simulated |alpha| ~9.25 at gamma=5, 7x7x7 wide-support). Cap-bound
-#   cells surface as EC_NEWTON_FAIL in diagnostics['total_newton_failures'].
+#   cells surface as EC_NEWTON_FAIL in diagnostics['total_newton_failures'];
+#   under CCV most "Newton failures" are these cap-bound cells where the
+#   warm-restart fallback finds the correct KKT-bound policy.
+# wealth_dynamics_spec="ccv_log": use Campbell-Viceira (NBER w8566 eq.10)
+#   continuous-rebalancing log-portfolio approximation with Jensen + Itō
+#   corrections. R_p = exp(r_p^CCV) > 0 strictly, so no bankruptcy boundary
+#   and no integrand discontinuity. Solver and simulator both use this same
+#   spec internally — the docstring at lifecycle/model.py:188-194 enforces
+#   the constraint (otherwise sR_p disagrees and EE diagnostics break).
+#   Adopted 2026-05-05 as canonical wealth dynamics; see
+#   LOBATTO_CONFIG_TRACKER.md §11 for the empirical case (worst_foc_resid
+#   30x better than simple_clamp; max log10|EE| 6x better at v4_lobatto-
+#   equivalent disc settings).
 CANONICAL_SOLVER = SolverConfig(
     tol=1e-7,
     max_iter=20,
@@ -105,6 +125,7 @@ CANONICAL_SOLVER = SolverConfig(
     alpha_min=-6.0,
     alpha_max=6.0,
     delta_bequest=0.001,
+    wealth_dynamics_spec="ccv_log",
 )
 
 

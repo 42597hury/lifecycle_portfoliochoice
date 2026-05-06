@@ -2,7 +2,7 @@
 
 Consolidated record of every Lobatto/quadrature config run during the bond-bankruptcy investigation, what we measured, and what we learned. **Read this before proposing a new config.** Mistakes-corrected section names hypotheses already empirically refuted so we don't re-debate them.
 
-Last updated: 2026-05-05 (added v12/v12c, ccv_retire row, §3.6 factorized moment recovery, §3.7 CCV-regime findings, §6 pre-flight arbitrage rule, §11 CCV regime).
+Last updated: 2026-05-05 (canonical promoted to ccv_wide9_gh_k4; added ccv_wide_gh + ccv_wide9_gh_k4 rows, §3.9 trilinear-spacing finding, §3.10 Newton-failure mechanism, §6 canonical updated).
 
 ---
 
@@ -21,8 +21,12 @@ All bundles solve retirement-only (ages 67–99) unless noted. All use `state_gr
 | **v12_state_z4_z6p5** | **(2.93, 2.93, 2.93)** | **(3,5,5)** | **(None, 7, 7)** | **(3,5,5)** | **(None, 4.0, 6.5)** | **5,625** |
 | v12c_state_z4_z5 | (2.93, 2.93, 2.93) | (3,5,5) | (None, 7, 7) | (3,5,5) | (None, 4.0, 5.0) | 5,625 |
 | **ccv_retire** ‡ | **(2.0, 2.25, 2.25)** | **(3,5,5)** | **(None, 7, 7)** | **(3,5,5)** | **(None, 7, 7)** | **5,625** |
+| ccv_wide_gh ‡ | (2.93, 2.93, 2.93) | (3,5,5) | None | (3,5,5) | None | 5,625 |
+| **ccv_wide9_gh_k4 ‡** ★ | **(2.93, 2.93, 2.93)** | **(3,5,5)** | **None** | **(3,4,4)** | **None** | **3,600** |
 
-‡ Same disc-config as v4_lobatto, but solved with `wealth_dynamics_spec="ccv_log"` (Campbell-Viceira log-portfolio approximation, no bankruptcy clamp). See §11.
+‡ Solved with `wealth_dynamics_spec="ccv_log"` (Campbell-Viceira log-portfolio approximation; no bankruptcy clamp). See §11.
+
+★ **Current CCV canonical** (promoted 2026-05-05). Note: 9×9×9 state grid (vs 7×7×7 elsewhere); only config with that grid size. State cells per bundle: 9³=729 vs 7³=343.
 
 ## 2. Outcomes
 
@@ -39,8 +43,12 @@ Sim-path retirement EE under `--eval-mode next_finer` with `--n-simulations 5000
 | **v12_state_z4_z6p5** | **−2.27** | — | **−0.035** | **0.08%** ✓ | **−0.077** | **4.4e+48** ⚠ | 1.41M | 2.83 |
 | v12c_state_z4_z5 | −2.21 | — | −0.040 | 0.69% | +0.21 | 0.22 | 1.10M | 4.25 |
 | **ccv_retire** | −2.22 | — | **−0.40 (40% rel)** | unknown ‡ | n/a ‡ | **0.020** ✓✓ | 653k | 0.90 |
+| ccv_wide_gh | −1.95 | — | −0.72 (19% rel) | 0% ✓ | −0.69 | 0.020 ✓✓ | 3.5M | 1.44 |
+| **ccv_wide9_gh_k4** ★ | **−2.18** | — | **−0.71 (19% rel)** | **0%** ✓ | **−0.69** | **0.021** ✓✓ | 7.4M | 1.41 |
 
 ‡ Diagnostic API mismatch on AWS at the time; gridpoint-EE and invalid-cells reports failed to generate. Solver-internal numbers are clean.
+
+★ **Current CCV canonical.** Trilinear-spacing hypothesis confirmed (§3.9): bumping state grid from 7³ to 9³ at the wider envelope recovers body-EE to near ccv_retire's level (mean −2.18 vs −2.22) while keeping the wider grid's tail benefit (max −0.71 vs −0.72).
 
 **Best-on-bulk-metrics: v4_lobatto.** Mean log10|EE| = −2.57 with 0% invalidity. Has a residual long-bond cluster at i₂=6 corners (167 cells with |EE| > 3%) but no catastrophic failures.
 
@@ -190,6 +198,37 @@ is exact only in continuous time. Discrete-time approximation error scales as `�
 
 **Implication for state envelope.** §3.4's "wider grid is intrinsically harder" finding was driven by simple_clamp's bankruptcy at wide corners. **Under CCV, wider grids should be safe.** The wider envelope just gives more accurate integration of the stationary distribution mass. Empirical confirmation pending (no wide-grid CCV bundle solved yet).
 
+### 3.9 Trilinear-cell-spacing dominates body-EE under CCV (confirmed 2026-05-05)
+
+**Hypothesis:** ccv_wide_gh's body-EE degradation vs ccv_retire (mean −1.95 vs −2.22 at fixed Lobatto/CCV settings) is driven by trilinear-interpolation cell width in physical state space, not by Lobatto-vs-GH choice or coverage envelope per se.
+
+**Test:** ccv_wide9_gh_k4 keeps the wider envelope (n_stds=2.93, 99% coverage) but bumps state grid from 7³ to 9³, tightening u-space spacing from 0.978σ → 0.733σ (matching ccv_retire's 0.750σ).
+
+**Result:** sim mean log10|EE| recovered from −1.95 to −2.18, while max log10|EE| stayed at −0.71 (matching ccv_wide_gh's tail). gridpoint mean improved from −2.57 → −2.88. **Body-EE was almost entirely a function of trilinear-cell spacing, NOT envelope width or quad K.**
+
+**Quantification:** trilinear interpolation error scales as `O(cell_width²)` for a smooth policy. ccv_wide_gh had `(0.978/0.750)² = 1.70×` ccv_retire's body penalty; ccv_wide9_gh_k4 has `(0.733/0.750)² = 0.96×` (nearly identical). The empirical mean shifted by 0.27 log units (ccv_retire→ccv_wide_gh) and back by 0.23 log units (ccv_wide_gh→ccv_wide9_gh_k4) — directionally consistent with the spacing-squared scaling.
+
+**Implication.** Coverage and body resolution are independent design knobs:
+- **Coverage** is set by `state_n_stds`. Fewer than 99% means clipping stationary mass at the boundary.
+- **Body resolution** is set by `state_grid_sizes` (number of grid points per axis), NOT by `state_n_stds`. Wider envelope at fixed grid size = wider trilinear cells = noisier body interpolation.
+
+To get both 99% coverage and tight body resolution, you need a 9×9×9 grid at `n_stds=2.93`. That's what `ccv_wide9_gh_k4` does and why it's the new canonical (§6).
+
+### 3.10 "Newton failures" under CCV are mostly cap-bound cells, not bundle pathology
+
+**Mechanism.** The unconstrained-Newton FOC kernel ([solver.py:1670-1696](lifecycle/solver.py#L1670-L1696)) computes a Newton step, clips to `[alpha_min, alpha_max]^2 = [-6, +6]^2` (box clipping, not simplex projection), then line-searches for a residual decrease. When the **unconstrained optimal α is outside the box**, the clipped trial sits at the cap with non-zero gradient (KKT-bound), line search can't find an interior decrease, and Newton declares `EC_NEWTON_FAIL`. The warm-restart fallback then handles these cells correctly.
+
+**Empirical signature:**
+- ccv_retire: 653k Newton failures, `worst_foc_resid = 0.020`
+- ccv_wide_gh: 3.5M failures, `worst_foc_resid = 0.020`
+- ccv_wide9_gh_k4: 7.4M failures, `worst_foc_resid = 0.021`
+
+Failures scale with corner cell count (more cap-bound cells → more Newton failures), but `worst_foc_resid` stays clean across all three. This means warm-restart IS finding the right policies at cap cells.
+
+**Implication for interpretation.** The trace's "Newt%" column under CCV is misleading — it's measuring "% of cells where unconstrained Newton found an interior root", which excludes legitimately-cap-bound cells. **Under CCV the meaningful health metric is `worst_foc_resid` in metadata, not the trace's Newton%.** A Newton% of 80–85% with `worst_foc_resid < 0.05` is a healthy bundle; the warm-restart is just doing more work than the unconstrained Newton.
+
+This contrasts with simple_clamp where high Newton failure rate often DID indicate boundary cells where warm-restart returned poor policies (v4_lobatto had 183k failures with `worst_foc_resid = 0.67`). Under CCV the failure mode is benign.
+
 ---
 
 ## 4. Mistakes / debunked hypotheses
@@ -284,24 +323,26 @@ Cost: 2.6× state grid points → roughly 2.6× solve time.
 
 ## 6. Standing recommendations
 
-### Default canonical (under simple_clamp wealth dynamics)
-
-Keep v4_lobatto (n_stds=(2.0, 2.25, 2.25), K=(3,5,5), Z=(None, 7, 7) on both ret and state). Best on bulk metrics. Has a residual long-bond corner cluster (167 cells, 1% of sim cells with |EE| > 3%) but no other simple_clamp config has cleaned that without trading off something larger.
-
-### Default canonical (under CCV wealth dynamics — `wealth_dynamics_spec="ccv_log"`)
-
-Drop Lobatto entirely. See §3.7 and §11.
+### Default canonical (production) — `ccv_wide9_gh_k4` as of 2026-05-05
 
 ```python
-state_n_stds       = (2.93, 2.93, 2.93)   # 99% joint state coverage; safe under CCV
-n_state_quad_nodes = (3, 5, 5)
-state_lobatto_Z    = None
-n_ret_nodes_1d     = (3, 5, 5)
-ret_lobatto_Z      = None
-wealth_dynamics_spec = "ccv_log"
+state_grid_sizes     = (9, 9, 9)              # 729 state cells; tighter trilinear cells
+state_n_stds         = (2.93, 2.93, 2.93)     # 99% joint state coverage
+n_state_quad_nodes   = (3, 4, 4)              # GH on all axes (degree-7 exact on bond-loaded axes)
+state_lobatto_Z      = None
+n_ret_nodes_1d       = (3, 5, 5)              # GH on all axes (degree-9 on stock/bond residuals)
+ret_lobatto_Z        = None
+wealth_dynamics_spec = "ccv_log"              # smooth dynamics, no bankruptcy boundary
+wealth_min           = 0.05
 ```
 
-Pre-flight T-Q1 arbitrage check confirmed clean (max gap = 0 across all 343 corners).
+Pre-flight T-Q1 arbitrage clean. `worst_foc_resid = 0.021`, mean sim log10|EE| = −2.18, max = −0.71. Best Pareto-frontier point we've found: matches ccv_retire on body, matches ccv_wide_gh on tail, exceeds both on coverage (99% vs 91%). See §11 and §3.9.
+
+This is set as `CANONICAL_DISC` and `CANONICAL_SOLVER` in `configs/_canonical.py`.
+
+### Legacy canonical (under `wealth_dynamics_spec="simple_clamp"`)
+
+If you need to roll back to simple_clamp dynamics for a specific experiment, use **v4_lobatto's config**: `n_stds=(2.0, 2.25, 2.25)`, K=(3,5,5), Z=(None, 7, 7) on both ret and state. Best simple_clamp config on mean (−2.57). Note this had a long-bond corner cluster (167 cells, 1% of sim cells with |EE| > 3%) — the bankruptcy-clamp kink is the underlying cause and is structurally fixed by switching to ccv_log.
 
 ### Operating rules
 

@@ -227,14 +227,18 @@ class Precompute:
 
         # No r_bill_grid — bill rate is now uncertain (part of return quadrature).
 
-        # --- Conditional-covariance scalars for the CCV log wealth-dynamics ---
-        # Σ_xx is the conditional 2×2 covariance of (xr, xb) — bottom-right block of
-        # Sigma_r_cond. CCV r_p^CVC formula uses these constants in Jensen and Itô
-        # corrections; precomputing avoids indexing into the model's array inside
-        # the njit hot loop. Used only when SolverConfig.wealth_dynamics_spec="ccv_log".
-        self.sigma2_xr  = float(model.Sigma_r_cond[1, 1])
-        self.sigma2_xb  = float(model.Sigma_r_cond[2, 2])
-        self.sigma_xrxb = float(model.Sigma_r_cond[1, 2])
+        # --- Innovation-covariance scalars for the CCV log wealth-dynamics ---
+        # Σ_xx in CCV w8566 eq. (10) is the (xr,xb) block of the FULL innovation
+        # covariance Sigma_v (eq. 5), i.e. the unconditional one — NOT the
+        # state-orthogonalized Sigma_r_cond. Eq. (10) approximates the realized
+        # log portfolio return per draw, with sigma^2 entering as a constant
+        # offset in the per-realization Itô correction; the expectation is over
+        # the full innovation v_{t+1}, so the constants must use Sigma_rr.
+        # Numerical match: CCV Table 2 reports sigma_xr ~~ 15.5%/yr — matches
+        # Sigma_rr (15.9%) within 3%, off Sigma_r_cond (3.1%) by ~5x.
+        self.sigma2_xr  = float(model.Sigma_rr[1, 1])
+        self.sigma2_xb  = float(model.Sigma_rr[2, 2])
+        self.sigma_xrxb = float(model.Sigma_rr[1, 2])
 
         # --- Bequest annuity factors (one per financial state) ---
         # A(y_1, spr, b_bar): PV of b_bar annual payments discounted at a

@@ -307,10 +307,20 @@ def main():
         print(f"  shape (age, z, state, wealth): {S_mat.shape}")
         print(f"  wealth_dynamics_spec: {meta.get('wealth_dynamics_spec', '?')}")
         # Drop ages where the policy is undefined (shape may already be tight)
-        a_s = S_mat.ravel()
-        a_b = B_mat.ravel()
+        a_s_full = S_mat.ravel()
+        a_b_full = B_mat.ravel()
+        mask = np.isfinite(a_s_full) & np.isfinite(a_b_full)
+        a_s = a_s_full[mask]
+        a_b = a_b_full[mask]
+        print(f"  finite policy cells: {mask.sum():,} / {mask.size:,} "
+              f"({100*mask.mean():.1f}%)")
         mag = np.sqrt(a_s ** 2 + a_b ** 2)
         l1 = np.abs(a_s) + np.abs(a_b)
+        # Per-age fraction of solved ages (likely retire-only bundle)
+        per_age_finite = np.isfinite(S_mat).reshape(S_mat.shape[0], -1).any(axis=1)
+        ages_solved = np.where(per_age_finite)[0]
+        if ages_solved.size:
+            print(f"  ages with any finite policy: {ages_solved.min()}..{ages_solved.max()}")
         for q in (50, 90, 95, 99, 99.9, 100):
             print(f"  pct {q:5.1f}: |a_s|={np.percentile(np.abs(a_s), q):6.2f}, "
                   f"|a_b|={np.percentile(np.abs(a_b), q):6.2f}, "

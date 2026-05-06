@@ -164,6 +164,12 @@ def save_policy_bundle(
         "dtype_B": str(B_mat.dtype),
         "compressed": bool(compress),
         "wealth_dynamics_spec": str(spec),
+        # Records which Sigma feeds the CCV eq. (10) constants in
+        # precompute.py:235-237. "sigma_rr" = full innovation cov (CCV's
+        # prescription, in force from 2026-05-06). "sigma_r_cond" = the legacy
+        # (incorrect) state-orthogonalized variant used by bundles pre-patch.
+        # Absence at load time is treated as legacy and will warn.
+        "ccv_sigma_choice": "sigma_rr",
     }
     if diagnostics is not None:
         metadata["diagnostics_summary"] = _to_jsonable(diagnostics)
@@ -243,6 +249,33 @@ def load_policy_bundle(
             )
     except Exception:
         # Guard is advisory; never block a load on an inspection failure.
+        pass
+
+    # ccv_sigma_choice guard: warn when a CCV bundle was solved with the
+    # legacy Sigma_r_cond reading (pre-2026-05-06). The kernel constants now
+    # come from Sigma_rr, so old CCV bundles' policies and any post-load
+    # diagnostics they feed will be inconsistent with current code.
+    try:
+        if metadata.get("wealth_dynamics_spec") == "ccv_log":
+            choice = metadata.get("ccv_sigma_choice")
+            if choice is None:
+                warnings.warn(
+                    f"Bundle '{bundle.name}' is a CCV bundle with no "
+                    "'ccv_sigma_choice' tag, so it predates the 2026-05-06 "
+                    "fix that switched precompute.py to Sigma_rr. Its policies "
+                    "were solved under Sigma_r_cond (smaller sigma^2_x, "
+                    "weaker Itô drag) and will not match a freshly-solved "
+                    "policy at the same calibration. Re-solve to migrate.",
+                    stacklevel=2,
+                )
+            elif choice != "sigma_rr":
+                warnings.warn(
+                    f"Bundle '{bundle.name}' has ccv_sigma_choice="
+                    f"{choice!r}, but the current code uses 'sigma_rr'. "
+                    "Policies and diagnostics will be inconsistent. Re-solve.",
+                    stacklevel=2,
+                )
+    except Exception:
         pass
 
     return C_mat, S_mat, B_mat, diagnostics, metadata

@@ -59,8 +59,8 @@ where
 |---|---|
 | `r_bill` | realised log nominal bill return (`= log(1+y₁)`) |
 | `xr`, `xb` | realised log excess returns over `r_bill` |
-| `σ²_xr`, `σ²_xb` | conditional variance of `xr`, `xb` after projecting out the state innovations |
-| `σ_xrxb` | conditional covariance of `xr` and `xb` |
+| `σ²_xr`, `σ²_xb` | unconditional innovation variance of `xr`, `xb` — `(xr,xb)` block of `Sigma_v` (CCV w8566 eq. 5) |
+| `σ_xrxb` | unconditional innovation covariance of `xr` and `xb` |
 
 The Jensen lift `+(½)α·σ²_x` arises from `E[exp(X)] = exp(E[X] + ½Var[X])`
 applied to each individual asset. The vol-drag `−(½)α'Σ_xx α` is the Itô
@@ -198,18 +198,29 @@ branch test costs nothing.
 | File | Purpose |
 |---|---|
 | [lifecycle/model.py:195](../lifecycle/model.py#L195) | `SolverConfig.wealth_dynamics_spec: str = "ccv_log"` (the user-facing knob) |
-| [lifecycle/precompute.py:230-237](../lifecycle/precompute.py#L230-L237) | `Precompute.sigma2_xr`, `sigma2_xb`, `sigma_xrxb` populated from `model.Sigma_r_cond[1:,1:]` |
+| [lifecycle/precompute.py:230-237](../lifecycle/precompute.py#L230-L237) | `Precompute.sigma2_xr`, `sigma2_xb`, `sigma_xrxb` populated from `model.Sigma_rr[1:,1:]` (full innovation cov, CCV w8566 eq. 5) |
 | [lifecycle/solver.py:2105](../lifecycle/solver.py#L2105) | `use_ccv = (solver_config.wealth_dynamics_spec == "ccv_log")` |
 | [lifecycle/solver.py:3849](../lifecycle/solver.py#L3849) | `run_lifecycle_solver` unpacks the same flag for the inner driver loop |
 | [lifecycle/policy_io.py:145-167](../lifecycle/policy_io.py#L145-L167) | `save_policy_bundle` writes `metadata["wealth_dynamics_spec"]` so downstream consumers can detect CCV bundles without re-loading the config |
 | [lifecycle/inf_horizon_solver.py:558](../lifecycle/inf_horizon_solver.py#L558) | Stability proxy `β·E[R_p^{1−γ}]` branches on the same flag |
 
-`Sigma_r_cond` is the *conditional* covariance of `(rtb, xr, xb)` after
-projecting out state innovations — `Sigma_rr − M·Sigma_sr` in `var.py`.
-The CCV formula uses the conditional one, *not* the unconditional
-`Sigma_rr`. The two differ by ~30–50% in the production VAR because state
-predictability explains a meaningful share of return variance; using the
-unconditional matrix would mis-state the Itô vol-drag by the same factor.
+`Sigma_rr` is the *unconditional* (full) innovation covariance of
+`(rtb, xr, xb)` — the (r,r) block of `Sigma_v` in CCV w8566 eq. (5). This
+is the matrix CCV's eq. (10) prescribes for the Itô / Jensen constants:
+the formula approximates the realized log portfolio return per draw, with
+the expectation taken over the entire innovation `v_{t+1}`, *not* over the
+state-orthogonalized residual `eps_r = v_r - M v_s`. Numerical sanity
+check: CCV Table 2 reports `sigma_xr ≈ 15.5%/yr`, which matches `Sigma_rr`
+(15.9%) within 3% and is ~5× the conditional `Sigma_r_cond` (3.1%).
+
+**Historical note**: a previous version of this file (and of
+`precompute.py:235-237`) populated these constants from `Sigma_r_cond`. That
+was a misreading of CCV — the partial-out into `(v_s, eps_r)` is an
+internal step in the *quadrature* (the nested integration uses
+`Sigma_r_cond` as the Cholesky factor for `eps_r` conditional on `v_s`),
+not a redefinition of the eq. (10) constants. Bundles saved before this fix
+carry the old (smaller) sigma; the bundle metadata now records
+`ccv_sigma_choice` to distinguish them.
 
 ### 2.2 The five FOC kernels
 
@@ -274,8 +285,9 @@ read the flag from metadata explicitly
 `_diag_euler_errors.py` is the canonical Euler-residual reporter. It has
 its own copy of the CCV `R_p` formula in `_compute_euler_sum_*_continuous`
 (lines 725–800 retirement, 870–945 working-age) — the diagnostic does not
-call into the solver kernel; it re-derives `R_p` from `Sigma_r_cond` and
-the state-conditional means. This means there are two implementations of
+call into the solver kernel; it re-derives `R_p` from the
+precomputed `(sigma2_xr, sigma2_xb, sigma_xrxb)` constants (now sourced
+from `Sigma_rr`) and the state-conditional means. This means there are two implementations of
 the same formula in the repository (solver + diagnostic), and they must
 stay in sync. [tests/test_cvc_diagnostic_consistency.py:35-86](../tests/test_cvc_diagnostic_consistency.py#L35-L86)
 checks them at five representative `(α, shock)` points to a tolerance of
@@ -456,9 +468,9 @@ These remain on the road map regardless of the default flip.
 ## Appendix A — formula reference card
 
 ```
-σ²_xr  = pc.sigma2_xr   = Sigma_r_cond[1, 1]
-σ²_xb  = pc.sigma2_xb   = Sigma_r_cond[2, 2]
-σ_xrxb = pc.sigma_xrxb  = Sigma_r_cond[1, 2]
+σ²_xr  = pc.sigma2_xr   = Sigma_rr[1, 1]   # full innovation cov, CCV w8566 eq. 5
+σ²_xb  = pc.sigma2_xb   = Sigma_rr[2, 2]
+σ_xrxb = pc.sigma_xrxb  = Sigma_rr[1, 2]
 
 # At quadrature node (k_v, k_r):
 log_R_bill = mu_r_bill   + ret_nodes[k_r, 0]

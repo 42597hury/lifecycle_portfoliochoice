@@ -30,13 +30,32 @@ import multiprocessing as _mp
 
 def _configure_xla_devices():
     """Expose ``len(jax.devices()) == cpu_count`` so the JAX solver can pmap
-    across virtual devices on a single CPU. XLA's CPU backend is single-threaded
-    per device, so creating one virtual device per core is the standard pattern
-    for parallelising a pure-JAX workload on CPU.
+    across virtual devices on a CPU-only host. XLA's CPU backend is
+    single-threaded per device, so creating one virtual device per core is
+    the standard pattern for parallelising a pure-JAX workload on CPU.
 
-    Skipped if ``XLA_FLAGS`` is already set so user-supplied flags win.
+    On GPU/TPU hosts this flag must NOT be set: ``--xla_force_host_platform_device_count``
+    forces XLA's host platform and HIDES the accelerator. Skipped when:
+
+    - ``XLA_FLAGS`` is already set (user customisation wins);
+    - ``JAX_PLATFORMS`` is set to anything that doesn't include ``cpu``
+      (e.g. ``cuda``, ``cuda,cpu`` — explicit GPU intent);
+    - ``LIFECYCLE_DISABLE_VIRTUAL_CPUS=1`` is set (explicit opt-out for
+      GPU/TPU runs on a host where JAX_PLATFORMS isn't otherwise customised).
+
+    On AWS p4d/p5 instances the standard recipe is::
+
+        export LIFECYCLE_DISABLE_VIRTUAL_CPUS=1
+        python verify_smoke.py    # JAX picks up the GPU automatically
     """
     if "XLA_FLAGS" in _os.environ:
+        return
+    platforms = _os.environ.get("JAX_PLATFORMS", "").lower()
+    # If JAX_PLATFORMS is set and doesn't include CPU, the user wants
+    # accelerator-only — don't fight that.
+    if platforms and "cpu" not in [p.strip() for p in platforms.split(",")]:
+        return
+    if _os.environ.get("LIFECYCLE_DISABLE_VIRTUAL_CPUS", "").lower() in ("1", "true", "yes"):
         return
     try:
         n = _mp.cpu_count()

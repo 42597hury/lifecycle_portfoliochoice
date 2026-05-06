@@ -192,6 +192,41 @@ class SolverConfig(NamedTuple):
     # scalar (init_alpha_s, init_alpha_b). Terminal age is always cold.
     use_backward_age_warm_start: bool = True
 
+    # --- Cell-axis vmap chunking (single-GPU memory bounding) ---
+    # Splits the per-age vmap over (n_z * N_state) cells into this many
+    # sequential chunks. Each chunk has fixed shape (chunk_size, ...) so XLA
+    # traces the inner vmap once and reuses for all chunks. Per-chunk peak
+    # HBM = (worst-case full materialisation / K), giving a deterministic
+    # memory bound independent of XLA's compilation choices.
+    #
+    # When 1: no chunking (default; matches today's behaviour, fastest dispatch).
+    # When > 1: K sequential vmap calls per age. Adds ~K kernel-launch
+    # dispatches per age but bounds memory.
+    #
+    # Heuristic for picking K on a single GPU:
+    #   per_cell_memory_MB = n_state_quad * n_z * 2**n_state * n_w * 8 / 1e6
+    #   total_worst_case   = per_cell_memory_MB * (n_z * N_state)
+    #   K_min              = ceil(total_worst_case / target_HBM_budget_MB)
+    # On GH200 (97 GB HBM, ~30 GB headroom for other state):
+    #   target_HBM_budget = 60 GB → K = ceil(total_worst_case / 60_000)
+    #
+    # Only the vmap-only (single-device) path honours this knob; the pmap
+    # multi-device path keeps its existing per-device padding.
+    cell_vmap_chunks: int = 1
+
+    # --- Mixed precision toggle ---
+    # When "f64" (default): all solver arithmetic in fp64. Bit-identical to the
+    # pre-toggle baseline.
+    # When "f32": the c_corners gather + multilinear/bilinear interpolation
+    # (in both _interp_c_and_mpc_at_cell and the inline per_kv_kr inside
+    # retirement_foc_jac_ccv) runs in fp32; results cast back to fp64 BEFORE
+    # any CRRA / FOC / Newton arithmetic. Captures memory-bandwidth savings
+    # without precision loss in convergence-critical paths.
+    # WARNING: f32 path produces alphas that differ from f64 by ~1e-5 relative
+    # (real arithmetic noise, not just bit-shuffle). Bit-identity test does
+    # not apply; agreement test at 1e-4 relative does.
+    gather_precision: str = "f64"
+
 
 # =============================================================================
 # SOLVE CONTROL

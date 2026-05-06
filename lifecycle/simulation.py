@@ -19,16 +19,14 @@ Wealth-extrapolation policy:
     rate (c/x) is preserved at the upper edge — matches CRRA homotheticity.
 
 Wealth-dynamics in the simulated economy:
-    Arithmetic ``R_p = a_s*R_stock + a_b*R_bond + a_bill*R_bill`` —
-    INTENTIONALLY divergent from the solver's CCV log spec. The CCV form is
-    a value-function approximation; the simulator uses the truth. See the
-    handoff-3 spec for the rationale (don't "harmonise" them).
+    CCV log-portfolio return — matches the solver's CCV w8566 eq. (10)
+    implementation in solver._ccv_log_return_and_grad. Solver and
+    simulator MUST compute R_p identically at every realisation,
+    otherwise every Euler-residual and policy-evaluation diagnostic
+    is biased by the Jensen-minus-Itô wedge (see docs/CCV_RETURNS.md).
 
-Bankruptcy: NO clamp on ``estate_t``. With leverage uncapped, catastrophic
-portfolio realisations can drive ``x_{t+1} < 0``. The bracket-clamp on
-consumption (``c_t = 0`` when ``x_t <= 0``) keeps the household alive on
-negative wealth; ``_wealth_offgrid_diagnostics`` reports the share of
-households below ``wealth_min`` so this is visible without breaking the run.
+Bankruptcy: NO clamp on estate_t (under CCV, R_p = exp(r_p^CCV) > 0,
+    so s * R_p > 0 whenever s > 0; the clamp is unnecessary).
 """
 
 from __future__ import annotations
@@ -254,6 +252,7 @@ def _build_simulate_kernel(
     pe, mu_eps1, sigma_eps1, sigma_eps2, mu_eps2_eff,
     n_age, n_z, n_ret, n_state,
     rtb_idx, xr_pos, xb_pos,
+    sigma2_xr, sigma2_xb, sigma_xrxb,
     use_mc_returns,
 ):
     """Return a jit'd kernel that simulates one batch of households.
@@ -347,15 +346,22 @@ def _build_simulate_kernel(
             log_x_s = mu_r[xr_pos] + ret_nodes[ret_idx, xr_pos]
             log_x_b = mu_r[xb_pos] + ret_nodes[ret_idx, xb_pos]
 
-        R_bill = jnp.exp(log_R_bill)
-        R_stock = R_bill * jnp.exp(log_x_s)
-        R_bond = R_bill * jnp.exp(log_x_b)
-
-        a_bill_t = 1.0 - a_s_t - a_b_t
-        R_port = a_s_t * R_stock + a_b_t * R_bond + a_bill_t * R_bill
-        # No clamp on estate — the simulator reflects the truth, including
-        # rare catastrophic realisations under uncapped leverage. The
-        # offgrid diagnostic surfaces these post-hoc.
+        # CCV log portfolio return (Campbell-Viceira w8566 eq. 10).
+        # Must agree node-by-node with solver._ccv_log_return_and_grad —
+        # verified in verify_ccv_solver_sim_parity.py.
+        log_R_port = (
+            log_R_bill
+            + a_s_t * log_x_s + a_b_t * log_x_b
+            + 0.5 * (a_s_t * sigma2_xr + a_b_t * sigma2_xb)
+            - 0.5 * (
+                a_s_t * a_s_t * sigma2_xr
+                + 2.0 * a_s_t * a_b_t * sigma_xrxb
+                + a_b_t * a_b_t * sigma2_xb
+            )
+        )
+        R_port = jnp.exp(log_R_port)
+        # Under CCV: R_port = exp(r_p) > 0 by construction, so s * R_port > 0
+        # whenever s > 0. No clamp needed.
         estate_t = savings_t * R_port
 
         # ----- Survival (linear z-interp on the policy's iz_lo / frac_z) -----
@@ -445,7 +451,13 @@ def _validate_policy_shapes(C_mat, S_mat, B_mat, pc):
 
 
 def _wealth_offgrid_diagnostics(sim_x, sim_alive, wealth_grid):
-    """Per-age fraction of alive households whose cash-on-hand is outside the grid."""
+    """Per-age fraction of alive households whose cash-on-hand is outside the grid.
+
+    Under CCV log-wealth dynamics ``s * R_port > 0`` for all ``s > 0`` (since
+    ``R_port = exp(r_p) > 0`` by construction) and ``x_{t+1} = s * R_port + pi``
+    with ``pi >= 0``, so ``negative_frac`` is expected to be 0. A non-zero value
+    typically signals a stale policy from the pre-CCV-fix simulator era.
+    """
     wlo = float(wealth_grid[0])
     whi = float(wealth_grid[-1])
     n_age = sim_x.shape[1]
@@ -493,7 +505,7 @@ def simulate_lifecycle(
     seed=42,
     return_draw_mode="monte_carlo",
     wealth_offgrid_warn_threshold=0.05,
-    wealth_dynamics_spec="ccv_log",   # accepted for compat; simulator always uses arithmetic returns
+    wealth_dynamics_spec="ccv_log",
     verbose=True,
 ):
     """Simulate lifecycle paths using the JAX kernel.
@@ -513,8 +525,9 @@ def simulate_lifecycle(
     seed : int
     return_draw_mode : "monte_carlo" | "quadrature"
     wealth_offgrid_warn_threshold : float (0–1)
-    wealth_dynamics_spec : kept for signature compat — simulator uses
-        arithmetic ``R_p = a_s*R_stock + a_b*R_bond + a_bill*R_bill``.
+    wealth_dynamics_spec : "ccv_log" only. Simulator computes R_p with the
+        same CCV log-portfolio formula the solver uses (see solver.py
+        _ccv_log_return_and_grad). Anything else raises ValueError.
     verbose : bool
 
     Returns
@@ -523,6 +536,12 @@ def simulate_lifecycle(
     income, estate, estate_at_death, z, z_idx, state_idx, state_coords,
     alive, death_age, ages, wealth_offgrid.
     """
+    if wealth_dynamics_spec != "ccv_log":
+        raise ValueError(
+            f"wealth_dynamics_spec must be 'ccv_log' (got {wealth_dynamics_spec!r}); "
+            "the JAX simulator only supports CCV log-wealth dynamics, matching the "
+            "solver. The 'simple_clamp' branch was removed in the JAX rewrite."
+        )
     _validate_policy_shapes(C_mat, S_mat, B_mat, pc)
     if return_draw_mode not in ("monte_carlo", "quadrature"):
         raise ValueError(
@@ -698,6 +717,9 @@ def simulate_lifecycle(
         n_age=int(n_age), n_z=int(pc.n_z), n_ret=int(n_ret),
         n_state=n_state_int,
         rtb_idx=rtb_idx, xr_pos=xr_pos, xb_pos=xb_pos,
+        sigma2_xr=jnp.float64(pc.sigma2_xr),
+        sigma2_xb=jnp.float64(pc.sigma2_xb),
+        sigma_xrxb=jnp.float64(pc.sigma_xrxb),
         use_mc_returns=use_mc_returns,
     )
 

@@ -320,6 +320,34 @@ def _grid_strides(axis_sizes):
     return strides
 
 
+def _cast_for_gather(arr, gather_dtype):
+    """Cast ``arr`` to ``gather_dtype`` if not already that dtype.
+
+    No-op when ``gather_dtype is jnp.float64`` (the default). Used to
+    optionally lower the gather/interp boundary to fp32 — see
+    ``SolverConfig.gather_precision``.
+    """
+    return arr if arr.dtype == gather_dtype else arr.astype(gather_dtype)
+
+
+def _resolve_gather_dtype(sc):
+    """Map ``SolverConfig.gather_precision`` string to a JAX dtype.
+
+    Returns a Python dtype object (``jnp.float64``/``jnp.float32``) suitable
+    for embedding in the kernel ``static`` tuple — bakes into the JIT trace
+    cleanly without forcing per-call recompiles.
+    """
+    pref = getattr(sc, "gather_precision", "f64")
+    pref = str(pref).strip().lower()
+    if pref in ("f64", "float64", "fp64"):
+        return jnp.float64
+    if pref in ("f32", "float32", "fp32"):
+        return jnp.float32
+    raise ValueError(
+        f"SolverConfig.gather_precision must be 'f64' or 'f32', got {pref!r}"
+    )
+
+
 def bequest_mu_and_mup(W, A, gamma, b_bar, delta):
     """Shifted-bequest marginal utility and its W-derivative.
 
@@ -354,7 +382,9 @@ def newton_2d_with_line_search(
     """2D Newton on (alpha_s, alpha_b) with backtracking line search.
 
     ``foc_fn(a_s, a_b) -> (fs, fb, Jss, Jbb, Jsb, e)``. Returns
-    ``(a_s, a_b, e, exit_code, err_norm, n_iter)``.
+    ``(a_s, a_b, e, exit_code, err_norm, n_iter, n_backtrack_total)``,
+    where ``n_backtrack_total`` is the sum across all Newton iters of the
+    halvings the line search evaluated before finding an improving step.
 
     ``use_fori`` is a Python bool selected at JIT-trace time:
       - True  -> ``lax.fori_loop`` + mask (GPU-friendly, deterministic dispatch,
@@ -401,15 +431,16 @@ def _newton_while(
         fs0, fb0, Jss0, Jbb0, Jsb0,
         e0, err0,
         jnp.int32(0),
+        jnp.int32(0),                  # n_backtrack_total (summed across iters)
         err0 < tol * scale,
     )
 
     def cond_fn(state):
-        *_, k, done = state
+        *_, k, _n_bt_total, done = state
         return jnp.logical_and(jnp.logical_not(done), k < max_iter)
 
     def body_fn(state):
-        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, _ = state
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_total, _ = state
 
         det = Jss * Jbb - Jsb * Jsb
         is_singular = jnp.abs(det) < singular_det
@@ -479,7 +510,7 @@ def _newton_while(
             )
 
         bt_final = lax.while_loop(bt_cond, bt_body, bt_init)
-        (_k_bt, _alpha, new_a_s, new_a_b, new_fs, new_fb,
+        (k_bt, _alpha, new_a_s, new_a_b, new_fs, new_fb,
          new_Jss, new_Jbb, new_Jsb, new_e, new_err, found_any) = bt_final
 
         new_done = jnp.logical_or(
@@ -489,13 +520,13 @@ def _newton_while(
         return (
             new_a_s, new_a_b, new_fs, new_fb,
             new_Jss, new_Jbb, new_Jsb,
-            new_e, new_err, k + 1, new_done,
+            new_e, new_err, k + 1, n_bt_total + k_bt, new_done,
         )
 
     final = lax.while_loop(cond_fn, body_fn, init_state)
-    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, _done = final
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_total, _done = final
     exit_code = jnp.where(err < tol * scale, EC_INTERIOR, EC_NEWTON_FAIL)
-    return a_s, a_b, e, exit_code, err / scale, k
+    return a_s, a_b, e, exit_code, err / scale, k, n_bt_total
 
 
 def _backtracking_fori(
@@ -510,7 +541,9 @@ def _backtracking_fori(
     keep computing ``foc_fn`` but mask out the result.
 
     Returns the best-so-far state plus a ``found`` flag (False if no halving
-    improved on the current err).
+    improved on the current err) and ``n_used`` — the number of halvings
+    actually evaluated before finding an improvement (0 if the full step
+    succeeded; capped at ``max_backtrack_iter`` if none improved).
     """
     # Best-so-far init: full-step result if it improved, else current state.
     init = (
@@ -525,10 +558,11 @@ def _backtracking_fori(
         jnp.where(full_improves, e_f, e_old),
         jnp.where(full_improves, err_f, err_old),
         full_improves,                         # found
+        jnp.int32(0),                          # n_used (halvings evaluated before found)
     )
 
     def bt_body(_i, bt_state):
-        alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found = bt_state
+        alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found, n_used = bt_state
         new_alpha = alpha * 0.5
         a_s_t = a_s + new_alpha * step_s
         a_b_t = a_b + new_alpha * step_b
@@ -537,6 +571,7 @@ def _backtracking_fori(
         # Replicate while_loop semantics: only adopt the FIRST halving that
         # improves on err_old. Once found, hold state.
         improved_now = jnp.logical_and(jnp.logical_not(found), err_t < err_old)
+        is_active = jnp.logical_not(found)
         return (
             jnp.where(found, alpha, new_alpha),
             jnp.where(improved_now, a_s_t, a_s_b),
@@ -549,11 +584,12 @@ def _backtracking_fori(
             jnp.where(improved_now, e_t, e_b),
             jnp.where(improved_now, err_t, err_b),
             jnp.logical_or(found, improved_now),
+            n_used + jnp.where(is_active, jnp.int32(1), jnp.int32(0)),
         )
 
     final = lax.fori_loop(0, max_backtrack_iter, bt_body, init)
-    _alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found = final
-    return a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found
+    _alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found, n_used = final
+    return a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found, n_used
 
 
 def _newton_fori(
@@ -581,12 +617,13 @@ def _newton_fori(
         fs0, fb0, Jss0, Jbb0, Jsb0,
         e0, err0,
         jnp.int32(0),                  # n_iters_used (active iters only)
+        jnp.int32(0),                  # n_backtrack_total (sum across active iters)
         err0 < tol * scale,            # converged
         jnp.bool_(False),              # ls_failed
     )
 
     def fori_body(_i, state):
-        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, converged, ls_failed = state
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_total, converged, ls_failed = state
         is_active = jnp.logical_not(jnp.logical_or(converged, ls_failed))
 
         det = Jss * Jbb - Jsb * Jsb
@@ -615,14 +652,13 @@ def _newton_fori(
         err_f = jnp.sqrt(fs_f * fs_f + fb_f * fb_f)
         full_improves = err_f < err
 
-        new_a_s, new_a_b, new_fs, new_fb, new_Jss, new_Jbb, new_Jsb, new_e, new_err, found_any = (
-            _backtracking_fori(
-                a_s, a_b, step_s, step_b,
-                a_s_full, a_b_full,
-                fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f, err_f, full_improves,
-                fs, fb, Jss, Jbb, Jsb, e, err,
-                foc_fn, max_backtrack_iter,
-            )
+        (new_a_s, new_a_b, new_fs, new_fb, new_Jss, new_Jbb, new_Jsb,
+         new_e, new_err, found_any, n_bt_iter) = _backtracking_fori(
+            a_s, a_b, step_s, step_b,
+            a_s_full, a_b_full,
+            fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f, err_f, full_improves,
+            fs, fb, Jss, Jbb, Jsb, e, err,
+            foc_fn, max_backtrack_iter,
         )
 
         new_converged = new_err < tol * scale
@@ -640,14 +676,15 @@ def _newton_fori(
             jnp.where(is_active, new_e, e),
             jnp.where(is_active, new_err, err),
             n_used + jnp.where(is_active, jnp.int32(1), jnp.int32(0)),
+            n_bt_total + jnp.where(is_active, n_bt_iter, jnp.int32(0)),
             jnp.where(is_active, new_converged, converged),
             jnp.where(is_active, new_ls_failed, ls_failed),
         )
 
     final = lax.fori_loop(0, max_iter, fori_body, init_state)
-    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, converged, _ls_failed = final
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_total, converged, _ls_failed = final
     exit_code = jnp.where(converged, EC_INTERIOR, EC_NEWTON_FAIL)
-    return a_s, a_b, e, exit_code, err / scale, n_used
+    return a_s, a_b, e, exit_code, err / scale, n_used, n_bt_total
 
 
 # =============================================================================
@@ -789,7 +826,8 @@ def _build_step_state_brackets(state_grid_i, Phi_0_state, Phi_11, v_nodes,
 
 def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
                                iz_lo, frac_z, x_next_scalar, wealth_grid,
-                               min_consumption):
+                               min_consumption,
+                               gather_dtype=jnp.float64):
     """Multilinear-state × bilinear-z × linear-wealth interp of c_next and
     the marginal propensity to consume out of wealth (slope dc/dx).
 
@@ -797,23 +835,36 @@ def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
     cell, so the inner FOC reads from c_corners_kv with scalar (iz, iw)
     indices and a single full slice on the corner axis — this lowers to
     dynamic_slice instead of an advanced gather (verified via jaxpr).
+
+    When ``gather_dtype is jnp.float32`` (mixed-precision mode), the gather
+    + bracket + multilinear interp run in fp32; ``c`` and ``mpc`` cast back
+    to fp64 BEFORE the ``min_consumption`` floor and the ``[0,1]`` clip so
+    callers see fp64 outputs identical in dtype to the all-fp64 path.
     """
-    n_w = wealth_grid.shape[0]
-    iw = jnp.clip(jnp.searchsorted(wealth_grid, x_next_scalar, side="right") - 1, 0, n_w - 2)
+    # Cast bracket inputs to the gather precision. Indices iz_lo/iz_hi stay
+    # int (untouched by the cast). frac_z is a [0,1]-bounded weight.
+    c_corners_g = _cast_for_gather(c_corners_kv, gather_dtype)
+    w_corners_g = _cast_for_gather(w_corners_kv, gather_dtype)
+    x_next_g = _cast_for_gather(jnp.asarray(x_next_scalar), gather_dtype)
+    wealth_grid_g = _cast_for_gather(wealth_grid, gather_dtype)
+    frac_z_g = _cast_for_gather(jnp.asarray(frac_z), gather_dtype)
+
+    n_w = wealth_grid_g.shape[0]
+    iw = jnp.clip(jnp.searchsorted(wealth_grid_g, x_next_g, side="right") - 1, 0, n_w - 2)
     iw_hi = iw + 1
     iz_hi = iz_lo + 1
-    x0 = wealth_grid[iw]
-    x1 = wealth_grid[iw_hi]
-    inv_dw = 1.0 / (x1 - x0)
-    fw = (x_next_scalar - x0) * inv_dw
+    x0 = wealth_grid_g[iw]
+    x1 = wealth_grid_g[iw_hi]
+    inv_dw = jnp.asarray(1.0, dtype=gather_dtype) / (x1 - x0)
+    fw = (x_next_g - x0) * inv_dw
 
-    # c_corners_kv: (n_z, n_corners, n_w) where n_corners = 2**n_state. Scalar
+    # c_corners_g: (n_z, n_corners, n_w) where n_corners = 2**n_state. Scalar
     # (iz_*, iw_*) on axes 0 and 2 with a full slice on axis 1 lowers to
     # dynamic_slice — no advanced indexing in the Newton hot loop.
-    c_zlo_w0 = c_corners_kv[iz_lo, :, iw]
-    c_zlo_w1 = c_corners_kv[iz_lo, :, iw_hi]
-    c_zhi_w0 = c_corners_kv[iz_hi, :, iw]
-    c_zhi_w1 = c_corners_kv[iz_hi, :, iw_hi]
+    c_zlo_w0 = c_corners_g[iz_lo, :, iw]
+    c_zlo_w1 = c_corners_g[iz_lo, :, iw_hi]
+    c_zhi_w0 = c_corners_g[iz_hi, :, iw]
+    c_zhi_w1 = c_corners_g[iz_hi, :, iw_hi]
 
     # Linear in wealth at each (z, state corner). Shape: (n_corners,).
     c_zlo = c_zlo_w0 + (c_zlo_w1 - c_zlo_w0) * fw
@@ -822,12 +873,18 @@ def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
     slope_zhi = (c_zhi_w1 - c_zhi_w0) * inv_dw
 
     # Linear in z at each state corner. Shape: (n_corners,).
-    c_per_corner = (1.0 - frac_z) * c_zlo + frac_z * c_zhi
-    slope_per_corner = (1.0 - frac_z) * slope_zlo + frac_z * slope_zhi
+    one = jnp.asarray(1.0, dtype=gather_dtype)
+    c_per_corner = (one - frac_z_g) * c_zlo + frac_z_g * c_zhi
+    slope_per_corner = (one - frac_z_g) * slope_zlo + frac_z_g * slope_zhi
 
     # Multilinear in state. Scalars.
-    c = jnp.sum(w_corners_kv * c_per_corner)
-    mpc = jnp.sum(w_corners_kv * slope_per_corner)
+    c_g = jnp.sum(w_corners_g * c_per_corner)
+    mpc_g = jnp.sum(w_corners_g * slope_per_corner)
+
+    # Cast back to fp64 BEFORE the floor / clip. Downstream FOC arithmetic
+    # (CRRA, Newton residual) consumes c / mpc in fp64.
+    c = c_g.astype(jnp.float64)
+    mpc = mpc_g.astype(jnp.float64)
 
     c = jnp.maximum(c, min_consumption)
     mpc = jnp.clip(mpc, 0.0, 1.0)
@@ -847,6 +904,7 @@ def retirement_foc_jac_ccv(
     A_is,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     gamma, b_bar, delta, min_consumption,
+    gather_dtype=jnp.float64,
 ):
     """Retirement FOC sums over ``(k_v, k_r)``: bequest + alive contributions.
 
@@ -854,6 +912,11 @@ def retirement_foc_jac_ccv(
     is a scalar and the caller pre-slices c_next at z_idx → c_corners_at_z
     has shape (n_state_quad, n_corners, n_w) where n_corners = 2**n_state,
     and the inner gather is a dynamic_slice.
+
+    When ``gather_dtype is jnp.float32`` the inline ``per_kv_kr`` bilinear
+    interp runs in fp32; ``c`` and ``mpc`` cast back to fp64 before the
+    ``min_consumption`` floor / ``[0,1]`` clip. The FOC sum (mu_bq + mu_alive
+    aggregates over k_v, k_r) stays fp64 throughout.
     """
     R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
         alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
@@ -864,36 +927,48 @@ def retirement_foc_jac_ccv(
 
     mu_bq, mup_bq = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
 
-    n_w = wealth_grid.shape[0]
+    # Cast wealth_grid + corner inputs to gather precision once for the inline
+    # interp. fp64 default → no-op.
+    wealth_grid_g = _cast_for_gather(wealth_grid, gather_dtype)
+    c_corners_at_z_g = _cast_for_gather(c_corners_at_z, gather_dtype)
+    w_corners_g = _cast_for_gather(w_corners, gather_dtype)
+
+    n_w = wealth_grid_g.shape[0]
     def per_kv_kr(x_scalar, c_kv, w_kv):
         # c_kv: (n_corners, n_w), w_kv: (n_corners,) where n_corners = 2**n_state.
         # Scalar iw → dynamic_slice on axis 1.
-        iw = jnp.clip(jnp.searchsorted(wealth_grid, x_scalar, side="right") - 1, 0, n_w - 2)
+        x_scalar_g = _cast_for_gather(jnp.asarray(x_scalar), gather_dtype)
+        iw = jnp.clip(jnp.searchsorted(wealth_grid_g, x_scalar_g, side="right") - 1, 0, n_w - 2)
         iw_hi = iw + 1
-        x0 = wealth_grid[iw]
-        x1 = wealth_grid[iw_hi]
-        inv_dw = 1.0 / (x1 - x0)
-        fw = (x_scalar - x0) * inv_dw
+        x0 = wealth_grid_g[iw]
+        x1 = wealth_grid_g[iw_hi]
+        inv_dw = jnp.asarray(1.0, dtype=gather_dtype) / (x1 - x0)
+        fw = (x_scalar_g - x0) * inv_dw
 
         c_w0 = c_kv[:, iw]                  # (n_corners,)
         c_w1 = c_kv[:, iw_hi]
         c_per_corner = c_w0 + (c_w1 - c_w0) * fw
         slope_per_corner = (c_w1 - c_w0) * inv_dw
 
-        c = jnp.sum(w_kv * c_per_corner)
-        mpc = jnp.sum(w_kv * slope_per_corner)
+        c_g = jnp.sum(w_kv * c_per_corner)
+        mpc_g = jnp.sum(w_kv * slope_per_corner)
+
+        # Cast back to fp64 BEFORE floor / clip. FOC arithmetic below is fp64.
+        c = c_g.astype(jnp.float64)
+        mpc = mpc_g.astype(jnp.float64)
         c = jnp.maximum(c, min_consumption)
         mpc = jnp.clip(mpc, 0.0, 1.0)
         return c, mpc
 
     # Vmap over k_v (c_kv, w_kv vary), then over k_r (x_scalar varies).
-    # Shape: (n_state_quad, n_ret_quad)
+    # Shape: (n_state_quad, n_ret_quad). Pass the gather-precision-cast tensors
+    # so the inner per_kv_kr receives c_kv / w_kv at gather_dtype.
     c_at_xn, mpc_at_xn = vmap(
         lambda c_kv, w_kv, x_row: vmap(per_kv_kr, in_axes=(0, None, None))(
             x_row, c_kv, w_kv
         ),
         in_axes=(0, 0, 0),
-    )(c_corners_at_z, w_corners, x_next)
+    )(c_corners_at_z_g, w_corners_g, x_next)
 
     mu_alive = c_at_xn ** (-gamma)
     mup_alive = -gamma * mu_alive / c_at_xn * mpc_at_xn
@@ -938,12 +1013,18 @@ def working_foc_jac_ccv(
     A_is,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     gamma, b_bar, delta, min_consumption,
+    gather_dtype=jnp.float64,
 ):
     """Working-age FOC. Bequest summed over ``(k_v, k_r)``; alive summed over
     ``(k_v, k_r, k_eta, i_e)``. Caller supplies the income_next gather table
     and pre-gathers c_next at multilinear-state corners → c_corners_T has k_v
     leading so the outer vmap consumes its leading axis. ``n_corners`` =
     ``2**n_state``.
+
+    When ``gather_dtype is jnp.float32`` the c_corners gather + multilinear
+    interpolation runs in fp32; ``c_at_xn`` and ``mpc_at_xn`` returned from
+    ``_interp_c_and_mpc_at_cell`` are already cast back to fp64, so the FOC
+    sum (CRRA, bequest combine, residual, Jacobian) stays fp64 throughout.
     """
     R_p, dr_da_s, dr_da_b = _ccv_log_return_and_grad(
         alpha_s, alpha_b, log_R_bill, log_x_s, log_x_b,
@@ -985,6 +1066,7 @@ def working_foc_jac_ccv(
         def at_eta_eps(x_scalar, iz, fz):
             return _interp_c_and_mpc_at_cell(
                 c_kv, w_kv, iz, fz, x_scalar, wealth_grid, min_consumption,
+                gather_dtype=gather_dtype,
             )
 
         def per_kr(x_kr):
@@ -1066,15 +1148,17 @@ def _egm_scan_cell(
     fail to converge if ``max_iter`` is too tight — bump max_iter and
     track ``newton_failures`` post-hoc.
 
-    Returns (x_egm, c_egm, a_s_egm, a_b_egm) each shape ``(n_savings + 1,)``,
-    with the first entry being the egm_anchor at s = 0.
+    Returns ``(x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm)``
+    each shape ``(n_savings + 1,)``, with the first entry being the egm_anchor
+    at s = 0 (iter counts padded with 0 there).
     """
     def per_savings_point(s_val):
         foc_fn = foc_factory(s_val)
         _, _, _, _, _, e0 = foc_fn(0.0, 0.0)
         scale = jnp.maximum(jnp.abs(e0), 1e-30)
 
-        a_s_opt, a_b_opt, V_dot, _exit_code, _err, _n_iter = newton_2d_with_line_search(
+        (a_s_opt, a_b_opt, V_dot, _exit_code, _err,
+         n_iter_used, n_bt_total) = newton_2d_with_line_search(
             foc_fn, init_a_s, init_a_b, scale,
             tol, max_iter, max_backtrack_iter,
             line_search_max_step, singular_det,
@@ -1089,15 +1173,17 @@ def _egm_scan_cell(
         a_s_out = jnp.where(tiny, init_a_s, a_s_opt)
         a_b_out = jnp.where(tiny, init_a_b, a_b_opt)
         x_out = c_out + s_val
-        return x_out, c_out, a_s_out, a_b_out
+        return x_out, c_out, a_s_out, a_b_out, n_iter_used, n_bt_total
 
-    x_arr, c_arr, a_s_arr, a_b_arr = vmap(per_savings_point)(s_grid)
+    x_arr, c_arr, a_s_arr, a_b_arr, ni_arr, nb_arr = vmap(per_savings_point)(s_grid)
 
     x_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=x_arr.dtype), x_arr])
     c_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=c_arr.dtype), c_arr])
     a_s_egm = jnp.concatenate([jnp.array([0.0], dtype=a_s_arr.dtype), a_s_arr])
     a_b_egm = jnp.concatenate([jnp.array([0.0], dtype=a_b_arr.dtype), a_b_arr])
-    return x_egm, c_egm, a_s_egm, a_b_egm
+    n_iters_egm = jnp.concatenate([jnp.array([0], dtype=ni_arr.dtype), ni_arr])
+    n_backtrack_egm = jnp.concatenate([jnp.array([0], dtype=nb_arr.dtype), nb_arr])
+    return x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm
 
 
 def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid):
@@ -1140,7 +1226,8 @@ def _solve_terminal_at_i_s(
             )
         return foc_fn
 
-    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+    (x_egm, c_egm, a_s_egm, a_b_egm,
+     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1149,7 +1236,10 @@ def _solve_terminal_at_i_s(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    n_iters_max = jnp.max(n_iters_egm)
+    n_backtrack_total = jnp.sum(n_backtrack_egm)
+    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
 
 
 def _solve_retirement_at_cell(
@@ -1167,6 +1257,7 @@ def _solve_retirement_at_cell(
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
     use_fori,
+    gather_dtype,
 ):
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
@@ -1175,7 +1266,10 @@ def _solve_retirement_at_cell(
     # Pre-gather c_next at multilinear-state corners for this (z_idx, i_s).
     # Hoisted out of the FOC so the Newton inner loop sees only dynamic_slice
     # reads instead of a 4-axis advanced gather. j_corners_i: (n_state_quad, n_corners).
+    # Cast to gather_dtype here lets XLA fuse the gather + dtype convert into a
+    # single load (verify in HLO at gate 3). Storage of c_next stays fp64.
     c_corners_at_z = c_next[z_idx, j_corners_i, :]   # (n_state_quad, n_corners, n_w)
+    c_corners_at_z = _cast_for_gather(c_corners_at_z, gather_dtype)
 
     def foc_factory(s_val):
         def foc_fn(a_s, a_b):
@@ -1187,10 +1281,12 @@ def _solve_retirement_at_cell(
                 pension_next_z, A_is,
                 sigma2_xr, sigma2_xb, sigma_xrxb,
                 gamma, b_bar, delta, min_consumption,
+                gather_dtype=gather_dtype,
             )
         return foc_fn
 
-    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+    (x_egm, c_egm, a_s_egm, a_b_egm,
+     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1199,7 +1295,10 @@ def _solve_retirement_at_cell(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    n_iters_max = jnp.max(n_iters_egm)
+    n_backtrack_total = jnp.sum(n_backtrack_egm)
+    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
 
 
 def _solve_working_at_cell(
@@ -1221,6 +1320,7 @@ def _solve_working_at_cell(
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
     use_fori,
+    gather_dtype,
 ):
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
@@ -1232,8 +1332,11 @@ def _solve_working_at_cell(
     # 2**n_state; under vmap this batches to (n_cells, ...). At n_state=3 the
     # per-cell footprint is ~3MB; at n_state=4 it's ~6MB before fusion — verify
     # peak HBM on the first 4-D GPU run before running canonical.
+    # Cast to gather_dtype lets XLA fuse the gather + transpose + dtype convert
+    # into a single load chain (verify in HLO at gate 3). c_next storage stays fp64.
     c_corners = c_next[:, j_corners_i, :]                 # (n_z, n_state_quad, n_corners, n_w)
     c_corners_T = jnp.transpose(c_corners, (1, 0, 2, 3))  # (n_state_quad, n_z, n_corners, n_w)
+    c_corners_T = _cast_for_gather(c_corners_T, gather_dtype)
 
     def foc_factory(s_val):
         def foc_fn(a_s, a_b):
@@ -1248,10 +1351,12 @@ def _solve_working_at_cell(
                 A_is,
                 sigma2_xr, sigma2_xb, sigma_xrxb,
                 gamma, b_bar, delta, min_consumption,
+                gather_dtype=gather_dtype,
             )
         return foc_fn
 
-    x_egm, c_egm, a_s_egm, a_b_egm = _egm_scan_cell(
+    (x_egm, c_egm, a_s_egm, a_b_egm,
+     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1260,7 +1365,10 @@ def _solve_working_at_cell(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    n_iters_max = jnp.max(n_iters_egm)
+    n_backtrack_total = jnp.sum(n_backtrack_egm)
+    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
 
 
 def _all_is_log_returns_numpy(pcj):
@@ -1499,16 +1607,100 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
         return vmap(per_i_s)(log_Rb_block, lxs_block, lxb_block, ann_block)
 
     def call(_unused_age_idx=None):
-        c_pm, as_pm, ab_pm = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
+        (c_pm, as_pm, ab_pm,
+         ni_pm, nb_pm) = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
 
         # Stay on device — caller threads jnp arrays through to the next kernel.
         def collapse(a):
             arr = jnp.reshape(a, (pad_n,) + a.shape[2:])
             return arr[:N_state]
 
-        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+        return (
+            collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(ni_pm), collapse(nb_pm),
+        )
 
     return call
+
+
+def _build_chunked_index_arrays(n_z, N_state, n_chunks):
+    """Build padded (z_idx, is_idx) arrays for cell-axis chunking.
+
+    Padding is done in NumPy at builder time and converted to jnp once,
+    matching the pmap path's strategy. Done outside ``@jit`` so the padded
+    arrays are jnp-array constants by the time the kernel traces — no
+    in-trace concatenate/full ops, no constant-folding ambiguity.
+
+    Returns
+    -------
+    z_idx_padded, is_idx_padded : jnp.ndarray, shape ``(chunk_size * n_chunks,)``
+    n_cells : int
+        Real cell count = ``n_z * N_state`` (used to slice off padding).
+    chunk_size : int
+        Per-chunk fixed cell count = ``ceil(n_cells / n_chunks)``.
+    """
+    n_cells = n_z * N_state
+    chunk_size = (n_cells + n_chunks - 1) // n_chunks
+    n_cells_padded = chunk_size * n_chunks
+
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    z_idx_np = (cell_idx // N_state).astype(np.int64)
+    is_idx_np = (cell_idx % N_state).astype(np.int64)
+
+    pad_count = n_cells_padded - n_cells
+    if pad_count > 0:
+        z_idx_np = np.concatenate(
+            [z_idx_np, np.full(pad_count, z_idx_np[-1], dtype=np.int64)]
+        )
+        is_idx_np = np.concatenate(
+            [is_idx_np, np.full(pad_count, is_idx_np[-1], dtype=np.int64)]
+        )
+
+    return jnp.asarray(z_idx_np), jnp.asarray(is_idx_np), n_cells, chunk_size
+
+
+def _chunked_vmap_cells(per_cell_fn, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks):
+    """Split a per-cell vmap into ``n_chunks`` sequential vmap calls.
+
+    Each chunk has fixed shape ``chunk_size`` so XLA traces the inner vmap
+    once and reuses for all chunks. The padded index arrays are pre-built by
+    ``_build_chunked_index_arrays`` at kernel-builder time (outside @jit).
+
+    Parameters
+    ----------
+    per_cell_fn : callable (z_idx, i_s) -> tuple of arrays
+        Per-cell solver. Each output is leading-axis vmappable.
+    z_idx_padded, is_idx_padded : jnp.ndarray, shape ``(chunk_size * n_chunks,)``
+        Pre-padded index arrays (last cell index repeated to fill).
+    n_cells : int
+        Real cell count = ``n_z * N_state``. Used to slice off padding.
+    chunk_size : int
+        Per-chunk fixed cell count.
+    n_chunks : int
+        Static Python int. Must be >= 1.
+
+    Returns
+    -------
+    tuple of jnp.ndarray, one entry per output of ``per_cell_fn``, each
+    sliced to ``n_cells`` along the leading axis.
+    """
+    if n_chunks == 1:
+        outs = vmap(per_cell_fn)(z_idx_padded[:n_cells], is_idx_padded[:n_cells])
+        return outs
+
+    chunk_results = []
+    for i in range(n_chunks):
+        start = i * chunk_size
+        z_chunk = lax.dynamic_slice_in_dim(z_idx_padded, start, chunk_size)
+        is_chunk = lax.dynamic_slice_in_dim(is_idx_padded, start, chunk_size)
+        chunk_results.append(vmap(per_cell_fn)(z_chunk, is_chunk))
+
+    n_outs = len(chunk_results[0])
+    out_full = tuple(
+        jnp.concatenate([r[k] for r in chunk_results], axis=0)[:n_cells]
+        for k in range(n_outs)
+    )
+    return out_full
 
 
 def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
@@ -1527,10 +1719,29 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
     # the pmap path; only the padding/reshape-for-pmap step is dropped.
     log_R_bill, log_x_s, log_x_b = _all_is_log_returns_numpy(pcj)
 
-    log_R_bill_jnp = jnp.asarray(log_R_bill)
-    log_x_s_jnp = jnp.asarray(log_x_s)
-    log_x_b_jnp = jnp.asarray(log_x_b)
-    ann_jnp = jnp.asarray(np.asarray(pcj.annuity_factors))
+    n_chunks = int(sc.cell_vmap_chunks)
+    N_state = log_R_bill.shape[0]
+
+    # Pre-pad on the host so the kernel sees jnp constants. Same strategy as
+    # the pmap path (np.concatenate at build time).
+    if n_chunks == 1:
+        chunk_size = N_state
+        N_padded = N_state
+    else:
+        chunk_size = (N_state + n_chunks - 1) // n_chunks
+        N_padded = chunk_size * n_chunks
+
+    def pad0_np(arr_np, target_n):
+        if arr_np.shape[0] == target_n:
+            return arr_np
+        last = arr_np[-1:]
+        extra = target_n - arr_np.shape[0]
+        return np.concatenate([arr_np] + [last] * extra, axis=0)
+
+    log_R_bill_jnp = jnp.asarray(pad0_np(log_R_bill, N_padded))
+    log_x_s_jnp = jnp.asarray(pad0_np(log_x_s, N_padded))
+    log_x_b_jnp = jnp.asarray(pad0_np(log_x_b, N_padded))
+    ann_jnp = jnp.asarray(pad0_np(np.asarray(pcj.annuity_factors), N_padded))
 
     @jit
     def all_is():
@@ -1543,7 +1754,24 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
             )
-        return vmap(per_i_s)(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+
+        if n_chunks == 1:
+            return vmap(per_i_s)(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+
+        chunk_results = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            log_Rb_c = lax.dynamic_slice_in_dim(log_R_bill_jnp, start, chunk_size, axis=0)
+            lxs_c = lax.dynamic_slice_in_dim(log_x_s_jnp, start, chunk_size, axis=0)
+            lxb_c = lax.dynamic_slice_in_dim(log_x_b_jnp, start, chunk_size, axis=0)
+            ann_c = lax.dynamic_slice_in_dim(ann_jnp, start, chunk_size, axis=0)
+            chunk_results.append(vmap(per_i_s)(log_Rb_c, lxs_c, lxb_c, ann_c))
+
+        n_outs = len(chunk_results[0])
+        return tuple(
+            jnp.concatenate([r[k] for r in chunk_results], axis=0)[:N_state]
+            for k in range(n_outs)
+        )
 
     def call(_unused_age_idx=None):
         return all_is()
@@ -1572,11 +1800,13 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
     gathered as ``[z_idx, i_s, w_ref_idx]`` (mid-wealth slice), giving each
     cell a single warm-started scalar shared across the savings vmap.
     """
+    gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor,
-              bool(sc.use_fori_newton))
+              bool(sc.use_fori_newton),
+              gather_dtype)
 
     # Per-i_s precompute is supplied by the caller (single trace shared across
     # retirement / working / boundary builders).
@@ -1618,7 +1848,8 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
         return vmap(per_cell)(z_block, is_block)
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-        c_pm, as_pm, ab_pm = per_dev_solve(
+        (c_pm, as_pm, ab_pm,
+         ni_pm, nb_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -1626,8 +1857,12 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
         # Stay on device.
         def collapse(a):
             flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
-            return jnp.reshape(flat[:n_cells], (n_z, N_state, -1))
-        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+            return jnp.reshape(flat[:n_cells], (n_z, N_state) + a.shape[2:])
+
+        return (
+            collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(ni_pm), collapse(nb_pm),
+        )
 
     return call
 
@@ -1637,21 +1872,23 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
     XLA can fuse the entire per-age solve into one kernel. Output shape matches
     the pmap path: ``(n_z, N_state, n_w)`` per array.
     """
+    gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor,
-              bool(sc.use_fori_newton))
+              bool(sc.use_fori_newton),
+              gather_dtype)
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
     n_w = pcj.wealth_grid.shape[0]
     w_ref_idx = n_w // 2
 
-    n_cells = n_z * N_state
-    cell_idx = np.arange(n_cells, dtype=np.int64)
-    z_idx_arr = jnp.asarray((cell_idx // N_state).astype(np.int64))
-    is_idx_arr = jnp.asarray((cell_idx % N_state).astype(np.int64))
+    n_chunks = int(sc.cell_vmap_chunks)
+    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_chunked_index_arrays(
+        n_z, N_state, n_chunks,
+    )
 
     @jit
     def all_cells(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
@@ -1669,16 +1906,20 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
             )
-        return vmap(per_cell)(z_idx_arr, is_idx_arr)
+        return _chunked_vmap_cells(
+            per_cell, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+        )
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-        c_flat, s_flat, b_flat = all_cells(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat = all_cells(
             c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
         )
         return (
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(ni_flat, (n_z, N_state)),
+            jnp.reshape(nb_flat, (n_z, N_state)),
         )
 
     return call
@@ -1704,11 +1945,13 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
     ``init_a_s_arr[z_idx, i_s, w_ref_idx]`` (and similarly for a_b),
     where ``init_*_arr`` is the previous (older) age's converged policy.
     """
+    gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor,
-              bool(sc.use_fori_newton))
+              bool(sc.use_fori_newton),
+              gather_dtype)
 
     # Per-i_s precompute is supplied by the caller (single trace shared across
     # retirement / working / boundary builders).
@@ -1779,15 +2022,20 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
-        c_pm, as_pm, ab_pm = per_dev_solve(
+        (c_pm, as_pm, ab_pm,
+         ni_pm, nb_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
         # Stay on device.
         def collapse(a):
             flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
-            return jnp.reshape(flat[:n_cells], (n_z, N_state, -1))
-        return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+            return jnp.reshape(flat[:n_cells], (n_z, N_state) + a.shape[2:])
+
+        return (
+            collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(ni_pm), collapse(nb_pm),
+        )
 
     return call
 
@@ -1797,21 +2045,23 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
     when ``use_pension_next``). Drops pmap padding/reshape/collapse so XLA can
     fuse the per-age solve into one kernel.
     """
+    gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
               sc.min_consumption, sc.egm_anchor,
-              bool(sc.use_fori_newton))
+              bool(sc.use_fori_newton),
+              gather_dtype)
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
     n_w = pcj.wealth_grid.shape[0]
     w_ref_idx = n_w // 2
 
-    n_cells = n_z * N_state
-    cell_idx = np.arange(n_cells, dtype=np.int64)
-    z_idx_arr = jnp.asarray((cell_idx // N_state).astype(np.int64))
-    is_idx_arr = jnp.asarray((cell_idx % N_state).astype(np.int64))
+    n_chunks = int(sc.cell_vmap_chunks)
+    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_chunked_index_arrays(
+        n_z, N_state, n_chunks,
+    )
 
     @jit
     def all_cells(
@@ -1853,13 +2103,15 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
                 *static,
             )
 
-        return vmap(per_cell)(z_idx_arr, is_idx_arr)
+        return _chunked_vmap_cells(
+            per_cell, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+        )
 
     def call(
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat = all_cells(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat = all_cells(
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -1867,6 +2119,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(ni_flat, (n_z, N_state)),
+            jnp.reshape(nb_flat, (n_z, N_state)),
         )
 
     return call
@@ -1905,6 +2159,10 @@ def run_lifecycle_solver(
         raise NotImplementedError(
             "JAX solver implements the canonical ccv_log wealth dynamics only. "
             f"Got wealth_dynamics_spec={sc.wealth_dynamics_spec!r}."
+        )
+    if int(sc.cell_vmap_chunks) < 1:
+        raise ValueError(
+            f"SolverConfig.cell_vmap_chunks must be >= 1, got {sc.cell_vmap_chunks}."
         )
     delta = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
 
@@ -1970,6 +2228,13 @@ def run_lifecycle_solver(
     # ---- Per-age diagnostics (post-hoc only) ----
     age_max_foc = np.zeros(n_age)
     age_newton_fail = np.zeros(n_age, dtype=np.int64)
+
+    # Per-age Newton-iter / backtrack-iter counts, one entry per cell. Terminal
+    # is z-invariant, so its entries are (N_state,) — broadcast-equivalent to
+    # (n_z, N_state) for histogram aggregation. Lists hold device or host
+    # arrays; converted to NumPy at the histogram aggregation step at end.
+    newton_iter_per_age = [None] * n_age
+    backtrack_iter_per_age = [None] * n_age
 
     checkpoint_path = solve_control.checkpoint_path
     youngest_age_to_solve = solve_control.youngest_age_to_solve
@@ -2045,7 +2310,7 @@ def run_lifecycle_solver(
     if not solved_age_mask[-1]:
         if verbose >= 1:
             print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
-        c_T, s_T, b_T = terminal_kernel()
+        c_T, s_T, b_T, ni_T, nb_T = terminal_kernel()
         # Broadcast across z (terminal policy is z-invariant — bequest only).
         # jnp.broadcast_to stays on device. On the pmap path (n_dev > 1) the
         # next kernel reads it via in_axes=None and materialises lazily; on
@@ -2055,6 +2320,11 @@ def run_lifecycle_solver(
         C_list[-1] = jnp.broadcast_to(c_T[None, :, :], (n_z, N_state, n_w))
         S_list[-1] = jnp.broadcast_to(s_T[None, :, :], (n_z, N_state, n_w))
         B_list[-1] = jnp.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w))
+        # Terminal iter counts are (N_state,) — z-invariant. Materialise to
+        # NumPy now (~5KB) so the orchestrator's aggregator never holds a
+        # device array for them.
+        newton_iter_per_age[-1] = np.asarray(ni_T)
+        backtrack_iter_per_age[-1] = np.asarray(nb_T)
         solved_age_mask[-1] = True
         if verbose >= 1:
             # Small reduction (~5KB transfer) for the print line; cheap.
@@ -2116,7 +2386,7 @@ def run_lifecycle_solver(
 
             if age >= retire_age:
                 pension_next = pension_table_jnp[t + 1, :]
-                c_t, s_t, b_t = retirement_kernel(
+                c_t, s_t, b_t, ni_t, nb_t = retirement_kernel(
                     c_next_jnp, pension_next, psi_t, init_a_s_arr, init_a_b_arr,
                 )
                 label = "RETIRE"
@@ -2125,14 +2395,14 @@ def run_lifecycle_solver(
                 if use_pen:
                     pension_next = pension_table_jnp[t + 1, :]
                     income_table = jnp.zeros((n_z, pc.n_eta, pc.n_eps))   # ignored on this branch
-                    c_t, s_t, b_t = boundary_kernel(
+                    c_t, s_t, b_t, ni_t, nb_t = boundary_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
                 else:
                     pension_next = pension_dummy_z_jnp
                     income_table = working_income_next_jnp[t + 1]  # (n_z, n_eta, n_eps)
-                    c_t, s_t, b_t = working_kernel(
+                    c_t, s_t, b_t, ni_t, nb_t = working_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
@@ -2142,6 +2412,10 @@ def run_lifecycle_solver(
             C_list[t] = c_t
             S_list[t] = s_t
             B_list[t] = b_t
+            # Iter counts are tiny (n_z * N_state ints) — materialise per age
+            # so device memory isn't pinned by the histogram aggregator.
+            newton_iter_per_age[t] = np.asarray(ni_t)
+            backtrack_iter_per_age[t] = np.asarray(nb_t)
             solved_age_mask[t] = True
 
             if verbose >= 1:
@@ -2223,6 +2497,18 @@ def run_lifecycle_solver(
     )
     diagnostics = _build_diagnostics(**diag_kwargs)
 
+    # ---- Newton / backtrack iter histograms ----
+    # Per-age entries are either None (unsolved age) or NumPy arrays — terminal
+    # is (N_state,), non-terminal is (n_z, N_state). Flatten each, then build
+    # aggregate p50/p95/p99/max stats and per-age p99. Under fori_loop both
+    # max_iter and max_backtrack_iter are wall cost regardless of cell
+    # convergence, so these stats let the user set them from data.
+    ni_diag, nb_diag = _build_iter_histograms(
+        newton_iter_per_age, backtrack_iter_per_age, ages, solved_age_mask,
+    )
+    diagnostics["newton_iter_histogram"] = ni_diag
+    diagnostics["backtrack_iter_histogram"] = nb_diag
+
     # Single materialisation point: device-resident policy list -> NumPy.
     # All downstream consumers (final save, sanity check, return value) read
     # from these arrays.
@@ -2262,6 +2548,19 @@ def run_lifecycle_solver(
             print(f"  Policy sanity: NaN(C={nan_c} S={nan_s} B={nan_b}) Inf(C={inf_c} S={inf_s} B={inf_b})")
         print(f"  alpha_s range: [{S_eval.min():.3f}, {S_eval.max():.3f}]")
         print(f"  alpha_b range: [{B_eval.min():.3f}, {B_eval.max():.3f}]")
+        nih = diagnostics["newton_iter_histogram"]
+        bth = diagnostics["backtrack_iter_histogram"]
+        if nih.get("n_cells", 0) > 0:
+            print(
+                f"  Newton iters:    p50={nih['p50']:.0f}  p95={nih['p95']:.0f}  "
+                f"p99={nih['p99']:.0f}  max={nih['max']}  "
+                f"(max_iter={sc.max_iter})"
+            )
+            print(
+                f"  Backtrack iters: p50={bth['p50']:.1f}  p95={bth['p95']:.1f}  "
+                f"p99={bth['p99']:.1f}  max={bth['max']}  "
+                f"(max_backtrack_iter={sc.max_backtrack_iter})"
+            )
         print(f"{'='*100}\n")
 
     # _materialize_policy_lists already filled unsolved ages with NaN, so
@@ -2271,6 +2570,56 @@ def run_lifecycle_solver(
         raise KeyboardInterrupt
 
     return C_mat, S_mat, B_mat, diagnostics
+
+
+def _build_iter_histograms(newton_iter_per_age, backtrack_iter_per_age,
+                            ages, solved_age_mask):
+    """Aggregate Newton-iter and backtrack-iter counts into a diag-friendly dict.
+
+    Each per-age entry is either ``None`` (unsolved) or a NumPy array of shape
+    ``(N_state,)`` (terminal) / ``(n_z, N_state)`` (non-terminal). All entries
+    flatten to 1-D and concatenate; per-age stats are computed on the
+    flattened slice.
+
+    Returns a tuple ``(newton_diag, backtrack_diag)`` of dicts with keys
+    ``p50``, ``p95``, ``p99``, ``max``, ``per_age_p99``, ``per_age_max``,
+    ``per_age_ages``, and ``n_cells``. When no ages were solved, returns
+    empty stats with ``n_cells=0``.
+    """
+    def _stats_for(per_age_list):
+        per_age_p99 = []
+        per_age_max = []
+        per_age_age = []
+        flat_chunks = []
+        for t, arr in enumerate(per_age_list):
+            if arr is None or not solved_age_mask[t]:
+                continue
+            arr_flat = np.asarray(arr).ravel()
+            if arr_flat.size == 0:
+                continue
+            flat_chunks.append(arr_flat)
+            per_age_p99.append(float(np.percentile(arr_flat, 99)))
+            per_age_max.append(int(arr_flat.max()))
+            per_age_age.append(int(ages[t]))
+        if not flat_chunks:
+            return {
+                "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0,
+                "per_age_p99": [], "per_age_max": [], "per_age_ages": [],
+                "n_cells": 0,
+            }
+        all_flat = np.concatenate(flat_chunks)
+        return {
+            "p50": float(np.median(all_flat)),
+            "p95": float(np.percentile(all_flat, 95)),
+            "p99": float(np.percentile(all_flat, 99)),
+            "max": int(all_flat.max()),
+            "per_age_p99": per_age_p99,
+            "per_age_max": per_age_max,
+            "per_age_ages": per_age_age,
+            "n_cells": int(all_flat.size),
+        }
+
+    return _stats_for(newton_iter_per_age), _stats_for(backtrack_iter_per_age)
 
 
 def _build_diagnostics(

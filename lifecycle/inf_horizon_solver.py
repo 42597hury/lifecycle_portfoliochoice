@@ -358,15 +358,62 @@ def _compute_stability_proxy(model, pc, solver_config, S, B, trim_wealth_points)
     return float(max_proxy)
 
 
+def _build_iter_histograms_per_iter(newton_iter_per_iter, backtrack_iter_per_iter):
+    """Per-iteration analog of solver._build_iter_histograms.
+
+    Each entry is a NumPy array of shape ``(n_z, N_state)`` from one
+    fixed-point iteration's kernel call. Mirrors the lifecycle solver's
+    histogram dict shape (p50/p95/p99/max + per-iter slices) so downstream
+    consumers can read both diagnostics surfaces with the same code, modulo
+    the per_age_* -> per_iter_* key rename.
+    """
+    def _stats_for(per_iter_list):
+        per_iter_p99 = []
+        per_iter_max = []
+        flat_chunks = []
+        for arr in per_iter_list:
+            if arr is None:
+                continue
+            arr_flat = np.asarray(arr).ravel()
+            if arr_flat.size == 0:
+                continue
+            flat_chunks.append(arr_flat)
+            per_iter_p99.append(float(np.percentile(arr_flat, 99)))
+            per_iter_max.append(int(arr_flat.max()))
+        if not flat_chunks:
+            return {
+                "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0,
+                "per_iter_p99": [], "per_iter_max": [], "n_cells": 0,
+            }
+        all_flat = np.concatenate(flat_chunks)
+        return {
+            "p50": float(np.median(all_flat)),
+            "p95": float(np.percentile(all_flat, 95)),
+            "p99": float(np.percentile(all_flat, 99)),
+            "max": int(all_flat.max()),
+            "per_iter_p99": per_iter_p99,
+            "per_iter_max": per_iter_max,
+            "n_cells": int(all_flat.size),
+        }
+
+    return _stats_for(newton_iter_per_iter), _stats_for(backtrack_iter_per_iter)
+
+
 def _build_diagnostics(
     model, pc, solver_config, C, S, B,
     converged, n_iter_done, total_newton_failures,
     policy_supnorm_history, xi_supnorm_history, share_supnorm_history,
+    newton_iter_per_iter, backtrack_iter_per_iter,
     tol, damping, trim_wealth_points, used_warm_start,
 ):
     policy_hist = np.asarray(policy_supnorm_history[:n_iter_done], dtype=np.float64).copy()
     xi_hist = np.asarray(xi_supnorm_history[:n_iter_done], dtype=np.float64).copy()
     share_hist = np.asarray(share_supnorm_history[:n_iter_done], dtype=np.float64).copy()
+
+    ni_hist, nb_hist = _build_iter_histograms_per_iter(
+        newton_iter_per_iter[:n_iter_done],
+        backtrack_iter_per_iter[:n_iter_done],
+    )
 
     diagnostics: dict[str, Any] = {
         "converged": bool(converged),
@@ -384,6 +431,10 @@ def _build_diagnostics(
         "final_share_supnorm": float(share_hist[-1]) if n_iter_done else float("nan"),
         "final_stopping_supnorm": float(max(xi_hist[-1], share_hist[-1])) if n_iter_done else float("nan"),
         "total_newton_failures": int(total_newton_failures),
+        "newton_iter_histogram": ni_hist,
+        "backtrack_iter_histogram": nb_hist,
+        "newton_iter_p99": float(ni_hist["p99"]),
+        "n_backtrack_total_p99": float(nb_hist["p99"]),
     }
     diagnostics.update(_compute_z_invariance(C, S, B))
     diagnostics.update(_compute_wealth_homogeneity(C, S, B, pc.wealth_grid, trim_wealth_points))
@@ -497,6 +548,12 @@ def run_infinite_horizon_solver(
     policy_supnorm_history = []
     xi_supnorm_history = []
     share_supnorm_history = []
+    # Per-iteration Newton-iter and backtrack-iter counts, one (n_z, N_state)
+    # array per iteration. Aggregated in _build_diagnostics into a histogram
+    # dict keyed parallel to run_lifecycle_solver's diagnostics["newton_iter_
+    # histogram"] (modulo per_age_* -> per_iter_* key rename).
+    newton_iter_per_iter = []
+    backtrack_iter_per_iter = []
     converged = False
     n_iter_done = 0
 
@@ -515,12 +572,14 @@ def run_infinite_horizon_solver(
         # point, vs much higher under cold init.
         s_old_jnp = jnp.asarray(S_old)
         b_old_jnp = jnp.asarray(B_old)
-        c_new_jnp, s_new_jnp, b_new_jnp, _ni_jnp, _nb_jnp = retirement_kernel(
+        c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp = retirement_kernel(
             c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
         )
         C_new = np.asarray(c_new_jnp)
         S_new = np.asarray(s_new_jnp)
         B_new = np.asarray(b_new_jnp)
+        newton_iter_per_iter.append(np.asarray(ni_jnp))
+        backtrack_iter_per_iter.append(np.asarray(nb_jnp))
 
         # Damped update.
         if damping == 1.0:
@@ -572,6 +631,8 @@ def run_infinite_horizon_solver(
         np.asarray(policy_supnorm_history),
         np.asarray(xi_supnorm_history),
         np.asarray(share_supnorm_history),
+        newton_iter_per_iter,
+        backtrack_iter_per_iter,
         tol, damping, trim_wealth_points, used_warm_start=used_warm_start,
     )
 

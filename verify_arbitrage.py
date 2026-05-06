@@ -1,52 +1,71 @@
-"""verify_arbitrage.py -- Spurious-arbitrage check for saved policy bundles.
+"""verify_arbitrage.py -- Discrete-cloud arbitrage check (pre-solve diagnostic).
 
-Loads a bundle, evaluates per-cell arbitrage gap at the solved (alpha_s, alpha_b)
-using the same CCV log-return arithmetic the solver used. Per cell, the gap is
+Spurious arbitrage is a discretization artifact: at some state corner i_s, the
+discrete (state x return) quadrature cloud admits a feasible portfolio that
+DOMINATES another asset on every quadrature node — i.e. the worst node of one
+asset still beats the best node of another, OR more generally a separating
+direction exists between the origin and the convex hull of excess returns.
+The continuous lognormal distribution does NOT admit such a dominance, so any
+"arbitrage" the integrator finds is fake; if the solver exploits it (Lobatto
+tails or finer GH would erase it), policies tilt toward unhedged-bankruptcy
+positions that look risk-free under the cloud but blow up out-of-sample.
 
-    gap = min_{k_v, k_r} R_p(alpha)  -  E_quad[R_bill]
+This is a pre-solve check. It depends ONLY on (model + discretization), not
+on solved policies. Run it before paying for a solve; if it fails, re-config
+``ret_lobatto_Z`` / ``state_lobatto_Z`` and re-test.
 
-where R_p uses ``_ccv_log_return_and_grad`` and R_bill = exp(log_R_bill_kv) is
-read from the next-period state vector at ``rtb_index_in_state``. If any cell's
-gap > 0 the discrete quadrature certifies a "free lunch" (a feasible portfolio
-that the discrete integrator says cannot lose) that the continuous lognormal
-distribution does not actually admit.
+What's tested
+-------------
+For each state corner i_s in the joint state grid, build the gross-return
+cloud (R_bill, R_stock, R_bond) at every (k_v, k_r) quadrature node and
+evaluate two gaps:
 
-This is the cheap pre-launch test for whether Lobatto-style tail nodes are
-needed: if the bundle's existing (Gauss-Hermite) quadrature passes here at the
-solved policy, downstream analysis is safe; if it fails, re-solve with
-``ret_lobatto_Z`` / ``state_lobatto_Z`` configured.
+    1. Axis-aligned dominance gap (the user-facing definition):
+           gap_dom = max over ordered (i, j) pairs of  min_n R_i  -  max_n R_j
+       gap_dom > 0 ⇒ asset i's worst quadrature node still strictly beats
+       asset j's best — a discrete dominance arbitrage.
+
+    2. Convex-hull arbitrage gap (the more general check):
+           gap_hull = max over unit directions d in R^2 of
+                      min_n d · (X_s, X_b)_n
+       where X_s = R_stock - R_bill, X_b = R_bond - R_bill. gap_hull > 0 ⇒
+       the origin is strictly outside the convex hull of the excess-return
+       cloud ⇒ ∃ (alpha_s, alpha_b) such that R_p(alpha) > R_bill on every
+       node, even if no single axis-aligned pair dominates.
+
+Both gaps are zero (within float roundoff) on a well-resolved cloud and
+strictly positive when the discretization mis-resolves the lognormal tails.
 
 Usage
 -----
+    # Bundle path (uses bundle metadata.run_config to rebuild precompute):
     python verify_arbitrage.py <bundle-name-or-path>
 
-Examples
---------
-    python verify_arbitrage.py system_iv_full_var_unconstrained_cholesky_grid5x5x5x5_nz11_jax_benchmark
-    python verify_arbitrage.py saved_runs/system_iv_full_var_..._jax_benchmark
+    # Config module path (.py): import as module, read base_config +
+    # disc_config_template; this is the pre-launch entry point that does
+    # NOT need a saved bundle:
+    python verify_arbitrage.py configs/<some>.py
 
 Output
 ------
-    ./<bundle>/arbitrage.json plus per-age summary on stdout.
+    <bundle>/arbitrage.json   when invoked on a bundle directory
+    ./arbitrage.json           when invoked on a config (cwd output)
 
 Pass criteria
 -------------
-- PASS:        max gap < 1e-6 globally, no NaN cells, no cell with gap > 0
-- CONCERNING:  max in [1e-6, 1e-4]   OR  fraction-above-1e-6 > 1%
-- FAIL:        max > 1e-4            OR  fraction-above-1e-6 > 5%
+- PASS:        max(gap_dom, gap_hull) < 1e-6      (within float roundoff)
+- CONCERNING:  max in [1e-6, 1e-4]                (consider Lobatto)
+- FAIL:        max > 1e-4                          (Lobatto required)
 
-Scope
------
-Initial port: arbitrage gap at the SOLVED policy only. The alpha-sweep
-variant from main's _diag_arbitrage_quadsweep is deferred (TODO at end of
-file). Adapted for the JAX rewrite: 4-D state, CCV log returns, rtb-as-state
-(R_bill comes from s_next[k_v, rtb_idx], not a return draw). Memory is
-bounded by the same chunk-outside-JIT pattern used in
-``verify_ee_residuals.py``.
+The thresholds match the post-rtb-as-state Sigma_r_cond rank-drift gate
+(``1e-5``) order of magnitude — anything above ~1e-6 means the cloud is
+materially mis-resolving the tails relative to where solver convergence
+checks operate.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
@@ -57,38 +76,29 @@ sys.path.insert(0, ".")
 
 import numpy as np
 
-import jax
-import jax.numpy as jnp
-from jax import jit, vmap
-
-from lifecycle.model import (
-    DELTA_BEQUEST,
-    DiscretizationConfig,
-    SolverConfig,
-)
+from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.policy_io import load_policy_bundle
 from lifecycle.precompute import build_model, build_precompute
-from lifecycle.solver import (
-    _ccv_log_return_and_grad,
-    _pc_to_jnp,
-    _precompute_per_is_tensors,
-)
 from lifecycle.var import build_nominal_system1_var_config_hardcoded
 
 
 # =============================================================================
-# Bundle loading + config rehydration  (mirrors verify_ee_residuals.py)
+# Input resolution: bundle directory OR config .py
 # =============================================================================
 
-def _resolve_bundle_path(bundle_arg: str) -> Path:
-    p = Path(bundle_arg)
+def _resolve_input(arg: str) -> tuple[str, Path]:
+    """Return ('bundle', dir_path) or ('config', file_path)."""
+    p = Path(arg)
+    if p.is_file() and p.suffix == ".py":
+        return "config", p
     if p.is_dir():
-        return p
-    p2 = Path("saved_runs") / bundle_arg
+        return "bundle", p
+    p2 = Path("saved_runs") / arg
     if p2.is_dir():
-        return p2
+        return "bundle", p2
     raise FileNotFoundError(
-        f"Bundle directory not found. Tried: {p}, {p2}"
+        f"Could not resolve {arg!r} as a bundle directory or a .py config. "
+        f"Tried: {p}, {p2}."
     )
 
 
@@ -108,7 +118,7 @@ def _rehydrate_disc_config(d: dict) -> DiscretizationConfig:
         "state_lobatto_Z",
     }
     valid = set(DiscretizationConfig._fields)
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     for k, v in d.items():
         if k not in valid:
             continue
@@ -119,246 +129,251 @@ def _rehydrate_disc_config(d: dict) -> DiscretizationConfig:
     return DiscretizationConfig(**kwargs)
 
 
-def _rehydrate_solver_config(d: dict | None) -> SolverConfig:
-    if d is None:
-        return SolverConfig()
-    valid = set(SolverConfig._fields)
-    kwargs = {k: v for k, v in d.items() if k in valid}
-    return SolverConfig(**kwargs)
-
-
-def _rebuild_model_and_pc(metadata: dict, verbose: bool = False):
+def _build_pc_from_bundle(bundle_path: Path, verbose: bool):
+    C, _S, _B, _diag, metadata = load_policy_bundle(bundle_path)
     run_config = metadata.get("run_config")
     if run_config is None:
         raise ValueError(
-            "Bundle metadata has no 'run_config'. Cannot rebuild the precompute. "
-            "Re-solve with the current verify_benchmark_bundle.py."
+            "Bundle metadata has no 'run_config'; cannot rebuild the precompute."
         )
     base_config = run_config.get("base_config")
-    if base_config is None:
-        raise ValueError("Bundle run_config missing 'base_config'.")
     disc_config_dict = run_config.get("discretization_config")
-    if disc_config_dict is None:
-        raise ValueError("Bundle run_config missing 'discretization_config'.")
-
+    if base_config is None or disc_config_dict is None:
+        raise ValueError(
+            "Bundle run_config missing base_config or discretization_config."
+        )
     disc_config = _rehydrate_disc_config(disc_config_dict)
-    solver_config = _rehydrate_solver_config(run_config.get("solver_config"))
-
     var_config = build_nominal_system1_var_config_hardcoded()
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)
-    return model, pc, solver_config, run_config
+    return model, pc, disc_config, metadata
 
 
-def _solved_mask_from_metadata(metadata: dict, n_age: int) -> np.ndarray | None:
-    diag_summary = metadata.get("diagnostics_summary", {})
-    if not isinstance(diag_summary, dict):
-        return None
-    sma = diag_summary.get("solved_age_mask")
-    if isinstance(sma, dict) and "values" in sma:
-        m = np.asarray(sma["values"], dtype=bool)
-    elif isinstance(sma, list):
-        m = np.asarray(sma, dtype=bool)
-    else:
-        return None
-    if m.size != n_age:
-        return None
-    return m
-
-
-def _infer_solved_mask_from_C(C: np.ndarray) -> np.ndarray:
-    return np.array(
-        [not np.isnan(C[t]).any() for t in range(C.shape[0])],
-        dtype=bool,
-    )
-
-
-# =============================================================================
-# Cell-axis chunking helpers (mirrors verify_ee_residuals.py)
-# =============================================================================
-
-def _build_padded_cell_indices(n_z: int, N_state: int, n_chunks: int):
-    n_cells = n_z * N_state
-    chunk_size = (n_cells + n_chunks - 1) // n_chunks
-    n_cells_padded = chunk_size * n_chunks
-
-    cell_idx = np.arange(n_cells, dtype=np.int64)
-    z_idx_np = (cell_idx // N_state).astype(np.int64)
-    is_idx_np = (cell_idx % N_state).astype(np.int64)
-
-    pad_count = n_cells_padded - n_cells
-    if pad_count > 0:
-        z_idx_np = np.concatenate(
-            [z_idx_np, np.full(pad_count, z_idx_np[-1], dtype=np.int64)]
+def _build_pc_from_config(config_path: Path, verbose: bool):
+    spec = importlib.util.spec_from_file_location("cfg", config_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load config module {config_path}")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    base_config = getattr(m, "base_config", None) or getattr(m, "BASE_CONFIG", None)
+    disc_config = getattr(m, "disc_config_template", None) or getattr(m, "DISC_CONFIG", None)
+    if base_config is None or disc_config is None:
+        raise ValueError(
+            f"Config {config_path} must define base_config and disc_config_template."
         )
-        is_idx_np = np.concatenate(
-            [is_idx_np, np.full(pad_count, is_idx_np[-1], dtype=np.int64)]
-        )
-    return jnp.asarray(z_idx_np), jnp.asarray(is_idx_np), n_cells, chunk_size
-
-
-def _make_chunk_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
-                       n_cells: int, chunk_size: int, n_chunks: int,
-                       n_z: int, N_state: int):
-    """Return a runner that calls jit_chunk_fn n_chunks times, concatenates,
-    and reshapes back to (n_z, N_state, n_w). Output is a single array
-    (the per-cell arbitrage gap)."""
-    def runner(*kernel_args):
-        parts = []
-        for i in range(n_chunks):
-            start = i * chunk_size
-            z_chunk = jax.device_put(z_idx_padded[start:start + chunk_size])
-            is_chunk = jax.device_put(is_idx_padded[start:start + chunk_size])
-            piece = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
-            piece.block_until_ready()
-            parts.append(piece)
-        full = jnp.concatenate(parts, axis=0)[:n_cells]
-        n_w = full.shape[-1]
-        return full.reshape(n_z, N_state, n_w)
-    return runner
+    var_config = build_nominal_system1_var_config_hardcoded()
+    model = build_model(base_config, var_config, verbose=verbose)
+    pc = build_precompute(model, disc_config, verbose=verbose)
+    return model, pc, disc_config
 
 
 # =============================================================================
-# Per-age arbitrage-gap kernel
+# Per-state-corner gross-return cloud
 # =============================================================================
 
-def _build_arbitrage_kernel(pcj, sc: SolverConfig, per_is_tensors,
-                             n_z: int, N_state: int, n_chunks: int):
-    """JIT'd per-age kernel returning per-cell arbitrage gap of shape
-    ``(n_z, N_state, n_w)``.
+def _build_gross_cloud_per_state(model, pc) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the gross-return cloud (R_bill, R_stock, R_bond, weights) at every
+    state corner i_s.
 
-    For each cell ``(z_idx, i_s, w_idx)``:
-      1. Look up the per-i_s log-return scenario tensors (shape
-         ``(n_state_quad, n_ret_quad)``).
-      2. Compute ``R_p[k_v, k_r]`` at the solved (alpha_s, alpha_b) via
-         ``_ccv_log_return_and_grad`` (we drop the grad outputs).
-      3. ``R_bill[k_v, k_r] = exp(log_R_bill[k_v, k_r])`` — broadcast across
-         k_r since rtb is a state-axis realisation, not a return draw.
-      4. ``gap = min_{k_v, k_r} R_p  -  sum(weight_kv_kr * R_bill)``.
+    Returns
+    -------
+    R_bill  : (N_state, n_state_quad, n_ret_quad)
+    R_stock : (N_state, n_state_quad, n_ret_quad)
+    R_bond  : (N_state, n_state_quad, n_ret_quad)
+    weights : (n_state_quad, n_ret_quad)  joint quadrature weights, sum to 1
 
-    Cells where c is NaN/Inf or where savings <= sc.tiny_savings are NaN'd
-    in the output (the policy was not actually solved at that cell).
+    Identical math to the solver's ``_build_step_log_returns`` (rtb-as-state):
+      - R_bill[k_v, k_r] = exp(s_next[k_v, rtb_idx])  (constant across k_r)
+      - R_stock = R_bill * exp(log_x_s)
+      - R_bond  = R_bill * exp(log_x_b)
+    where log_x_s, log_x_b are the (xr, xb) log-excess returns at each node.
+    NumPy-only — no JAX needed; the cloud is small (N_state * n_state_quad *
+    n_ret_quad ~ a few million float64 entries even for 9^4 grids).
     """
-    log_R_bill_all, log_x_s_all, log_x_b_all, _, _ = per_is_tensors
-    weight_kv_kr = pcj.weight_kv_kr
+    state_grid = np.asarray(pc.state_grid, dtype=np.float64)         # (N_state, n_state)
+    const_r = np.asarray(pc.const_r, dtype=np.float64)               # (n_ret,)
+    A_r = np.asarray(pc.A_r, dtype=np.float64)                        # (n_ret, n_state)
+    M_v_nodes = np.asarray(pc.M_v_nodes, dtype=np.float64)           # (n_state_quad, n_ret)
+    ret_nodes = np.asarray(pc.ret_nodes, dtype=np.float64)           # (n_ret_quad, n_ret)
+    Phi_0 = np.asarray(model.Phi_0_state, dtype=np.float64)          # (n_state,)
+    Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)              # (n_state, n_state)
+    v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)               # (n_state_quad, n_state)
 
-    sigma2_xr = pcj.sigma2_xr
-    sigma2_xb = pcj.sigma2_xb
-    sigma_xrxb = pcj.sigma_xrxb
+    rtb_idx = int(model.rtb_index_in_state)
+    ret_names = list(model.ret_names)
+    xr_pos = ret_names.index("xr")
+    xb_pos = ret_names.index("xb")
 
-    tiny_savings = jnp.float64(sc.tiny_savings)
+    # Mean log-excess at each (i_s, k_v): same as _build_step_log_returns vectorised over i_s
+    base_mu_r = const_r[None, :] + state_grid @ A_r.T                # (N_state, n_ret)
+    mu_r_per = base_mu_r[:, None, :] + M_v_nodes[None, :, :]         # (N_state, n_state_quad, n_ret)
 
-    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_padded_cell_indices(
-        n_z, N_state, n_chunks,
-    )
+    # s_next[i_s, k_v, :] = Phi_0 + Phi_11 @ s_t + v[k_v]
+    s_next = (
+        Phi_0[None, None, :]
+        + state_grid[:, None, :] @ Phi_11.T[None, :, :]
+        + v_nodes[None, :, :]
+    )                                                                # (N_state, n_state_quad, n_state)
+    log_R_bill_kv = s_next[:, :, rtb_idx]                            # (N_state, n_state_quad)
 
-    def per_cell(z_idx, i_s, C_t, S_t, B_t):
-        log_R_bill_i = log_R_bill_all[i_s]              # (n_state_quad, n_ret_quad)
-        log_x_s_i = log_x_s_all[i_s]
-        log_x_b_i = log_x_b_all[i_s]
+    # Broadcast across k_r — bill is realised at the state node, identical for all return nodes.
+    R_bill = np.exp(log_R_bill_kv)[:, :, None]                       # (N_state, n_state_quad, 1)
 
-        # E[R_bill] under the joint quadrature. R_bill is constant across
-        # k_r so this also equals sum_kv v_weights[kv] * exp(log_R_bill_kv);
-        # writing it as the joint sum keeps the diagnostic symmetric with the
-        # joint-cloud arbitrage test on main and means we don't need to
-        # separately materialise v_weights / ret_weights here.
-        R_bill = jnp.exp(log_R_bill_i)
-        R_bill_mean = jnp.sum(weight_kv_kr * R_bill)
+    # log_x_s[i_s, k_v, k_r] = mu_r_per[i_s, k_v, xr_pos] + ret_nodes[k_r, xr_pos]
+    res_xs = ret_nodes[:, xr_pos]                                    # (n_ret_quad,)
+    res_xb = ret_nodes[:, xb_pos]
+    log_x_s = mu_r_per[:, :, xr_pos:xr_pos + 1] + res_xs[None, None, :]
+    log_x_b = mu_r_per[:, :, xb_pos:xb_pos + 1] + res_xb[None, None, :]
 
-        c_arr = C_t[z_idx, i_s, :]                       # (n_w,)
-        s_arr = S_t[z_idx, i_s, :]
-        b_arr = B_t[z_idx, i_s, :]
-        wealth_arr = pcj.wealth_grid                     # (n_w,)
+    R_stock = R_bill * np.exp(log_x_s)
+    R_bond = R_bill * np.exp(log_x_b)
 
-        def at_w(c, alpha_s, alpha_b, wealth):
-            R_p, _, _ = _ccv_log_return_and_grad(
-                alpha_s, alpha_b,
-                log_R_bill_i, log_x_s_i, log_x_b_i,
-                sigma2_xr, sigma2_xb, sigma_xrxb,
-            )                                             # (n_state_quad, n_ret_quad)
-            R_p_min = jnp.min(R_p)
-            gap = R_p_min - R_bill_mean
+    # Broadcast bill to full shape so callers don't need to think about it.
+    R_bill_full = np.broadcast_to(
+        R_bill, (state_grid.shape[0], M_v_nodes.shape[0], ret_nodes.shape[0])
+    ).copy()
 
-            savings = wealth - c
-            invalid = jnp.logical_or(
-                jnp.logical_not(jnp.isfinite(c)),
-                savings <= tiny_savings,
-            )
-            invalid = jnp.logical_or(
-                invalid,
-                jnp.logical_not(jnp.isfinite(alpha_s) & jnp.isfinite(alpha_b)),
-            )
-            return jnp.where(invalid, jnp.float64(jnp.nan), gap)
+    v_weights = np.asarray(pc.v_weights, dtype=np.float64)
+    ret_weights = np.asarray(pc.ret_weights, dtype=np.float64)
+    weights = np.outer(v_weights, ret_weights)                       # (n_state_quad, n_ret_quad)
 
-        return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)  # (n_w,)
+    return R_bill_full, R_stock, R_bond, weights
 
-    @jit
-    def per_chunk(C_t, S_t, B_t, z_chunk, is_chunk):
-        return vmap(per_cell, in_axes=(0, 0, None, None, None))(
-            z_chunk, is_chunk, C_t, S_t, B_t,
-        )
 
-    runner = _make_chunk_runner(
-        per_chunk, z_idx_padded, is_idx_padded,
-        n_cells, chunk_size, n_chunks, n_z, N_state,
-    )
+# =============================================================================
+# Per-state-corner gaps
+# =============================================================================
 
-    def per_age(C_t, S_t, B_t):
-        return runner(C_t, S_t, B_t)
+ASSET_NAMES = ("bill", "stock", "bond")
 
-    return per_age
+
+def _axis_aligned_dominance_gaps(
+    R_bill: np.ndarray, R_stock: np.ndarray, R_bond: np.ndarray,
+) -> dict:
+    """Per-state-corner axis-aligned dominance: for each ordered pair (i, j)
+    of distinct assets, gap_ij[i_s] = min_node R_i[i_s] - max_node R_j[i_s].
+
+    gap_ij > 0 ⇒ asset i strictly dominates asset j on every quadrature node
+    at state corner i_s — a spurious dominance arbitrage in the discrete
+    cloud (the user's definition: "the worst return of asset i is still
+    better than the best return of asset j").
+    """
+    flat = lambda R: R.reshape(R.shape[0], -1)                       # (N_state, n_nodes)
+    R_flat = {"bill": flat(R_bill), "stock": flat(R_stock), "bond": flat(R_bond)}
+    R_min = {a: R_flat[a].min(axis=1) for a in ASSET_NAMES}
+    R_max = {a: R_flat[a].max(axis=1) for a in ASSET_NAMES}
+
+    pairs: dict[str, np.ndarray] = {}
+    for i in ASSET_NAMES:
+        for j in ASSET_NAMES:
+            if i == j:
+                continue
+            pairs[f"{i}_dominates_{j}"] = R_min[i] - R_max[j]
+    return pairs
+
+
+def _convex_hull_arbitrage_gap(
+    R_bill: np.ndarray, R_stock: np.ndarray, R_bond: np.ndarray,
+    n_angles: int = 720,
+) -> np.ndarray:
+    """Per-state-corner 2D convex-hull arbitrage gap on the excess-return cloud.
+
+        gap_hull[i_s] = max_{||d||=1, d in R^2}  min_n d . (X_s, X_b)_n
+
+    where X_s = R_stock - R_bill and X_b = R_bond - R_bill. gap_hull > 0 ⇒
+    a separating direction d exists s.t. d . X > 0 at every node ⇒ the
+    portfolio with weights ∝ d achieves strictly positive excess returns on
+    every quadrature node. This is the most general discrete-arbitrage test
+    (axis-aligned dominance is the special case d = e_s or e_b).
+    """
+    Xs = (R_stock - R_bill).reshape(R_stock.shape[0], -1)            # (N_state, n_nodes)
+    Xb = (R_bond - R_bill).reshape(R_bond.shape[0], -1)
+
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+    cos = np.cos(angles)                                              # (n_angles,)
+    sin = np.sin(angles)
+    # proj[i_s, n, a] = cos[a] * Xs[i_s, n] + sin[a] * Xb[i_s, n]
+    # min over nodes per (i_s, angle), then max over angles per i_s.
+    # Memory for the full (N_state, n_nodes, n_angles) tensor can be large at
+    # 9^4 x 36 x 25 x 720 ~ 8 GB in float64; chunk over angles to bound peak.
+    N_state = Xs.shape[0]
+    gap = np.full(N_state, -np.inf, dtype=np.float64)
+    chunk = 64
+    for a0 in range(0, n_angles, chunk):
+        a1 = min(a0 + chunk, n_angles)
+        c = cos[a0:a1][None, None, :]                                 # (1, 1, n_a)
+        s = sin[a0:a1][None, None, :]
+        # (N_state, n_nodes, n_a)
+        proj = Xs[:, :, None] * c + Xb[:, :, None] * s
+        # min over nodes, then max over angles in this chunk
+        chunk_min = proj.min(axis=1)                                  # (N_state, n_a)
+        chunk_max = chunk_min.max(axis=1)                             # (N_state,)
+        gap = np.maximum(gap, chunk_max)
+    # Clip at zero per main's definition: "gap" is positive iff origin
+    # strictly outside hull; a small negative value just means origin is
+    # comfortably inside (no arbitrage).
+    return np.maximum(gap, 0.0)
 
 
 # =============================================================================
 # Aggregation + reporting
 # =============================================================================
 
-def _per_age_stats(gap_arr: np.ndarray, age: int) -> dict:
-    finite = gap_arr[np.isfinite(gap_arr)]
-    n_cells = int(gap_arr.size)
-    n_finite = int(finite.size)
-    n_nan = n_cells - n_finite
-    if n_finite == 0:
-        return {
-            "age": int(age),
-            "n_cells": n_cells,
-            "n_nan": n_nan,
-            "min_gap": None,
-            "median_gap": None,
-            "p99_gap": None,
-            "max_gap": None,
-            "frac_gap_pos": None,
-            "frac_above_1e-6": None,
-            "frac_above_1e-4": None,
+def _summarise_dominance(pair_gaps: dict[str, np.ndarray]) -> dict:
+    out: dict[str, Any] = {}
+    worst_overall = -np.inf
+    worst_overall_pair = None
+    worst_overall_idx = None
+    for pair, g in pair_gaps.items():
+        max_idx = int(np.argmax(g))
+        max_val = float(g[max_idx])
+        n_pos = int(np.sum(g > 0.0))
+        out[pair] = {
+            "max_gap": max_val,
+            "argmax_state_idx": max_idx,
+            "n_state_corners_dominant": n_pos,
+            "n_state_corners_total": int(g.size),
         }
+        if max_val > worst_overall:
+            worst_overall = max_val
+            worst_overall_pair = pair
+            worst_overall_idx = max_idx
+    out["_worst"] = {
+        "pair": worst_overall_pair,
+        "max_gap": float(worst_overall) if np.isfinite(worst_overall) else None,
+        "argmax_state_idx": worst_overall_idx,
+    }
+    return out
+
+
+def _summarise_hull(gap_hull: np.ndarray) -> dict:
+    max_idx = int(np.argmax(gap_hull))
     return {
-        "age": int(age),
-        "n_cells": n_cells,
-        "n_nan": n_nan,
-        "min_gap": float(np.min(finite)),
-        "median_gap": float(np.median(finite)),
-        "p99_gap": float(np.percentile(finite, 99.0)),
-        "max_gap": float(np.max(finite)),
-        "frac_gap_pos": float(np.sum(finite > 0.0) / n_finite),
-        "frac_above_1e-6": float(np.sum(finite > 1e-6) / n_finite),
-        "frac_above_1e-4": float(np.sum(finite > 1e-4) / n_finite),
+        "max_gap": float(gap_hull[max_idx]),
+        "argmax_state_idx": max_idx,
+        "n_state_corners_with_arb": int(np.sum(gap_hull > 0.0)),
+        "n_state_corners_total": int(gap_hull.size),
+        "median_gap": float(np.median(gap_hull)),
+        "p99_gap": float(np.percentile(gap_hull, 99.0)),
     }
 
 
-def _format_age_line(s: dict) -> str:
-    if s["max_gap"] is None:
-        return f"Age {s['age']:3d}: all-NaN ({s['n_nan']}/{s['n_cells']})"
-    return (
-        f"Age {s['age']:3d}: "
-        f"max={s['max_gap']:+.2e}  "
-        f"p99={s['p99_gap']:+.2e}  "
-        f"median={s['median_gap']:+.2e}  "
-        f"min={s['min_gap']:+.2e}  "
-        f"gap>0: {s['frac_gap_pos']*100:5.2f}%  "
-        f">1e-6: {s['frac_above_1e-6']*100:5.2f}%  "
-        f">1e-4: {s['frac_above_1e-4']*100:5.2f}%  "
-        f"NaN: {s['n_nan']}/{s['n_cells']}"
-    )
+def _state_index_to_tuple(i_s: int, sizes: tuple[int, ...]) -> tuple[int, ...]:
+    """Decode a flat row-major index into per-axis indices for the state grid."""
+    out = []
+    rem = int(i_s)
+    for n in reversed(sizes):
+        out.append(rem % int(n))
+        rem //= int(n)
+    return tuple(reversed(out))
+
+
+def _format_worst_corner(idx: int, pc) -> str:
+    sizes = tuple(int(s) for s in pc.state_grid_sizes)
+    tup = _state_index_to_tuple(idx, sizes)
+    coords = np.asarray(pc.state_grid[idx], dtype=np.float64)
+    coord_str = ", ".join(f"{c:+.4f}" for c in coords)
+    return f"i_s={idx}  axes={tup}  state=({coord_str})"
 
 
 # =============================================================================
@@ -368,8 +383,9 @@ def _format_age_line(s: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
-        "bundle",
-        help="Bundle directory or bare bundle name (looked up under ./saved_runs/<name>/).",
+        "target",
+        help="Bundle directory, bare bundle name (looked up under saved_runs/), "
+             "or a .py config module that defines base_config + disc_config_template.",
     )
     parser.add_argument(
         "--no-save",
@@ -377,202 +393,167 @@ def main() -> int:
         help="Skip writing arbitrage.json.",
     )
     parser.add_argument(
-        "--cell-chunks",
+        "--n-angles",
         type=int,
-        default=None,
-        help="Number of fixed-size chunks the per-age vmap is split into. "
-             "Defaults to a heuristic that keeps per-chunk cells <= 256 — but the "
-             "arbitrage kernel's per-cell working set is much smaller than EE's "
-             "(no c_corners gather), so 1 is fine for most configs.",
+        default=720,
+        help="Direction count for the convex-hull sweep (default 720).",
+    )
+    parser.add_argument(
+        "--top-corners",
+        type=int,
+        default=8,
+        help="Detail this many worst state corners in the JSON output.",
     )
     args = parser.parse_args()
 
-    bundle_path = _resolve_bundle_path(args.bundle)
-    print(f"Bundle: {bundle_path}", flush=True)
+    kind, in_path = _resolve_input(args.target)
+    print(f"Input ({kind}): {in_path}", flush=True)
 
-    print("Loading bundle...", flush=True)
-    C, S, B, _diag, metadata = load_policy_bundle(bundle_path)
-    print(f"  Policy shape: C={C.shape}, dtype={C.dtype}", flush=True)
-
-    spec = metadata.get("wealth_dynamics_spec", "?")
-    if spec != "ccv_log":
-        print(
-            f"  WARNING: bundle wealth_dynamics_spec={spec!r}, but the arbitrage "
-            f"kernel evaluates the CCV log specification. Gaps will not be "
-            f"meaningful for non-ccv_log bundles.",
-            flush=True,
-        )
-
-    print("\nRebuilding model + precompute from bundle metadata...", flush=True)
+    print("Building model + precompute...", flush=True)
     t0 = time.time()
-    model, pc, solver_config, _run_config = _rebuild_model_and_pc(metadata, verbose=False)
-    delta = solver_config.delta_bequest if solver_config.delta_bequest >= 0.0 else DELTA_BEQUEST
+    metadata: dict[str, Any] | None = None
+    if kind == "bundle":
+        model, pc, disc_config, metadata = _build_pc_from_bundle(in_path, verbose=False)
+    else:
+        model, pc, disc_config = _build_pc_from_config(in_path, verbose=False)
     print(
         f"  Setup wall: {time.time() - t0:.1f}s; "
-        f"N_state={pc.N_state}, n_z={pc.n_z}, n_w={pc.n_w}, "
-        f"n_state_quad={pc.n_state_quad}, n_ret_quad={pc.n_ret_quad}",
+        f"N_state={pc.N_state}, n_state_quad={pc.n_state_quad}, "
+        f"n_ret_quad={pc.n_ret_quad}",
         flush=True,
     )
 
-    expected_shape = (pc.n_age, pc.n_z, pc.N_state, pc.n_w)
-    if C.shape != expected_shape:
-        raise RuntimeError(
-            f"Policy shape mismatch: bundle has {C.shape}, "
-            f"rebuilt precompute expects {expected_shape}."
-        )
-
-    pcj = _pc_to_jnp(pc, delta)
-    per_is_tensors = _precompute_per_is_tensors(pcj)
-
-    # Cell-axis chunking. Per-cell working set here is just the (n_state_quad
-    # x n_ret_quad) R_p tensor — no c_corners gather — so memory is minor.
-    # Default: at most 1024 cells per chunk (more relaxed than EE's 256).
-    n_cells_total = pc.n_z * pc.N_state
-    if args.cell_chunks is not None:
-        n_chunks = max(1, int(args.cell_chunks))
-    else:
-        n_chunks = max(1, (n_cells_total + 1023) // 1024)
-    chunk_size_dbg = (n_cells_total + n_chunks - 1) // n_chunks
+    print("Building per-state-corner gross-return cloud...", flush=True)
+    t1 = time.time()
+    R_bill, R_stock, R_bond, weights = _build_gross_cloud_per_state(model, pc)
     print(
-        f"  Cell-chunk split: {n_chunks} chunk(s) over {n_cells_total} cells "
-        f"(~{chunk_size_dbg} cells/chunk)",
+        f"  Cloud shapes: bill/stock/bond = {R_bill.shape}; "
+        f"weights = {weights.shape}; sum(weights) = {weights.sum():.6f} "
+        f"(should be ~1.0); wall: {time.time() - t1:.2f}s",
         flush=True,
     )
 
-    arb_kernel = _build_arbitrage_kernel(
-        pcj, solver_config, per_is_tensors,
-        pc.n_z, pc.N_state, n_chunks,
-    )
+    print("\nComputing axis-aligned dominance gaps...", flush=True)
+    t2 = time.time()
+    pair_gaps = _axis_aligned_dominance_gaps(R_bill, R_stock, R_bond)
+    dom_summary = _summarise_dominance(pair_gaps)
+    print(f"  Dominance wall: {time.time() - t2:.2f}s", flush=True)
 
-    ages = np.asarray(pc.ages)
-    n_age = pc.n_age
+    print(f"\nComputing convex-hull arbitrage gap (n_angles={args.n_angles})...", flush=True)
+    t3 = time.time()
+    gap_hull = _convex_hull_arbitrage_gap(R_bill, R_stock, R_bond, n_angles=args.n_angles)
+    hull_summary = _summarise_hull(gap_hull)
+    print(f"  Hull wall: {time.time() - t3:.2f}s", flush=True)
 
-    solved_mask = _solved_mask_from_metadata(metadata, n_age)
-    if solved_mask is None:
-        print("  (no solved_age_mask in metadata; inferring from C NaN slabs)", flush=True)
-        solved_mask = _infer_solved_mask_from_C(np.asarray(C))
-    n_solved = int(solved_mask.sum())
-    print(f"  Solved ages: {n_solved}/{n_age}", flush=True)
-
-    eligible_t = [t for t in range(n_age) if solved_mask[t]]
-    if not eligible_t:
-        print("\nNo solved ages to evaluate. Exiting.", flush=True)
-        return 1
-
-    print(
-        f"\nEvaluating arbitrage gap at {len(eligible_t)} solved age(s): "
-        f"ages {int(ages[eligible_t[0]])}..{int(ages[eligible_t[-1]])}",
-        flush=True,
-    )
-
-    per_age_stats: list[dict] = []
-    global_max = -np.inf
-    global_min = np.inf
-    global_nan = 0
-    global_pos_cells = 0
-    global_finite_cells = 0
-    t_sweep = time.time()
-
-    for t in eligible_t:
-        age = int(ages[t])
-        C_jnp = jnp.asarray(C[t])
-        S_jnp = jnp.asarray(S[t])
-        B_jnp = jnp.asarray(B[t])
-
-        gap = arb_kernel(C_jnp, S_jnp, B_jnp)
-        gap_np = np.asarray(jax.device_get(gap))
-        stats = _per_age_stats(gap_np, age)
-        per_age_stats.append(stats)
-
-        if stats["max_gap"] is not None:
-            global_max = max(global_max, stats["max_gap"])
-            global_min = min(global_min, stats["min_gap"])
-            n_finite_age = stats["n_cells"] - stats["n_nan"]
-            global_finite_cells += n_finite_age
-            global_pos_cells += int(round(stats["frac_gap_pos"] * n_finite_age))
-        global_nan += stats["n_nan"]
-
-        elapsed = time.time() - t_sweep
+    # Per-pair report.
+    print("\n" + "-" * 70, flush=True)
+    print("Axis-aligned dominance (one asset min > another asset max)", flush=True)
+    print("-" * 70, flush=True)
+    for pair in pair_gaps:
+        s = dom_summary[pair]
+        flag = "  ARB" if s["max_gap"] > 0.0 else ""
         print(
-            f"  t={t:3d} age={age:3d}  ({elapsed:6.1f}s)  "
-            + _format_age_line(stats),
+            f"  {pair:>22}: "
+            f"max={s['max_gap']:+.3e}  "
+            f"corners_dominant={s['n_state_corners_dominant']}/{s['n_state_corners_total']}  "
+            f"argmax_i_s={s['argmax_state_idx']}{flag}",
+            flush=True,
+        )
+    worst_dom = dom_summary["_worst"]
+    print(f"\n  Worst dominance: {worst_dom['pair']}  gap={worst_dom['max_gap']:+.3e}  "
+          f"at i_s={worst_dom['argmax_state_idx']}", flush=True)
+
+    print("\n" + "-" * 70, flush=True)
+    print(f"Convex-hull arbitrage (separating direction in (X_s, X_b))", flush=True)
+    print("-" * 70, flush=True)
+    print(
+        f"  max_gap={hull_summary['max_gap']:+.3e}  "
+        f"p99={hull_summary['p99_gap']:+.3e}  "
+        f"median={hull_summary['median_gap']:+.3e}",
+        flush=True,
+    )
+    print(
+        f"  Corners with hull arb: {hull_summary['n_state_corners_with_arb']}/"
+        f"{hull_summary['n_state_corners_total']}  "
+        f"argmax_i_s={hull_summary['argmax_state_idx']}",
+        flush=True,
+    )
+
+    # Top-K worst corners by hull gap.
+    top_k = min(args.top_corners, gap_hull.size)
+    worst_idx = np.argsort(-gap_hull)[:top_k]
+    worst_corners = []
+    print(f"\n  Top {top_k} worst corners (by hull gap):", flush=True)
+    for rank, idx in enumerate(worst_idx, 1):
+        idx_int = int(idx)
+        # Largest pairwise dominance at this corner across all 6 ordered pairs.
+        per_corner_dom = max(
+            float(g[idx_int]) for g in pair_gaps.values()
+        )
+        worst_corners.append({
+            "rank": rank,
+            "i_s": idx_int,
+            "axis_indices": list(_state_index_to_tuple(
+                idx_int, tuple(int(s) for s in pc.state_grid_sizes),
+            )),
+            "state_coords": list(map(float, np.asarray(pc.state_grid[idx_int]))),
+            "hull_gap": float(gap_hull[idx_int]),
+            "max_dominance_gap": per_corner_dom,
+        })
+        print(
+            f"    {rank:>2}.  hull={float(gap_hull[idx_int]):+.3e}  "
+            f"max_dom={per_corner_dom:+.3e}  "
+            f"{_format_worst_corner(idx_int, pc)}",
             flush=True,
         )
 
-    total_sweep = time.time() - t_sweep
-    print(f"\nTotal arbitrage-sweep wall: {total_sweep:.1f}s", flush=True)
+    # Verdict: max of dominance and hull gaps.
+    max_dom = float(worst_dom["max_gap"]) if worst_dom["max_gap"] is not None else 0.0
+    max_hull = float(hull_summary["max_gap"])
+    overall_max = max(max_dom, max_hull)
 
-    per_age_stats.sort(key=lambda s: s["age"])
-
-    if not np.isfinite(global_max):
-        global_max = None
-    if not np.isfinite(global_min):
-        global_min = None
+    if overall_max > 1e-4:
+        verdict = "FAIL  (max gap > 1e-4 — Lobatto required)"
+    elif overall_max > 1e-6:
+        verdict = "CONCERNING  (max gap in [1e-6, 1e-4] — consider Lobatto)"
+    else:
+        verdict = "PASS  (max gap < 1e-6 — discrete cloud admits no arbitrage)"
 
     summary = {
-        "bundle_path": str(bundle_path),
-        "wealth_dynamics_spec": metadata.get("wealth_dynamics_spec"),
-        "ret_lobatto_Z": _list_to_tuple_recursive(
-            (metadata.get("run_config", {}) or {}).get("discretization_config", {}).get("ret_lobatto_Z")
-        ),
-        "state_lobatto_Z": _list_to_tuple_recursive(
-            (metadata.get("run_config", {}) or {}).get("discretization_config", {}).get("state_lobatto_Z")
-        ),
-        "n_ages_evaluated": len(per_age_stats),
-        "global_max_gap": global_max,
-        "global_min_gap": global_min,
-        "global_nan_count": int(global_nan),
-        "global_finite_cells": int(global_finite_cells),
-        "global_cells_with_gap_pos": int(global_pos_cells),
-        "per_age": per_age_stats,
+        "input_kind": kind,
+        "input_path": str(in_path),
+        "n_state_corners": int(R_bill.shape[0]),
+        "n_quad_nodes_per_corner": int(R_bill.shape[1] * R_bill.shape[2]),
+        "n_state_quad": int(R_bill.shape[1]),
+        "n_ret_quad": int(R_bill.shape[2]),
+        "ret_lobatto_Z": _list_to_tuple_recursive(disc_config.ret_lobatto_Z),
+        "state_lobatto_Z": _list_to_tuple_recursive(disc_config.state_lobatto_Z),
+        "n_angles": int(args.n_angles),
+        "axis_aligned_dominance": dom_summary,
+        "convex_hull_arbitrage": hull_summary,
+        "worst_corners": worst_corners,
+        "max_dominance_gap": max_dom,
+        "max_hull_gap": max_hull,
+        "overall_max_gap": overall_max,
+        "verdict": verdict.split()[0],
     }
 
     print("\n" + "=" * 70, flush=True)
-    print("Arbitrage-gap summary", flush=True)
+    print("Arbitrage summary", flush=True)
     print("=" * 70, flush=True)
-    print(f"  Bundle           : {bundle_path}", flush=True)
-    print(f"  Spec             : {summary['wealth_dynamics_spec']}", flush=True)
+    print(f"  Input            : {in_path}", flush=True)
     print(f"  ret_lobatto_Z    : {summary['ret_lobatto_Z']}", flush=True)
     print(f"  state_lobatto_Z  : {summary['state_lobatto_Z']}", flush=True)
-    print(f"  Ages evaluated   : {summary['n_ages_evaluated']}", flush=True)
-    print(f"  Global max gap   : "
-          f"{global_max:+.3e}" if global_max is not None else "  Global max gap   : N/A", flush=True)
-    print(f"  Global min gap   : "
-          f"{global_min:+.3e}" if global_min is not None else "  Global min gap   : N/A", flush=True)
-    print(f"  Cells with gap>0 : {global_pos_cells}/{global_finite_cells}",
-          flush=True)
-    print(f"  Global NaN cells : {summary['global_nan_count']}", flush=True)
-
-    # Pass / concerning / fail (per the handoff §3 thresholds).
-    max_for_verdict = global_max if global_max is not None else 0.0
-    frac_above_1e6_global = (
-        max(
-            (s["frac_above_1e-6"] or 0.0) for s in per_age_stats
-        ) if per_age_stats else 0.0
-    )
-    fail = (
-        max_for_verdict > 1e-4
-        or frac_above_1e6_global > 0.05
-    )
-    concerning = (
-        not fail
-        and (
-            max_for_verdict > 1e-6
-            or frac_above_1e6_global > 0.01
-        )
-    )
-    if fail:
-        verdict = "FAIL  (max gap > 1e-4 or fraction-above-1e-6 > 5%)"
-    elif concerning:
-        verdict = "CONCERNING  (max gap in [1e-6, 1e-4] or some age has >1% above 1e-6)"
-    else:
-        verdict = "PASS  (max gap < 1e-6 globally; no spurious arbitrage)"
-    summary["verdict"] = verdict.split()[0]
+    print(f"  N_state corners  : {summary['n_state_corners']}", flush=True)
+    print(f"  Nodes per corner : {summary['n_quad_nodes_per_corner']}", flush=True)
+    print(f"  Max dominance    : {max_dom:+.3e}", flush=True)
+    print(f"  Max hull arb     : {max_hull:+.3e}", flush=True)
+    print(f"  Overall max gap  : {overall_max:+.3e}", flush=True)
     print(f"  Verdict          : {verdict}", flush=True)
     print("=" * 70, flush=True)
 
     if not args.no_save:
-        out_path = bundle_path / "arbitrage.json"
+        out_path = (in_path / "arbitrage.json") if kind == "bundle" else Path("arbitrage.json")
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\nSaved: {out_path}", flush=True)
@@ -584,14 +565,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-# TODO (deferred — see HANDOFF_PORT_ARBITRAGE_DIAGNOSTIC.md §8.1):
-# Add an alpha-sweep variant. The stronger test from main's
-# _diag_arbitrage_quadsweep evaluates:
-#     gap_sweep(cell) = max_alpha (min_{k_v,k_r} R_p(alpha)) - E[R_bill]
-# over a coarse alpha grid (e.g. alpha_s in {-2, -1, 0, 1, 2} x alpha_b
-# similar) at each cell. If gap_sweep > 0 the *quadrature* admits arbitrage
-# even where the solver did not exploit it. Cheap to add (vmap over
-# alpha-grid points + take max), but expand the per-cell working set by the
-# alpha-grid factor; bump n_chunks accordingly.

@@ -160,28 +160,43 @@ import json; print('REPORT_JSON', json.dumps(report.to_dict()))
 Fail mode: any test 1–9 (per `diagnostics.py` Test numbering) reports `FAIL`.
 Cite the failing Test # and the checklist § in the failure report.
 
-### Phase D — Arbitrage / discrete free lunch (DFL) sweep (300–600 s)
+### Phase D — Arbitrage / discrete free lunch (DFL) check (≤ 30 s)
 
 This is checklist GAP §12.1: not auto-run by `build_precompute`; you must
 invoke it explicitly. **This is the single most expensive lesson encoded
 in the repo.** Do not skip.
 
+A *spurious arbitrage* in the discrete (state × return) quadrature cloud
+is the situation where, at some state corner, the worst quadrature node
+of one asset still strictly beats the best node of another (axis-aligned
+dominance) — or, more generally, the origin sits outside the convex hull
+of the (X_stock, X_bond) excess-return cloud, so a separating direction
+exists. The continuous lognormal model never admits such a free lunch;
+any "arbitrage" the integrator sees is a discretization artifact, and a
+solver running over that cloud will tilt toward unhedged-bankruptcy
+positions that look risk-free under the cloud but blow up out-of-sample.
+
 ```bash
-python scripts/diagnostics/_diag_arbitrage_quadsweep.py <config-path>
+python verify_arbitrage.py <config-path>
 ```
 
-⚠️ **Known bug:** `_diag_arbitrage_quadsweep._make_pc` strips Lobatto args
-when reconstructing the precompute (checklist GAP §12.7). If the config
-has non-`None` `ret_lobatto_Z` / `state_lobatto_Z`, the script silently
-loses the tail correction. Workaround: the script accepts an explicit
-disc-config override; pass `--no-strip-lobatto` if available, otherwise
-**flag this in the WARNING list and proceed only if the config has
-`*_lobatto_Z=None`**.
+The script accepts either a config `.py` (preferred for preflight — no
+bundle needed) or a saved bundle directory (rebuilds the same precompute
+from `metadata.run_config`). It builds the per-state-corner gross-return
+cloud, computes the 6 axis-aligned dominance gaps and the 2D convex-hull
+arbitrage gap, and writes `arbitrage.json` (cwd or `<bundle>/`).
 
-Pass: max bond-arbitrage residual ≤ `1e-6` and no non-trivial
-discrete-free-lunch path identified. Fail (BLOCKER): any positive
-arbitrage path. Capture the script's full stdout; cite checklist §1.5
-and the docs/notes/LOBATTO_CONFIG_TRACKER.md §6 standing rule.
+Pass criteria (per the script's own thresholds):
+
+- **PASS**: `max(dominance_gap, hull_gap) < 1e-6` (within float roundoff).
+- **CONCERNING (WARNING)**: max in `[1e-6, 1e-4]` — record the worst
+  state corner in the sentinel; consider Lobatto.
+- **FAIL (BLOCKER)**: max `> 1e-4` — Lobatto required. Hand back to the
+  proposer with the worst-corner table; cite checklist §1.5 and the
+  standing rule in `docs/notes/LOBATTO_CONFIG_TRACKER.md` §6.
+
+The check honours `ret_lobatto_Z` / `state_lobatto_Z` from the config —
+no Lobatto-stripping caveat applies.
 
 ### Phase E — Smoke solve at 5⁴ retire-only (5–10 min)
 
@@ -360,29 +375,34 @@ different inputs, different decision — but they share this doc because the
 operator needs the same kind of unambiguous pass/fail signal in both places.
 
 **Hard rule:** any agent or human about to consume a bundle for downstream
-analysis (plotting, simulation, EE deep-dive, thesis figures) MUST run all
-three checks below and confirm PASS on each. Skipping is not allowed; the
-checks are cheap (≤ 15 min combined on a laptop) and silent failures
-downstream are expensive.
+analysis (plotting, simulation, EE deep-dive, thesis figures) MUST run both
+checks below and confirm PASS on each. Skipping is not allowed; the checks
+are cheap (≤ 15 min combined on a laptop) and silent failures downstream
+are expensive.
 
 ```bash
 # 1. Cheap NumPy scan: NaN/Inf, extreme alphas, tiny-savings fallback.
 python verify_invalid_cells.py <bundle-name-or-path>
 
-# 2. Quadrature spurious-arbitrage at the solved policy (CCV, 4-D state,
-#    rtb-as-state). Pass = max gap < 1e-6 globally; concerning in
-#    [1e-6, 1e-4] (consider Lobatto); fail above 1e-4 (Lobatto required,
-#    re-solve before consuming).
-python verify_arbitrage.py <bundle-name-or-path>
-
-# 3. Euler-equation residual at every solved (z, state, w) cell. Pass per
+# 2. Euler-equation residual at every solved (z, state, w) cell. Pass per
 #    HANDOFF_PORT_EE_DIAGNOSTIC.md §7 thresholds.
 python verify_ee_residuals.py <bundle-name-or-path> --use-relative
 ```
 
 Each writes a JSON summary into the bundle directory — `invalid_cells.json`,
-`arbitrage.json`, `ee_residuals.json` — with a `verdict` field readable by
-downstream automation.
+`ee_residuals.json` — with a `verdict` field readable by downstream
+automation.
+
+**The discrete-cloud arbitrage check (`verify_arbitrage.py`) is NOT a
+post-bundle gate** — it depends only on (model + discretization), not on
+solved policies. It belongs in Phase D of preflight (§4). Run it
+post-bundle only as a regression check (e.g. "did the bundle's saved
+config match the one preflight signed off on"); the same script accepts a
+bundle path and rebuilds the precompute from `metadata.run_config`:
+
+```bash
+python verify_arbitrage.py <bundle-name-or-path>     # regression-only
+```
 
 **If any check fails:** investigate before consuming. Do NOT proceed to
 plotting, simulation, or thesis-figure work. The likely remediations:
@@ -390,17 +410,16 @@ plotting, simulation, or thesis-figure work. The likely remediations:
 - `verify_invalid_cells.py` fails ⇒ bundle is structurally broken
   (NaN policies, extreme alphas at solved cells). Investigate the solve,
   do not re-use the bundle.
-- `verify_arbitrage.py` fails ⇒ the discrete quadrature certifies a "free
-  lunch" the continuous model doesn't admit. Re-solve with
-  `ret_lobatto_Z` / `state_lobatto_Z` configured (see
-  `lifecycle/quadrature_with_tails.py` and the standing rule in
-  `docs/notes/LOBATTO_CONFIG_TRACKER.md` §6).
 - `verify_ee_residuals.py` fails ⇒ the solver did not converge at some
   cells. Investigate Newton iter counts, tolerance, and grid coverage.
+- `verify_arbitrage.py` fails post-bundle but passed in preflight ⇒ the
+  bundle was solved against a different config than the one preflight
+  cleared (look for an unscheduled rebuild). If preflight was skipped,
+  re-config with `ret_lobatto_Z` / `state_lobatto_Z` and re-solve.
 
-**Wall budget on a laptop:** ≤ 1 s for invalid-cells; ~80 s for arbitrage
-on a 5⁴ × n_z=11 retirement-only bundle (scales linearly with cell count);
-~5-15 min for EE residuals depending on grid size. Free; run unconditionally.
+**Wall budget on a laptop:** ≤ 1 s for invalid-cells; ≤ 30 s for
+arbitrage at a typical 5⁴–9⁴ grid; ~5-15 min for EE residuals depending
+on grid size. Free; run unconditionally.
 
 **Why this lives in PREFLIGHT_AGENT.md and not its own doc:** the same
 agents that pre-flight a config also gate downstream consumption of the

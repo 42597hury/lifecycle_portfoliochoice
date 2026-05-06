@@ -15,12 +15,18 @@ Config:
     n_state_quad_nodes = (3, 4, 4)             # 48 state quad points
     youngest_age_to_solve = 67  →  retirement-only (33 ages: 67..99)
     wealth_dynamics_spec = "ccv_log"
+    max_iter = 400                              # tighter than canonical 8000
 
-Expected JAX wall on c8a.4xlarge: roughly 30 min – 2 hours, depending on how
-well XLA fuses the per-cell scan + Newton on this config. If wall exceeds
-3 hours, kill the run and report — that signals JAX needs more optimisation
-before CPU runs at this size are economical.
+Outputs:
+    ./saved_runs/<bundle-name>/                — local bundle (npz + metadata)
+    s3://${S3_BUCKET}/saved_runs/<bundle-name>/ — if S3_BUCKET env var is set
+
+Plus a post-solve terminal-portfolio diagnostic printed to stdout for a quick
+sanity check (FOC residuals at the solved policy).
 """
+import os
+import shutil
+import subprocess
 import sys
 sys.path.insert(0, ".")
 
@@ -32,6 +38,11 @@ from lifecycle.model import SolveControl
 from lifecycle.var import build_nominal_system1_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
+from lifecycle.policy_io import save_policy_bundle
+from lifecycle.diagnostics import diagnose_terminal_portfolio_states
+
+BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid9x9x9_nz11_jax_benchmark"
+BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
 
 # Mirror configs/run_ccv_wide9_gh_k4.py from the main branch verbatim.
 disc_config = CANONICAL_DISC._replace(
@@ -137,3 +148,77 @@ print(
     flush=True,
 )
 print("=" * 70, flush=True)
+
+
+# =============================================================================
+# Save bundle locally (and optionally upload to S3)
+# =============================================================================
+
+print(f"\n=== Saving bundle ===", flush=True)
+print(f"  Local target: {BUNDLE_DIR}", flush=True)
+if os.path.exists(BUNDLE_DIR):
+    print(f"  (overwriting existing bundle)", flush=True)
+    shutil.rmtree(BUNDLE_DIR)
+
+run_config_snapshot = {
+    "base_config": dict(BASE_CONFIG),
+    "discretization_config": disc_config._asdict(),
+    "solver_config": solver_config._asdict(),
+    "solve_control": solve_control._asdict(),
+    "predictability_ablation": {
+        "system_label": "system_iv_full_var",
+        "system_title": "System IV (full VAR baseline)",
+    },
+    "bundle_name": BUNDLE_NAME,
+    "wall_time_seconds": float(wall),
+}
+
+bundle_path = save_policy_bundle(
+    BUNDLE_DIR,
+    C, S, B,
+    diagnostics=diag,
+    run_config=run_config_snapshot,
+    overwrite=True,
+)
+print(f"  Saved local bundle: {bundle_path}", flush=True)
+
+s3_bucket = os.environ.get("S3_BUCKET")
+if s3_bucket:
+    s3_uri = f"s3://{s3_bucket}/saved_runs/{BUNDLE_NAME}/"
+    print(f"\n  S3_BUCKET set; uploading to {s3_uri}", flush=True)
+    rc = subprocess.run(
+        ["aws", "s3", "sync", BUNDLE_DIR, s3_uri,
+         "--region", os.environ.get("AWS_REGION", "eu-north-1")],
+        check=False,
+    ).returncode
+    if rc == 0:
+        print(f"  S3 upload OK", flush=True)
+    else:
+        print(f"  S3 upload FAILED (rc={rc}) — bundle remains in {BUNDLE_DIR}", flush=True)
+else:
+    print(f"\n  (S3_BUCKET not set; skipping S3 upload)", flush=True)
+
+
+# =============================================================================
+# Post-solve diagnostic
+# =============================================================================
+
+print(f"\n=== Post-solve terminal-portfolio diagnostic ===", flush=True)
+try:
+    term_result = diagnose_terminal_portfolio_states(
+        model, pc, C, S, B,
+        solver_config=solver_config,
+        max_fail_rows=12,
+        print_report=True,
+    )
+    summary = term_result["summary"]
+    print(
+        f"\n  Summary: {summary['n_interior']}/{summary['n_states']} states interior, "
+        f"{summary['n_fail']} fails. "
+        f"Resid median={summary['resid_median']:.2e} max={summary['resid_max']:.2e}",
+        flush=True,
+    )
+except Exception as exc:
+    print(f"  diagnose_terminal_portfolio_states raised: {type(exc).__name__}: {exc}", flush=True)
+
+print("\n=== ALL DONE ===", flush=True)

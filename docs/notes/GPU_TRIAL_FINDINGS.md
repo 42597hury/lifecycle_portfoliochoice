@@ -234,6 +234,41 @@ Plus a unit test asserting `solver._ccv_log_return_and_grad` and `simulation._co
 
 ---
 
+## 2026-05-06 — Grid-EE residuals on the 5⁴ bundle
+
+First quantitative correctness check on the JAX 5⁴ production bundle. **Grid-based** Euler-residual sweep (not sim-path — that's queued for tomorrow). Same-quadrature mode: training quadrature reused for the FOC re-evaluation.
+
+### Results
+
+| metric | JAX 5⁴ same | main 7³ v3 same | main 7³ v4_lobatto next_finer |
+|---|---|---|---|
+| typical (median/mean) log10\|EE\| | -6.5 (median) | -7.97 (mean) | -2.92 (mean) |
+| P95 log10\|EE\| | -3.5 | -2.48 | -1.96 |
+| P99 log10\|EE\| | -2.7 | n/a | n/a |
+| MAX log10\|EE\| | -2.0 | -0.39 | -0.007 |
+| worst abs EE | 9.65e-3 (1%) | 0.41 (41%) | 0.98 (98%) |
+| total cells probed | 39,600,000 | 13,365 | — |
+
+### Interpretation
+
+- **JAX is materially better than main v3 on the tail** — worst-cell residual ~1% vs main's 41%, P95 ~10× tighter.
+- **Median (-6.5) vs main's mean (-7.97) is apples-to-oranges** (different statistics + different cell-set sizes). The directly comparable metrics (P95, MAX) all favour JAX.
+- **MAX 9.65e-3 sits right at the PASS/CONCERNING boundary** per main's threshold convention (PASS<1e-2, FAIL>5e-2). Just inside PASS.
+- **39.6M probes vs main's 13.4K** — 3000× more samples. The JAX sweep is *guaranteed* to surface tail cells main never visits; that the worst is still <1% is a strong signal.
+- **The v4_lobatto next_finer column** (worst cell 98%) is a separate quadrature-truncation question (training quad vs higher-fidelity quad), not a policy-correctness question. Don't read it as a regression metric.
+
+### Caveats
+
+- This is **grid-EE**, not **sim-EE**. The 1% worst cell is "somewhere in the 39.6M probe space" — not "somewhere a household actually visits." Tail cells in the grid (extreme spr or rtb) are exactly where you'd expect grid-EE to deteriorate, and they may carry zero ergodic-measure weight.
+- main publishes against **sim-EE** numbers, so the apples-to-apples comparison for the thesis comes from the sim-path port (queued, math review tomorrow before agent dispatch).
+- Eval mode was `same` only. `next_finer` (different quadrature for eval vs training) is a separate pass that exposes truncation-error contributions.
+
+### Verdict
+
+**Bundle passes correctness gate** under grid-EE. No regression vs main on directly comparable metrics. Sim-EE will be the headline thesis number; this confirms the policies aren't broken in some way grid-EE would catch.
+
+---
+
 ## Synthesis: what we learned about the JAX code itself
 
 ### Confirmed working as designed (production scale)
@@ -325,3 +360,22 @@ Multiply by `n_cells = n_z × N_state` for worst-case full materialization. Real
 ### What to do differently next time
 - ...
 ```
+
+---
+
+## Operating notes (running checklist)
+
+### `max_iter` / `max_backtrack_iter` calibration
+
+Under `use_fori_newton=True`, both values are **wall cost regardless of cell convergence** (every cell pays the full `max_iter × (1 + max_backtrack_iter)` FOC calls per Newton solve). Calibrate measurement-driven, not by guessing.
+
+**Workflow:** after each real bundle (5⁴ or larger; do NOT calibrate from 3⁴ smoke — too easy, p99 not representative), read `diag['newton_iter_histogram']` and `diag['backtrack_iter_histogram']` and set for the next run:
+
+```
+max_iter_next            = max(20, ceil(1.5 × p99_newton))
+max_backtrack_iter_next  = max(3,  ceil(1.5 × p99_backtrack))
+```
+
+Bundle that's calibrated against doesn't itself benefit; the **next** bundle does. Each launch is one calibration cycle. Skip the dial if `total_newton_failures > 0` — that means cells didn't converge at the *current* max_iter, dialing tighter would lose them entirely.
+
+Note: tonight's 5⁴ bundle was solved BEFORE the histogram-exposing commit (`051423a`), so its diag is empty for these fields. **First real calibration data lands with the next post-`051423a` GPU run.**

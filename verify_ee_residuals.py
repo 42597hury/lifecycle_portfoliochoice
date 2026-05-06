@@ -48,6 +48,7 @@ sys.path.insert(0, ".")
 import numpy as np
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 from jax import jit, vmap
 
@@ -196,10 +197,79 @@ def _infer_solved_mask_from_C(C: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
+# Cell-axis chunking helpers
+# =============================================================================
+
+def _build_padded_cell_indices(n_z: int, N_state: int, n_chunks: int):
+    """Pad the (z_idx, i_s) cell index arrays so each chunk has fixed size.
+
+    Mirrors solver.py's ``_build_chunked_index_arrays`` (out of @jit so the
+    padded arrays are jnp constants by trace time). Last cell is repeated to
+    fill the padding; results sliced off later via ``[:n_cells]``.
+    """
+    n_cells = n_z * N_state
+    chunk_size = (n_cells + n_chunks - 1) // n_chunks
+    n_cells_padded = chunk_size * n_chunks
+
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    z_idx_np = (cell_idx // N_state).astype(np.int64)
+    is_idx_np = (cell_idx % N_state).astype(np.int64)
+
+    pad_count = n_cells_padded - n_cells
+    if pad_count > 0:
+        z_idx_np = np.concatenate(
+            [z_idx_np, np.full(pad_count, z_idx_np[-1], dtype=np.int64)]
+        )
+        is_idx_np = np.concatenate(
+            [is_idx_np, np.full(pad_count, is_idx_np[-1], dtype=np.int64)]
+        )
+    return jnp.asarray(z_idx_np), jnp.asarray(is_idx_np), n_cells, chunk_size
+
+
+def _make_chunk_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
+                       n_cells: int, chunk_size: int, n_chunks: int,
+                       n_z: int, N_state: int):
+    """Return ``runner(*kernel_args) -> (residual, rel_residual)`` that calls
+    a JIT'd per-chunk vmap kernel ``n_chunks`` times in pure Python.
+
+    Why outside @jit: with the chunk loop inside @jit, XLA fuses all chunks
+    into one HLO graph and may schedule their per-cell intermediates
+    concurrently — defeating the memory bound. Running each chunk as a
+    separate JIT call forces the previous chunk's buffers to be freed before
+    the next one runs, so peak HBM is one chunk's worth.
+
+    The per-chunk kernel is traced once for ``chunk_size`` and reused.
+    """
+    def runner(*kernel_args):
+        a_parts = []
+        b_parts = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            z_chunk = jax.device_put(z_idx_padded[start:start + chunk_size])
+            is_chunk = jax.device_put(is_idx_padded[start:start + chunk_size])
+            a_i, b_i = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
+            # Force chunk completion before scheduling the next one — bounds
+            # peak HBM at one chunk's worth of intermediates.
+            a_i.block_until_ready()
+            a_parts.append(a_i)
+            b_parts.append(b_i)
+        a_full = jnp.concatenate(a_parts, axis=0)[:n_cells]
+        b_full = jnp.concatenate(b_parts, axis=0)[:n_cells]
+        n_w = a_full.shape[-1]
+        return (
+            a_full.reshape(n_z, N_state, n_w),
+            b_full.reshape(n_z, N_state, n_w),
+        )
+
+    return runner
+
+
+# =============================================================================
 # Per-age residual kernels
 # =============================================================================
 
-def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors):
+def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
+                                      n_z: int, N_state: int, n_chunks: int):
     """JIT'd per-age residual kernel for retirement ages (age >= retire_age).
 
     Returns ``per_age(C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr)
@@ -218,80 +288,89 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors):
     min_consumption = jnp.float64(sc.min_consumption)
     tiny_savings = jnp.float64(sc.tiny_savings)
 
+    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_padded_cell_indices(
+        n_z, N_state, n_chunks,
+    )
+
+    def per_cell(z_idx, i_s, C_t, S_t, B_t, C_next,
+                 pension_next_z_arr, psi_z_arr):
+        log_R_bill_i = log_R_bill_all[i_s]
+        log_x_s_i = log_x_s_all[i_s]
+        log_x_b_i = log_x_b_all[i_s]
+        j_corners_i = j_corners_all[i_s]
+        w_corners_i = w_corners_all[i_s]
+
+        A_is = pcj.annuity_factors[i_s]
+        psi_z = psi_z_arr[z_idx]
+        pension_next_z = pension_next_z_arr[z_idx]
+
+        c_corners_at_z = C_next[z_idx, j_corners_i, :]
+
+        c_arr = C_t[z_idx, i_s, :]
+        s_arr = S_t[z_idx, i_s, :]
+        b_arr = B_t[z_idx, i_s, :]
+        wealth_arr = pcj.wealth_grid
+
+        def at_w(c, alpha_s, alpha_b, wealth):
+            savings = wealth - c
+            savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
+
+            fs, fb, _, _, _, _ = retirement_foc_jac_ccv(
+                alpha_s, alpha_b, savings_safe, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
+                w_corners_i, c_corners_at_z, pcj.wealth_grid,
+                pension_next_z, A_is,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                gamma, b_bar, delta_j, min_consumption,
+            )
+            # Newton scale = |V_dot| at (a_s=0, a_b=0) — same scale the
+            # solver's Newton uses to grade convergence (err < tol * scale).
+            _, _, _, _, _, e0 = retirement_foc_jac_ccv(
+                jnp.float64(0.0), jnp.float64(0.0), savings_safe, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
+                w_corners_i, c_corners_at_z, pcj.wealth_grid,
+                pension_next_z, A_is,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                gamma, b_bar, delta_j, min_consumption,
+            )
+            scale = jnp.maximum(jnp.abs(e0), 1e-30)
+            residual = jnp.sqrt(fs * fs + fb * fb)
+            rel_residual = residual / scale
+
+            invalid = jnp.logical_or(
+                jnp.logical_not(jnp.isfinite(c)),
+                savings <= tiny_savings,
+            )
+            nan = jnp.float64(jnp.nan)
+            return (
+                jnp.where(invalid, nan, residual),
+                jnp.where(invalid, nan, rel_residual),
+            )
+
+        return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
+
     @jit
+    def per_chunk(C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr,
+                  z_chunk, is_chunk):
+        return vmap(
+            per_cell, in_axes=(0, 0, None, None, None, None, None, None),
+        )(z_chunk, is_chunk, C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr)
+
+    runner = _make_chunk_runner(
+        per_chunk, z_idx_padded, is_idx_padded,
+        n_cells, chunk_size, n_chunks, n_z, N_state,
+    )
+
     def per_age(C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr):
-        def per_cell(z_idx, i_s):
-            log_R_bill_i = log_R_bill_all[i_s]
-            log_x_s_i = log_x_s_all[i_s]
-            log_x_b_i = log_x_b_all[i_s]
-            j_corners_i = j_corners_all[i_s]
-            w_corners_i = w_corners_all[i_s]
-
-            A_is = pcj.annuity_factors[i_s]
-            psi_z = psi_z_arr[z_idx]
-            pension_next_z = pension_next_z_arr[z_idx]
-
-            c_corners_at_z = C_next[z_idx, j_corners_i, :]
-
-            c_arr = C_t[z_idx, i_s, :]
-            s_arr = S_t[z_idx, i_s, :]
-            b_arr = B_t[z_idx, i_s, :]
-            wealth_arr = pcj.wealth_grid
-
-            def at_w(c, alpha_s, alpha_b, wealth):
-                savings = wealth - c
-                # Use a positive savings argument inside the FOC even for
-                # invalid cells; we mask the residual back to NaN below.
-                savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
-
-                fs, fb, _, _, _, _ = retirement_foc_jac_ccv(
-                    alpha_s, alpha_b, savings_safe, psi_z,
-                    log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
-                    w_corners_i, c_corners_at_z, pcj.wealth_grid,
-                    pension_next_z, A_is,
-                    pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                    gamma, b_bar, delta_j, min_consumption,
-                )
-                # Newton scale = |V_dot| at (a_s=0, a_b=0) — same scale the
-                # solver's Newton uses to grade convergence (err < tol * scale).
-                _, _, _, _, _, e0 = retirement_foc_jac_ccv(
-                    jnp.float64(0.0), jnp.float64(0.0), savings_safe, psi_z,
-                    log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
-                    w_corners_i, c_corners_at_z, pcj.wealth_grid,
-                    pension_next_z, A_is,
-                    pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                    gamma, b_bar, delta_j, min_consumption,
-                )
-                scale = jnp.maximum(jnp.abs(e0), 1e-30)
-                residual = jnp.sqrt(fs * fs + fb * fb)
-                rel_residual = residual / scale
-
-                invalid = jnp.logical_or(
-                    jnp.logical_not(jnp.isfinite(c)),
-                    savings <= tiny_savings,
-                )
-                nan = jnp.float64(jnp.nan)
-                return (
-                    jnp.where(invalid, nan, residual),
-                    jnp.where(invalid, nan, rel_residual),
-                )
-
-            return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
-
-        n_z = C_t.shape[0]
-        N_state = C_t.shape[1]
-        cell_idx = jnp.arange(n_z * N_state)
-        z_idx_arr = cell_idx // N_state
-        is_idx_arr = cell_idx % N_state
-        res_flat, rel_flat = vmap(per_cell)(z_idx_arr, is_idx_arr)
-        n_w = C_t.shape[2]
-        return res_flat.reshape(n_z, N_state, n_w), rel_flat.reshape(n_z, N_state, n_w)
+        return runner(C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr)
 
     return per_age
 
 
 def _build_working_residual_kernel(
-    pcj, model, sc, delta, per_is_tensors, use_pension_next: bool,
+    pcj, model, sc, delta, per_is_tensors,
+    n_z: int, N_state: int, n_chunks: int,
+    use_pension_next: bool,
 ):
     """JIT'd per-age residual kernel for working ages.
 
@@ -308,100 +387,117 @@ def _build_working_residual_kernel(
     min_consumption = jnp.float64(sc.min_consumption)
     tiny_savings = jnp.float64(sc.tiny_savings)
 
-    @jit
-    def per_age(C_t, S_t, B_t, C_next,
-                income_next_table, pension_next_z_arr, psi_z_arr):
-        def per_cell(z_idx, i_s):
-            log_R_bill_i = log_R_bill_all[i_s]
-            log_x_s_i = log_x_s_all[i_s]
-            log_x_b_i = log_x_b_all[i_s]
-            j_corners_i = j_corners_all[i_s]
-            w_corners_i = w_corners_all[i_s]
+    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_padded_cell_indices(
+        n_z, N_state, n_chunks,
+    )
 
-            A_is = pcj.annuity_factors[i_s]
-            psi_z = psi_z_arr[z_idx]
+    def per_cell(z_idx, i_s, C_t, S_t, B_t, C_next,
+                 income_next_table, pension_next_z_arr, psi_z_arr):
+        log_R_bill_i = log_R_bill_all[i_s]
+        log_x_s_i = log_x_s_all[i_s]
+        log_x_b_i = log_x_b_all[i_s]
+        j_corners_i = j_corners_all[i_s]
+        w_corners_i = w_corners_all[i_s]
 
-            # z_next bracket: same pattern as solver's working kernel
-            z_now = pcj.z_grid[z_idx]
-            z_next = rho * z_now + pcj.eta_nodes
-            iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
-                z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
+        A_is = pcj.annuity_factors[i_s]
+        psi_z = psi_z_arr[z_idx]
+
+        # z_next bracket: same pattern as solver's working kernel
+        z_now = pcj.z_grid[z_idx]
+        z_next = rho * z_now + pcj.eta_nodes
+        iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
+            z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
+        )
+
+        if use_pension_next:
+            pension_at_eta = (
+                (1.0 - frac_z) * pension_next_z_arr[iz_lo]
+                + frac_z * pension_next_z_arr[iz_lo + 1]
+            )
+            income_table_z = (
+                pension_at_eta[:, None]
+                * jnp.ones_like(pcj.eps_weights)[None, :]
+            )
+        else:
+            income_table_z = income_next_table[z_idx]
+
+        # c_corners pre-gather at multilinear-state corners, transposed so
+        # k_v leads (matches the working FOC's outer vmap layout).
+        c_corners = C_next[:, j_corners_i, :]
+        c_corners_T = jnp.transpose(c_corners, (1, 0, 2, 3))
+
+        c_arr = C_t[z_idx, i_s, :]
+        s_arr = S_t[z_idx, i_s, :]
+        b_arr = B_t[z_idx, i_s, :]
+        wealth_arr = pcj.wealth_grid
+
+        def at_w(c, alpha_s, alpha_b, wealth):
+            savings = wealth - c
+            savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
+
+            fs, fb, _, _, _, _ = working_foc_jac_ccv(
+                alpha_s, alpha_b, savings_safe, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
+                w_corners_i,
+                c_corners_T, pcj.wealth_grid,
+                income_table_z,
+                iz_lo, frac_z,
+                pcj.eta_weights, pcj.eps_weights,
+                A_is,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                gamma, b_bar, delta_j, min_consumption,
+            )
+            _, _, _, _, _, e0 = working_foc_jac_ccv(
+                jnp.float64(0.0), jnp.float64(0.0), savings_safe, psi_z,
+                log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
+                w_corners_i,
+                c_corners_T, pcj.wealth_grid,
+                income_table_z,
+                iz_lo, frac_z,
+                pcj.eta_weights, pcj.eps_weights,
+                A_is,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                gamma, b_bar, delta_j, min_consumption,
+            )
+            scale = jnp.maximum(jnp.abs(e0), 1e-30)
+            residual = jnp.sqrt(fs * fs + fb * fb)
+            rel_residual = residual / scale
+
+            invalid = jnp.logical_or(
+                jnp.logical_not(jnp.isfinite(c)),
+                savings <= tiny_savings,
+            )
+            nan = jnp.float64(jnp.nan)
+            return (
+                jnp.where(invalid, nan, residual),
+                jnp.where(invalid, nan, rel_residual),
             )
 
-            if use_pension_next:
-                pension_at_eta = (
-                    (1.0 - frac_z) * pension_next_z_arr[iz_lo]
-                    + frac_z * pension_next_z_arr[iz_lo + 1]
-                )
-                income_table_z = (
-                    pension_at_eta[:, None]
-                    * jnp.ones_like(pcj.eps_weights)[None, :]
-                )
-            else:
-                income_table_z = income_next_table[z_idx]
+        return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
 
-            # c_corners pre-gather at multilinear-state corners, transposed so
-            # k_v leads (matches the working FOC's outer vmap layout).
-            c_corners = C_next[:, j_corners_i, :]
-            c_corners_T = jnp.transpose(c_corners, (1, 0, 2, 3))
+    @jit
+    def per_chunk(C_t, S_t, B_t, C_next,
+                  income_next_table, pension_next_z_arr, psi_z_arr,
+                  z_chunk, is_chunk):
+        return vmap(
+            per_cell, in_axes=(0, 0, None, None, None, None, None, None, None),
+        )(
+            z_chunk, is_chunk,
+            C_t, S_t, B_t, C_next,
+            income_next_table, pension_next_z_arr, psi_z_arr,
+        )
 
-            c_arr = C_t[z_idx, i_s, :]
-            s_arr = S_t[z_idx, i_s, :]
-            b_arr = B_t[z_idx, i_s, :]
-            wealth_arr = pcj.wealth_grid
+    runner = _make_chunk_runner(
+        per_chunk, z_idx_padded, is_idx_padded,
+        n_cells, chunk_size, n_chunks, n_z, N_state,
+    )
 
-            def at_w(c, alpha_s, alpha_b, wealth):
-                savings = wealth - c
-                savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
-
-                fs, fb, _, _, _, _ = working_foc_jac_ccv(
-                    alpha_s, alpha_b, savings_safe, psi_z,
-                    log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
-                    w_corners_i,
-                    c_corners_T, pcj.wealth_grid,
-                    income_table_z,
-                    iz_lo, frac_z,
-                    pcj.eta_weights, pcj.eps_weights,
-                    A_is,
-                    pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                    gamma, b_bar, delta_j, min_consumption,
-                )
-                _, _, _, _, _, e0 = working_foc_jac_ccv(
-                    jnp.float64(0.0), jnp.float64(0.0), savings_safe, psi_z,
-                    log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
-                    w_corners_i,
-                    c_corners_T, pcj.wealth_grid,
-                    income_table_z,
-                    iz_lo, frac_z,
-                    pcj.eta_weights, pcj.eps_weights,
-                    A_is,
-                    pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                    gamma, b_bar, delta_j, min_consumption,
-                )
-                scale = jnp.maximum(jnp.abs(e0), 1e-30)
-                residual = jnp.sqrt(fs * fs + fb * fb)
-                rel_residual = residual / scale
-
-                invalid = jnp.logical_or(
-                    jnp.logical_not(jnp.isfinite(c)),
-                    savings <= tiny_savings,
-                )
-                nan = jnp.float64(jnp.nan)
-                return (
-                    jnp.where(invalid, nan, residual),
-                    jnp.where(invalid, nan, rel_residual),
-                )
-
-            return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
-
-        n_z = C_t.shape[0]
-        N_state = C_t.shape[1]
-        cell_idx = jnp.arange(n_z * N_state)
-        z_idx_arr = cell_idx // N_state
-        is_idx_arr = cell_idx % N_state
-        res_flat, rel_flat = vmap(per_cell)(z_idx_arr, is_idx_arr)
-        n_w = C_t.shape[2]
-        return res_flat.reshape(n_z, N_state, n_w), rel_flat.reshape(n_z, N_state, n_w)
+    def per_age(C_t, S_t, B_t, C_next,
+                income_next_table, pension_next_z_arr, psi_z_arr):
+        return runner(
+            C_t, S_t, B_t, C_next,
+            income_next_table, pension_next_z_arr, psi_z_arr,
+        )
 
     return per_age
 
@@ -478,6 +574,14 @@ def main():
         action="store_true",
         help="Skip writing ee_residuals.json (useful for ad hoc spot checks).",
     )
+    parser.add_argument(
+        "--cell-chunks",
+        type=int,
+        default=None,
+        help="Number of fixed-size chunks the per-age vmap is split into. "
+             "Bounds peak HBM at ~(per-cell working set * n_z*N_state / n_chunks). "
+             "Defaults to 1 for small grids and ~ceil((n_z*N_state)/2048) above that.",
+    )
     args = parser.parse_args()
 
     bundle_path = _resolve_bundle_path(args.bundle)
@@ -527,13 +631,37 @@ def main():
     working_income_next_jnp = jnp.asarray(pc.working_income_next)     # (n_age, n_z, n_eta, n_eps)
     wealth_dummy_pension = jnp.zeros(pc.n_z, dtype=jnp.float64)
 
+    # Cell-axis chunking. n_cells = n_z * N_state can reach 72k at canonical
+    # 9⁴ x 11; the per-cell c_corners gather is ~3.3 MB (retirement) or ~36 MB
+    # (working — extra n_z factor), and JAX/XLA materialises a chunk_size-sized
+    # batch of per-cell FOC intermediates (the inner vmap doesn't have a scan
+    # to force serialisation). 5⁴ x 11 = 6875 cells with chunk_size=2048 OOM'd
+    # at ~68 GB on the first run, so the default keeps per-chunk cells <= 256.
+    # Override with --cell-chunks if you have headroom and want fewer dispatches.
+    n_cells_total = pc.n_z * pc.N_state
+    if args.cell_chunks is not None:
+        n_chunks = max(1, int(args.cell_chunks))
+    else:
+        n_chunks = max(1, (n_cells_total + 255) // 256)
+    chunk_size_dbg = (n_cells_total + n_chunks - 1) // n_chunks
+    print(
+        f"  Cell-chunk split: {n_chunks} chunk(s) over {n_cells_total} cells "
+        f"(~{chunk_size_dbg} cells/chunk)",
+        flush=True,
+    )
+
     # Build kernels.
-    retire_kernel = _build_retirement_residual_kernel(pcj, model, solver_config, delta, per_is_tensors)
+    retire_kernel = _build_retirement_residual_kernel(
+        pcj, model, solver_config, delta, per_is_tensors,
+        pc.n_z, pc.N_state, n_chunks,
+    )
     working_kernel = _build_working_residual_kernel(
-        pcj, model, solver_config, delta, per_is_tensors, use_pension_next=False,
+        pcj, model, solver_config, delta, per_is_tensors,
+        pc.n_z, pc.N_state, n_chunks, use_pension_next=False,
     )
     boundary_kernel = _build_working_residual_kernel(
-        pcj, model, solver_config, delta, per_is_tensors, use_pension_next=True,
+        pcj, model, solver_config, delta, per_is_tensors,
+        pc.n_z, pc.N_state, n_chunks, use_pension_next=True,
     )
 
     ages = np.asarray(pc.ages)

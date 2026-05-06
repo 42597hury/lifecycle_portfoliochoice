@@ -14,7 +14,7 @@ Solver diagnostics (unchanged from prior version):
   - diagnose_terminal_portfolio_states(...)         -- terminal portfolio per-state
   - diagnose_newton_failures_retirement(...)        -- Newton failure classification
 
-Dependencies: numpy, numba, model, solver
+Dependencies: numpy, jax (transitively via solver), model, solver
 """
 
 import numpy as np

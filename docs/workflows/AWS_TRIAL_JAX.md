@@ -13,6 +13,8 @@ For now: launch one cheap instance, run `verify_smoke.py`, confirm pass.
 - The virtual-CPU pmap pattern (auto-enabled at `lifecycle/__init__.py` import time) discovers `nproc` and uses all cores.
 - The 6-age tiny-config smoke produces the expected policies.
 
+The JAX persistent compilation cache is enabled by default (status line printed at import time). With the S3 sync step in §2 below, second-and-later launches skip the cold JIT compile (~5-15 min on hpc8a) and start solving in seconds.
+
 ## What this trial does NOT validate
 
 - GPU code path (need an actual A100/H100 — `p4d.24xlarge` or `p5.48xlarge`).
@@ -59,9 +61,26 @@ sudo -u ec2-user python3.11 -m venv venv
 sudo -u ec2-user ./venv/bin/pip install --upgrade pip
 sudo -u ec2-user ./venv/bin/pip install -r requirements.txt
 
+# 3b. Configure JAX compilation cache (cross-launch reuse via S3)
+# Hardware-keyed prefix: keep CPU and GPU caches separate (JAX hashes the
+# trace key with hardware identity — a hpc8a CPU cache will NOT hit on
+# p4d/p5 GPUs). Bump the v1 → v2 segment after a JAX upgrade.
+export LIFECYCLE_JAX_CACHE_DIR=/home/ec2-user/.cache/jax_lifecycle
+export S3_CACHE_BUCKET=hugo-thesis-runs       # set to "" to disable cross-launch reuse
+export S3_CACHE_PREFIX=jax-cache/v1/cpu-hpc8a  # e.g. cpu-hpc8a, gpu-a100, gpu-h100
+
+if [ -n "${S3_CACHE_BUCKET:-}" ]; then
+    sudo -u ec2-user mkdir -p "$LIFECYCLE_JAX_CACHE_DIR"
+    sudo -u ec2-user aws s3 sync \
+        "s3://${S3_CACHE_BUCKET}/${S3_CACHE_PREFIX}/" \
+        "$LIFECYCLE_JAX_CACHE_DIR" \
+        --region eu-north-1 || echo "cache pull failed; continuing"
+fi
+
 # 4. Run smoke
 echo "=== running verify_smoke.py at $(date -Is) ==="
-sudo -u ec2-user ./venv/bin/python verify_smoke.py
+sudo -u ec2-user --preserve-env=LIFECYCLE_JAX_CACHE_DIR \
+    ./venv/bin/python verify_smoke.py
 SMOKE_EXIT=$?
 
 echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
@@ -69,12 +88,29 @@ echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
 # 5. (Optional) upload log to S3 if you have a bucket configured
 # aws s3 cp /var/log/jax-trial.log s3://hugo-thesis-runs/jax-trial/$(date +%Y%m%dT%H%M%S).log
 
-# 6. Auto-terminate on success (comment out if you want to SSH in afterwards)
+# 6. Push cache back to S3 then auto-terminate
+if [ "$SMOKE_EXIT" -eq 0 ] && [ -n "${S3_CACHE_BUCKET:-}" ]; then
+    sudo -u ec2-user aws s3 sync \
+        "$LIFECYCLE_JAX_CACHE_DIR" \
+        "s3://${S3_CACHE_BUCKET}/${S3_CACHE_PREFIX}/" \
+        --size-only --region eu-north-1 || echo "cache push failed"
+fi
+
 if [ "$SMOKE_EXIT" -eq 0 ]; then
     echo "=== smoke PASSED, shutting down ==="
     shutdown -h now
 fi
 ```
+
+**Cache env vars** (read by `lifecycle/__init__.py`):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `LIFECYCLE_JAX_CACHE_DIR` | `~/.cache/jax_lifecycle` | Cache directory. Set to `""` to disable. |
+| `LIFECYCLE_JAX_CACHE_MIN_COMPILE_SECS` | `1.0` | Only persist traces with compile time ≥ this. |
+| `LIFECYCLE_JAX_CACHE_MAX_SIZE_BYTES` | `10737418240` (10 GB) | Total cache size cap. `-1` = unlimited. |
+
+**Hardware-keyed S3 prefix**: JAX namespaces cache entries by hardware identity, so a CPU cache will not hit on GPU and vice versa. Use distinct `S3_CACHE_PREFIX` values per hardware tier (`cpu-hpc8a`, `gpu-a100`, `gpu-h100`) to avoid mixing them. Bump the version segment (`v1` → `v2`) on JAX upgrades to discard stale entries.
 
 **For the agent that handles AWS:** if you don't use userdata, the equivalent is to SSH in and run the bash blocks 1–4 manually.
 

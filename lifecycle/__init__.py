@@ -69,9 +69,73 @@ _configure_xla_devices()
 import jax as _jax  # noqa: E402
 
 _jax.config.update("jax_enable_x64", True)
-_jax.config.update("jax_compilation_cache_dir", _os.path.expanduser("~/.cache/jax_lifecycle"))
-_jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
-_jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+
+
+def _configure_persistent_cache():
+    """Configure JAX's persistent compilation cache.
+
+    Cache directory:
+        ``LIFECYCLE_JAX_CACHE_DIR`` env var, falling back to
+        ``~/.cache/jax_lifecycle/``. Set to the empty string to disable
+        (skip all jax_compilation_cache_* config).
+
+    Min compile time threshold (seconds):
+        ``LIFECYCLE_JAX_CACHE_MIN_COMPILE_SECS`` env var (float),
+        default 1.0. Traces faster than this are not persisted.
+
+    Max cache size (bytes):
+        ``LIFECYCLE_JAX_CACHE_MAX_SIZE_BYTES`` env var (int),
+        default 10 * 1024**3 (10 GB). Use -1 for unlimited.
+
+    Prints one status line on enable so AWS log scrubbing can confirm.
+    """
+    cache_dir_raw = _os.environ.get(
+        "LIFECYCLE_JAX_CACHE_DIR",
+        _os.path.expanduser("~/.cache/jax_lifecycle"),
+    )
+    if cache_dir_raw == "":
+        print("[lifecycle] JAX compilation cache: DISABLED (LIFECYCLE_JAX_CACHE_DIR='')", flush=True)
+        return
+
+    cache_dir = _os.path.expanduser(cache_dir_raw)
+    try:
+        _os.makedirs(cache_dir, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"[lifecycle] JAX compilation cache: COULD NOT CREATE {cache_dir} ({exc}); "
+            f"continuing without persistent cache",
+            flush=True,
+        )
+        return
+
+    try:
+        min_secs = float(_os.environ.get("LIFECYCLE_JAX_CACHE_MIN_COMPILE_SECS", "1.0"))
+    except ValueError:
+        min_secs = 1.0
+    try:
+        max_bytes = int(_os.environ.get("LIFECYCLE_JAX_CACHE_MAX_SIZE_BYTES", str(10 * 1024**3)))
+    except ValueError:
+        max_bytes = 10 * 1024**3
+
+    _jax.config.update("jax_compilation_cache_dir", cache_dir)
+    _jax.config.update("jax_persistent_cache_min_compile_time_secs", min_secs)
+    _jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    if max_bytes >= 0:
+        # Newer JAX versions support this; older ones ignore the unknown key.
+        try:
+            _jax.config.update("jax_compilation_cache_max_size_bytes", max_bytes)
+        except (AttributeError, KeyError):
+            pass
+
+    size_str = "unlimited" if max_bytes < 0 else f"{max_bytes / 1024**3:.1f} GB"
+    print(
+        f"[lifecycle] JAX compilation cache: enabled at {cache_dir} "
+        f"(min_compile={min_secs}s, max_size={size_str})",
+        flush=True,
+    )
+
+
+_configure_persistent_cache()
 
 
 def _check_runtime_platform():

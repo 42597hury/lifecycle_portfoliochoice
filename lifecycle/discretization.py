@@ -192,8 +192,8 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="ch
     mu_intercept = np.asarray(mu_intercept, dtype=float)
 
     k = len(N_vec)
-    if k < 1 or k > 3:
-        raise ValueError("build_state_grid currently requires 1, 2, or 3 state dimensions")
+    if k < 1 or k > 4:
+        raise ValueError("build_state_grid currently requires 1, 2, 3, or 4 state dimensions")
     if Phi.shape != (k, k):
         raise ValueError(f"Phi must have shape {(k, k)}")
     if Sigma_innov.shape != (k, k):

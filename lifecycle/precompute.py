@@ -77,13 +77,13 @@ class Precompute(NamedTuple):
     Financial state (VAR):
       state_grid   (N_state, n_state)   joint state grid; row i = slow-state vector
       Pi_state     (N_state, N_state)   Pi_state[i,j] = P(s_{t+1}=j | s_t=i)
-      mu_r         (N_state, N_state, n_ret)
-                                        mu_r[i,j,0] = E[rtb | s_t=i, s_{t+1}=j]  log real bill return
-                                        mu_r[i,j,1] = E[xr  | s_t=i, s_{t+1}=j]  log excess stock return
-                                        mu_r[i,j,2] = E[xb  | s_t=i, s_{t+1}=j]  log excess bond return
+      mu_r         (N_state, N_state, n_ret)  with n_ret == 2 post rtb-as-state
+                                        mu_r[i,j,0] = E[xr | s_t=i, s_{t+1}=j]  log excess stock return
+                                        mu_r[i,j,1] = E[xb | s_t=i, s_{t+1}=j]  log excess bond return
+                                        rtb is no longer here — read realised rtb
+                                        from state_grid[j, rtb_index_in_state] directly.
       ret_nodes    (n_ret_quad, n_ret)  residual log-return shocks drawn from N(0, Sigma_r_cond)
       ret_weights  (n_ret_quad,)        quadrature weights; sum=1
-      exp_ret_bill (n_ret_quad,)        exp(ret_nodes[:, 0]) for rtb residuals
 
     Income:
       z_grid       (n_z,)               persistent income states (log, mean-zero)
@@ -155,8 +155,7 @@ class Precompute(NamedTuple):
     A_r: np.ndarray
     M_v_nodes: np.ndarray
 
-    # Exp of return-quadrature residual nodes
-    exp_ret_bill: np.ndarray
+    # Exp of return-quadrature residual nodes (xr, xb only post rtb-as-state)
     exp_ret_stock: np.ndarray
     exp_ret_bond: np.ndarray
 
@@ -293,9 +292,13 @@ def build_precompute(model, disc_config=None, verbose=True):
     A_r = np.array(model.Phi_21, dtype=float)
     M_v_nodes = v_nodes @ model.M.T
 
-    exp_ret_bill = np.exp(ret_nodes[:, 0])
-    exp_ret_stock = np.exp(ret_nodes[:, 1])
-    exp_ret_bond = np.exp(ret_nodes[:, 2])
+    # Look up xr/xb positions in the partitioned return block by name. Robust
+    # to any future re-permutation of the return ordering — index-by-position
+    # would silently break if return_indices were ever reordered.
+    xr_pos = model.ret_names.index("xr")
+    xb_pos = model.ret_names.index("xb")
+    exp_ret_stock = np.exp(ret_nodes[:, xr_pos])
+    exp_ret_bond = np.exp(ret_nodes[:, xb_pos])
 
     # --- CCV log-return covariance scalars ---
     # CCV w8566 eq. (10) takes expectations over the FULL VAR innovation
@@ -306,9 +309,9 @@ def build_precompute(model, disc_config=None, verbose=True):
     # which can be ~10–30x in this calibration; using the wrong matrix shrinks
     # the Itô vol-drag and inflates converged alpha_s past sensible levels.
     # Patched 2026-05-06 (Sigma_rr matches CCV Table 2 vols + Markowitz alpha).
-    sigma2_xr = float(model.Sigma_rr[1, 1])
-    sigma2_xb = float(model.Sigma_rr[2, 2])
-    sigma_xrxb = float(model.Sigma_rr[1, 2])
+    sigma2_xr = float(model.Sigma_rr[xr_pos, xr_pos])
+    sigma2_xb = float(model.Sigma_rr[xb_pos, xb_pos])
+    sigma_xrxb = float(model.Sigma_rr[xr_pos, xb_pos])
 
     # --- Bequest annuity factors ---
     y_1_idx = model.y_1_index_in_state
@@ -426,7 +429,6 @@ def build_precompute(model, disc_config=None, verbose=True):
         const_r=const_r,
         A_r=A_r,
         M_v_nodes=M_v_nodes,
-        exp_ret_bill=exp_ret_bill,
         exp_ret_stock=exp_ret_stock,
         exp_ret_bond=exp_ret_bond,
         sigma2_xr=sigma2_xr,
@@ -645,6 +647,8 @@ def _print_precompute_summary(pc):
               f"  ({pc.model.state_names[pc.model.spr_index_in_state]})")
     else:
         print(f"spr (scalar)     : {pc.model.spr_scalar_fallback:.4%}")
+    print(f"rtb idx in state : {pc.model.rtb_index_in_state}"
+          f"  ({pc.model.state_names[pc.model.rtb_index_in_state]})")
     print(f"annuity_factors      : {pc.annuity_factors.shape}  range=[{pc.annuity_factors.min():.2f}, {pc.annuity_factors.max():.2f}]")
     print(f"working_income       : {pc.working_income.shape}  (n_age x n_z x n_eps)")
     print(f"working_income_next  : {pc.working_income_next.shape}  (n_age x n_z x n_eta x n_eps)")
@@ -658,6 +662,8 @@ def _print_precompute_summary(pc):
 
 def build_model(base_config, var_config, verbose=True):
     """Build LifecyclePortfolioModel from primitive configs."""
+    import warnings as _warnings
+
     parts = partition_var(
         Phi_full=np.asarray(var_config["Phi"], dtype=float),
         Omega_full=np.asarray(var_config["Omega"], dtype=float),
@@ -667,6 +673,24 @@ def build_model(base_config, var_config, verbose=True):
         variable_names=var_config["variable_names"],
         verbose=verbose,
     )
+
+    # rtb-as-state drift detector. The OPTION-B failure mode (rtb left in
+    # returns and pi added as a state) collapses Sigma_r_cond's smallest
+    # eigenvalue to ~3e-7 along the rtb axis. The PROPOSED partition has
+    # smallest eig ~5e-4. The 1e-5 threshold sits comfortably between them.
+    src = parts["Sigma_r_cond"]
+    if src.size > 0:
+        eig_min = float(np.min(np.linalg.eigvalsh(0.5 * (src + src.T))))
+        if eig_min < 1e-5:
+            ret_names = parts["ret_names"]
+            diag_idx = int(np.argmin(np.diag(src)))
+            suspect = ret_names[diag_idx] if diag_idx < len(ret_names) else f"ret[{diag_idx}]"
+            _warnings.warn(
+                f"Sigma_r_cond smallest eigenvalue {eig_min:.2e} is below 1e-5; "
+                f"likely rank-deficiency along the {suspect!r} axis. This is the "
+                f"OPTION-B drift signature — verify rtb is in the state block.",
+                RuntimeWarning, stacklevel=2,
+            )
 
     y_1_idx_raw = var_config.get("y_1_index_in_state", None)
     y_1_scalar = var_config.get("y_1_scalar_fallback", None)
@@ -714,6 +738,23 @@ def build_model(base_config, var_config, verbose=True):
             "when both are grid indices"
         )
 
+    rtb_idx_raw = var_config.get("rtb_index_in_state", None)
+    if rtb_idx_raw is None:
+        raise ValueError(
+            "var_config must provide rtb_index_in_state (rtb-as-state migration "
+            "requires rtb to live on the state grid)"
+        )
+    rtb_index_in_state = int(rtb_idx_raw)
+    if rtb_index_in_state < 0 or rtb_index_in_state >= parts["n_state"]:
+        raise ValueError(
+            f"rtb_index_in_state ({rtb_index_in_state}) out of bounds "
+            f"for state vector of size {parts['n_state']}"
+        )
+    if y_1_index_in_state is not None and rtb_index_in_state == y_1_index_in_state:
+        raise ValueError("rtb_index_in_state and y_1_index_in_state must be distinct")
+    if spr_index_in_state is not None and rtb_index_in_state == spr_index_in_state:
+        raise ValueError("rtb_index_in_state and spr_index_in_state must be distinct")
+
     return LifecyclePortfolioModel(
         beta=float(base_config["beta"]),
         gamma=float(base_config["gamma"]),
@@ -753,6 +794,7 @@ def build_model(base_config, var_config, verbose=True):
         Sigma_r_cond=parts["Sigma_r_cond"],
         y_1_index_in_state=y_1_index_in_state,
         spr_index_in_state=spr_index_in_state,
+        rtb_index_in_state=rtb_index_in_state,
         y_1_scalar_fallback=y_1_scalar_fallback,
         spr_scalar_fallback=spr_scalar_fallback,
     )

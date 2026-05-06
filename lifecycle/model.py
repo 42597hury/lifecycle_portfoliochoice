@@ -164,7 +164,7 @@ class SolverConfig(NamedTuple):
     line_search_max_step: float = 2.0          # raw Newton step cap
 
     # --- Thresholds ---
-    tiny_savings: float = 1e-6                 # below this, hold warm-start alphas, c -> floor
+    tiny_savings: float = 1e-6                 # below this, hold cold-init alphas, c -> floor
     singular_det: float = 1e-15                # Jacobian determinant singularity threshold
     grad_denom_eps: float = 1e-10              # epsilon in gradient fallback denominator
 

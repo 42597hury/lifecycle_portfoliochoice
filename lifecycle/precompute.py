@@ -105,7 +105,7 @@ class Precompute(NamedTuple):
                                         Next-period working-age income evaluated at
                                         z_{t+1} = rho*z_t + eta_{t+1}, transitory eps_{t+1}.
                                         Zero for rows where t+1 is not a working-age period.
-                                        Consumed by the JAX FOC kernel (handoff 2).
+                                        Consumed by the JAX FOC kernel.
       pension_after_tax   (n_age, n_z)
                                         pension_after_tax[t, iz] = after-tax Social Security
                                         benefit; constant across ages, indexed by career z
@@ -366,7 +366,7 @@ def build_precompute(model, disc_config=None, verbose=True):
     working_income = _precompute_working_income(log_det_profile, z_grid, eps_nodes)
     pension_after_tax = _precompute_pension(z_grid, ages, avg_det)
 
-    # NEW: next-period working income table for the JAX FOC kernel (handoff 2)
+    # Next-period working income table for the JAX FOC kernel.
     retire_age_idx = model.retire_age - model.start_age
     working_income_next = _precompute_working_income_next(
         log_det_profile=log_det_profile,
@@ -571,9 +571,8 @@ def _precompute_working_income_next(
 
     Shape: (n_age, n_z, n_eta, n_eps), dtype float64.
 
-    Not consumed by the existing Numba solver; the JAX FOC kernel
-    (handoff 2) replaces its in-loop scalar_disposable_income call
-    with a lookup into this table.
+    The JAX FOC kernel reads this table instead of recomputing
+    disposable_income inside the inner loop.
     """
     n_age = len(log_det_profile)
     n_z = len(z_grid)

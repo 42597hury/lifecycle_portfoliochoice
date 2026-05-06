@@ -143,10 +143,12 @@ def save_policy_bundle(
             )
 
     # Wealth-dynamics spec — drawn from run_config.solver_config if present;
-    # otherwise tagged "simple_clamp" (the legacy default). Storing this at
-    # the top of the metadata makes it cheap to verify at load time that the
-    # simulator/diagnostics are run under the same spec the solver used.
-    spec = "simple_clamp"
+    # otherwise tagged "ccv_log" (the only spec the JAX solver accepts; the
+    # historic "simple_clamp" branch was removed in the JAX rewrite). Storing
+    # this at the top of the metadata makes it cheap to verify at load time
+    # that the simulator/diagnostics are run under the same spec the solver
+    # used.
+    spec = "ccv_log"
     if run_config is not None:
         sc = run_config.get("solver_config") if isinstance(run_config, dict) else None
         if isinstance(sc, dict):

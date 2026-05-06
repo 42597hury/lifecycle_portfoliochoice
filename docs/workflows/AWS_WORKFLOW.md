@@ -1,5 +1,11 @@
 # AWS Workflow — Lifecycle Solver Runs
 
+> **Branch note:** this workflow is **for the `main` (Numba) branch** and depends on
+> `scripts/launch_run.py`, `scripts/run_solve.py`, `scripts/preflight_sweep.py`, etc.
+> On the `jax-rewrite` branch the `scripts/` directory was deleted in handoff 1 and
+> the sweep machinery has not been ported. For one-off trial runs on the JAX branch,
+> follow [AWS_TRIAL_JAX.md](AWS_TRIAL_JAX.md) instead.
+
 Run model solves on EC2 from your laptop. Bundles land in `saved_runs/` just like local runs.
 
 **Prereqs (already done — see Section 4 if you ever need to redo them):**

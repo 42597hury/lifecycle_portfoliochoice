@@ -170,9 +170,8 @@ def _bracket_uniform(z, z_lo, dz, n_z):
 def _bracket_axis(grid, val):
     """Bracket ``val`` in a sorted (possibly non-uniform) axis grid.
 
-    Mirrors solver._build_step_state_brackets's per-axis logic. Canonical
-    n_state == 3 means each axis grid has at least 2 points; degenerate
-    n=1 axes are not supported here (that's handoff-4 territory).
+    Mirrors solver._bracket_axis. Each axis must have at least 2 points;
+    degenerate n=1 axes are not supported.
     """
     n = grid.shape[0]
     lo = jnp.clip(jnp.searchsorted(grid, val, side="right") - 1, 0, n - 2)
@@ -243,7 +242,7 @@ def _trilinear_z_w_lookup(arr4d, t_idx, iz_lo, frac_z,
 def _build_simulate_kernel(
     C_mat, S_mat, B_mat,
     wealth_grid, z_grid, dz, z_lo,
-    state_grids_0, state_grids_1, state_grids_2,
+    axis_grids, axis_sizes, corner_offsets, strides,
     state_bracket_shift, state_bracket_L_inv, L_ss,
     Phi_0_state, Phi_11, const_r, A_r, M_matrix,
     ret_nodes, ret_weights, ret_factor,
@@ -253,17 +252,22 @@ def _build_simulate_kernel(
     is_pre_retire_boundary_per_age,  # (n_age,) bool
     rho, pz, mu_eta1, sigma_eta1, sigma_eta2, mu_eta2_eff,
     pe, mu_eps1, sigma_eps1, sigma_eps2, mu_eps2_eff,
-    n_age, n_z, n_ret,
+    n_age, n_z, n_ret, n_state,
+    rtb_idx, xr_pos, xb_pos,
     use_mc_returns,
 ):
     """Return a jit'd kernel that simulates one batch of households.
 
     All arrays close over the kernel scope so the per-household scan body
     can index them by ``t_idx`` directly. ``use_mc_returns`` and ``n_age``
-    are baked in at trace time.
+    are baked in at trace time. Generic over n_state via the static
+    ``corner_offsets`` table and ``strides`` array.
+
+    Post rtb-as-state migration: realised ``log_R_bill`` ( = rtb_{t+1}) is
+    read from the next-period state vector at ``rtb_idx``; the return block
+    carries (xr, xb) only.
     """
-    N1 = state_grids_1.shape[0]
-    N2 = state_grids_2.shape[0]
+    n_corners = 1 << int(n_state)
 
     def step_fn(carry, draws_t):
         z_val, s_t, x_t, alive, income_t, t_idx = carry
@@ -282,42 +286,27 @@ def _build_simulate_kernel(
 
         # ----- state bracket on transformed coords (Cholesky-decorrelated) -----
         b_vec = state_bracket_L_inv @ (s_t - state_bracket_shift)
-        lo0, f0 = _bracket_axis(state_grids_0, b_vec[0])
-        lo1, f1 = _bracket_axis(state_grids_1, b_vec[1])
-        lo2, f2 = _bracket_axis(state_grids_2, b_vec[2])
-        hi0, hi1, hi2 = lo0 + 1, lo1 + 1, lo2 + 1
+        lo_list = []
+        frac_list = []
+        for d in range(n_state):
+            lo_d, f_d = _bracket_axis(axis_grids[d], b_vec[d])
+            lo_list.append(lo_d)
+            frac_list.append(f_d)
+        lo = jnp.stack(lo_list)                              # (n_state,)
+        frac = jnp.stack(frac_list)                          # (n_state,)
 
-        # 8 trilinear corners, flat indexing matching solver layout
-        j_corners = jnp.stack([
-            lo0 * N1 * N2 + lo1 * N2 + lo2,
-            lo0 * N1 * N2 + lo1 * N2 + hi2,
-            lo0 * N1 * N2 + hi1 * N2 + lo2,
-            lo0 * N1 * N2 + hi1 * N2 + hi2,
-            hi0 * N1 * N2 + lo1 * N2 + lo2,
-            hi0 * N1 * N2 + lo1 * N2 + hi2,
-            hi0 * N1 * N2 + hi1 * N2 + lo2,
-            hi0 * N1 * N2 + hi1 * N2 + hi2,
-        ])
-        w_corners = jnp.stack([
-            (1.0 - f0) * (1.0 - f1) * (1.0 - f2),
-            (1.0 - f0) * (1.0 - f1) * f2,
-            (1.0 - f0) * f1 * (1.0 - f2),
-            (1.0 - f0) * f1 * f2,
-            f0 * (1.0 - f1) * (1.0 - f2),
-            f0 * (1.0 - f1) * f2,
-            f0 * f1 * (1.0 - f2),
-            f0 * f1 * f2,
-        ])
+        # 2^n_state multilinear corners, flat indexing matching solver layout
+        per_axis = jnp.where(corner_offsets > 0, frac[None, :], 1.0 - frac[None, :])
+        w_corners = jnp.prod(per_axis, axis=1)               # (2^n_state,)
+        idx_per_axis = lo[None, :] + corner_offsets          # (2^n_state, n_state)
+        j_corners = jnp.sum(idx_per_axis * strides[None, :], axis=1).astype(jnp.int32)
 
-        # Diagnostic state index: nearest-corner flatten (post-rewrite, this
-        # is the only consumer of nearest-corner indexing — keep it for
-        # backwards-compatible panel layout).
-        d0 = jnp.where(f0 <= 0.5, lo0, hi0)
-        d1 = jnp.where(f1 <= 0.5, lo1, hi1)
-        d2 = jnp.where(f2 <= 0.5, lo2, hi2)
-        state_idx_near = d0 * N1 * N2 + d1 * N2 + d2
+        # Diagnostic state index: nearest-corner flatten — kept for the
+        # backwards-compatible panel layout.
+        nearest_offsets = (frac > 0.5).astype(corner_offsets.dtype)
+        state_idx_near = jnp.sum((lo + nearest_offsets) * strides).astype(jnp.int32)
 
-        # ----- Policy lookup: trilinear in s × bilinear in (z, x) -----
+        # ----- Policy lookup: multilinear in s × bilinear in (z, x) -----
         c_t = _trilinear_z_w_lookup(C_mat, t_idx, iz_lo, frac_z,
                                      j_corners, w_corners, x_t, wealth_grid)
         a_s_t = _trilinear_z_w_lookup(S_mat, t_idx, iz_lo, frac_z,
@@ -332,31 +321,31 @@ def _build_simulate_kernel(
         c_t = jnp.where(x_t > wealth_max_grid, c_t * (x_t / wealth_max_grid), c_t)
 
         # Bracket-clamp on consumption: 0 <= c <= max(x, 0).
-        # If x_t < 0 (catastrophic portfolio loss under uncapped leverage),
-        # consume zero and let the household ride with negative wealth.
         c_t = jnp.maximum(c_t, 0.0)
         c_t = jnp.minimum(c_t, jnp.maximum(x_t, 0.0))
         savings_t = x_t - c_t
 
         # ----- State innovation v^s = L_ss @ standard_normals -----
-        z_innov = lax.dynamic_slice(n, (n_ret + 2,), (3,))  # (3,) — n_state == 3
+        z_innov = lax.dynamic_slice(n, (n_ret + 2,), (n_state,))
         v_s = L_ss @ z_innov
 
-        # ----- Conditional return mean given (s_t, v^s) -----
-        base_mu_r = const_r + A_r @ s_t                        # (3,)
-        mu_r = base_mu_r + M_matrix @ v_s                      # (3,)
+        # ----- Next-period state vector (carries the realised rtb) -----
+        s_next = Phi_0_state + Phi_11 @ s_t + v_s              # (n_state,)
+        log_R_bill = s_next[rtb_idx]                           # rtb_{t+1}
+
+        # ----- Conditional return mean for (xr, xb) given (s_t, v^s) -----
+        base_mu_r = const_r + A_r @ s_t                        # (n_ret,)
+        mu_r = base_mu_r + M_matrix @ v_s                      # (n_ret,)
 
         if use_mc_returns:
             # Continuous return residuals: factor @ standard_normals.
             ret_resid = ret_factor @ lax.dynamic_slice(n, (0,), (n_ret,))
-            log_R_bill = mu_r[0] + ret_resid[0]
-            log_x_s = mu_r[1] + ret_resid[1]
-            log_x_b = mu_r[2] + ret_resid[2]
+            log_x_s = mu_r[xr_pos] + ret_resid[xr_pos]
+            log_x_b = mu_r[xb_pos] + ret_resid[xb_pos]
         else:
             ret_idx = _draw_discrete(ret_weights, u[3])
-            log_R_bill = mu_r[0] + ret_nodes[ret_idx, 0]
-            log_x_s = mu_r[1] + ret_nodes[ret_idx, 1]
-            log_x_b = mu_r[2] + ret_nodes[ret_idx, 2]
+            log_x_s = mu_r[xr_pos] + ret_nodes[ret_idx, xr_pos]
+            log_x_b = mu_r[xb_pos] + ret_nodes[ret_idx, xb_pos]
 
         R_bill = jnp.exp(log_R_bill)
         R_stock = R_bill * jnp.exp(log_x_s)
@@ -429,11 +418,10 @@ def _build_simulate_kernel(
             "alive": alive,
             "z_idx": z_idx_near,
             "state_idx": state_idx_near,
-            "state_coords": s_t,   # (3,)
+            "state_coords": s_t,
         }
 
-        # Carry forward
-        s_next = Phi_0_state + Phi_11 @ s_t + v_s
+        # Carry forward — s_next was already computed above (rtb-as-state)
         carry_next = (z_next, s_next, x_next, alive_next, income_next, t_idx + 1)
         return carry_next, out
 
@@ -540,10 +528,10 @@ def simulate_lifecycle(
         raise ValueError(
             f"return_draw_mode must be 'monte_carlo' or 'quadrature', got '{return_draw_mode}'."
         )
-    if int(model.n_state) != 3:
+    n_state_int = int(model.n_state)
+    if n_state_int < 1 or n_state_int > 4:
         raise NotImplementedError(
-            "JAX simulator supports n_state == 3 only (canonical model). "
-            f"Got n_state={int(model.n_state)} — handoff-4 territory."
+            f"JAX simulator supports n_state in {{1, 2, 3, 4}} (got {n_state_int})."
         )
 
     retire_age_idx = model.retire_age - model.start_age
@@ -561,7 +549,9 @@ def simulate_lifecycle(
         print(f"  Return draw mode:   {return_draw_mode}")
         if return_draw_mode == "monte_carlo":
             diag = np.sqrt(np.clip(np.diag(model.Sigma_r_cond), 0.0, None))
-            print(f"  sigma_resid (rtb,xr,xb): {diag[0]:.4f}, {diag[1]:.4f}, {diag[2]:.4f}")
+            label = ",".join(model.ret_names)
+            diag_str = ", ".join(f"{v:.4f}" for v in diag)
+            print(f"  sigma_resid ({label}): {diag_str}")
 
     rng = np.random.default_rng(seed)
 
@@ -625,8 +615,10 @@ def simulate_lifecycle(
         print(f"  Initial x mean: {np.mean(init_x):.3f}  p25={np.percentile(init_x,25):.3f}  p75={np.percentile(init_x,75):.3f}")
 
     # --- Pre-generate RNG draws (NumPy, shipped to device) ---
+    # n_normal_cols = n_ret (return residuals) + 2 (eta, eps standard normals)
+    #                 + n_state (state-innovation standard normals).
     uniform_draws = rng.uniform(size=(n_simulations, n_age, 4))
-    n_normal_cols = n_ret + 2 + 3
+    n_normal_cols = n_ret + 2 + n_state_int
     normal_draws = rng.standard_normal(size=(n_simulations, n_age, n_normal_cols))
 
     if return_draw_mode == "monte_carlo":
@@ -651,14 +643,33 @@ def simulate_lifecycle(
     L_ss = np.linalg.cholesky(0.5 * (np.asarray(model.Sigma_ss) + np.asarray(model.Sigma_ss).T))
 
     j = jnp.asarray
+    # Build the n_state-generic axis and corner arrays. Mirrors solver._pc_to_jnp.
+    axis_grids = tuple(j(np.asarray(g)) for g in pc.state_bracket_grids)
+    axis_sizes = tuple(int(g.shape[0]) for g in pc.state_bracket_grids)
+    n_corners = 1 << n_state_int
+    corner_offsets_np = np.zeros((n_corners, n_state_int), dtype=np.int32)
+    for c in range(n_corners):
+        for d in range(n_state_int):
+            corner_offsets_np[c, d] = (c >> (n_state_int - 1 - d)) & 1
+    strides_np = np.empty(n_state_int, dtype=np.int32)
+    s = 1
+    for d in range(n_state_int - 1, -1, -1):
+        strides_np[d] = s
+        s *= axis_sizes[d]
+
+    rtb_idx = int(model.rtb_index_in_state)
+    xr_pos = int(model.ret_names.index("xr"))
+    xb_pos = int(model.ret_names.index("xb"))
+
     kernel = _build_simulate_kernel(
         C_mat=j(C_mat), S_mat=j(S_mat), B_mat=j(B_mat),
         wealth_grid=j(pc.wealth_grid),
         z_grid=j(pc.z_grid), dz=jnp.float64(pc.dz),
         z_lo=jnp.float64(pc.z_grid[0]),
-        state_grids_0=j(np.asarray(pc.state_bracket_grids[0])),
-        state_grids_1=j(np.asarray(pc.state_bracket_grids[1])),
-        state_grids_2=j(np.asarray(pc.state_bracket_grids[2])),
+        axis_grids=axis_grids,
+        axis_sizes=axis_sizes,
+        corner_offsets=j(corner_offsets_np),
+        strides=j(strides_np),
         state_bracket_shift=j(pc.state_bracket_shift),
         state_bracket_L_inv=j(pc.state_bracket_L_inv),
         L_ss=j(L_ss),
@@ -685,6 +696,8 @@ def simulate_lifecycle(
         sigma_eps2=jnp.float64(model.sigma_eps2),
         mu_eps2_eff=jnp.float64(mu_eps2_eff),
         n_age=int(n_age), n_z=int(pc.n_z), n_ret=int(n_ret),
+        n_state=n_state_int,
+        rtb_idx=rtb_idx, xr_pos=xr_pos, xb_pos=xb_pos,
         use_mc_returns=use_mc_returns,
     )
 

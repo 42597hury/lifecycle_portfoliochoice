@@ -1,4 +1,4 @@
-"""Phase 3 canonical-small: 78-age lifecycle on (3,3,3) state grid + small wealth/savings/z."""
+"""Phase 3 canonical-small: 78-age lifecycle on (3,3,3,3) state grid + small wealth/savings/z."""
 import time
 import numpy as np
 
@@ -12,14 +12,14 @@ from lifecycle.simulation import simulate_lifecycle
 disc = DiscretizationConfig(
     n_wealth=40, wealth_min=0.13, wealth_max=200.0,
     n_savings=40,
-    state_grid_sizes=(3, 3, 3),
+    state_grid_sizes=(3, 3, 3, 3),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.25),
+    state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_z=5,
     n_eps_nodes=3,
     n_eta_nodes=3,
-    n_ret_nodes_1d=(2, 3, 3),
-    n_state_quad_nodes=(2, 3, 3),
+    n_ret_nodes_1d=(3, 3),
+    n_state_quad_nodes=(2, 3, 2, 3),
 )
 
 print("Building model and precompute...", flush=True)

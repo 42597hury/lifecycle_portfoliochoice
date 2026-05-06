@@ -27,6 +27,7 @@ from lifecycle.solver import (
     ModelParams,
     _build_per_age_retirement_kernel,
     _pc_to_jnp,
+    _precompute_per_is_tensors,
 )
 
 
@@ -138,20 +139,28 @@ def _markowitz_cold_start(model, pc):
         raise ValueError("Quadrature weights must sum to a positive finite number")
     weight_vec = weight_vec / weight_sum
 
+    rtb_idx = int(model.rtb_index_in_state)
+    xr_pos = int(model.ret_names.index("xr"))
+    xb_pos = int(model.ret_names.index("xb"))
+    Phi_0_state = np.asarray(model.Phi_0_state, dtype=np.float64)
+    Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)
+    v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)
+
     for i_s in range(N_state):
         base_mu_r = pc.const_r + pc.A_r @ pc.state_grid[i_s]
+        # rtb realisation per state-quadrature node lives in s_next:
+        s_next_kv = Phi_0_state[None, :] + pc.state_grid[i_s] @ Phi_11.T + v_nodes
 
         returns = np.empty((weight_vec.size, 3), dtype=np.float64)
         row = 0
         for k_v in range(len(pc.v_weights)):
-            mu_bill = base_mu_r[0] + pc.M_v_nodes[k_v, 0]
-            mu_stock = base_mu_r[1] + pc.M_v_nodes[k_v, 1]
-            mu_bond = base_mu_r[2] + pc.M_v_nodes[k_v, 2]
-            exp_mu_bill = np.exp(mu_bill)
+            mu_stock = base_mu_r[xr_pos] + pc.M_v_nodes[k_v, xr_pos]
+            mu_bond = base_mu_r[xb_pos] + pc.M_v_nodes[k_v, xb_pos]
+            log_R_bill_kv = float(s_next_kv[k_v, rtb_idx])
+            R_bill = np.exp(log_R_bill_kv)
             exp_mu_stock = np.exp(mu_stock)
             exp_mu_bond = np.exp(mu_bond)
             for k_r in range(len(pc.ret_weights)):
-                R_bill = exp_mu_bill * pc.exp_ret_bill[k_r]
                 R_stock = R_bill * exp_mu_stock * pc.exp_ret_stock[k_r]
                 R_bond = R_bill * exp_mu_bond * pc.exp_ret_bond[k_r]
                 returns[row, 0] = R_bill
@@ -309,21 +318,28 @@ def _compute_stability_proxy(model, pc, solver_config, S, B, trim_wealth_points)
     sigma2_xb = float(pc.sigma2_xb)
     sigma_xrxb = float(pc.sigma_xrxb)
 
+    rtb_idx = int(model.rtb_index_in_state)
+    xr_pos = int(model.ret_names.index("xr"))
+    xb_pos = int(model.ret_names.index("xb"))
+    Phi_0_state = np.asarray(model.Phi_0_state, dtype=np.float64)
+    Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)
+    v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)
+
     for i_s in range(pc.N_state):
         s_i = pc.state_grid[i_s]
         base_mu_r_i = pc.const_r + pc.A_r @ s_i
+        s_next_kv = Phi_0_state[None, :] + s_i @ Phi_11.T + v_nodes
         alpha_s = float(S[i_z, i_s, i_w])
         alpha_b = float(B[i_z, i_s, i_w])
 
         expected_rpow = 0.0
         for k_v, w_v in enumerate(pc.v_weights):
-            mu_r_bill = base_mu_r_i[0] + pc.M_v_nodes[k_v, 0]
-            mu_r_stock = base_mu_r_i[1] + pc.M_v_nodes[k_v, 1]
-            mu_r_bond = base_mu_r_i[2] + pc.M_v_nodes[k_v, 2]
+            mu_r_stock = base_mu_r_i[xr_pos] + pc.M_v_nodes[k_v, xr_pos]
+            mu_r_bond = base_mu_r_i[xb_pos] + pc.M_v_nodes[k_v, xb_pos]
+            log_R_bill = float(s_next_kv[k_v, rtb_idx])
             for k_r, p_ret in enumerate(pc.ret_weights):
-                log_R_bill = mu_r_bill + pc.ret_nodes[k_r, 0]
-                log_x_s = mu_r_stock + pc.ret_nodes[k_r, 1]
-                log_x_b = mu_r_bond + pc.ret_nodes[k_r, 2]
+                log_x_s = mu_r_stock + pc.ret_nodes[k_r, xr_pos]
+                log_x_b = mu_r_bond + pc.ret_nodes[k_r, xb_pos]
                 r_p = (
                     log_R_bill
                     + alpha_s * log_x_s + alpha_b * log_x_b
@@ -459,8 +475,9 @@ def run_infinite_horizon_solver(
         rho=jnp.float64(model.rho),
     )
     n_dev = len(jax.devices())
+    per_is_tensors = _precompute_per_is_tensors(pcj)
     retirement_kernel = _build_per_age_retirement_kernel(
-        pcj, mp, solver_config, n_dev, pc.n_z, pc.N_state,
+        pcj, mp, solver_config, n_dev, pc.n_z, pc.N_state, per_is_tensors,
     )
 
     pension_zero = jnp.zeros(pc.n_z, dtype=jnp.float64)
@@ -587,8 +604,9 @@ def compile_inner_kernel_smoke_test(
         rho=jnp.float64(model.rho),
     )
     n_dev = len(jax.devices())
+    per_is_tensors = _precompute_per_is_tensors(pcj)
     retirement_kernel = _build_per_age_retirement_kernel(
-        pcj, mp, solver_config, n_dev, pc.n_z, pc.N_state,
+        pcj, mp, solver_config, n_dev, pc.n_z, pc.N_state, per_is_tensors,
     )
 
     expected_shape = (pc.n_z, pc.N_state, pc.n_w)

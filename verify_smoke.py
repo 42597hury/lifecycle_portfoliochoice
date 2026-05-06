@@ -12,14 +12,15 @@ from lifecycle.solver import run_lifecycle_solver
 tiny_disc = DiscretizationConfig(
     n_wealth=20, wealth_min=0.13, wealth_max=200.0,
     n_savings=20,
-    state_grid_sizes=(3, 3, 3),
+    # Post rtb-as-state: 4-D state vector (cy, spr, rtb, y_1).
+    state_grid_sizes=(3, 3, 3, 3),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.25),
+    state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_z=5,
     n_eps_nodes=3,
     n_eta_nodes=3,
-    n_ret_nodes_1d=(2, 3, 3),
-    n_state_quad_nodes=(2, 3, 3),
+    n_ret_nodes_1d=(3, 3),
+    n_state_quad_nodes=(2, 3, 2, 3),
 )
 
 # Override the canonical age range so the smoke is fast.

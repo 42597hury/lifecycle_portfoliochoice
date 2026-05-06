@@ -27,10 +27,13 @@ base_config = BASE_CONFIG
 disc_config_template = CANONICAL_DISC._replace(
     n_wealth=40,
     n_savings=40,
-    state_grid_sizes=(3, 3, 3),
+    state_grid_sizes=(3, 3, 3, 3),
+    state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_z=5,
-    n_state_quad_nodes=(2, 2, 2),
-    n_ret_nodes_1d=(3, 5, 3),
+    n_state_quad_nodes=(2, 2, 2, 2),
+    state_lobatto_Z=None,
+    n_ret_nodes_1d=(3, 3),
+    ret_lobatto_Z=None,
 )
 
 # Solver: identical to canonical (proves the exact same code path).

@@ -4,15 +4,15 @@ Mirrors thesisscripts/configs/run_ccv_wide9_gh_k4.py — the most recent bundle
 at the time of writing (system_iv_full_var_unconstrained_cholesky_grid9x9x9_nz11_ccv_wide9_gh_k4).
 That run took 1341.9s = 22.4 min on Numba (likely c6i.4xlarge / 16 vCPU).
 
-Config:
-    state_grid_sizes = (9, 9, 9)              # N_state = 729
-    state_n_stds     = (2.93, 2.93, 2.93)
+Config (post rtb-as-state — state vector is 4-D (cy, spr, rtb, y_1)):
+    state_grid_sizes = (9, 9, 9, 9)            # N_state = 6561
+    state_n_stds     = (2.93, 2.93, 2.93, 2.93)
     n_z              = 11
     n_wealth         = 180,  wealth_min = 0.05
     n_savings        = 180
     n_eps_nodes      = 4,    n_eta_nodes = 4
-    n_ret_nodes_1d   = (3, 5, 5)               # 75 return quad points
-    n_state_quad_nodes = (3, 4, 4)             # 48 state quad points
+    n_ret_nodes_1d   = (5, 5)                  # (xr, xb) only; 25 return quad points
+    n_state_quad_nodes = (3, 4, 3, 4)          # 144 state quad points
     youngest_age_to_solve = 67  →  retirement-only (33 ages: 67..99)
     wealth_dynamics_spec = "ccv_log"
     max_iter = 400                              # tighter than canonical 8000
@@ -41,17 +41,19 @@ from lifecycle.solver import run_lifecycle_solver
 from lifecycle.policy_io import save_policy_bundle
 from lifecycle.diagnostics import diagnose_terminal_portfolio_states
 
-BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid9x9x9_nz11_jax_benchmark"
+BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid9x9x9x9_nz11_jax_benchmark"
 BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
 
-# Mirror configs/run_ccv_wide9_gh_k4.py from the main branch verbatim.
+# 4-D state grid post rtb-as-state. axes are (cy, spr, rtb, y_1); 9-points
+# per axis matches the previous CCV-wide setting on the three retained axes
+# and adds a matching width on the new rtb axis.
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(9, 9, 9),
-    state_n_stds=(2.93, 2.93, 2.93),
-    n_ret_nodes_1d=(3, 5, 5),
+    state_grid_sizes=(9, 9, 9, 9),
+    state_n_stds=(2.93, 2.93, 2.93, 2.93),
+    n_ret_nodes_1d=(5, 5),
     ret_lobatto_Z=None,
-    n_state_quad_nodes=(3, 4, 4),
+    n_state_quad_nodes=(3, 4, 3, 4),
     state_lobatto_Z=None,
 )
 solver_config = CANONICAL_SOLVER._replace(
@@ -72,7 +74,7 @@ solve_control = SolveControl(
 )
 
 print("=" * 70, flush=True)
-print("JAX BENCHMARK: 9x9x9 retirement-only run", flush=True)
+print("JAX BENCHMARK: 9x9x9x9 retirement-only run", flush=True)
 print(f"Numba reference: 1341.9s = 22.4 min", flush=True)
 print("=" * 70, flush=True)
 

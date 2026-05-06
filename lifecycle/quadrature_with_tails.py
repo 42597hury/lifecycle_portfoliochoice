@@ -278,10 +278,9 @@ def get_return_quadrature_with_axis_tails(model, K_per_dim, axis: int, Z: float)
     Drop-in replacement for `discretization.get_return_quadrature(model, K_per_dim)`
     that swaps the 1D rule on `axis` for a prescribed-tails rule with parameter Z.
 
-    Axis convention (under default ordering, ret_names = ('rtb', 'xr', 'xb')):
-        axis = 0  ->  prescribed tails on rtb residual (z_0)
-        axis = 1  ->  prescribed tails on purified xr residual (z_1)
-        axis = 2  ->  prescribed tails on purified xb residual (z_2)  <-- bond axis
+    Axis convention (post rtb-as-state migration, ret_names = ('xr', 'xb')):
+        axis = 0  ->  prescribed tails on xr residual (z_0)
+        axis = 1  ->  prescribed tails on purified xb residual (z_1)  <-- bond axis
     """
     from lifecycle.discretization import _normalize_ret_nodes  # lazy: avoid cycle
     n_ret = int(model.n_ret)
@@ -296,10 +295,11 @@ def get_state_quadrature_with_axis_tails(model, K_per_dim, axis: int, Z: float):
     """State-innovation quadrature with prescribed tails on the chosen axis.
 
     Drop-in replacement for `discretization.get_state_quadrature(model, K_per_dim)`.
-    Under the default state ordering (cy, spr, y_1):
+    Under the default state ordering post rtb-as-state (cy, spr, rtb, y_1):
         axis = 0  ->  prescribed tails on cy axis
         axis = 1  ->  prescribed tails on spr-purified axis
-        axis = 2  ->  prescribed tails on y_1-purified axis  <-- bond driver
+        axis = 2  ->  prescribed tails on rtb-purified axis (inflation surprise)
+        axis = 3  ->  prescribed tails on y_1-purified axis  <-- bond driver
     """
     from lifecycle.discretization import _normalize_state_nodes  # lazy: avoid cycle
     n_state = int(model.n_state)
@@ -371,11 +371,14 @@ if __name__ == "__main__":
     print("2.  Tensor-product return quadrature: mean=0, cov=Sigma_r_cond")
     print("=" * 72)
     print(f"    {'config':<55}  {'|sumw-1|':>10}  {'|mean|':>10}  {'|cov-S|':>10}")
+    # Post rtb-as-state: return block is (xr, xb), so axis 0 = xr and
+    # axis 1 = xb (the bond residual). The legacy "tails on rtb" axis-0
+    # case is dropped — rtb no longer lives in the return block.
     cases = [
-        ("axis=2, Z=3, K=(3,5,3) [tails on xb]",   2, 3.0, (3, 5, 3)),
-        ("axis=2, Z=4, K=(3,5,3) [tails on xb]",   2, 4.0, (3, 5, 3)),
-        ("axis=2, Z=4, K=(3,5,5) [tails on xb]",   2, 4.0, (3, 5, 5)),
-        ("axis=0, Z=3, K=(3,5,3) [tails on rtb]",  0, 3.0, (3, 5, 3)),
+        ("axis=1, Z=3, K=(5,3) [tails on xb]",   1, 3.0, (5, 3)),
+        ("axis=1, Z=4, K=(5,3) [tails on xb]",   1, 4.0, (5, 3)),
+        ("axis=1, Z=4, K=(5,5) [tails on xb]",   1, 4.0, (5, 5)),
+        ("axis=0, Z=3, K=(5,3) [tails on xr]",   0, 3.0, (5, 3)),
     ]
     for label, axis, Z, K in cases:
         r, w = get_return_quadrature_with_axis_tails(model, K, axis, Z)
@@ -391,13 +394,14 @@ if __name__ == "__main__":
     print("3.  Bond-residual tail coverage: Hermite vs prescribed-tail rules")
     print("=" * 72)
     print(f"    {'rule':<55}  {'min(xb_resid)':>14}  {'max(xb_resid)':>14}")
-    for K in [(3, 5, 3), (3, 5, 5), (3, 5, 7)]:
+    # Post rtb-as-state: return block is (xr, xb); xb is at column 1.
+    for K in [(5, 3), (5, 5), (5, 7)]:
         r, _ = get_return_quadrature(model, n_nodes=K)
-        print(f"    {'Hermite K=' + str(K):<55}  {r[:,2].min():>14.4f}  {r[:,2].max():>14.4f}")
+        print(f"    {'Hermite K=' + str(K):<55}  {r[:,1].min():>14.4f}  {r[:,1].max():>14.4f}")
     for Z in (3.0, 4.0):
-        r, _ = get_return_quadrature_with_axis_tails(model, (3, 5, 5), axis=2, Z=Z)
-        print(f"    {f'Prescribed-tails axis=2 K=(3,5,5) Z={Z}':<55}  "
-              f"{r[:,2].min():>14.4f}  {r[:,2].max():>14.4f}")
+        r, _ = get_return_quadrature_with_axis_tails(model, (5, 5), axis=1, Z=Z)
+        print(f"    {f'Prescribed-tails axis=1 K=(5,5) Z={Z}':<55}  "
+              f"{r[:,1].min():>14.4f}  {r[:,1].max():>14.4f}")
 
     # ---- 4: validity-window error message --------------------------------
     print()

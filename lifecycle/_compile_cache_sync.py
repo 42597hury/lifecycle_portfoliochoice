@@ -40,7 +40,11 @@ def pull_from_s3(bucket, prefix, region=None):
     if region:
         cmd += ["--region", region]
     print(f"[cache_sync] pulling cache: {' '.join(cmd)}", flush=True)
-    rc = subprocess.run(cmd, check=False).returncode
+    try:
+        rc = subprocess.run(cmd, check=False).returncode
+    except FileNotFoundError:
+        print("[cache_sync] aws CLI not found on PATH; skipping S3 sync", flush=True)
+        return 127
     print(f"[cache_sync] s3 pull rc={rc}", flush=True)
     return rc
 
@@ -64,6 +68,10 @@ def push_to_s3(bucket, prefix, region=None):
     if region:
         cmd += ["--region", region]
     print(f"[cache_sync] pushing cache: {' '.join(cmd)}", flush=True)
-    rc = subprocess.run(cmd, check=False).returncode
+    try:
+        rc = subprocess.run(cmd, check=False).returncode
+    except FileNotFoundError:
+        print("[cache_sync] aws CLI not found on PATH; skipping S3 sync", flush=True)
+        return 127
     print(f"[cache_sync] s3 push rc={rc}", flush=True)
     return rc

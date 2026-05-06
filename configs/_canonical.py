@@ -62,24 +62,26 @@ CANONICAL_DISC = DiscretizationConfig(
     wealth_min=0.13,
     wealth_max=750.0,
     n_savings=180,
-    state_grid_sizes=(7, 7, 7),
+    # Post rtb-as-state migration: state vector is (cy, spr, rtb, y_1).
+    # Axis 0 = cy (clean orthogonal knob), axis 1 = spr, axis 2 = rtb
+    # (inflation-surprise axis, between spr and y_1 to break their rho=-0.87
+    # adjacency), axis 3 = y_1 (bond-return refinement target).
+    state_grid_sizes=(7, 7, 7, 7),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.25),
+    state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_z=11,
     n_stds=3.0,
     n_eps_nodes=4,
     n_eta_nodes=4,
-    # Lobatto on stock/bond return-residual axes (ret[1], ret[2]) and on the
-    # spr/y_1 state-innovation axes (state[1], state[2]). These are the four
-    # axes where the empirical bond-tail discrete-free-lunch lives. See
-    # diagnostics_reports/diagnostics_quadrature_arbitrage_nz11_v3.md and
-    # scripts/diagnostics/_diag_per_axis_tail.py for the per-axis evidence.
-    # Z=7 (sigma units of the standardised orthogonalised axis) puts the
-    # explicit tail node at +/-7 sigma => +/-17% R_bond surprise on ret[2].
-    n_ret_nodes_1d=(3, 5, 5),
-    ret_lobatto_Z=(None, 7.0, 7.0),
-    n_state_quad_nodes=(3, 5, 5),
-    state_lobatto_Z=(None, 7.0, 7.0),
+    # Return block now (xr, xb) — n_ret_nodes_1d / ret_lobatto_Z drop the
+    # leading rtb axis. Lobatto tails on both stock and bond residuals at
+    # Z=7 sigma (the tail-correction setting validated against the bond-tail
+    # discrete-free-lunch evidence). State-axis Lobatto: tails on rtb and
+    # y_1 (the inflation-surprise and bond-return refinement axes).
+    n_ret_nodes_1d=(5, 5),
+    ret_lobatto_Z=(7.0, 7.0),
+    n_state_quad_nodes=(3, 5, 3, 5),
+    state_lobatto_Z=(None, 7.0, None, 7.0),
 )
 
 

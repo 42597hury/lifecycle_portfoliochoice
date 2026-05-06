@@ -148,7 +148,18 @@ def _check_runtime_platform():
         somewhere up the stack and we didn't catch it. Both produce a
         runnable but slow workload that AWS bills full GPU rates for.
     """
-    devices = _jax.devices()
+    try:
+        devices = _jax.devices()
+    except RuntimeError as exc:
+        print(f"[lifecycle] WARNING: jax.devices() raised: {exc}", flush=True)
+        print(
+            "[lifecycle] WARNING: GPU env hints set but JAX runtime failed to "
+            "enumerate devices. Likely cause: CUDA driver/runtime mismatch "
+            "with jax[cuda12] wheel. Run nvidia-smi and "
+            "`python -c 'import jax; print(jax.devices())'` to confirm.",
+            flush=True,
+        )
+        return
     platforms = sorted({d.platform for d in devices})
     summary = f"{len(devices)} device(s), platform(s)={platforms}"
     print(f"[lifecycle] JAX runtime: {summary}", flush=True)

@@ -115,7 +115,7 @@ sweeps (per-age S3 checkpointing, 24h self-destruct timer, $-cap budgeting).
 | [scripts/ec2_userdata_serial.sh](scripts/ec2_userdata_serial.sh) | EC2 user-data template (serial) |
 | [scripts/run_solve.py](scripts/run_solve.py) | EC2-side solve runner |
 
-End-to-end runbook: [docs/workflows/AWS_WORKFLOW.md](docs/workflows/AWS_WORKFLOW.md).
+End-to-end runbook: [docs/agents/AWS_WORKFLOW.md](docs/agents/AWS_WORKFLOW.md).
 
 ## Repository layout
 
@@ -170,7 +170,7 @@ End-to-end runbook: [docs/workflows/AWS_WORKFLOW.md](docs/workflows/AWS_WORKFLOW
     ├── STATE_SPACE.md         financial state grid
     ├── RESULTS.md             figure / table inventory
     ├── TODO.md                living task list
-    ├── workflows/             AWS, EE diagnostic, state-grid plan
+    ├── agents/                agent runbooks (AWS, EE diagnostic, etc.)
     ├── handoff/               active sprint tickets
     ├── notes/                 chronological dev trackers
     └── archive/               retired handoffs
@@ -183,7 +183,7 @@ End-to-end runbook: [docs/workflows/AWS_WORKFLOW.md](docs/workflows/AWS_WORKFLOW
 | Run a solve end-to-end | [main.ipynb](main.ipynb) |
 | Understand the model | [docs/DESIGN.md](docs/DESIGN.md), then [docs/CONVENTIONS.md](docs/CONVENTIONS.md) |
 | Tune a sweep config | [docs/CONFIG.md](docs/CONFIG.md), then `configs/_canonical.py` |
-| Run on AWS | [docs/workflows/AWS_WORKFLOW.md](docs/workflows/AWS_WORKFLOW.md) |
+| Run on AWS | [docs/agents/AWS_WORKFLOW.md](docs/agents/AWS_WORKFLOW.md) |
 | Add a new diagnostic probe | [scripts/diagnostics/](scripts/diagnostics/) — copy an existing `_diag_*.py` |
 | Reproduce a saved bundle | `metadata.json` in the bundle directory |
 

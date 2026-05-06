@@ -56,7 +56,7 @@ BASE_CONFIG = {
 # wealth_min: explicit so it can never silently inherit a stale model.py
 #   default. Raised to 0.05 on 2026-05-03 to skip the EGM constrained
 #   region (see docs/STATE_SPACE.md §wealth_min and
-#   docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md). precompute.py reads this directly.
+#   docs/agents/EE_DIAGNOSTIC_WORKFLOW.md). precompute.py reads this directly.
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
     wealth_min=0.13,

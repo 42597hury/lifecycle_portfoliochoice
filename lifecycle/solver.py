@@ -1014,21 +1014,30 @@ def _egm_scan_cell(
     min_consumption, egm_anchor,
     use_fori,
 ):
-    """Sweep ``s_grid`` (largest -> smallest) with warm-started Newton.
+    """Solve the EGM portfolio FOC at every savings point IN PARALLEL.
+
+    Each savings point's Newton starts from the canonical cold init
+    ``(init_a_s, init_a_b)`` instead of warming from the previous savings
+    point's converged solution. This breaks the sequential dependency that
+    forced a ``lax.scan`` loop, letting JAX/XLA vmap the entire savings
+    sweep into a single batched kernel call.
+
+    The trade-off: cold-start Newton typically needs more iterations to
+    converge (the warm-start was buying ~5-15 iters/cell). The robustness
+    cost is that cells where the optimum is far from the cold init may
+    fail to converge if ``max_iter`` is too tight — bump max_iter and
+    track ``newton_failures`` post-hoc.
 
     Returns (x_egm, c_egm, a_s_egm, a_b_egm) each shape ``(n_savings + 1,)``,
     with the first entry being the egm_anchor at s = 0.
     """
-    s_grid_rev = s_grid[::-1]
-
-    def step(carry, s_val):
-        warm_a_s, warm_a_b = carry
+    def per_savings_point(s_val):
         foc_fn = foc_factory(s_val)
         _, _, _, _, _, e0 = foc_fn(0.0, 0.0)
         scale = jnp.maximum(jnp.abs(e0), 1e-30)
 
         a_s_opt, a_b_opt, V_dot, _exit_code, _err, _n_iter = newton_2d_with_line_search(
-            foc_fn, warm_a_s, warm_a_b, scale,
+            foc_fn, init_a_s, init_a_b, scale,
             tol, max_iter, max_backtrack_iter,
             line_search_max_step, singular_det,
             grad_step_size, grad_denom_eps,
@@ -1039,18 +1048,12 @@ def _egm_scan_cell(
 
         tiny = s_val <= tiny_savings
         c_out = jnp.where(tiny, min_consumption, c_opt)
-        a_s_out = jnp.where(tiny, warm_a_s, a_s_opt)
-        a_b_out = jnp.where(tiny, warm_a_b, a_b_opt)
+        a_s_out = jnp.where(tiny, init_a_s, a_s_opt)
+        a_b_out = jnp.where(tiny, init_a_b, a_b_opt)
         x_out = c_out + s_val
-        return (a_s_out, a_b_out), (x_out, c_out, a_s_out, a_b_out)
+        return x_out, c_out, a_s_out, a_b_out
 
-    init_carry = (init_a_s, init_a_b)
-    _, (x_rev, c_rev, a_s_rev, a_b_rev) = lax.scan(step, init_carry, s_grid_rev)
-
-    x_arr = x_rev[::-1]
-    c_arr = c_rev[::-1]
-    a_s_arr = a_s_rev[::-1]
-    a_b_arr = a_b_rev[::-1]
+    x_arr, c_arr, a_s_arr, a_b_arr = vmap(per_savings_point)(s_grid)
 
     x_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=x_arr.dtype), x_arr])
     c_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=c_arr.dtype), c_arr])
@@ -1252,8 +1255,19 @@ def _precompute_per_is_tensors(pcj):
 
 
 # =============================================================================
-# Per-age JIT kernels (vmap over cells; pmap over devices)
+# Per-age JIT kernels (vmap over cells; pmap over devices iff n_dev > 1)
 # =============================================================================
+#
+# Each builder dispatches at trace time on ``n_dev = len(jax.devices())``:
+#   - n_dev > 1 (multi-core CPU with virtual XLA devices, multi-GPU host):
+#     pmap shards cells across devices, with an inner vmap per shard. Real
+#     parallelism on CPU; suboptimal but correct on multi-GPU.
+#   - n_dev == 1 (single-GPU, or CPU with virtual devices disabled): pure
+#     vmap over flat cell indices. Drops the pmap padding/reshape/collapse
+#     so XLA-CUDA can fuse the per-age solve into a single kernel.
+#
+# The two paths produce identical outputs (modulo the float reorder XLA may
+# do under fusion). See docs/handoff/HANDOFF_PMAP_TO_VMAP.md.
 
 # A pytree of jnp arrays + static scalars, threaded through the per-age kernels.
 # Static scalars are bound by closure at kernel-build time (the orchestrator
@@ -1318,6 +1332,13 @@ def _pc_to_jnp(pc, delta):
 
 
 def _build_per_age_terminal_kernel(pcj, mp, sc, n_dev):
+    """Dispatch on n_dev: vmap-only on single-device hosts, pmap+vmap on multi-device."""
+    if n_dev == 1:
+        return _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc)
+    return _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev)
+
+
+def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
     """Build a pmap'd terminal kernel that returns ``(N_state_padded, n_w)``
     arrays. Padding is invisible at the call site — caller slices to
     ``[:N_state]`` after gather.
@@ -1400,12 +1421,78 @@ def _build_per_age_terminal_kernel(pcj, mp, sc, n_dev):
     return call
 
 
-def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
-    """Build a pmap'd retirement kernel. Returns a callable
-    ``call(c_next, pension_next_by_z, psi_per_z) -> (n_z, N_state, n_w)``.
+def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
+    """Single-device terminal kernel. Drops the pmap padding/reshape/collapse
+    so XLA can fuse the per-i_s solve into one kernel. Output: ``(N_state, n_w)``.
     """
     init_a_s = jnp.float64(sc.init_alpha_s)
     init_a_b = jnp.float64(sc.init_alpha_b)
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
+
+    # Pre-build per-i_s log-return tensors (NumPy → jnp) once. Same prep as the
+    # pmap path; only the padding/reshape-for-pmap step is dropped.
+    state_grid_np = np.asarray(pcj.state_grid)
+    const_r_np = np.asarray(pcj.const_r)
+    A_r_np = np.asarray(pcj.A_r)
+    M_v_nodes_np = np.asarray(pcj.M_v_nodes)
+    ret_nodes_np = np.asarray(pcj.ret_nodes)
+    base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T
+    mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]
+    res_bill = ret_nodes_np[:, 0]
+    res_xs = ret_nodes_np[:, 1]
+    res_xb = ret_nodes_np[:, 2]
+    log_R_bill = mu_r_per[:, :, 0:1] + res_bill[None, None, :]
+    log_x_s = mu_r_per[:, :, 1:2] + res_xs[None, None, :]
+    log_x_b = mu_r_per[:, :, 2:3] + res_xb[None, None, :]
+    log_R_bill = log_R_bill.reshape(log_R_bill.shape[0], log_R_bill.shape[1], -1)
+    log_x_s = log_x_s.reshape(log_x_s.shape[0], log_x_s.shape[1], -1)
+    log_x_b = log_x_b.reshape(log_x_b.shape[0], log_x_b.shape[1], -1)
+
+    log_R_bill_jnp = jnp.asarray(log_R_bill)
+    log_x_s_jnp = jnp.asarray(log_x_s)
+    log_x_b_jnp = jnp.asarray(log_x_b)
+    ann_jnp = jnp.asarray(np.asarray(pcj.annuity_factors))
+
+    @jit
+    def all_is():
+        def per_i_s(log_Rb, lxs, lxb, A):
+            return _solve_terminal_at_i_s(
+                log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s, init_a_b,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+        return vmap(per_i_s)(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+
+    def call(_unused_age_idx=None):
+        return all_is()
+
+    return call
+
+
+def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
+    """Dispatch on n_dev: vmap-only on single-device hosts, pmap+vmap on multi-device."""
+    if n_dev == 1:
+        return _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state)
+    return _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state)
+
+
+def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state):
+    """Build a pmap'd retirement kernel. Returns a callable
+    ``call(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr)
+    -> (n_z, N_state, n_w)``.
+
+    ``init_a_s_arr``/``init_a_b_arr`` are (n_z, N_state, n_w) policy arrays
+    from the previous (older) age. The Newton init at cell (z_idx, i_s) is
+    gathered as ``[z_idx, i_s, w_ref_idx]`` (mid-wealth slice), giving each
+    cell a single warm-started scalar shared across the savings vmap.
+    """
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
@@ -1416,6 +1503,9 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
         _precompute_per_is_tensors(pcj)
     )
+
+    n_w = pcj.wealth_grid.shape[0]
+    w_ref_idx = n_w // 2
 
     n_cells = n_z * N_state
     pad_n = math.ceil(n_cells / n_dev) * n_dev
@@ -1428,24 +1518,32 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
     z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
     is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
 
-    @partial(pmap, in_axes=(0, 0, None, None, None))
-    def per_dev_solve(z_block, is_block, c_next, pension_next_by_z, psi_per_z):
+    @partial(pmap, in_axes=(0, 0, None, None, None, None, None))
+    def per_dev_solve(
+        z_block, is_block, c_next, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr,
+    ):
         def per_cell(z_idx, i_s):
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
             return _solve_retirement_at_cell(
                 z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
                 log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
                 j_corners_all[i_s], w_corners_all[i_s],
                 pcj.weight_kv_kr, pcj.annuity_factors,
                 pcj.s_grid, pcj.wealth_grid,
-                init_a_s, init_a_b,
+                init_a_s_cell, init_a_b_cell,
                 mp.gamma, mp.beta, mp.b_bar, mp.delta,
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
             )
         return vmap(per_cell)(z_block, is_block)
 
-    def call(c_next_jnp, pension_next_by_z, psi_per_z):
-        c_pm, as_pm, ab_pm = per_dev_solve(z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z)
+    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+        c_pm, as_pm, ab_pm = per_dev_solve(
+            z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
+        )
         # (n_dev, per_dev, n_w) -> (pad_n, n_w) -> (n_cells, n_w) -> (n_z, N_state, n_w)
         # Stay on device.
         def collapse(a):
@@ -1456,13 +1554,76 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
     return call
 
 
+def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state):
+    """Single-device retirement kernel. Drops pmap padding/reshape/collapse so
+    XLA can fuse the entire per-age solve into one kernel. Output shape matches
+    the pmap path: ``(n_z, N_state, n_w)`` per array.
+    """
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
+
+    log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
+        _precompute_per_is_tensors(pcj)
+    )
+
+    n_w = pcj.wealth_grid.shape[0]
+    w_ref_idx = n_w // 2
+
+    n_cells = n_z * N_state
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    z_idx_arr = jnp.asarray((cell_idx // N_state).astype(np.int64))
+    is_idx_arr = jnp.asarray((cell_idx % N_state).astype(np.int64))
+
+    @jit
+    def all_cells(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+        def per_cell(z_idx, i_s):
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+            return _solve_retirement_at_cell(
+                z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+                j_corners_all[i_s], w_corners_all[i_s],
+                pcj.weight_kv_kr, pcj.annuity_factors,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s_cell, init_a_b_cell,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+        return vmap(per_cell)(z_idx_arr, is_idx_arr)
+
+    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+        c_flat, s_flat, b_flat = all_cells(
+            c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
+        )
+        return (
+            jnp.reshape(c_flat, (n_z, N_state, -1)),
+            jnp.reshape(s_flat, (n_z, N_state, -1)),
+            jnp.reshape(b_flat, (n_z, N_state, -1)),
+        )
+
+    return call
+
+
 def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next):
+    """Dispatch on n_dev: vmap-only on single-device hosts, pmap+vmap on multi-device."""
+    if n_dev == 1:
+        return _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pension_next)
+    return _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next)
+
+
+def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pension_next):
     """Build a pmap'd working-age kernel. The boundary case
     (work -> retirement, ``use_pension_next == True``) is a separate trace
     selected by the orchestrator.
+
+    Newton init at each (z_idx, i_s) cell is gathered from
+    ``init_a_s_arr[z_idx, i_s, w_ref_idx]`` (and similarly for a_b),
+    where ``init_*_arr`` is the previous (older) age's converged policy.
     """
-    init_a_s = jnp.float64(sc.init_alpha_s)
-    init_a_b = jnp.float64(sc.init_alpha_b)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
@@ -1473,6 +1634,9 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
         _precompute_per_is_tensors(pcj)
     )
+
+    n_w = pcj.wealth_grid.shape[0]
+    w_ref_idx = n_w // 2
 
     n_cells = n_z * N_state
     pad_n = math.ceil(n_cells / n_dev) * n_dev
@@ -1485,10 +1649,11 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
     z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
     is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
 
-    @partial(pmap, in_axes=(0, 0, None, None, None, None))
+    @partial(pmap, in_axes=(0, 0, None, None, None, None, None, None))
     def per_dev_solve(
         z_block, is_block, c_next,
         income_next_table_z, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr,
     ):
         def per_cell(z_idx, i_s):
             # z_next = rho * z + eta_nodes  ->  (n_eta,)
@@ -1510,6 +1675,9 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
                 # Working: gather the precomputed table at z_idx (shape (n_eta, n_eps)).
                 income_table = income_next_table_z[z_idx]
 
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+
             return _solve_working_at_cell(
                 z_idx, i_s, c_next,
                 income_table,
@@ -1520,7 +1688,7 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
                 j_corners_all[i_s], w_corners_all[i_s],
                 pcj.weight_kv_kr, pcj.annuity_factors,
                 pcj.s_grid, pcj.wealth_grid,
-                init_a_s, init_a_b,
+                init_a_s_cell, init_a_b_cell,
                 mp.gamma, mp.beta, mp.b_bar, mp.delta,
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
@@ -1528,15 +1696,101 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
 
         return vmap(per_cell)(z_block, is_block)
 
-    def call(c_next_jnp, income_next_table, pension_next_by_z, psi_per_z):
+    def call(
+        c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr,
+    ):
         c_pm, as_pm, ab_pm = per_dev_solve(
-            z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z
+            z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
         )
         # Stay on device.
         def collapse(a):
             flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
             return jnp.reshape(flat[:n_cells], (n_z, N_state, -1))
         return collapse(c_pm), collapse(as_pm), collapse(ab_pm)
+
+    return call
+
+
+def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pension_next):
+    """Single-device working-age kernel (and work->retirement boundary case
+    when ``use_pension_next``). Drops pmap padding/reshape/collapse so XLA can
+    fuse the per-age solve into one kernel.
+    """
+    static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
+              sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
+              sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
+
+    log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
+        _precompute_per_is_tensors(pcj)
+    )
+
+    n_w = pcj.wealth_grid.shape[0]
+    w_ref_idx = n_w // 2
+
+    n_cells = n_z * N_state
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    z_idx_arr = jnp.asarray((cell_idx // N_state).astype(np.int64))
+    is_idx_arr = jnp.asarray((cell_idx % N_state).astype(np.int64))
+
+    @jit
+    def all_cells(
+        c_next, income_next_table_z, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr,
+    ):
+        def per_cell(z_idx, i_s):
+            z_now = pcj.z_grid[z_idx]
+            z_next = mp.rho * z_now + pcj.eta_nodes
+            iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
+                z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
+            )
+
+            if use_pension_next:
+                pension_at_eta = (
+                    (1.0 - frac_z) * pension_next_by_z[iz_lo]
+                    + frac_z * pension_next_by_z[iz_lo + 1]
+                )
+                income_table = pension_at_eta[:, None] * jnp.ones_like(pcj.eps_weights)[None, :]
+            else:
+                income_table = income_next_table_z[z_idx]
+
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+
+            return _solve_working_at_cell(
+                z_idx, i_s, c_next,
+                income_table,
+                iz_lo, frac_z,
+                pcj.eta_weights, pcj.eps_weights,
+                psi_per_z,
+                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+                j_corners_all[i_s], w_corners_all[i_s],
+                pcj.weight_kv_kr, pcj.annuity_factors,
+                pcj.s_grid, pcj.wealth_grid,
+                init_a_s_cell, init_a_b_cell,
+                mp.gamma, mp.beta, mp.b_bar, mp.delta,
+                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+                *static,
+            )
+
+        return vmap(per_cell)(z_idx_arr, is_idx_arr)
+
+    def call(
+        c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr,
+    ):
+        c_flat, s_flat, b_flat = all_cells(
+            c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
+        )
+        return (
+            jnp.reshape(c_flat, (n_z, N_state, -1)),
+            jnp.reshape(s_flat, (n_z, N_state, -1)),
+            jnp.reshape(b_flat, (n_z, N_state, -1)),
+        )
 
     return call
 
@@ -1580,9 +1834,12 @@ def run_lifecycle_solver(
     solve_control, control_active = _normalize_solve_control(model, pc, solve_control)
 
     if verbose >= 1:
+        n_dev_log = len(jax.devices())
+        pattern = "vmap-only (single-device)" if n_dev_log == 1 else f"pmap+vmap ({n_dev_log} devices)"
         print(f"\n{'='*70}")
         print(f"LIFECYCLE PORTFOLIO SOLVER  (JAX, EGM + 2D Newton)")
         print(f"  Devices: {jax.devices()}")
+        print(f"  Cell-batching pattern: {pattern}")
         print(f"  Solver: {solver_config}")
         print(f"  Discretization: {pc.disc_config}")
         if control_active:
@@ -1739,6 +1996,15 @@ def run_lifecycle_solver(
     survival = np.asarray(pc.survival_probs_2d)
     working_income_next_full = np.asarray(pc.working_income_next)  # (n_age, n_z, n_eta, n_eps)
 
+    # Backward-age warm-start init arrays. When the toggle is off, every cell
+    # at every age is seeded from the canonical scalar (init_alpha_s,
+    # init_alpha_b); we express that through the same kernel signature by
+    # passing constant (n_z, N_state, n_w) arrays so the kernel trace is
+    # identical regardless of the toggle.
+    init_arr_shape = (n_z, N_state, n_w)
+    cold_init_a_s_arr = jnp.full(init_arr_shape, sc.init_alpha_s, dtype=jnp.float64)
+    cold_init_a_b_arr = jnp.full(init_arr_shape, sc.init_alpha_b, dtype=jnp.float64)
+
     try:
         for t in reversed(range(n_age - 1)):
             age = ages[t]
@@ -1752,20 +2018,38 @@ def run_lifecycle_solver(
             # c_next_jnp is the previous age's policy, already on device.
             c_next_jnp = C_list[t + 1]
 
+            # Backward-age warm-start: previous (older) age's converged policy
+            # at the same (z, state) cell, gathered at mid-wealth inside the
+            # kernel. Toggle off -> uniform cold init across all cells.
+            if sc.use_backward_age_warm_start:
+                init_a_s_arr = S_list[t + 1]
+                init_a_b_arr = B_list[t + 1]
+            else:
+                init_a_s_arr = cold_init_a_s_arr
+                init_a_b_arr = cold_init_a_b_arr
+
             if age >= retire_age:
                 pension_next = jnp.asarray(pension_table[t + 1, :])
-                c_t, s_t, b_t = retirement_kernel(c_next_jnp, pension_next, psi_t)
+                c_t, s_t, b_t = retirement_kernel(
+                    c_next_jnp, pension_next, psi_t, init_a_s_arr, init_a_b_arr,
+                )
                 label = "RETIRE"
             else:
                 use_pen = (age == retire_age - 1)
                 if use_pen:
                     pension_next = jnp.asarray(pension_table[t + 1, :])
                     income_table = jnp.zeros((n_z, pc.n_eta, pc.n_eps))   # ignored on this branch
-                    c_t, s_t, b_t = boundary_kernel(c_next_jnp, income_table, pension_next, psi_t)
+                    c_t, s_t, b_t = boundary_kernel(
+                        c_next_jnp, income_table, pension_next, psi_t,
+                        init_a_s_arr, init_a_b_arr,
+                    )
                 else:
                     pension_next = jnp.asarray(pension_dummy_z)
                     income_table = jnp.asarray(working_income_next_full[t + 1])  # (n_z, n_eta, n_eps)
-                    c_t, s_t, b_t = working_kernel(c_next_jnp, income_table, pension_next, psi_t)
+                    c_t, s_t, b_t = working_kernel(
+                        c_next_jnp, income_table, pension_next, psi_t,
+                        init_a_s_arr, init_a_b_arr,
+                    )
                 label = "WORK  "
 
             # Store device arrays directly — no D->H round trip.

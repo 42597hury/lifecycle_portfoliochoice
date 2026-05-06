@@ -184,6 +184,13 @@ class SolverConfig(NamedTuple):
     # run_lifecycle_solver.
     wealth_dynamics_spec: str = "ccv_log"
 
+    # --- Newton init source ---
+    # When True, every non-terminal age seeds Newton at each (z, state) cell
+    # from the previous (older) age's converged policy at that same cell
+    # (gathered at mid-wealth). When False, every cell uses the canonical
+    # scalar (init_alpha_s, init_alpha_b). Terminal age is always cold.
+    use_backward_age_warm_start: bool = True
+
 
 # =============================================================================
 # SOLVE CONTROL

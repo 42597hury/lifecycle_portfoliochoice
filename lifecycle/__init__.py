@@ -72,3 +72,43 @@ _jax.config.update("jax_enable_x64", True)
 _jax.config.update("jax_compilation_cache_dir", _os.path.expanduser("~/.cache/jax_lifecycle"))
 _jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 _jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+
+
+def _check_runtime_platform():
+    """Print active JAX platform once at import. Warns if running on CPU when
+    the env signals GPU intent (presence of CUDA-related env vars).
+
+    Why this exists: a GPU instance can silently fall through to CPU if
+    (a) plain ``jax`` was installed instead of ``jax[cuda12]``, or
+    (b) ``XLA_FLAGS=--xla_force_host_platform_device_count=...`` was set
+        somewhere up the stack and we didn't catch it. Both produce a
+        runnable but slow workload that AWS bills full GPU rates for.
+    """
+    devices = _jax.devices()
+    platforms = sorted({d.platform for d in devices})
+    summary = f"{len(devices)} device(s), platform(s)={platforms}"
+    print(f"[lifecycle] JAX runtime: {summary}", flush=True)
+
+    cpu_only = platforms == ["cpu"]
+    gpu_intent = any(
+        _os.environ.get(k) for k in (
+            "CUDA_VISIBLE_DEVICES",
+            "NVIDIA_VISIBLE_DEVICES",
+            "JAX_PLATFORMS",
+        )
+    ) or _os.environ.get("LIFECYCLE_DISABLE_VIRTUAL_CPUS", "").lower() in ("1", "true", "yes")
+
+    if cpu_only and gpu_intent:
+        print(
+            "[lifecycle] WARNING: GPU env hints set "
+            "(CUDA_VISIBLE_DEVICES / JAX_PLATFORMS / LIFECYCLE_DISABLE_VIRTUAL_CPUS) "
+            "but JAX reports CPU only. "
+            "Likely causes: (1) `pip install jax` instead of `pip install jax[cuda12]`; "
+            "(2) NVIDIA driver / CUDA runtime not present; "
+            "(3) `nvidia-smi` would fail. "
+            "Run `python -c \"import jax; print(jax.devices())\"` to confirm.",
+            flush=True,
+        )
+
+
+_check_runtime_platform()

@@ -150,16 +150,123 @@ Capture that block + the per-age progress lines for the report.
 
 ## 6. After the trial / benchmark passes
 
-Two paths forward:
+### 6.A) Same branch, larger CPU run
 
-**A) Larger CPU run, same branch.** Adapt `verify_smoke.py` to a bigger config (e.g., `verify_canonical_small.py` already in the repo at `n_w=40, n_s=40, n_z=5, state=(3,3,3)`). Expect ~10–20 min wall on `hpc8a.64xlarge`, ~30–50 min on `c8a.4xlarge`. Still no S3 upload — pull from instance via SCP if you want bundles.
+Adapt `verify_smoke.py` to a bigger config or use `verify_canonical_small.py`
+(already in repo at `n_w=40, n_s=40, n_z=5, state=(3,3,3)`). Same `c8a.4xlarge`
+or `hpc8a.64xlarge` instance, no recipe change needed. Expect ~10–20 min wall
+on `hpc8a.64xlarge`, ~30–50 min on `c8a.4xlarge`. Still no S3 upload — pull
+from instance via SCP if you want bundles.
 
-**B) GPU run on `p4d.24xlarge` (A100) or `p5.48xlarge` (H100).** Same bootstrap recipe, but:
-1. Set `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1` (or `JAX_PLATFORMS=cuda`) before running Python.
-2. Install JAX with CUDA support: `pip install -U "jax[cuda12]"` (instead of plain `jax`).
-3. Verify `python -c "import jax; print(jax.devices())"` shows `[CudaDevice(id=0)]`.
+### 6.B) GPU run on `p4d.24xlarge` (A100) or `p5.48xlarge` (H100)
 
-Avoid consumer-grade GPUs (`g4dn`, `g5`) — their fp64 throughput is 1:32 of fp32, which makes our float64 solver unusable. Stick to A100/H100/V100.
+**Instance:** start with `p4d.24xlarge` (8× A100 40 GB). Single-GPU operation
+initially — the codebase doesn't yet shard across multiple GPUs, so the other
+seven A100s sit idle. (Multi-GPU is the work tracked in
+[HANDOFF_PMAP_TO_VMAP.md](../handoff/HANDOFF_PMAP_TO_VMAP.md).)
+
+Avoid consumer-grade GPUs (`g4dn`, `g5`) — their fp64 throughput is 1:32 of
+fp32, which makes our float64 solver unusable. Stick to A100/H100/V100. The
+one exception: `g6.xlarge` (1× L4) is fp64-acceptable for a smoke bring-up
+only (NOT canonical); fp64 on L4 is 1:64.
+
+**AMI:** prefer **AWS Deep Learning AMI GPU PyTorch 2.x (Amazon Linux 2023)**.
+It ships with the NVIDIA driver, CUDA 12, and cuDNN already configured.
+A bare AL2023 AMI works but adds 20–30 min of driver install — skip unless
+you have a reason.
+
+**Userdata:**
+
+```bash
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/jax-gpu-trial.log) 2>&1
+
+echo "=== JAX GPU trial bootstrap starting at $(date -Is) ==="
+
+# 0. Confirm GPU is visible to the OS
+nvidia-smi || { echo "FATAL: nvidia-smi failed; AMI lacks NVIDIA driver"; exit 1; }
+
+# 1. Python 3.11 + git
+dnf install -y python3.11 python3.11-pip git || true
+
+# 2. Clone branch
+cd /home/ec2-user
+sudo -u ec2-user git clone -b jax-rewrite \
+    https://github.com/42597hury/lifecycle_portfoliochoice.git
+cd lifecycle_portfoliochoice
+
+# 3. Venv + GPU deps. Note: requirements-gpu.txt pulls jax[cuda12].
+sudo -u ec2-user python3.11 -m venv venv
+sudo -u ec2-user ./venv/bin/pip install --upgrade pip
+sudo -u ec2-user ./venv/bin/pip install -r requirements-gpu.txt
+
+# 4. CRITICAL env vars — disable virtual-CPU XLA flag, force CUDA platform
+export LIFECYCLE_DISABLE_VIRTUAL_CPUS=1
+export JAX_PLATFORMS=cuda
+# Persist into the ec2-user env so the venv python sees them
+sudo -u ec2-user bash -c 'cat >> ~/.bashrc <<EOF
+export LIFECYCLE_DISABLE_VIRTUAL_CPUS=1
+export JAX_PLATFORMS=cuda
+EOF'
+
+# 5. Sanity check: confirm JAX sees the GPU before the heavy work
+sudo -u ec2-user -E ./venv/bin/python -c "
+import jax
+devs = jax.devices()
+plats = sorted({d.platform for d in devs})
+print('Devices:', devs)
+print('Platforms:', plats)
+assert plats == ['cuda'], f'Expected CUDA only, got {plats}'
+"
+
+# 6. Run smoke
+echo "=== running verify_smoke.py at $(date -Is) ==="
+sudo -u ec2-user -E ./venv/bin/python verify_smoke.py
+SMOKE_EXIT=$?
+
+echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
+
+# 7. Auto-terminate on success
+if [ "$SMOKE_EXIT" -eq 0 ]; then
+    echo "=== smoke PASSED, shutting down ==="
+    shutdown -h now
+fi
+```
+
+**Success criteria** (in `/var/log/jax-gpu-trial.log`):
+
+```
+[lifecycle] JAX runtime: 1 device(s), platform(s)=['cuda']
+...
+Devices: [CudaDevice(id=0)]
+Platforms: ['cuda']
+...
+  Status: complete  (6/6 ages solved)
+  Policy sanity: PASS  (no NaN/Inf in solved ages)
+```
+
+The CUDA-platform line is the new gate — if it says `['cpu']` despite the env
+vars, the wheel install fell through to CPU. Investigate `pip list | grep jax`
+on the instance: should show `jax-cuda12-pjrt` and `jax-cuda12-plugin`
+alongside plain `jax`.
+
+**Common GPU-specific failure modes:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `[lifecycle] WARNING: GPU env hints set ... but JAX reports CPU only` | Wheel install fell through to CPU | Confirm `requirements-gpu.txt` was used, not `requirements.txt` |
+| `nvidia-smi: command not found` | AMI without NVIDIA driver | Use Deep Learning AMI, or add CUDA toolkit install step |
+| `RuntimeError: CUDA runtime version mismatch` | jax[cuda12] expects CUDA 12, AMI has CUDA 11 | Use AMI shipped with CUDA 12; do NOT downgrade JAX to a CUDA 11 build |
+| OOM on solve at 9×9×9 | Single A100's 40 GB HBM | Switch to A100 80 GB (`p4de.24xlarge`) or H100 (`p5.48xlarge`); profile memory before bumping config |
+
+**Hard timeout:** if the smoke exceeds 30 min on a GPU instance, terminate
+and report — JIT pathology, not normal. (CPU smoke takes ~20 min and is
+JIT-bound; GPU JIT should be faster, not slower.)
+
+### 6.C) Production sweeps
+
+Not yet supported on `jax-rewrite`. See §7.
 
 ## 7. Production sweeps
 

@@ -1,0 +1,9 @@
+# requirements-gpu.txt
+# Overlay for GPU runs. Use INSTEAD of requirements.txt's plain `jax`:
+#     pip install -r requirements-gpu.txt
+#
+# This pulls the CUDA-compiled XLA backend. Plain `jax` from requirements.txt
+# would silently install the CPU-only backend even on a GPU instance.
+
+-r requirements.txt
+jax[cuda12]>=0.4.30

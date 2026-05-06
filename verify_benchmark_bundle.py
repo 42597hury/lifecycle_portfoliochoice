@@ -43,7 +43,17 @@ disc_config = CANONICAL_DISC._replace(
     n_state_quad_nodes=(3, 4, 4),
     state_lobatto_Z=None,
 )
-solver_config = CANONICAL_SOLVER._replace(wealth_dynamics_spec="ccv_log")
+solver_config = CANONICAL_SOLVER._replace(
+    wealth_dynamics_spec="ccv_log",
+    # Tighten Newton cap from 8000 → 400. The smoke (6-age) showed identical
+    # policies at max_iter=100 vs 8000; 400 leaves a 4-13× margin over typical
+    # convergence (5-30 iters/cell). lax.while_loop's per-iter overhead is
+    # higher than Numba's plain Python loop, so 8000 is wasteful on JAX.
+    # Newton failures will show in diag["total_newton_failures"] if any cell
+    # actually needs more.
+    max_iter=400,
+    max_iter_unconstrained=400,
+)
 solve_control = SolveControl(
     youngest_age_to_solve=67,
     save_on_interrupt=False,

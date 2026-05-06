@@ -8,11 +8,11 @@ from lifecycle.var import (
     build_iid_var_config,
     build_no_cy_var_config,
     build_nominal_system1_var_config,
-    build_y1_only_var_config,
+    build_rtb_y1_var_config,
 )
 
 
-DEFAULT_TEMPLATE_STATE_NAMES = ("cy", "spr", "y_1")
+DEFAULT_TEMPLATE_STATE_NAMES = ("cy", "spr", "rtb", "y_1")
 
 
 class PredictabilitySystemSpec(NamedTuple):
@@ -29,33 +29,33 @@ _SYSTEM_SPECS: dict[str, PredictabilitySystemSpec] = {
         code="I",
         label="system_i_iid",
         name="iid returns",
-        description="No return predictability; returns are iid and the state grid is a dummy singleton axis.",
+        description="No return predictability; rtb is iid in the single-axis state, returns are iid.",
         builder=build_iid_var_config,
-        state_names=("dummy",),
+        state_names=("rtb",),
     ),
     "II": PredictabilitySystemSpec(
         code="II",
-        label="system_ii_y1_only",
-        name="y_1 only",
-        description="Only the short-rate predictor y_1 remains on the state grid.",
-        builder=build_y1_only_var_config,
-        state_names=("y_1",),
+        label="system_ii_rtb_y1",
+        name="rtb plus y_1",
+        description="Inflation-persistence channel (rtb) plus the short rate; state is ordered (rtb, y_1).",
+        builder=build_rtb_y1_var_config,
+        state_names=("rtb", "y_1"),
     ),
     "III": PredictabilitySystemSpec(
         code="III",
-        label="system_iii_spr_y1",
-        name="spread plus y_1",
-        description="Rate-side predictability only; cy is removed and the state is ordered (spr, y_1).",
+        label="system_iii_rtb_spr_y1",
+        name="rtb plus spread plus y_1",
+        description="Rate-side predictability with inflation persistence; cy removed; state ordered (rtb, spr, y_1).",
         builder=build_no_cy_var_config,
-        state_names=("spr", "y_1"),
+        state_names=("rtb", "spr", "y_1"),
     ),
     "IV": PredictabilitySystemSpec(
         code="IV",
         label="system_iv_full_var",
         name="full VAR baseline",
-        description="Baseline lifecycle model with the full (cy, spr, y_1) state vector.",
+        description="Baseline lifecycle model with the full (cy, spr, rtb, y_1) state vector.",
         builder=build_nominal_system1_var_config,
-        state_names=("cy", "spr", "y_1"),
+        state_names=("cy", "spr", "rtb", "y_1"),
     ),
 }
 
@@ -72,18 +72,15 @@ _SYSTEM_ALIASES = {
     "2": "II",
     "system_ii": "II",
     "system_2": "II",
-    "y1": "II",
-    "y_1": "II",
-    "y1_only": "II",
-    "y_1_only": "II",
-    "interest_rate_only": "II",
+    "rtb_y1": "II",
+    "rtb_y_1": "II",
     "iii": "III",
     "3": "III",
     "system_iii": "III",
     "system_3": "III",
     "no_cy": "III",
-    "spr_y1": "III",
-    "spread_y1": "III",
+    "rtb_spr_y1": "III",
+    "rtb_spread_y1": "III",
     "rate_side": "III",
     "iv": "IV",
     "4": "IV",
@@ -170,11 +167,32 @@ def project_predictability_disc_config(
     template_state_names: tuple[str, ...] = DEFAULT_TEMPLATE_STATE_NAMES,
 ) -> DiscretizationConfig:
     """Project a baseline discretization config onto a lower-dimensional state vector."""
-    if target_state_names == ("dummy",):
+    if target_state_names == ("rtb",):
+        # System I: rtb is iid in a single-axis state. Use a small grid since
+        # there's no persistence; the axis still needs >1 node so the solver
+        # can read the rtb realisation off the state vector.
+        rtb_size = _project_axis_setting(
+            disc_config_template.state_grid_sizes,
+            template_state_names,
+            ("rtb",),
+            "state_grid_sizes",
+        )
+        rtb_n_stds = _project_axis_setting(
+            disc_config_template.state_n_stds,
+            template_state_names,
+            ("rtb",),
+            "state_n_stds",
+        )
+        rtb_quad = _project_axis_setting(
+            disc_config_template.n_state_quad_nodes,
+            template_state_names,
+            ("rtb",),
+            "n_state_quad_nodes",
+        )
         return disc_config_template._replace(
-            state_grid_sizes=(1,),
-            state_n_stds=(1.0,),
-            n_state_quad_nodes=(1,),
+            state_grid_sizes=rtb_size,
+            state_n_stds=rtb_n_stds,
+            n_state_quad_nodes=rtb_quad,
         )
 
     return disc_config_template._replace(

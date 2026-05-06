@@ -228,9 +228,11 @@ def _build_padded_cell_indices(n_z: int, N_state: int, n_chunks: int):
 
 def _make_chunk_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
                        n_cells: int, chunk_size: int, n_chunks: int,
-                       n_z: int, N_state: int):
-    """Return ``runner(*kernel_args) -> (residual, rel_residual)`` that calls
-    a JIT'd per-chunk vmap kernel ``n_chunks`` times in pure Python.
+                       n_z: int, N_state: int, n_outputs: int = 3):
+    """Return ``runner(*kernel_args) -> tuple of (n_z, N_state, n_w) arrays``.
+
+    Calls a JIT'd per-chunk vmap kernel ``n_chunks`` times in pure Python and
+    concatenates the outputs.
 
     Why outside @jit: with the chunk loop inside @jit, XLA fuses all chunks
     into one HLO graph and may schedule their per-cell intermediates
@@ -241,25 +243,22 @@ def _make_chunk_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
     The per-chunk kernel is traced once for ``chunk_size`` and reused.
     """
     def runner(*kernel_args):
-        a_parts = []
-        b_parts = []
+        chunk_results: list[tuple] = []
         for i in range(n_chunks):
             start = i * chunk_size
             z_chunk = jax.device_put(z_idx_padded[start:start + chunk_size])
             is_chunk = jax.device_put(is_idx_padded[start:start + chunk_size])
-            a_i, b_i = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
+            outs = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
             # Force chunk completion before scheduling the next one — bounds
             # peak HBM at one chunk's worth of intermediates.
-            a_i.block_until_ready()
-            a_parts.append(a_i)
-            b_parts.append(b_i)
-        a_full = jnp.concatenate(a_parts, axis=0)[:n_cells]
-        b_full = jnp.concatenate(b_parts, axis=0)[:n_cells]
-        n_w = a_full.shape[-1]
-        return (
-            a_full.reshape(n_z, N_state, n_w),
-            b_full.reshape(n_z, N_state, n_w),
+            outs[0].block_until_ready()
+            chunk_results.append(outs)
+        full = tuple(
+            jnp.concatenate([r[k] for r in chunk_results], axis=0)[:n_cells]
+            for k in range(n_outputs)
         )
+        n_w = full[0].shape[-1]
+        return tuple(arr.reshape(n_z, N_state, n_w) for arr in full)
 
     return runner
 
@@ -273,7 +272,13 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
     """JIT'd per-age residual kernel for retirement ages (age >= retire_age).
 
     Returns ``per_age(C_t, S_t, B_t, C_next, pension_next_z_arr, psi_z_arr)
-    -> (residual, rel_residual)`` each of shape ``(n_z, N_state, n_w)``.
+    -> (residual_abs, residual_rel, ee_cons)`` each of shape ``(n_z, N_state, n_w)``.
+
+    Three metrics computed per cell:
+      - ``residual_abs``: ``||(FOC_alpha_s, FOC_alpha_b)||`` (raw portfolio FOC norm)
+      - ``residual_rel``: ``residual_abs / |V_dot at alpha=0|`` (Newton scale; what tol grades)
+      - ``ee_cons``: ``1 - (beta * e_sum)^(-1/gamma) / c`` (consumption Euler residual,
+        the metric main's *_same.md grid reports use)
 
     Vmaps over (z_idx, i_s) cells and (per cell) over wealth indices.
     c_corners_at_z is gathered once per (z_idx, i_s) cell and shared across all
@@ -283,6 +288,7 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
     gamma = jnp.float64(model.gamma)
+    beta = jnp.float64(model.beta)
     b_bar = jnp.float64(model.b_bar)
     delta_j = jnp.float64(delta)
     min_consumption = jnp.float64(sc.min_consumption)
@@ -315,7 +321,7 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
             savings = wealth - c
             savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
 
-            fs, fb, _, _, _, _ = retirement_foc_jac_ccv(
+            fs, fb, _, _, _, e_sum = retirement_foc_jac_ccv(
                 alpha_s, alpha_b, savings_safe, psi_z,
                 log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
                 w_corners_i, c_corners_at_z, pcj.wealth_grid,
@@ -337,6 +343,13 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
             residual = jnp.sqrt(fs * fs + fb * fb)
             rel_residual = residual / scale
 
+            # Consumption Euler residual (matches main's `log10|EE|` metric)
+            beta_e = beta * e_sum
+            ee_valid = jnp.logical_and(beta_e > 0.0, c > 0.0)
+            c_implied = jnp.power(jnp.where(ee_valid, beta_e, 1.0), -1.0 / gamma)
+            ee_cons = jnp.where(ee_valid, 1.0 - c_implied / jnp.where(c > 0.0, c, 1.0),
+                                jnp.nan)
+
             invalid = jnp.logical_or(
                 jnp.logical_not(jnp.isfinite(c)),
                 savings <= tiny_savings,
@@ -345,6 +358,7 @@ def _build_retirement_residual_kernel(pcj, model, sc, delta, per_is_tensors,
             return (
                 jnp.where(invalid, nan, residual),
                 jnp.where(invalid, nan, rel_residual),
+                jnp.where(invalid, nan, ee_cons),
             )
 
         return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
@@ -381,6 +395,7 @@ def _build_working_residual_kernel(
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
     gamma = jnp.float64(model.gamma)
+    beta = jnp.float64(model.beta)
     b_bar = jnp.float64(model.b_bar)
     delta_j = jnp.float64(delta)
     rho = jnp.float64(model.rho)
@@ -435,7 +450,7 @@ def _build_working_residual_kernel(
             savings = wealth - c
             savings_safe = jnp.where(savings > 0.0, savings, 1e-12)
 
-            fs, fb, _, _, _, _ = working_foc_jac_ccv(
+            fs, fb, _, _, _, e_sum = working_foc_jac_ccv(
                 alpha_s, alpha_b, savings_safe, psi_z,
                 log_R_bill_i, log_x_s_i, log_x_b_i, pcj.weight_kv_kr,
                 w_corners_i,
@@ -463,6 +478,12 @@ def _build_working_residual_kernel(
             residual = jnp.sqrt(fs * fs + fb * fb)
             rel_residual = residual / scale
 
+            beta_e = beta * e_sum
+            ee_valid = jnp.logical_and(beta_e > 0.0, c > 0.0)
+            c_implied = jnp.power(jnp.where(ee_valid, beta_e, 1.0), -1.0 / gamma)
+            ee_cons = jnp.where(ee_valid, 1.0 - c_implied / jnp.where(c > 0.0, c, 1.0),
+                                jnp.nan)
+
             invalid = jnp.logical_or(
                 jnp.logical_not(jnp.isfinite(c)),
                 savings <= tiny_savings,
@@ -471,6 +492,7 @@ def _build_working_residual_kernel(
             return (
                 jnp.where(invalid, nan, residual),
                 jnp.where(invalid, nan, rel_residual),
+                jnp.where(invalid, nan, ee_cons),
             )
 
         return vmap(at_w)(c_arr, s_arr, b_arr, wealth_arr)
@@ -506,7 +528,14 @@ def _build_working_residual_kernel(
 # Aggregation + reporting
 # =============================================================================
 
-def _per_age_stats(residual_arr: np.ndarray, age: int) -> dict:
+# Floor for log10|EE| aggregation: c_implied ~= c gives -inf which would poison
+# means/medians. Matches main's np.log10(np.maximum(abs_ee, 1e-16)).
+LOG10_EE_FLOOR = -16.0
+
+
+def _per_age_stats_residual(residual_arr: np.ndarray, age: int) -> dict:
+    """Stats for a portfolio-FOC residual array (linear scale; threshold gates
+    at 1e-5/1e-4/1e-2 follow the handoff's pass/fail thresholds)."""
     finite = residual_arr[np.isfinite(residual_arr)]
     n_cells = int(residual_arr.size)
     n_finite = int(finite.size)
@@ -516,13 +545,8 @@ def _per_age_stats(residual_arr: np.ndarray, age: int) -> dict:
             "age": int(age),
             "n_cells": n_cells,
             "n_nan": n_nan,
-            "median": None,
-            "p95": None,
-            "p99": None,
-            "max": None,
-            "frac_above_1e-5": None,
-            "frac_above_1e-4": None,
-            "frac_above_1e-2": None,
+            "median": None, "p95": None, "p99": None, "max": None,
+            "frac_above_1e-5": None, "frac_above_1e-4": None, "frac_above_1e-2": None,
         }
     return {
         "age": int(age),
@@ -538,16 +562,59 @@ def _per_age_stats(residual_arr: np.ndarray, age: int) -> dict:
     }
 
 
-def _format_age_line(s: dict) -> str:
+def _per_age_stats_ee(ee_arr: np.ndarray, age: int) -> dict:
+    """Stats for the consumption-EE array. Reports on log10|EE| scale (matches
+    main's *_same.md / *_nextfiner.md gridpoint reports). Floors at LOG10_EE_FLOOR.
+    """
+    finite_ee = ee_arr[np.isfinite(ee_arr)]
+    n_cells = int(ee_arr.size)
+    n_finite = int(finite_ee.size)
+    n_nan = n_cells - n_finite
+    if n_finite == 0:
+        return {
+            "age": int(age),
+            "n_cells": n_cells,
+            "n_nan": n_nan,
+            "mean_log10_abs_ee": None, "median_log10_abs_ee": None,
+            "p95_log10_abs_ee": None,  "p99_log10_abs_ee": None,
+            "max_log10_abs_ee": None,
+            "frac_below_neg6": None, "frac_below_neg5": None, "frac_below_neg4": None,
+        }
+    log_abs = np.log10(np.maximum(np.abs(finite_ee), 10.0 ** LOG10_EE_FLOOR))
+    return {
+        "age": int(age),
+        "n_cells": n_cells,
+        "n_nan": n_nan,
+        "mean_log10_abs_ee":   float(np.mean(log_abs)),
+        "median_log10_abs_ee": float(np.median(log_abs)),
+        "p95_log10_abs_ee":    float(np.percentile(log_abs, 95.0)),
+        "p99_log10_abs_ee":    float(np.percentile(log_abs, 99.0)),
+        "max_log10_abs_ee":    float(np.max(log_abs)),
+        "frac_below_neg6": float(np.sum(log_abs < -6.0) / n_finite),
+        "frac_below_neg5": float(np.sum(log_abs < -5.0) / n_finite),
+        "frac_below_neg4": float(np.sum(log_abs < -4.0) / n_finite),
+    }
+
+
+def _format_age_line_residual(s: dict) -> str:
     if s["median"] is None:
         return f"Age {s['age']:3d}: all-NaN ({s['n_nan']}/{s['n_cells']})"
     return (
         f"Age {s['age']:3d}: "
-        f"median={s['median']:.2e}  "
-        f"p99={s['p99']:.2e}  "
-        f"max={s['max']:.2e}  "
-        f">1e-5: {s['frac_above_1e-5']*100:5.1f}%  "
-        f">1e-2: {s['frac_above_1e-2']*100:5.2f}%  "
+        f"median={s['median']:.2e}  p99={s['p99']:.2e}  max={s['max']:.2e}  "
+        f">1e-5: {s['frac_above_1e-5']*100:5.1f}%  >1e-2: {s['frac_above_1e-2']*100:5.2f}%  "
+        f"NaN: {s['n_nan']}/{s['n_cells']}"
+    )
+
+
+def _format_age_line_ee(s: dict) -> str:
+    if s["mean_log10_abs_ee"] is None:
+        return f"Age {s['age']:3d}: all-NaN ({s['n_nan']}/{s['n_cells']})"
+    return (
+        f"Age {s['age']:3d}: "
+        f"mean={s['mean_log10_abs_ee']:6.3f}  p95={s['p95_log10_abs_ee']:6.3f}  "
+        f"p99={s['p99_log10_abs_ee']:6.3f}  max={s['max_log10_abs_ee']:6.3f}  "
+        f"<-6: {s['frac_below_neg6']*100:5.1f}%  <-4: {s['frac_below_neg4']*100:5.1f}%  "
         f"NaN: {s['n_nan']}/{s['n_cells']}"
     )
 
@@ -563,11 +630,18 @@ def main():
         help="Bundle directory or bare bundle name (looked up under ./saved_runs/<name>/).",
     )
     parser.add_argument(
+        "--metric",
+        choices=("portfolio_abs", "portfolio_rel", "consumption_ee"),
+        default="consumption_ee",
+        help="Which metric drives stdout per-age trace and verdict. JSON always "
+             "carries stats for all three. consumption_ee is the metric main's "
+             "*_same.md / *_nextfiner.md gridpoint reports use (recommended for "
+             "comparison against historical Numba reports).",
+    )
+    parser.add_argument(
         "--use-relative",
         action="store_true",
-        help="Aggregate the relative residual (||FOC|| / |V_dot at zero|) "
-             "instead of the absolute residual. Relative is what the Newton's "
-             "tol applies to.",
+        help="DEPRECATED. Maps to --metric portfolio_rel for backwards compat.",
     )
     parser.add_argument(
         "--no-save",
@@ -692,18 +766,24 @@ def main():
               "(need solved t and solved t+1, t < terminal). Exiting.", flush=True)
         return 1
 
+    # --use-relative is deprecated; map to --metric portfolio_rel.
+    metric = "portfolio_rel" if args.use_relative else args.metric
+
     print(
         f"\nEvaluating EE residual at {len(eligible_t)} age(s): "
         f"ages {int(ages[eligible_t[0]])}..{int(ages[eligible_t[-1]])}",
         flush=True,
     )
-    if args.use_relative:
-        print("  (reporting RELATIVE residual = ||FOC|| / |V_dot at zero|)", flush=True)
-    else:
-        print("  (reporting ABSOLUTE residual = ||FOC||)", flush=True)
+    metric_descr = {
+        "portfolio_abs":  "ABSOLUTE portfolio FOC residual = ||(FOC_a_s, FOC_a_b)||",
+        "portfolio_rel":  "RELATIVE portfolio FOC residual = ||FOC|| / |V_dot at alpha=0|",
+        "consumption_ee": "CONSUMPTION Euler residual = 1 - (beta * E[mu' R])^(-1/gamma) / c "
+                          "(reported on log10|EE| scale, matches main's *_same.md reports)",
+    }
+    print(f"  (stdout metric: {metric_descr[metric]})", flush=True)
+    print("  (JSON carries all three metrics)", flush=True)
 
-    # Pre-stage policy slabs on device (one slab per age — keep it simple,
-    # device transfer is cheap relative to the residual sweep).
+    # Pre-stage policy slabs on device.
     C_jnp_by_age = {}
     S_jnp_by_age = {}
     B_jnp_by_age = {}
@@ -713,9 +793,11 @@ def main():
         S_jnp_by_age[t] = jnp.asarray(S[t])
         B_jnp_by_age[t] = jnp.asarray(B[t])
 
-    per_age_stats: list[dict] = []
-    global_max = 0.0
-    global_nan = 0
+    # Per-age stats arrays — one list per metric.
+    stats_abs:  list[dict] = []
+    stats_rel:  list[dict] = []
+    stats_ee:   list[dict] = []
+    global_nan_total = 0
     t_sweep = time.time()
 
     for t in eligible_t:
@@ -724,7 +806,7 @@ def main():
 
         if age >= retire_age:
             pension_next_z = pension_table_jnp[t + 1, :]
-            res, rel = retire_kernel(
+            res, rel, ee = retire_kernel(
                 C_jnp_by_age[t], S_jnp_by_age[t], B_jnp_by_age[t],
                 C_jnp_by_age[t + 1],
                 pension_next_z, psi_z,
@@ -733,7 +815,7 @@ def main():
         elif age == retire_age - 1:
             pension_next_z = pension_table_jnp[t + 1, :]
             income_table = jnp.zeros((pc.n_z, pc.n_eta, pc.n_eps), dtype=jnp.float64)
-            res, rel = boundary_kernel(
+            res, rel, ee = boundary_kernel(
                 C_jnp_by_age[t], S_jnp_by_age[t], B_jnp_by_age[t],
                 C_jnp_by_age[t + 1],
                 income_table, pension_next_z, psi_z,
@@ -741,34 +823,55 @@ def main():
             phase = "BOUND "
         else:
             income_table = working_income_next_jnp[t + 1]
-            res, rel = working_kernel(
+            res, rel, ee = working_kernel(
                 C_jnp_by_age[t], S_jnp_by_age[t], B_jnp_by_age[t],
                 C_jnp_by_age[t + 1],
                 income_table, wealth_dummy_pension, psi_z,
             )
             phase = "WORK  "
 
-        chosen = rel if args.use_relative else res
-        chosen_np = np.asarray(jax.device_get(chosen))
-        stats = _per_age_stats(chosen_np, age)
-        per_age_stats.append(stats)
-
-        if stats["max"] is not None and stats["max"] > global_max:
-            global_max = stats["max"]
-        global_nan += stats["n_nan"]
+        res_np, rel_np, ee_np = (
+            np.asarray(jax.device_get(res)),
+            np.asarray(jax.device_get(rel)),
+            np.asarray(jax.device_get(ee)),
+        )
+        stats_abs.append(_per_age_stats_residual(res_np, age))
+        stats_rel.append(_per_age_stats_residual(rel_np, age))
+        stats_ee.append (_per_age_stats_ee     (ee_np,  age))
+        global_nan_total += stats_abs[-1]["n_nan"]
 
         elapsed = time.time() - t_sweep
-        print(
-            f" {phase} t={t:3d} age={age:3d}  ({elapsed:6.1f}s)  "
-            + _format_age_line(stats),
-            flush=True,
-        )
+        if metric == "consumption_ee":
+            line = _format_age_line_ee(stats_ee[-1])
+        elif metric == "portfolio_rel":
+            line = _format_age_line_residual(stats_rel[-1])
+        else:
+            line = _format_age_line_residual(stats_abs[-1])
+        print(f" {phase} t={t:3d} age={age:3d}  ({elapsed:6.1f}s)  {line}", flush=True)
 
     total_sweep = time.time() - t_sweep
     print(f"\nTotal residual-sweep wall: {total_sweep:.1f}s", flush=True)
 
-    # Sort per_age_stats by age for stable JSON output.
-    per_age_stats.sort(key=lambda s: s["age"])
+    # Sort by age for stable JSON output.
+    stats_abs.sort(key=lambda s: s["age"])
+    stats_rel.sort(key=lambda s: s["age"])
+    stats_ee.sort (key=lambda s: s["age"])
+
+    # Globals
+    abs_max = max((s["max"] for s in stats_abs if s["max"] is not None), default=None)
+    rel_max = max((s["max"] for s in stats_rel if s["max"] is not None), default=None)
+    ee_means = [s["mean_log10_abs_ee"] for s in stats_ee if s["mean_log10_abs_ee"] is not None]
+    ee_p95s  = [s["p95_log10_abs_ee"]  for s in stats_ee if s["p95_log10_abs_ee"]  is not None]
+    ee_p99s  = [s["p99_log10_abs_ee"]  for s in stats_ee if s["p99_log10_abs_ee"]  is not None]
+    ee_maxes = [s["max_log10_abs_ee"]  for s in stats_ee if s["max_log10_abs_ee"]  is not None]
+    ee_global = {
+        # mean: weighted across ages by cell count (all ages have the same n_cells = n_z*N_state*n_w
+        # so unweighted mean is also fine; keep simple)
+        "mean": float(np.mean(ee_means)) if ee_means else None,
+        "p95":  float(np.mean(ee_p95s))  if ee_p95s  else None,
+        "p99":  float(np.mean(ee_p99s))  if ee_p99s  else None,
+        "max":  float(np.max(ee_maxes))  if ee_maxes else None,
+    }
 
     summary = {
         "bundle_path": str(bundle_path),
@@ -776,49 +879,54 @@ def main():
         "tolerance_used_at_solve": float(solver_config.tol),
         "max_iter_used_at_solve": int(solver_config.max_iter),
         "delta_bequest_used": float(delta),
-        "residual_metric": "relative" if args.use_relative else "absolute",
-        "n_ages_evaluated": len(per_age_stats),
-        "global_max_residual": float(global_max),
-        "global_nan_count": int(global_nan),
-        "per_age": per_age_stats,
+        "metric_for_verdict": metric,
+        "log10_ee_floor": float(LOG10_EE_FLOOR),
+        "n_ages_evaluated": len(stats_abs),
+        "global_nan_count": int(global_nan_total),
+        # Portfolio FOC residual (linear scale)
+        "portfolio_abs": {
+            "global_max": float(abs_max) if abs_max is not None else None,
+            "per_age": stats_abs,
+        },
+        "portfolio_rel": {
+            "global_max": float(rel_max) if rel_max is not None else None,
+            "per_age": stats_rel,
+        },
+        # Consumption EE (log10 scale, matches main)
+        "consumption_ee": {
+            "global_mean_log10_abs_ee": ee_global["mean"],
+            "global_p95_log10_abs_ee":  ee_global["p95"],
+            "global_p99_log10_abs_ee":  ee_global["p99"],
+            "global_max_log10_abs_ee":  ee_global["max"],
+            "per_age": stats_ee,
+        },
     }
 
-    print("\n" + "=" * 70, flush=True)
+    # ---- Stdout summary ----
+    print("\n" + "=" * 72, flush=True)
     print("EE residuals summary", flush=True)
-    print("=" * 70, flush=True)
-    print(f"  Bundle           : {bundle_path}", flush=True)
-    print(f"  Spec             : {summary['wealth_dynamics_spec']}", flush=True)
-    print(f"  Solver tol       : {summary['tolerance_used_at_solve']:.1e}", flush=True)
-    print(f"  Metric           : {summary['residual_metric']}", flush=True)
-    print(f"  Ages evaluated   : {summary['n_ages_evaluated']}", flush=True)
-    print(f"  Global max resid : {summary['global_max_residual']:.3e}", flush=True)
-    print(f"  Global NaN cells : {summary['global_nan_count']}", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  Bundle              : {bundle_path}", flush=True)
+    print(f"  Spec                : {summary['wealth_dynamics_spec']}", flush=True)
+    print(f"  Solver tol          : {summary['tolerance_used_at_solve']:.1e}", flush=True)
+    print(f"  Verdict metric      : {metric}", flush=True)
+    print(f"  Ages evaluated      : {summary['n_ages_evaluated']}", flush=True)
+    print(f"  Global NaN cells    : {summary['global_nan_count']}", flush=True)
+    print(f"  Portfolio abs max   : {abs_max:.3e}" if abs_max is not None else "  Portfolio abs max   : n/a",
+          flush=True)
+    print(f"  Portfolio rel max   : {rel_max:.3e}" if rel_max is not None else "  Portfolio rel max   : n/a",
+          flush=True)
+    if ee_global["mean"] is not None:
+        print(f"  Cons. EE mean       : log10|EE|={ee_global['mean']:.3f}", flush=True)
+        print(f"  Cons. EE p95        : log10|EE|={ee_global['p95']:.3f}", flush=True)
+        print(f"  Cons. EE p99        : log10|EE|={ee_global['p99']:.3f}", flush=True)
+        print(f"  Cons. EE max        : log10|EE|={ee_global['max']:.3f}", flush=True)
 
-    # Pass / fail tag (per the handoff's section 7 thresholds).
-    fail = any(
-        (s["frac_above_1e-2"] is not None and s["frac_above_1e-2"] > 0.0)
-        for s in per_age_stats
-    ) or summary["global_nan_count"] > 0
-    concerning = (
-        not fail
-        and (
-            summary["global_max_residual"] > 1e-3
-            or any(
-                (s["frac_above_1e-5"] is not None and s["frac_above_1e-5"] > 0.01)
-                for s in per_age_stats
-            )
-        )
-    )
-    if fail:
-        verdict = "FAIL  (some age has frac_above_1e-2 > 0 or NaN cells)"
-    elif concerning:
-        verdict = "CONCERNING  (max > 1e-3 or some age has >1% above 1e-5)"
-    else:
-        verdict = "PASS  (all ages: max < 1e-2; <=1% above 1e-5; no NaN)"
+    # Verdict — depends on selected metric.
+    verdict = _verdict(metric, summary)
     summary["verdict"] = verdict.split()[0]
-    print(f"  Verdict          : {verdict}", flush=True)
-
-    print("=" * 70, flush=True)
+    print(f"  Verdict             : {verdict}", flush=True)
+    print("=" * 72, flush=True)
 
     if not args.no_save:
         out_path = bundle_path / "ee_residuals.json"
@@ -829,6 +937,45 @@ def main():
         print("\n(--no-save: skipping JSON write)", flush=True)
 
     return 0
+
+
+# Verdict logic (per metric)
+# - portfolio_abs / portfolio_rel: handoff's pass/fail thresholds (1e-2 / 1e-3 / 1e-5)
+# - consumption_ee: main's gate thresholds (mean <= -5 publication, mean <= -4 welfare)
+def _verdict(metric: str, summary: dict) -> str:
+    if metric == "consumption_ee":
+        ee = summary["consumption_ee"]
+        m, mx = ee["global_mean_log10_abs_ee"], ee["global_max_log10_abs_ee"]
+        if m is None or mx is None:
+            return "n/a (no valid cells)"
+        if m <= -5.0 and mx <= -3.0:
+            return f"PASS_PUBLICATION  (mean {m:.2f} <= -5, max {mx:.2f} <= -3)"
+        if m <= -4.0 and mx <= -2.0:
+            return f"PASS_WELFARE     (mean {m:.2f} <= -4, max {mx:.2f} <= -2)"
+        return f"FAIL              (mean {m:.2f}, max {mx:.2f})"
+
+    # Portfolio FOC verdict (handoff thresholds)
+    block = summary["portfolio_rel"] if metric == "portfolio_rel" else summary["portfolio_abs"]
+    g_max = block["global_max"]
+    per_age = block["per_age"]
+    if g_max is None:
+        return "n/a (no valid cells)"
+    fail = any(
+        (s["frac_above_1e-2"] is not None and s["frac_above_1e-2"] > 0.0)
+        for s in per_age
+    ) or summary["global_nan_count"] > 0
+    concerning = (
+        not fail
+        and (g_max > 1e-3 or any(
+            s["frac_above_1e-5"] is not None and s["frac_above_1e-5"] > 0.01
+            for s in per_age
+        ))
+    )
+    if fail:
+        return f"FAIL              (max {g_max:.2e}; some age has frac_above_1e-2 > 0 or NaN)"
+    if concerning:
+        return f"CONCERNING        (max {g_max:.2e}; >1% of cells exceed 1e-5)"
+    return f"PASS              (max {g_max:.2e}; <=1% above 1e-5; no NaN)"
 
 
 if __name__ == "__main__":

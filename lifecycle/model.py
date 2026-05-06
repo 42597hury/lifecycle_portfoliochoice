@@ -139,6 +139,15 @@ class SolverConfig(NamedTuple):
     # solver's run_lifecycle_solver still reads ``max_iter_unconstrained`` for
     # backwards compatibility with old configs; new code should use ``max_iter``.
     max_iter_unconstrained: int = 5000
+    # Newton outer/inner loop implementation.
+    # When True, use lax.fori_loop + masked updates (GPU-friendly: deterministic
+    # dispatch graph, no warp divergence). When False, use lax.while_loop with
+    # data-dependent termination (CPU-friendly: real early termination).
+    # WARNING: under fori_loop the Newton body runs ``max_iter`` iters
+    # unconditionally — early termination is mask-based, not loop-exit. Tune
+    # ``max_iter`` accordingly; the canonical 5000 default is unsuitable for
+    # fori_loop mode (override to <= 200 in production runs).
+    use_fori_newton: bool = True
 
     # --- Initial guess ---
     init_alpha_s: float = 0.1                  # initial stock weight guess

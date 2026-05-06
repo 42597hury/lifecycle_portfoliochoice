@@ -313,11 +313,49 @@ def newton_2d_with_line_search(
     singular_det,
     grad_step_size,
     grad_denom_eps,
+    use_fori=True,
 ):
     """2D Newton on (alpha_s, alpha_b) with backtracking line search.
 
     ``foc_fn(a_s, a_b) -> (fs, fb, Jss, Jbb, Jsb, e)``. Returns
     ``(a_s, a_b, e, exit_code, err_norm, n_iter)``.
+
+    ``use_fori`` is a Python bool selected at JIT-trace time:
+      - True  -> ``lax.fori_loop`` + mask (GPU-friendly, deterministic dispatch,
+                 runs ``max_iter`` iters unconditionally).
+      - False -> ``lax.while_loop`` with data-dependent exit (CPU-friendly,
+                 real early termination).
+    """
+    if use_fori:
+        return _newton_fori(
+            foc_fn, init_a_s, init_a_b, scale,
+            tol, max_iter, max_backtrack_iter,
+            line_search_max_step, singular_det,
+            grad_step_size, grad_denom_eps,
+        )
+    return _newton_while(
+        foc_fn, init_a_s, init_a_b, scale,
+        tol, max_iter, max_backtrack_iter,
+        line_search_max_step, singular_det,
+        grad_step_size, grad_denom_eps,
+    )
+
+
+def _newton_while(
+    foc_fn,
+    init_a_s,
+    init_a_b,
+    scale,
+    tol,
+    max_iter,
+    max_backtrack_iter,
+    line_search_max_step,
+    singular_det,
+    grad_step_size,
+    grad_denom_eps,
+):
+    """While-loop Newton path. Real early termination via lax.while_loop —
+    optimal on CPU (sequential vmap) and the historic baseline.
     """
     fs0, fb0, Jss0, Jbb0, Jsb0, e0 = foc_fn(init_a_s, init_a_b)
     err0 = jnp.sqrt(fs0 * fs0 + fb0 * fb0)
@@ -422,6 +460,158 @@ def newton_2d_with_line_search(
     a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, _done = final
     exit_code = jnp.where(err < tol * scale, EC_INTERIOR, EC_NEWTON_FAIL)
     return a_s, a_b, e, exit_code, err / scale, k
+
+
+def _backtracking_fori(
+    a_s, a_b, step_s, step_b,
+    a_s_full, a_b_full,
+    fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f, err_f, full_improves,
+    fs_old, fb_old, Jss_old, Jbb_old, Jsb_old, e_old, err_old,
+    foc_fn, max_backtrack_iter,
+):
+    """Mask-based backtracking line search. Runs ``max_backtrack_iter`` halvings
+    unconditionally; once the first improving alpha is found, subsequent iters
+    keep computing ``foc_fn`` but mask out the result.
+
+    Returns the best-so-far state plus a ``found`` flag (False if no halving
+    improved on the current err).
+    """
+    # Best-so-far init: full-step result if it improved, else current state.
+    init = (
+        jnp.float64(1.0),                     # alpha (current step size)
+        jnp.where(full_improves, a_s_full, a_s),
+        jnp.where(full_improves, a_b_full, a_b),
+        jnp.where(full_improves, fs_f, fs_old),
+        jnp.where(full_improves, fb_f, fb_old),
+        jnp.where(full_improves, Jss_f, Jss_old),
+        jnp.where(full_improves, Jbb_f, Jbb_old),
+        jnp.where(full_improves, Jsb_f, Jsb_old),
+        jnp.where(full_improves, e_f, e_old),
+        jnp.where(full_improves, err_f, err_old),
+        full_improves,                         # found
+    )
+
+    def bt_body(_i, bt_state):
+        alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found = bt_state
+        new_alpha = alpha * 0.5
+        a_s_t = a_s + new_alpha * step_s
+        a_b_t = a_b + new_alpha * step_b
+        fs_t, fb_t, Jss_t, Jbb_t, Jsb_t, e_t = foc_fn(a_s_t, a_b_t)
+        err_t = jnp.sqrt(fs_t * fs_t + fb_t * fb_t)
+        # Replicate while_loop semantics: only adopt the FIRST halving that
+        # improves on err_old. Once found, hold state.
+        improved_now = jnp.logical_and(jnp.logical_not(found), err_t < err_old)
+        return (
+            jnp.where(found, alpha, new_alpha),
+            jnp.where(improved_now, a_s_t, a_s_b),
+            jnp.where(improved_now, a_b_t, a_b_b),
+            jnp.where(improved_now, fs_t, fs_b),
+            jnp.where(improved_now, fb_t, fb_b),
+            jnp.where(improved_now, Jss_t, Jss_b),
+            jnp.where(improved_now, Jbb_t, Jbb_b),
+            jnp.where(improved_now, Jsb_t, Jsb_b),
+            jnp.where(improved_now, e_t, e_b),
+            jnp.where(improved_now, err_t, err_b),
+            jnp.logical_or(found, improved_now),
+        )
+
+    final = lax.fori_loop(0, max_backtrack_iter, bt_body, init)
+    _alpha, a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found = final
+    return a_s_b, a_b_b, fs_b, fb_b, Jss_b, Jbb_b, Jsb_b, e_b, err_b, found
+
+
+def _newton_fori(
+    foc_fn,
+    init_a_s,
+    init_a_b,
+    scale,
+    tol,
+    max_iter,
+    max_backtrack_iter,
+    line_search_max_step,
+    singular_det,
+    grad_step_size,
+    grad_denom_eps,
+):
+    """fori_loop + mask Newton path. Runs ``max_iter`` iters unconditionally;
+    converged or line-search-failed cells run identical math but mask out the
+    update. GPU-friendly (no warp divergence, deterministic dispatch).
+    """
+    fs0, fb0, Jss0, Jbb0, Jsb0, e0 = foc_fn(init_a_s, init_a_b)
+    err0 = jnp.sqrt(fs0 * fs0 + fb0 * fb0)
+
+    init_state = (
+        init_a_s, init_a_b,
+        fs0, fb0, Jss0, Jbb0, Jsb0,
+        e0, err0,
+        jnp.int32(0),                  # n_iters_used (active iters only)
+        err0 < tol * scale,            # converged
+        jnp.bool_(False),              # ls_failed
+    )
+
+    def fori_body(_i, state):
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, converged, ls_failed = state
+        is_active = jnp.logical_not(jnp.logical_or(converged, ls_failed))
+
+        det = Jss * Jbb - Jsb * Jsb
+        is_singular = jnp.abs(det) < singular_det
+
+        grad_norm = err + grad_denom_eps
+        step_s_grad = grad_step_size * fs / grad_norm
+        step_b_grad = grad_step_size * fb / grad_norm
+
+        inv_d = 1.0 / jnp.where(is_singular, 1.0, det)
+        step_s_newton = -(Jbb * fs - Jsb * fb) * inv_d
+        step_b_newton = -(-Jsb * fs + Jss * fb) * inv_d
+
+        step_s = jnp.where(is_singular, step_s_grad, step_s_newton)
+        step_b = jnp.where(is_singular, step_b_grad, step_b_newton)
+
+        slen = jnp.sqrt(step_s * step_s + step_b * step_b)
+        cap = jnp.minimum(1.0, line_search_max_step / jnp.where(slen > 0.0, slen, 1.0))
+        step_s = step_s * cap
+        step_b = step_b * cap
+
+        # Try alpha = 1 first.
+        a_s_full = a_s + step_s
+        a_b_full = a_b + step_b
+        fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f = foc_fn(a_s_full, a_b_full)
+        err_f = jnp.sqrt(fs_f * fs_f + fb_f * fb_f)
+        full_improves = err_f < err
+
+        new_a_s, new_a_b, new_fs, new_fb, new_Jss, new_Jbb, new_Jsb, new_e, new_err, found_any = (
+            _backtracking_fori(
+                a_s, a_b, step_s, step_b,
+                a_s_full, a_b_full,
+                fs_f, fb_f, Jss_f, Jbb_f, Jsb_f, e_f, err_f, full_improves,
+                fs, fb, Jss, Jbb, Jsb, e, err,
+                foc_fn, max_backtrack_iter,
+            )
+        )
+
+        new_converged = new_err < tol * scale
+        new_ls_failed = jnp.logical_not(found_any)
+
+        # Mask: hold all fields constant for cells already converged or failed.
+        return (
+            jnp.where(is_active, new_a_s, a_s),
+            jnp.where(is_active, new_a_b, a_b),
+            jnp.where(is_active, new_fs, fs),
+            jnp.where(is_active, new_fb, fb),
+            jnp.where(is_active, new_Jss, Jss),
+            jnp.where(is_active, new_Jbb, Jbb),
+            jnp.where(is_active, new_Jsb, Jsb),
+            jnp.where(is_active, new_e, e),
+            jnp.where(is_active, new_err, err),
+            n_used + jnp.where(is_active, jnp.int32(1), jnp.int32(0)),
+            jnp.where(is_active, new_converged, converged),
+            jnp.where(is_active, new_ls_failed, ls_failed),
+        )
+
+    final = lax.fori_loop(0, max_iter, fori_body, init_state)
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, converged, _ls_failed = final
+    exit_code = jnp.where(converged, EC_INTERIOR, EC_NEWTON_FAIL)
+    return a_s, a_b, e, exit_code, err / scale, n_used
 
 
 # =============================================================================
@@ -822,6 +1012,7 @@ def _egm_scan_cell(
     grad_step_size, grad_denom_eps,
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
+    use_fori,
 ):
     """Sweep ``s_grid`` (largest -> smallest) with warm-started Newton.
 
@@ -841,6 +1032,7 @@ def _egm_scan_cell(
             tol, max_iter, max_backtrack_iter,
             line_search_max_step, singular_det,
             grad_step_size, grad_denom_eps,
+            use_fori=use_fori,
         )
         beta_e = jnp.maximum(beta * V_dot, euler_inv_floor)
         c_opt = jnp.maximum(beta_e ** (-1.0 / gamma), min_consumption)
@@ -895,6 +1087,7 @@ def _solve_terminal_at_i_s(
     grad_step_size, grad_denom_eps,
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
+    use_fori,
 ):
     def foc_factory(s_val):
         def foc_fn(a_s, a_b):
@@ -913,6 +1106,7 @@ def _solve_terminal_at_i_s(
         line_search_max_step, singular_det,
         grad_step_size, grad_denom_eps,
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+        use_fori,
     )
     return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
 
@@ -931,6 +1125,7 @@ def _solve_retirement_at_cell(
     grad_step_size, grad_denom_eps,
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
+    use_fori,
 ):
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
@@ -961,6 +1156,7 @@ def _solve_retirement_at_cell(
         line_search_max_step, singular_det,
         grad_step_size, grad_denom_eps,
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+        use_fori,
     )
     return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
 
@@ -983,6 +1179,7 @@ def _solve_working_at_cell(
     grad_step_size, grad_denom_eps,
     tiny_savings, euler_inv_floor,
     min_consumption, egm_anchor,
+    use_fori,
 ):
     A_is = A_per_state[i_s]
     psi_z = psi_per_z[z_idx]
@@ -1018,6 +1215,7 @@ def _solve_working_at_cell(
         line_search_max_step, singular_det,
         grad_step_size, grad_denom_eps,
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
+        use_fori,
     )
     return _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
 
@@ -1129,7 +1327,8 @@ def _build_per_age_terminal_kernel(pcj, mp, sc, n_dev):
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
-              sc.min_consumption, sc.egm_anchor)
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
 
     # Pre-build per-i_s log-return tensors (NumPy → jnp) once.
     state_grid_np = np.asarray(pcj.state_grid)
@@ -1210,7 +1409,8 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state):
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
-              sc.min_consumption, sc.egm_anchor)
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
 
     # Hoist per-i_s precompute out of the cell vmap (independent of z).
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (
@@ -1266,7 +1466,8 @@ def _build_per_age_working_kernel(pcj, mp, sc, n_dev, n_z, N_state, use_pension_
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
-              sc.min_consumption, sc.egm_anchor)
+              sc.min_consumption, sc.egm_anchor,
+              bool(sc.use_fori_newton))
 
     # Hoist per-i_s precompute out of the cell vmap (independent of z).
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = (

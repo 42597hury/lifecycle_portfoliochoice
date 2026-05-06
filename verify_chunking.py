@@ -101,3 +101,123 @@ for n_chunks, max_C, max_S, max_B in results:
 if not all_pass:
     raise SystemExit("Chunking is NOT bit-identical -- see deltas above.")
 print("All chunked runs are bit-identical to baseline (<= 1e-10).")
+
+
+# =============================================================================
+# Memory-bound smoke
+# =============================================================================
+#
+# Bit-identity above proves the math is unchanged but says nothing about
+# whether chunking actually bounds memory. The earlier in-@jit chunk loop
+# passed bit-identity but did NOT bound memory at runtime — XLA fused all
+# chunks into one HLO graph and could schedule their working memory
+# concurrently, defeating the bound.
+#
+# This block runs at a config 4x larger than the bit-identity smoke and
+# asserts the K=4 path completes successfully. With psutil installed it also
+# samples peak RSS during K=1 vs K=4 and prints the comparison; if K=4 peak
+# RSS is materially lower than K=1, the chunks-outside-JIT pattern is
+# bounding memory as intended.
+print("\n" + "=" * 70)
+print("Memory-bound smoke (4x larger config)")
+print("=" * 70)
+
+bigger_disc = DiscretizationConfig(
+    n_wealth=20, wealth_min=0.13, wealth_max=200.0,
+    n_savings=20,
+    state_grid_sizes=(3, 3, 3, 3),    # 81 N_state vs 16 in the tiny config above
+    state_grid_mode="cholesky",
+    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    n_z=5,                             # 5 vs 4 above
+    n_eps_nodes=3,
+    n_eta_nodes=3,
+    n_ret_nodes_1d=(3, 3),
+    n_state_quad_nodes=(2, 2, 2, 2),
+)
+bigger_base = dict(BASE_CONFIG)
+bigger_base.update(start_age=63, retire_age=63, terminal_age=65)   # 3 ages — terminal + 2 retire
+bigger_model = build_model(bigger_base, var_config, verbose=False)
+bigger_pc = build_precompute(bigger_model, bigger_disc, verbose=False)
+print(
+    f"bigger config: n_age={bigger_pc.n_age}, n_z={bigger_pc.n_z}, "
+    f"N_state={bigger_pc.N_state}, n_w={bigger_pc.n_w}, "
+    f"cells/age={bigger_pc.n_z * bigger_pc.N_state}"
+)
+
+try:
+    import psutil
+    _have_psutil = True
+except ImportError:
+    _have_psutil = False
+    print("(psutil not installed — falling back to 'completes-without-crash' check)")
+
+import threading
+
+
+def solve_with_peak_rss(n_chunks):
+    sc = base_sc._replace(cell_vmap_chunks=n_chunks)
+    if not _have_psutil:
+        t0 = time.time()
+        run_lifecycle_solver(bigger_model, bigger_pc, sc, verbose=0)
+        return None, time.time() - t0
+
+    proc = psutil.Process()
+    peak = [proc.memory_info().rss]
+    stop_evt = threading.Event()
+
+    def sampler():
+        while not stop_evt.is_set():
+            try:
+                peak[0] = max(peak[0], proc.memory_info().rss)
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    th = threading.Thread(target=sampler, daemon=True)
+    th.start()
+    t0 = time.time()
+    try:
+        run_lifecycle_solver(bigger_model, bigger_pc, sc, verbose=0)
+    finally:
+        stop_evt.set()
+        th.join(timeout=2.0)
+    return peak[0] / (1024 ** 3), time.time() - t0
+
+
+print("\nK=1 (baseline) ...")
+rss_1, t_1 = solve_with_peak_rss(1)
+if _have_psutil:
+    print(f"  wall = {t_1:.1f}s  peak RSS = {rss_1:.2f} GB")
+else:
+    print(f"  wall = {t_1:.1f}s  (no RSS sampling)")
+
+print("\nK=4 (chunked) ...")
+rss_4, t_4 = solve_with_peak_rss(4)
+if _have_psutil:
+    print(f"  wall = {t_4:.1f}s  peak RSS = {rss_4:.2f} GB")
+else:
+    print(f"  wall = {t_4:.1f}s  (no RSS sampling)")
+
+print("\nVerdict (memory bounding):")
+if _have_psutil:
+    # On CPU the absolute saving is modest (host memory model, no HBM); we
+    # don't expect a 4x reduction. Just assert K=4 isn't materially worse
+    # than K=1 — confirms chunks aren't accidentally allocating extra,
+    # i.e. the runner pattern is sound. The full proof of memory bounding
+    # requires the GPU production run (see §6.3 in the handoff).
+    if rss_4 <= rss_1 * 1.10:
+        print(
+            f"  PASS: K=4 peak RSS ({rss_4:.2f} GB) is within 10% of K=1 "
+            f"({rss_1:.2f} GB) -- chunked path is at worst neutral on CPU."
+        )
+    else:
+        print(
+            f"  WARNING: K=4 peak RSS ({rss_4:.2f} GB) > K=1 ({rss_1:.2f} GB) by "
+            f"more than 10%. Chunked path may be allocating extra. Investigate."
+        )
+        raise SystemExit(1)
+else:
+    print(
+        f"  PASS: K=4 completed without crash on the 4x-larger config. "
+        f"(Install psutil for RSS-bounded gate.)"
+    )

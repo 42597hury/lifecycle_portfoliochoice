@@ -43,7 +43,7 @@ The §6.6 follow-up sketch from `HANDOFF_PMAP_TO_VMAP.md` is the right design. T
   - `_build_per_age_terminal_kernel_vmap_only`
   - `_build_per_age_retirement_kernel_vmap_only`
   - `_build_per_age_working_kernel_vmap_only`
-- A small helper `_chunked_vmap_cells(per_cell, z_idx_arr, is_idx_arr, n_chunks)` (or similar) factored once and called from all three builders.
+- A small helper `_chunked_vmap_runner(jit_chunk_fn, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks)` factored once and called from all three builders. Returns a Python-level runner that does the chunk loop *outside* `@jit`. (Earlier draft had `_chunked_vmap_cells(per_cell_fn, ...)` with the loop inside `@jit`; that's the pattern that bit us — see §4.2.)
 - One unit test in a new `test_chunking.py` (or a section in an existing test file) asserting bit-identical output between `n_chunks=1` and `n_chunks={2, 4, 8}` on the smoke config.
 
 ### Out of scope
@@ -93,77 +93,94 @@ class SolverConfig(NamedTuple):
 
 ### 4.2 The chunking helper
 
-Add a new helper function in `lifecycle/solver.py`, near the `_*_vmap_only` builders:
+**Critical: the chunk loop must run in Python, *outside* any `@jit` boundary.**
+If the loop sits inside an `@jit`'d function, Python unrolls it at trace
+time and XLA emits one HLO graph spanning all chunks — its scheduler is then
+free to materialise multiple chunks' working memory concurrently, which
+produces correct math (output is bit-identical) but **defeats the memory
+bound entirely**. Each chunk must be a separate `@jit` call: the for-loop
+runs in Python, each iteration calls the per-chunk JIT with that chunk's
+slice of the index arrays, and `.block_until_ready()` between chunks forces
+the previous chunk's intermediates to be released before the next chunk
+schedules its allocations.
+
+The helper in `lifecycle/solver.py` (near the `_*_vmap_only` builders)
+returns a *runner* that the kernel builder calls in its `call()` function:
 
 ```python
-def _chunked_vmap_cells(per_cell_fn, z_idx_arr, is_idx_arr, n_chunks):
-    """Split a per-cell vmap into n_chunks sequential vmap calls.
+def _chunked_vmap_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
+                          n_cells, chunk_size, n_chunks):
+    """Build a Python-level chunk-loop runner around a JIT'd per-chunk vmap.
 
-    Each chunk has fixed shape ``chunk_size = ceil(n_cells / n_chunks)``,
-    padded by repeating the last cell index. After all chunks complete,
-    the result is concatenated and sliced back to ``n_cells``.
-
-    Why padding to a fixed chunk_size: XLA compiles the inner vmap once
-    per shape. If the last chunk is shorter, XLA recompiles for it,
-    doubling JIT cost. Padding keeps every chunk the same shape so the
-    trace is reused.
+    The chunk loop runs in Python (outside any @jit boundary). Each iteration
+    is a separate JIT call; .block_until_ready() between chunks forces XLA
+    to release the previous chunk's intermediates before the next allocates.
 
     Parameters
     ----------
-    per_cell_fn : callable (z_idx, i_s) -> (c, s, b) tuple
-        The per-cell solver. Each output is shape (n_w,).
-    z_idx_arr : jnp.ndarray, shape (n_cells,)
-    is_idx_arr : jnp.ndarray, shape (n_cells,)
-    n_chunks : int
-        Static (Python int). Number of chunks.
+    jit_chunk_fn : @jit-compiled callable
+        Signature: jit_chunk_fn(*kernel_args, z_chunk, is_chunk) -> tuple,
+        each output entry has leading axis chunk_size.
+    z_idx_padded, is_idx_padded : jnp.ndarray, shape (chunk_size * n_chunks,)
+        Pre-padded index arrays from _build_chunked_index_arrays.
+    n_cells, chunk_size, n_chunks : int
 
     Returns
     -------
-    (c_flat, s_flat, b_flat) tuple of (n_cells, n_w) arrays.
+    runner(*kernel_args) -> tuple of (n_cells, ...) arrays.
     """
-    n_cells = z_idx_arr.shape[0]
-    if n_chunks == 1:
-        return vmap(per_cell_fn)(z_idx_arr, is_idx_arr)
-
-    chunk_size = (n_cells + n_chunks - 1) // n_chunks   # ceil
-    n_cells_padded = chunk_size * n_chunks
-
-    # Pad with the LAST cell index (matches the pmap path's padding pattern).
-    pad_count = n_cells_padded - n_cells
-    z_idx_padded = jnp.concatenate(
-        [z_idx_arr, jnp.full(pad_count, z_idx_arr[-1], dtype=z_idx_arr.dtype)]
-    )
-    is_idx_padded = jnp.concatenate(
-        [is_idx_arr, jnp.full(pad_count, is_idx_arr[-1], dtype=is_idx_arr.dtype)]
-    )
-
-    chunk_results = []
-    for i in range(n_chunks):
-        start = i * chunk_size
-        z_chunk = lax.dynamic_slice_in_dim(z_idx_padded, start, chunk_size)
-        is_chunk = lax.dynamic_slice_in_dim(is_idx_padded, start, chunk_size)
-        chunk_results.append(vmap(per_cell_fn)(z_chunk, is_chunk))
-
-    # Concatenate along cell axis and slice off padding.
-    c_full = jnp.concatenate([r[0] for r in chunk_results], axis=0)[:n_cells]
-    s_full = jnp.concatenate([r[1] for r in chunk_results], axis=0)[:n_cells]
-    b_full = jnp.concatenate([r[2] for r in chunk_results], axis=0)[:n_cells]
-    return c_full, s_full, b_full
+    def runner(*kernel_args):
+        chunk_results = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            z_chunk = z_idx_padded[start:start + chunk_size]
+            is_chunk = is_idx_padded[start:start + chunk_size]
+            out = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
+            out[0].block_until_ready()    # bounds peak HBM at one chunk
+            chunk_results.append(out)
+        n_outs = len(chunk_results[0])
+        return tuple(
+            jnp.concatenate([r[k] for r in chunk_results], axis=0)[:n_cells]
+            for k in range(n_outs)
+        )
+    return runner
 ```
 
 **Critical design decisions:**
 
-1. **`n_chunks` is a Python int, not a traced value.** Closure constant. XLA traces the inner vmap once per chunk-shape and reuses.
-2. **Padding pattern matches the existing pmap path** ([_build_per_age_*_kernel_pmap](../../lifecycle/solver.py#L1565)). Same pattern, same justification: pad with the last cell index, slice off after.
-3. **Separate concatenation per output array** because the per-cell fn returns a tuple of three arrays.
-4. **`lax.dynamic_slice_in_dim` instead of array slicing** because the chunk shape is fixed; using static slicing would force XLA to specialize per chunk index.
-5. **Sequential `for i in range(n_chunks):` is fine** — Python unrolls at trace time. Each `vmap(per_cell)` call compiles to a single GPU kernel, dispatched K times. We accept that overhead.
+1. **Chunk for-loop runs in Python (outside `@jit`).** This is the load-bearing
+   choice. An earlier version placed the loop inside `@jit def all_cells(...)`,
+   which produced bit-identical math but didn't bound memory at runtime — XLA's
+   scheduler fused all chunks into one graph. The fix is `_chunked_vmap_runner`'s
+   Python-level loop, with `.block_until_ready()` between chunks.
+2. **`n_chunks` is a Python int, not a traced value.** Closure constant. XLA
+   traces the inner vmap (`per_chunk`) once and the per-chunk @jit reuses
+   that trace for all K iterations.
+3. **Padding pattern matches the existing pmap path**
+   ([_build_per_age_*_kernel_pmap](../../lifecycle/solver.py#L1565)). Same
+   pattern, same justification: pad with the last cell index, slice off after.
+4. **Per-builder `per_chunk` is a separate `@jit` function** that wraps the
+   per-cell vmap. This is what gets called K times in the Python loop.
+5. **Single-chunk fast path shares the same `per_chunk` JIT** as the K>1
+   path. When `cell_vmap_chunks=1`, the builder's `call()` invokes
+   `per_chunk` once with the full unpadded `(z_idx, is_idx)` slices —
+   no chunk-loop wrapper, no inter-chunk block. **Sharing one JIT trace
+   between K=1 and K>1 is load-bearing for bit-identity:** an earlier
+   draft used a separate `@jit'd all_cells` for the K=1 fast path,
+   which produced output that differed from the K>1 path by ~1e-3 on
+   alphas (XLA's fusion pass made structurally-different traces
+   compute the same algorithm with slightly different op ordering, and
+   Newton at `tol=1e-7 * scale` amplified the difference). Use one
+   `per_chunk @jit` for both paths.
 
 ### 4.3 Wiring into the three vmap-only kernel builders
 
 #### Terminal kernel ([_build_per_age_terminal_kernel_vmap_only](../../lifecycle/solver.py#L1424))
 
-Terminal vmaps over `N_state` (no z axis). Adapt the helper or write a 1D version:
+Terminal vmaps over `N_state` (no z axis). It chunks over the padded
+`(log_R_bill, log_x_s, log_x_b, ann)` tensors directly, not over index
+arrays — so it inlines its own Python-level chunk loop rather than reusing
+`_chunked_vmap_runner`:
 
 ```python
 def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
@@ -172,103 +189,137 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter, ...,
               bool(sc.use_fori_newton))
 
-    # ... existing log_R_bill / log_x_s / log_x_b prep, unchanged ...
+    # ... existing log_R_bill / log_x_s / log_x_b / ann prep + numpy-padding,
+    # unchanged. After this block log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp,
+    # ann_jnp are jnp arrays of leading axis (chunk_size * n_chunks).
 
     n_chunks = int(sc.cell_vmap_chunks)
-    N_state = log_R_bill_jnp.shape[0]
+    N_state = log_R_bill.shape[0]
 
-    @jit
-    def all_is():
-        def per_i_s(log_Rb, lxs, lxb, A):
-            return _solve_terminal_at_i_s(
-                log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
-                pcj.s_grid, pcj.wealth_grid,
-                init_a_s, init_a_b,
-                ...,
-                *static,
-            )
+    def per_i_s(log_Rb, lxs, lxb, A):
+        return _solve_terminal_at_i_s(
+            log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
+            pcj.s_grid, pcj.wealth_grid,
+            init_a_s, init_a_b,
+            ...,
+            *static,
+        )
 
-        if n_chunks == 1:
+    if n_chunks == 1:
+        # Fast path: one @jit'd vmap, no chunk-loop wrapper.
+        @jit
+        def all_is():
             return vmap(per_i_s)(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+        def call(_unused_age_idx=None):
+            return all_is()
+        return call
 
-        chunk_size = (N_state + n_chunks - 1) // n_chunks
-        N_padded = chunk_size * n_chunks
-        pad_count = N_padded - N_state
+    # Chunked path: per_chunk @jit, Python-level loop in call(), block_until_ready.
+    @jit
+    def per_chunk(log_Rb_c, lxs_c, lxb_c, ann_c):
+        return vmap(per_i_s)(log_Rb_c, lxs_c, lxb_c, ann_c)
 
-        # Pad with last entry along axis 0.
-        def pad_axis0(arr):
-            return jnp.concatenate(
-                [arr, jnp.broadcast_to(arr[-1:], (pad_count,) + arr.shape[1:])],
-                axis=0,
-            )
-
-        log_Rb_pad = pad_axis0(log_R_bill_jnp)
-        lxs_pad = pad_axis0(log_x_s_jnp)
-        lxb_pad = pad_axis0(log_x_b_jnp)
-        ann_pad = pad_axis0(ann_jnp)
-
+    def call(_unused_age_idx=None):
         chunk_results = []
         for i in range(n_chunks):
             start = i * chunk_size
-            log_Rb_c = lax.dynamic_slice_in_dim(log_Rb_pad, start, chunk_size, axis=0)
-            lxs_c = lax.dynamic_slice_in_dim(lxs_pad, start, chunk_size, axis=0)
-            lxb_c = lax.dynamic_slice_in_dim(lxb_pad, start, chunk_size, axis=0)
-            ann_c = lax.dynamic_slice_in_dim(ann_pad, start, chunk_size, axis=0)
-            chunk_results.append(vmap(per_i_s)(log_Rb_c, lxs_c, lxb_c, ann_c))
-
-        c_full = jnp.concatenate([r[0] for r in chunk_results], axis=0)[:N_state]
-        s_full = jnp.concatenate([r[1] for r in chunk_results], axis=0)[:N_state]
-        b_full = jnp.concatenate([r[2] for r in chunk_results], axis=0)[:N_state]
-        return c_full, s_full, b_full
-
-    def call(_unused_age_idx=None):
-        return all_is()
+            log_Rb_c = log_R_bill_jnp[start:start + chunk_size]
+            lxs_c    = log_x_s_jnp   [start:start + chunk_size]
+            lxb_c    = log_x_b_jnp   [start:start + chunk_size]
+            ann_c    = ann_jnp       [start:start + chunk_size]
+            out = per_chunk(log_Rb_c, lxs_c, lxb_c, ann_c)
+            out[0].block_until_ready()      # bound peak HBM at one chunk
+            chunk_results.append(out)
+        n_outs = len(chunk_results[0])
+        return tuple(
+            jnp.concatenate([r[k] for r in chunk_results], axis=0)[:N_state]
+            for k in range(n_outs)
+        )
     return call
 ```
 
-**Note:** terminal pads four arrays (`log_R_bill_jnp`, `log_x_s_jnp`, `log_x_b_jnp`, `ann_jnp`) instead of two index arrays. The chunking helper from §4.2 doesn't directly apply because the per-i_s fn takes `(log_Rb, lxs, lxb, A)` not `(z_idx, i_s)`. **Either inline the chunking logic** as above, **or** generalize the helper to accept arbitrary input arrays. Inline is simpler given there are only three call sites total.
+**Note:** terminal slices four padded jnp tensors with Python-int starts
+(static slices, eager). The runner from §4.2 doesn't directly apply because
+its signature is geared to (z_idx, i_s) chunking. Inline is simpler given
+there are only three call sites total.
 
 #### Retirement kernel ([_build_per_age_retirement_kernel_vmap_only](../../lifecycle/solver.py#L1635))
 
-Use `_chunked_vmap_cells` from §4.2:
+Use `_chunked_vmap_runner` from §4.2 — the runner is built once at kernel-builder
+time and called from `call()` with the per-age kernel args:
 
 ```python
 def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is_tensors):
     ...
     n_chunks = int(sc.cell_vmap_chunks)
+    z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_chunked_index_arrays(
+        n_z, N_state, n_chunks,
+    )
 
+    def per_cell(z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+                  init_a_s_arr, init_a_b_arr):
+        # ... existing per-cell body, with kernel args now passed positionally
+        # rather than closed-over (so per_chunk can vmap with in_axes=(0,0,None,...)).
+        return _solve_retirement_at_cell(z_idx, i_s, c_next, ...)
+
+    # per_chunk: ONE @jit shared by both K=1 fast path and K>1 chunked path.
+    # Sharing one trace guarantees bit-identical math. Separate fast-path
+    # @jit'd `all_cells` re-introduces drift via XLA's fusion pass.
     @jit
-    def all_cells(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-        def per_cell(z_idx, i_s):
-            # ... existing per-cell body, unchanged ...
-            return _solve_retirement_at_cell(...)
+    def per_chunk(c_next, pension_next_by_z, psi_per_z,
+                   init_a_s_arr, init_a_b_arr, z_chunk, is_chunk):
+        return vmap(
+            per_cell, in_axes=(0, 0, None, None, None, None, None),
+        )(z_chunk, is_chunk, c_next, pension_next_by_z, psi_per_z,
+          init_a_s_arr, init_a_b_arr)
 
-        return _chunked_vmap_cells(per_cell, z_idx_arr, is_idx_arr, n_chunks)
-    ...
+    if n_chunks == 1:
+        # Fast path: one per_chunk call with the full unpadded indices.
+        z_full = z_idx_padded[:n_cells]
+        is_full = is_idx_padded[:n_cells]
+        def call(c_next_jnp, pension_next_by_z, psi_per_z,
+                  init_a_s_arr, init_a_b_arr):
+            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+                c_next_jnp, pension_next_by_z, psi_per_z,
+                init_a_s_arr, init_a_b_arr, z_full, is_full,
+            )
+            return (jnp.reshape(c_flat, (n_z, N_state, -1)), ...)
+        return call
+
+    # Chunked path: same per_chunk, called K times via the runner.
+    runner = _chunked_vmap_runner(
+        per_chunk, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+    )
+
+    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+            c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
+        )
+        return (
+            jnp.reshape(c_flat, (n_z, N_state, -1)),
+            jnp.reshape(s_flat, (n_z, N_state, -1)),
+            jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(ni_flat, (n_z, N_state)),
+            jnp.reshape(nb_flat, (n_z, N_state)),
+        )
+    return call
 ```
 
-Then in `call(...)`:
-
-```python
-def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-    c_flat, s_flat, b_flat = all_cells(
-        c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
-    )
-    return (
-        jnp.reshape(c_flat, (n_z, N_state, -1)),
-        jnp.reshape(s_flat, (n_z, N_state, -1)),
-        jnp.reshape(b_flat, (n_z, N_state, -1)),
-    )
-```
-
-The reshape pattern is unchanged from today. The output of `_chunked_vmap_cells` already has shape `(n_cells, n_w)` after the slice-off-padding step.
+The output shapes are unchanged from today. The runner returns
+`(n_cells, n_w)` arrays with padding sliced off; the reshape is identical.
 
 #### Working kernel ([_build_per_age_working_kernel_vmap_only](../../lifecycle/solver.py#L1795))
 
-Same pattern as retirement. The `per_cell` body is more complex (handles `use_pension_next` branch + per-cell `z_next` bracket arithmetic) but the chunking call is identical:
+Same pattern as retirement. The `per_cell` body is more complex (handles
+`use_pension_next` branch + per-cell `z_next` bracket arithmetic) and takes
+two extra kernel args (`income_next_table_z`, `pension_next_by_z`), so the
+`vmap` `in_axes` tuple grows by two `None`s. The chunking call is otherwise
+identical:
 
 ```python
-return _chunked_vmap_cells(per_cell, z_idx_arr, is_idx_arr, n_chunks)
+runner = _chunked_vmap_runner(
+    per_chunk, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+)
 ```
 
 ---
@@ -316,7 +367,11 @@ Each `vmap(per_cell)(z_chunk, is_chunk)` call has the same shape, so XLA traces 
 
 ### 5.9 Why not a `lax.scan` instead of a Python `for` loop?
 
-Tempting: `lax.scan` over chunks would be a single trace boundary instead of K. **But** the per-chunk vmap output shape is `(chunk_size, n_w)`, which scan's accumulator handling complicates. The Python for-loop approach traces once at JIT time and dispatches K kernel launches at runtime — same effect, simpler code. **Stick with the Python for-loop.**
+Tempting: `lax.scan` over chunks would be a single trace boundary instead of K. **But** scan runs its body inside `@jit` (it's a JAX primitive), which has the same memory-bounding pathology as putting the for-loop inside `@jit`: XLA emits one HLO graph spanning all K iterations and may schedule their working memory concurrently. **Don't use scan.** The Python for-loop with `.block_until_ready()` between chunks is the only pattern that gives a real per-chunk memory bound.
+
+### 5.11 Chunks-outside-JIT is load-bearing — verify before trusting
+
+If you ever refactor or simplify the chunk dispatch, **the for-loop must stay in Python, outside any `@jit`-traced function.** A clean-looking refactor that moves the loop inside `@jit` (e.g. into an `all_cells` wrapper, or into `lax.scan`/`lax.fori_loop`) will pass `verify_chunking.py`'s bit-identity tests and silently break the memory bound. The runtime memory test in `verify_chunking.py` (post-fix) is the gate that catches this regression — run it at production scale on the next GPU launch and confirm `nvidia-smi` peak HBM tracks `chunk_size * per_cell + persistent_state`, not the unchunked worst case.
 
 ### 5.10 Heuristic for choosing `cell_vmap_chunks` (document for users)
 
@@ -393,6 +448,17 @@ print("✅ Chunking is bit-identical (≤1e-10 across all configs)")
 
 **Expected:** all three deltas ≤ 1e-12 (effectively zero — same FLOPs, same operations, same float64 IEEE behaviour). 1e-10 tolerance is generous.
 
+### 6.1.1 Memory-bound smoke (added by post-fix patch)
+
+Bit-identity proves the math is unchanged but says nothing about whether chunking actually bounds memory. Add a runtime memory test that:
+
+1. Picks a config large enough that K=1 produces a substantial allocation, but small enough to run on local CPU within a few minutes.
+2. Runs the solve at K=1 and K=4 with `psutil` (or any available process-RSS probe) sampling peak resident memory.
+3. Asserts K=4 peak RSS ≤ ~K=1 peak RSS / 2 (generous margin — the absolute bound is per-chunk-working-memory + persistent-state).
+4. As a fallback when `psutil` isn't available, asserts that a config 4× the bit-identity smoke runs successfully at K=4 — proving at minimum that the chunking call path doesn't crash on a non-trivial workload.
+
+This sits in the same `verify_chunking.py` file as the bit-identity tests. Both run on local CPU and form the pre-commit gate.
+
 ### 6.2 Production-scale smoke
 
 After the unit test passes, on local CPU (since GPU is for paid runs):
@@ -429,7 +495,7 @@ This is a **post-merge production verification**, not a pre-commit gate. The bit
 | File | Change | Approx lines |
 |---|---|---|
 | [lifecycle/model.py](../../lifecycle/model.py) | Add `cell_vmap_chunks: int = 1` to `SolverConfig` with docstring | ~10 |
-| [lifecycle/solver.py](../../lifecycle/solver.py) | Add `_chunked_vmap_cells` helper; modify three `*_vmap_only` builders to use it; add validation in `run_lifecycle_solver` | ~80-100 net |
+| [lifecycle/solver.py](../../lifecycle/solver.py) | Add `_chunked_vmap_runner` helper; modify three `*_vmap_only` builders so each chunk is its own `@jit` and the chunk loop runs in Python (in `call()`); add validation in `run_lifecycle_solver` | ~80-100 net |
 | `verify_chunking.py` (new) | Bit-identity test from §6.1 | ~50 |
 | (no changes to docs/handoff/, no changes to scripts/) | — | — |
 
@@ -442,10 +508,10 @@ Total: ~140-160 lines net across 3 files (one new).
 - [ ] Read [docs/notes/GPU_TRIAL_FINDINGS.md](../notes/GPU_TRIAL_FINDINGS.md) §"XLA memory planning is non-monotonic" first to understand why this is needed.
 - [ ] Read existing `_*_vmap_only` builders end-to-end before touching them. They're in `lifecycle/solver.py` around lines 1424, 1635, 1795 (line numbers may have shifted post rtb-as-state).
 - [ ] Add `cell_vmap_chunks: int = 1` to `SolverConfig` per §4.1.
-- [ ] Add `_chunked_vmap_cells` helper near the existing builders per §4.2.
+- [ ] Add `_chunked_vmap_runner` helper near the existing builders per §4.2 (Python-level chunk loop, `.block_until_ready()` between chunks).
 - [ ] Update each of three vmap-only builders per §4.3:
-  - Terminal: inline chunking (different signature than retire/work).
-  - Retirement + Working: use `_chunked_vmap_cells`.
+  - Terminal: inline Python chunk loop (different chunked-arg signature than retire/work).
+  - Retirement + Working: use `_chunked_vmap_runner`. Restructure `per_cell` to take the kernel args positionally; define `per_chunk` as a separate `@jit` wrapping `vmap(per_cell, in_axes=(0, 0, None, ...))`. Keep the `n_chunks == 1` fast path (single `@jit'd vmap`, no runner wrapper).
 - [ ] Add validation `if n_chunks < 1: raise ValueError(...)` in `run_lifecycle_solver`.
 - [ ] Write `verify_chunking.py` per §6.1.
 - [ ] Run `python verify_chunking.py`. Expected: all three deltas ≤ 1e-10.

@@ -1659,48 +1659,61 @@ def _build_chunked_index_arrays(n_z, N_state, n_chunks):
     return jnp.asarray(z_idx_np), jnp.asarray(is_idx_np), n_cells, chunk_size
 
 
-def _chunked_vmap_cells(per_cell_fn, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks):
-    """Split a per-cell vmap into ``n_chunks`` sequential vmap calls.
+def _chunked_vmap_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
+                          n_cells, chunk_size, n_chunks):
+    """Build a Python-level chunk-loop runner around a JIT'd per-chunk vmap.
 
-    Each chunk has fixed shape ``chunk_size`` so XLA traces the inner vmap
-    once and reuses for all chunks. The padded index arrays are pre-built by
-    ``_build_chunked_index_arrays`` at kernel-builder time (outside @jit).
+    The chunk loop runs in Python (outside any ``@jit`` boundary). Each
+    iteration is a separate JIT call. ``.block_until_ready()`` on the first
+    output of each chunk forces that chunk's intermediates to be released
+    before the next chunk schedules its allocations — the deterministic
+    per-chunk memory bound the chunking design intends.
+
+    Why this matters: an earlier version placed the ``for i in range(n_chunks):``
+    loop *inside* an ``@jit`` function. Python unrolls the loop at trace time
+    and XLA emits one HLO graph spanning all chunks. The XLA scheduler is
+    then free to materialise multiple chunks' working memory concurrently,
+    which produces correct math (output is bit-identical) but defeats the
+    memory bound entirely. Moving the loop to Python land — with each chunk
+    being its own ``@jit`` call — restores the bound.
 
     Parameters
     ----------
-    per_cell_fn : callable (z_idx, i_s) -> tuple of arrays
-        Per-cell solver. Each output is leading-axis vmappable.
+    jit_chunk_fn : @jit-compiled callable
+        Signature ``jit_chunk_fn(*kernel_args, z_chunk, is_chunk) -> tuple``,
+        where each output entry has leading axis ``chunk_size``.
     z_idx_padded, is_idx_padded : jnp.ndarray, shape ``(chunk_size * n_chunks,)``
         Pre-padded index arrays (last cell index repeated to fill).
     n_cells : int
-        Real cell count = ``n_z * N_state``. Used to slice off padding.
+        Real cell count; used to slice off padding after concat.
     chunk_size : int
-        Per-chunk fixed cell count.
+        Per-chunk fixed cell count = ``ceil(n_cells / n_chunks)``.
     n_chunks : int
         Static Python int. Must be >= 1.
 
     Returns
     -------
-    tuple of jnp.ndarray, one entry per output of ``per_cell_fn``, each
-    sliced to ``n_cells`` along the leading axis.
+    runner : callable
+        ``runner(*kernel_args) -> tuple of (n_cells, ...) arrays``.
     """
-    if n_chunks == 1:
-        outs = vmap(per_cell_fn)(z_idx_padded[:n_cells], is_idx_padded[:n_cells])
-        return outs
-
-    chunk_results = []
-    for i in range(n_chunks):
-        start = i * chunk_size
-        z_chunk = lax.dynamic_slice_in_dim(z_idx_padded, start, chunk_size)
-        is_chunk = lax.dynamic_slice_in_dim(is_idx_padded, start, chunk_size)
-        chunk_results.append(vmap(per_cell_fn)(z_chunk, is_chunk))
-
-    n_outs = len(chunk_results[0])
-    out_full = tuple(
-        jnp.concatenate([r[k] for r in chunk_results], axis=0)[:n_cells]
-        for k in range(n_outs)
-    )
-    return out_full
+    def runner(*kernel_args):
+        chunk_results = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            z_chunk = z_idx_padded[start:start + chunk_size]
+            is_chunk = is_idx_padded[start:start + chunk_size]
+            out = jit_chunk_fn(*kernel_args, z_chunk, is_chunk)
+            # Block on this chunk's first output before scheduling the next.
+            # Without this, JAX's async dispatch lets multiple chunks queue
+            # up and XLA may allocate them concurrently — defeating the bound.
+            out[0].block_until_ready()
+            chunk_results.append(out)
+        n_outs = len(chunk_results[0])
+        return tuple(
+            jnp.concatenate([r[k] for r in chunk_results], axis=0)[:n_cells]
+            for k in range(n_outs)
+        )
+    return runner
 
 
 def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
@@ -1743,38 +1756,52 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
     log_x_b_jnp = jnp.asarray(pad0_np(log_x_b, N_padded))
     ann_jnp = jnp.asarray(pad0_np(np.asarray(pcj.annuity_factors), N_padded))
 
+    def per_i_s(log_Rb, lxs, lxb, A):
+        return _solve_terminal_at_i_s(
+            log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
+            pcj.s_grid, pcj.wealth_grid,
+            init_a_s, init_a_b,
+            mp.gamma, mp.beta, mp.b_bar, mp.delta,
+            pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+            *static,
+        )
+
+    # per_chunk: one @jit shared by both K=1 fast path and K>1 chunked path.
+    # Same trace structure for both => bit-identical math regardless of K.
     @jit
-    def all_is():
-        def per_i_s(log_Rb, lxs, lxb, A):
-            return _solve_terminal_at_i_s(
-                log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
-                pcj.s_grid, pcj.wealth_grid,
-                init_a_s, init_a_b,
-                mp.gamma, mp.beta, mp.b_bar, mp.delta,
-                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                *static,
-            )
+    def per_chunk(log_Rb_c, lxs_c, lxb_c, ann_c):
+        return vmap(per_i_s)(log_Rb_c, lxs_c, lxb_c, ann_c)
 
-        if n_chunks == 1:
-            return vmap(per_i_s)(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+    if n_chunks == 1:
+        # Fast path: single per_chunk call with the full unpadded tensors.
+        # No chunk loop, no inter-chunk block.
+        def call(_unused_age_idx=None):
+            return per_chunk(log_R_bill_jnp, log_x_s_jnp, log_x_b_jnp, ann_jnp)
+        return call
 
+    # Chunked path: per_chunk called K times in a Python-level loop with
+    # .block_until_ready() between chunks. Same memory-bounding rationale as
+    # `_chunked_vmap_runner` (see that helper's docstring). Terminal chunks
+    # over the i_s tensor inputs directly (no index arrays) so it inlines
+    # its own loop rather than reusing the index-array runner.
+    def call(_unused_age_idx=None):
         chunk_results = []
         for i in range(n_chunks):
             start = i * chunk_size
-            log_Rb_c = lax.dynamic_slice_in_dim(log_R_bill_jnp, start, chunk_size, axis=0)
-            lxs_c = lax.dynamic_slice_in_dim(log_x_s_jnp, start, chunk_size, axis=0)
-            lxb_c = lax.dynamic_slice_in_dim(log_x_b_jnp, start, chunk_size, axis=0)
-            ann_c = lax.dynamic_slice_in_dim(ann_jnp, start, chunk_size, axis=0)
-            chunk_results.append(vmap(per_i_s)(log_Rb_c, lxs_c, lxb_c, ann_c))
-
+            log_Rb_c = log_R_bill_jnp[start:start + chunk_size]
+            lxs_c = log_x_s_jnp[start:start + chunk_size]
+            lxb_c = log_x_b_jnp[start:start + chunk_size]
+            ann_c = ann_jnp[start:start + chunk_size]
+            out = per_chunk(log_Rb_c, lxs_c, lxb_c, ann_c)
+            # Block on this chunk's first output before scheduling the next,
+            # so its working memory is released before the next allocates.
+            out[0].block_until_ready()
+            chunk_results.append(out)
         n_outs = len(chunk_results[0])
         return tuple(
             jnp.concatenate([r[k] for r in chunk_results], axis=0)[:N_state]
             for k in range(n_outs)
         )
-
-    def call(_unused_age_idx=None):
-        return all_is()
 
     return call
 
@@ -1868,9 +1895,14 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
 
 
 def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is_tensors):
-    """Single-device retirement kernel. Drops pmap padding/reshape/collapse so
-    XLA can fuse the entire per-age solve into one kernel. Output shape matches
-    the pmap path: ``(n_z, N_state, n_w)`` per array.
+    """Single-device retirement kernel. Output shape matches the pmap path:
+    ``(n_z, N_state, n_w)`` per policy array.
+
+    Cell-axis chunking (``sc.cell_vmap_chunks``) is implemented with the
+    Python-level chunk loop in ``_chunked_vmap_runner`` — each chunk is its
+    own ``@jit`` call so peak HBM is bounded at one chunk's working memory
+    regardless of XLA's scheduler choices. ``cell_vmap_chunks=1`` keeps the
+    fast path: a single ``@jit'd vmap`` over all cells, no chunk-loop wrapper.
     """
     gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
@@ -1890,29 +1922,73 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
         n_z, N_state, n_chunks,
     )
 
-    @jit
-    def all_cells(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-        def per_cell(z_idx, i_s):
-            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
-            return _solve_retirement_at_cell(
-                z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
-                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
-                j_corners_all[i_s], w_corners_all[i_s],
-                pcj.weight_kv_kr, pcj.annuity_factors,
-                pcj.s_grid, pcj.wealth_grid,
-                init_a_s_cell, init_a_b_cell,
-                mp.gamma, mp.beta, mp.b_bar, mp.delta,
-                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                *static,
-            )
-        return _chunked_vmap_cells(
-            per_cell, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+    def per_cell(z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+                 init_a_s_arr, init_a_b_arr):
+        init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+        init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+        return _solve_retirement_at_cell(
+            z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
+            log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+            j_corners_all[i_s], w_corners_all[i_s],
+            pcj.weight_kv_kr, pcj.annuity_factors,
+            pcj.s_grid, pcj.wealth_grid,
+            init_a_s_cell, init_a_b_cell,
+            mp.gamma, mp.beta, mp.b_bar, mp.delta,
+            pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+            *static,
         )
 
-    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat = all_cells(
-            c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
+    # per_chunk: one @jit'd function shared by both K=1 (called once with the
+    # full padded indices) and K>1 (called K times via _chunked_vmap_runner).
+    # Using one trace for both paths guarantees K=1 and K>1 produce
+    # bit-identical math — separate fast-path traces can diverge in subtle
+    # XLA-fusion ways even when the algorithm is the same.
+    @jit
+    def per_chunk(c_next, pension_next_by_z, psi_per_z,
+                   init_a_s_arr, init_a_b_arr, z_chunk, is_chunk):
+        return vmap(
+            per_cell, in_axes=(0, 0, None, None, None, None, None),
+        )(
+            z_chunk, is_chunk,
+            c_next, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
+        )
+
+    if n_chunks == 1:
+        # Fast path: one per_chunk call with the full unpadded indices. No
+        # chunk-loop wrapper, no inter-chunk block — zero overhead vs the
+        # pre-chunking baseline for 5⁴ runs.
+        z_full = z_idx_padded[:n_cells]
+        is_full = is_idx_padded[:n_cells]
+
+        def call(c_next_jnp, pension_next_by_z, psi_per_z,
+                  init_a_s_arr, init_a_b_arr):
+            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+                c_next_jnp, pension_next_by_z, psi_per_z,
+                init_a_s_arr, init_a_b_arr,
+                z_full, is_full,
+            )
+            return (
+                jnp.reshape(c_flat, (n_z, N_state, -1)),
+                jnp.reshape(s_flat, (n_z, N_state, -1)),
+                jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(ni_flat, (n_z, N_state)),
+                jnp.reshape(nb_flat, (n_z, N_state)),
+            )
+        return call
+
+    # Chunked path: same per_chunk, called K times via _chunked_vmap_runner.
+    # The chunk for-loop runs in Python with .block_until_ready() between
+    # chunks so each chunk's working memory is freed before the next allocates.
+    runner = _chunked_vmap_runner(
+        per_chunk, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+    )
+
+    def call(c_next_jnp, pension_next_by_z, psi_per_z,
+              init_a_s_arr, init_a_b_arr):
+        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+            c_next_jnp, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
         )
         return (
             jnp.reshape(c_flat, (n_z, N_state, -1)),
@@ -2042,8 +2118,13 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
 
 def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pension_next, per_is_tensors):
     """Single-device working-age kernel (and work->retirement boundary case
-    when ``use_pension_next``). Drops pmap padding/reshape/collapse so XLA can
-    fuse the per-age solve into one kernel.
+    when ``use_pension_next``). Output shape matches the pmap path:
+    ``(n_z, N_state, n_w)`` per policy array.
+
+    Cell-axis chunking (``sc.cell_vmap_chunks``) is implemented via
+    ``_chunked_vmap_runner`` — Python-level chunk loop, ``.block_until_ready()``
+    between chunks, deterministic per-chunk HBM bound. ``cell_vmap_chunks=1``
+    keeps the fast path of a single ``@jit'd vmap`` over all cells.
     """
     gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
@@ -2063,55 +2144,92 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
         n_z, N_state, n_chunks,
     )
 
-    @jit
-    def all_cells(
-        c_next, income_next_table_z, pension_next_by_z, psi_per_z,
-        init_a_s_arr, init_a_b_arr,
-    ):
-        def per_cell(z_idx, i_s):
-            z_now = pcj.z_grid[z_idx]
-            z_next = mp.rho * z_now + pcj.eta_nodes
-            iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
-                z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
-            )
-
-            if use_pension_next:
-                pension_at_eta = (
-                    (1.0 - frac_z) * pension_next_by_z[iz_lo]
-                    + frac_z * pension_next_by_z[iz_lo + 1]
-                )
-                income_table = pension_at_eta[:, None] * jnp.ones_like(pcj.eps_weights)[None, :]
-            else:
-                income_table = income_next_table_z[z_idx]
-
-            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
-
-            return _solve_working_at_cell(
-                z_idx, i_s, c_next,
-                income_table,
-                iz_lo, frac_z,
-                pcj.eta_weights, pcj.eps_weights,
-                psi_per_z,
-                log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
-                j_corners_all[i_s], w_corners_all[i_s],
-                pcj.weight_kv_kr, pcj.annuity_factors,
-                pcj.s_grid, pcj.wealth_grid,
-                init_a_s_cell, init_a_b_cell,
-                mp.gamma, mp.beta, mp.b_bar, mp.delta,
-                pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
-                *static,
-            )
-
-        return _chunked_vmap_cells(
-            per_cell, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+    def per_cell(z_idx, i_s, c_next, income_next_table_z, pension_next_by_z,
+                  psi_per_z, init_a_s_arr, init_a_b_arr):
+        z_now = pcj.z_grid[z_idx]
+        z_next = mp.rho * z_now + pcj.eta_nodes
+        iz_lo, frac_z = vmap(bracket_uniform, in_axes=(0, None, None, None))(
+            z_next, pcj.z_grid[0], pcj.dz, pcj.z_grid.shape[0]
         )
+
+        if use_pension_next:
+            pension_at_eta = (
+                (1.0 - frac_z) * pension_next_by_z[iz_lo]
+                + frac_z * pension_next_by_z[iz_lo + 1]
+            )
+            income_table = pension_at_eta[:, None] * jnp.ones_like(pcj.eps_weights)[None, :]
+        else:
+            income_table = income_next_table_z[z_idx]
+
+        init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
+        init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+
+        return _solve_working_at_cell(
+            z_idx, i_s, c_next,
+            income_table,
+            iz_lo, frac_z,
+            pcj.eta_weights, pcj.eps_weights,
+            psi_per_z,
+            log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
+            j_corners_all[i_s], w_corners_all[i_s],
+            pcj.weight_kv_kr, pcj.annuity_factors,
+            pcj.s_grid, pcj.wealth_grid,
+            init_a_s_cell, init_a_b_cell,
+            mp.gamma, mp.beta, mp.b_bar, mp.delta,
+            pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
+            *static,
+        )
+
+    # per_chunk: one @jit shared by both K=1 (called once with full padded
+    # indices) and K>1 (called K times via the runner). One trace shared by
+    # both paths guarantees bit-identical math.
+    @jit
+    def per_chunk(
+        c_next, income_next_table_z, pension_next_by_z, psi_per_z,
+        init_a_s_arr, init_a_b_arr, z_chunk, is_chunk,
+    ):
+        return vmap(
+            per_cell, in_axes=(0, 0, None, None, None, None, None, None),
+        )(
+            z_chunk, is_chunk,
+            c_next, income_next_table_z, pension_next_by_z,
+            psi_per_z, init_a_s_arr, init_a_b_arr,
+        )
+
+    if n_chunks == 1:
+        # Fast path: single per_chunk call with the full unpadded indices.
+        z_full = z_idx_padded[:n_cells]
+        is_full = is_idx_padded[:n_cells]
+
+        def call(
+            c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+            init_a_s_arr, init_a_b_arr,
+        ):
+            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+                c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+                init_a_s_arr, init_a_b_arr,
+                z_full, is_full,
+            )
+            return (
+                jnp.reshape(c_flat, (n_z, N_state, -1)),
+                jnp.reshape(s_flat, (n_z, N_state, -1)),
+                jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(ni_flat, (n_z, N_state)),
+                jnp.reshape(nb_flat, (n_z, N_state)),
+            )
+        return call
+
+    # Chunked path: per_chunk called K times via _chunked_vmap_runner. Chunk
+    # loop runs in Python with .block_until_ready() between chunks.
+    runner = _chunked_vmap_runner(
+        per_chunk, z_idx_padded, is_idx_padded, n_cells, chunk_size, n_chunks,
+    )
 
     def call(
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat = all_cells(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )

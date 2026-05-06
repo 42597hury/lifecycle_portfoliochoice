@@ -328,7 +328,7 @@ Pre-flight T-Q1 arbitrage check confirmed clean (max gap = 0 across all 343 corn
 - `scripts/diagnostics/_diag_per_axis_tail.py` — per-axis tail-node coverage diagnostic. **Note §3.2 caveat** about its `M[xb,k]·L_state[k,k]` formula.
 - `scripts/diagnostics/_diag_arbitrage_quadsweep.py` — pre-flight arbitrage sweep. Has the known `_make_pc` Lobatto-stripping bug noted in HANDOFF_EVAL_LOBATTO_PROPAGATION.md.
 - `scripts/diagnostics/_diag_invalid_cells.py`, `_diag_simpath_worst_cells.py`, `_diag_gridpoint_ee.py`, `_diag_euler_errors.py` — the diagnostic battery.
-- `docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md` §4 — drill-down workflow with v4_lobatto as a worked example.
+- `docs/agents/EE_DIAGNOSTIC_WORKFLOW.md` §4 — drill-down workflow with v4_lobatto as a worked example.
 - `docs/handoff/HANDOFF_EVAL_LOBATTO_PROPAGATION.md` — eval-rule fix that surfaced real policy inaccuracy at v4 boundary cells.
 - `docs/handoff/HANDOFF_BANKRUPTCY_CLAMP_SMOOTHING.md` — proposal for the structural fix in §5.3.
 - `docs/handoff/HANDOFF_AWS_DIAGNOSTIC_AUTORUN.md` — AWS-side auto-diagnostic implementation.

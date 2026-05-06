@@ -72,7 +72,7 @@ Two channels deliver state innovations to the kink:
 1. **Direct return-axis Lobatto** (`ret_lobatto_Z`) — tail node on the bond residual itself.
 2. **M-coupling on state-axis Lobatto** (`state_lobatto_Z`) — `μ_r = const_r + A_r · s_t + M · v^s` with `M[xb, y_1] = −8.72`. State-axis tail node at +Z shifts μ_b by ~`-8.72·Z` ≈ −61 at Z=7, dwarfing pure GH reach.
 
-Both channels are necessary in the current calibration to reach the kink in different state corners. See [docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md](../workflows/EE_DIAGNOSTIC_WORKFLOW.md) §3 Step 4 ("Why state-axis Lobatto matters: the two channels for v^s") for the full argument.
+Both channels are necessary in the current calibration to reach the kink in different state corners. See [docs/agents/EE_DIAGNOSTIC_WORKFLOW.md](../agents/EE_DIAGNOSTIC_WORKFLOW.md) §3 Step 4 ("Why state-axis Lobatto matters: the two channels for v^s") for the full argument.
 
 ## Proposed solution
 
@@ -166,7 +166,7 @@ Read these in order. I've given line numbers for the current `lifecycle/` and di
 
 ## Reading order — context documents
 
-1. **[docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md](../workflows/EE_DIAGNOSTIC_WORKFLOW.md)** — the entire diagnostic battery and the v4_lobatto investigation. Pay particular attention to:
+1. **[docs/agents/EE_DIAGNOSTIC_WORKFLOW.md](../agents/EE_DIAGNOSTIC_WORKFLOW.md)** — the entire diagnostic battery and the v4_lobatto investigation. Pay particular attention to:
    - §1 — fixes already in place (log1p grids, Path B, raised `wealth_min`, leverage cap)
    - §2 Diagnostic A → "Bimodal wealth decomposition (Lobatto bundles)" — the dense low-wealth scan technique that produced the mode (1) / mode (2) split
    - §3 Step 4 mechanism table — historical failure mode catalog

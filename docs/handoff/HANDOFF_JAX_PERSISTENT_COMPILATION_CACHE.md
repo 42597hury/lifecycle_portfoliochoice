@@ -25,7 +25,7 @@ The current 3-line setup gives within-instance (intra-launch) reuse only. The us
 - Edit `lifecycle/__init__.py` to read three env vars (cache dir, min compile time, max size) with sensible defaults.
 - Add a single startup print describing cache state.
 - Add a small standalone module `lifecycle/_compile_cache_sync.py` with two functions: `pull_from_s3(bucket, prefix)` and `push_to_s3(bucket, prefix)` using `subprocess.run(["aws", "s3", "sync", ...])`. **Not** invoked from inside the package; called explicitly by the user-data script or `verify_*` runner.
-- Update [docs/workflows/AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) bootstrap recipe to use the env vars and S3 sync.
+- Update [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) bootstrap recipe to use the env vars and S3 sync.
 
 ### Out of scope (do not implement)
 
@@ -236,7 +236,7 @@ def push_to_s3(bucket, prefix, region=None):
 4. **No region default in code.** Caller passes it explicitly (or relies on env / IAM role). Avoid hardcoding `eu-north-1`.
 5. **No CLI / __main__ entrypoint.** Keep it library-only; the runner imports the functions.
 
-### 4.3 Update `docs/workflows/AWS_TRIAL_JAX.md`
+### 4.3 Update `docs/agents/AWS_TRIAL_JAX.md`
 
 In §2 (Bootstrap script userdata), insert just before step 4 ("Run smoke") :
 
@@ -346,7 +346,7 @@ This confirms the cache is being read, not just present on disk.
 |---|---|---|
 | [lifecycle/__init__.py](../../lifecycle/__init__.py) | Replace 3-line cache block with `_configure_persistent_cache()` function | ~50 net new lines (replaces ~3 existing) |
 | [lifecycle/_compile_cache_sync.py](../../lifecycle/_compile_cache_sync.py) | New file | ~60 lines |
-| [docs/workflows/AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) | Insert env-var section + S3 sync in userdata; brief note in trial-validates section | ~30 added lines |
+| [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) | Insert env-var section + S3 sync in userdata; brief note in trial-validates section | ~30 added lines |
 
 No test files touched (verification is via smoke timing, §5).
 
@@ -356,7 +356,7 @@ No test files touched (verification is via smoke timing, §5).
 
 - [ ] Replace the 3-line block at [lifecycle/__init__.py:72-74](../../lifecycle/__init__.py#L72-L74) with the `_configure_persistent_cache()` function from §4.1. Keep the existing `_configure_xla_devices()` and the `import jax as _jax` line above it untouched.
 - [ ] Add new file `lifecycle/_compile_cache_sync.py` exactly as in §4.2. Underscore prefix marks it as internal.
-- [ ] Update [docs/workflows/AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) §2 (Bootstrap script) and §3 (Success criteria) per §4.3. Mention `S3_CACHE_BUCKET` / `S3_CACHE_PREFIX` env vars and the hardware-keyed prefix convention from §6.2.
+- [ ] Update [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) §2 (Bootstrap script) and §3 (Success criteria) per §4.3. Mention `S3_CACHE_BUCKET` / `S3_CACHE_PREFIX` env vars and the hardware-keyed prefix convention from §6.2.
 - [ ] Run `verify_smoke.py` twice locally (first run wipes cache via `rm -rf ~/.cache/jax_lifecycle`). Confirm:
   - First run prints `[lifecycle] JAX compilation cache: enabled at ...`
   - Second run wall time is materially shorter (compile portion drops by 80-95%).
@@ -372,7 +372,7 @@ No test files touched (verification is via smoke timing, §5).
     one printed status line on enable, non-fatal failure path.
   - lifecycle/_compile_cache_sync.py: pull_from_s3/push_to_s3 helpers
     using aws s3 sync; idempotent pull, --size-only push.
-  - docs/workflows/AWS_TRIAL_JAX.md: bootstrap recipe uses the env vars
+  - docs/agents/AWS_TRIAL_JAX.md: bootstrap recipe uses the env vars
     and S3 sync; document hardware-keyed prefix convention.
 
   Verified: smoke run 2 compile drops from ~3 min to <30s on cache hit.
@@ -388,7 +388,7 @@ No test files touched (verification is via smoke timing, §5).
 - **S3 sync round-trip:** ~10-30 s for a ~200 MB cache from `eu-north-1`. Net savings on AWS launch: ~3-12 min per cache-hit launch.
 - **Cache disk usage at canonical:** ~100-200 MB per (model, hardware) combination.
 
-These are the numbers the agent should put in the commit message and update [docs/workflows/AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) with after running §5 verifications.
+These are the numbers the agent should put in the commit message and update [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) with after running §5 verifications.
 
 ---
 

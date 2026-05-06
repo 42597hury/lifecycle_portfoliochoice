@@ -1,8 +1,26 @@
 # AWS Trial Run — JAX Rewrite Branch
 
-**Scope:** verify the JAX-rewrite code runs end-to-end on AWS. **Not** the full sweep workflow yet — that machinery (`scripts/launch_run.py`, `scripts/run_solve.py`, S3 checkpoint sync, etc.) was deleted in handoff 1 and will need re-porting before production sweeps work on this branch. See [AWS_WORKFLOW.md](AWS_WORKFLOW.md) for the main-branch sweep flow.
+> **Agent role.** This is the runbook for the **cloud-runner agent** on the
+> `jax-rewrite` branch. Your contract:
+>   - **Input:** a config module path (e.g. `configs/sweep_main/06_h200_full_lite.py`)
+>     that has already passed the preflight checks documented in
+>     [`PREFLIGHT_AGENT.md`](PREFLIGHT_AGENT.md). If you were not handed a
+>     preflight sentinel, **halt and ask** — you are not the agent that
+>     decides whether a config is valid.
+>   - **Output:** policy bundle in S3 at `s3://hugo-thesis-runs/saved_runs/<bundle-name>/`
+>     plus the per-age `userdata.log`. Post-solve `diagnose_terminal_portfolio_states`
+>     residual ≤ 1e-6 is the final gate; on failure, leave the bundle in place
+>     and report the violation.
+>   - **Halt conditions:** wall-clock exceeds the configured hard timeout
+>     (§5/§6.B), `nvidia-smi` reports OOM, or the success-criteria string
+>     match in §3 / §6.B fails. Do NOT auto-retry — surface the failure.
+>
+> Companion working notebook: [GPU_TRIAL_FINDINGS.md](../notes/GPU_TRIAL_FINDINGS.md)
+> (real-run lessons; check it before recurring failure modes).
 
-For now: launch one cheap instance, run `verify_smoke.py`, confirm pass.
+**Scope:** verify the JAX-rewrite code runs end-to-end on AWS. **Not** the full sweep workflow yet — that machinery (`scripts/launch_run.py`, `scripts/run_solve.py`, S3 checkpoint sync, etc.) was deleted in handoff 1 and will need re-porting before production sweeps work on this branch. The Numba-branch sweep flow ([AWS_WORKFLOW.md](AWS_WORKFLOW.md)) is reference-only — most JAX agents will not need to read it.
+
+For one-off solves on this branch: launch one instance, run the verify script appropriate to the config size (smoke / canonical-small / benchmark), confirm pass, retrieve bundle.
 
 ---
 

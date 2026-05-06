@@ -1,10 +1,19 @@
 # AWS Workflow — Lifecycle Solver Runs
 
-> **Branch note:** this workflow is **for the `main` (Numba) branch** and depends on
-> `scripts/launch_run.py`, `scripts/run_solve.py`, `scripts/preflight_sweep.py`, etc.
-> On the `jax-rewrite` branch the `scripts/` directory was deleted in handoff 1 and
-> the sweep machinery has not been ported. For one-off trial runs on the JAX branch,
-> follow [AWS_TRIAL_JAX.md](AWS_TRIAL_JAX.md) instead.
+> **NUMBA / `main` BRANCH REFERENCE — JAX agents do not run this workflow.**
+> The sweep machinery this doc describes (`scripts/launch_run.py`,
+> `scripts/run_solve.py`, `scripts/preflight_sweep.py`, etc.) was deleted in
+> handoff 1 of the JAX rewrite and has not been re-ported. JAX cloud-runner
+> agents follow [AWS_TRIAL_JAX.md](AWS_TRIAL_JAX.md) instead.
+>
+> **Why it's still here:** §6.A documents lessons (resume-checkpoint validates
+> array *shape* only, never value semantics — silently corrupts on canonical
+> changes that don't change shape) that the JAX cloud-runner needs to know
+> about when checkpoint resume is wired up on this branch.
+>
+> **Agent role (Numba sweep agent only):** this is your end-to-end runbook —
+> launcher choice, vCPU quota math, budget alarms, parallel vs serial mode.
+> Treat §6.A as a BLOCKER; everything else is procedural.
 
 Run model solves on EC2 from your laptop. Bundles land in `saved_runs/` just like local runs.
 

@@ -22,7 +22,7 @@ The fix should leave non-Lobatto axes (those with `lobatto_Z[d] is None`) on pur
 1. A code change that propagates `ret_lobatto_Z` and `state_lobatto_Z` from solver to eval `DiscretizationConfig` inside the diagnostic infrastructure.
 2. The change should be configurable: an opt-out flag on the diagnostics (e.g. `--eval-disable-lobatto`) so the user can still run a "GH-only eval" comparison if they want — the rule-mismatch number is itself diagnostically interesting.
 3. A short verification: re-run `_diag_euler_errors` (sim-path EE) on the v4_lobatto bundle (`saved_runs/checkpoints/system_iv_full_var_unconstrained_principal_grid7x7x7_nz11_v4_lobatto`) with the fix applied. Report the new mean / median / max log10|EE| numbers and compare to the previous run (which had mean=−2.62, median=−2.53, max=−0.81 under the GH-mismatched eval).
-4. A short note in `docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md` documenting the change in semantics and what the opt-out flag is for.
+4. A short note in `docs/agents/EE_DIAGNOSTIC_WORKFLOW.md` documenting the change in semantics and what the opt-out flag is for.
 
 ## What you need to understand before changing anything
 

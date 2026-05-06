@@ -14,7 +14,7 @@
 Make GPU launches "just work" with three small, durable pieces:
 
 1. **A pinned GPU wheel** in a separate requirements file or install step. The current `requirements.txt` has plain `jax>=0.4.30`, which on Linux installs the CPU-only XLA backend.
-2. **Documented env vars** that EC2 user-data must set before any Python invocation. Already half-documented in [AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md); needs to be authoritative and version-pinned.
+2. **Documented env vars** that EC2 user-data must set before any Python invocation. Already half-documented in [AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md); needs to be authoritative and version-pinned.
 3. **A startup self-check** in [lifecycle/__init__.py](../../lifecycle/__init__.py) that prints the active platform and warns loudly if a CPU device is reported on a host where the user clearly intended GPU. Catches the silent-fallback failure mode where a GPU instance ends up running on CPU because of a missed env var or wheel.
 
 ---
@@ -25,7 +25,7 @@ Make GPU launches "just work" with three small, durable pieces:
 
 - Add `requirements-gpu.txt` (a thin overlay that pins `jax[cuda12]>=0.4.30` and pulls in CUDA plugins).
 - Add a `_check_runtime_platform()` function in [lifecycle/__init__.py](../../lifecycle/__init__.py) that prints platform + device count once at import.
-- Update [AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) §6 ("After the trial passes" → "B) GPU run") with an end-to-end userdata script for p4d/p5 that includes the right env vars.
+- Update [AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) §6 ("After the trial passes" → "B) GPU run") with an end-to-end userdata script for p4d/p5 that includes the right env vars.
 
 ### Out of scope
 
@@ -112,7 +112,7 @@ _check_runtime_platform()
 - We detect "GPU intent" via the union of three env vars + the explicit opt-out. If none are set, we assume CPU is intentional and stay quiet.
 - `flush=True` so the line lands in `cloud-init`/`user-data` logs immediately.
 
-### 3.3 Update [AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md)
+### 3.3 Update [AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md)
 
 Replace **all of §6** ("After the trial / benchmark passes") with the structure below. The current §6 mentions GPU but doesn't give a working userdata.
 
@@ -335,7 +335,7 @@ The package's `_configure_xla_devices()` skips setting `XLA_FLAGS` if it's alrea
 |---|---|---|
 | `requirements-gpu.txt` | New file | 6 |
 | [lifecycle/__init__.py](../../lifecycle/__init__.py) | Add `_check_runtime_platform()` after the existing cache config block | ~30 |
-| [docs/workflows/AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) | Replace §6 with structured A/B/C subsections; B is the new GPU recipe | ~80 (replacing existing ~60) |
+| [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) | Replace §6 with structured A/B/C subsections; B is the new GPU recipe | ~80 (replacing existing ~60) |
 
 No solver-side code changes. No test changes.
 
@@ -345,7 +345,7 @@ No solver-side code changes. No test changes.
 
 - [ ] Create `requirements-gpu.txt` per §3.1 (6 lines).
 - [ ] Add `_check_runtime_platform()` to [lifecycle/__init__.py](../../lifecycle/__init__.py) after the cache config block per §3.2. Make sure the function is called once at import.
-- [ ] Replace §6 of [AWS_TRIAL_JAX.md](../workflows/AWS_TRIAL_JAX.md) with the structured A/B/C content from §3.3.
+- [ ] Replace §6 of [AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) with the structured A/B/C content from §3.3.
 - [ ] Local verification (§4.1):
   - Plain import: confirm `[lifecycle] JAX runtime:` line prints with `platforms=['cpu']`.
   - With `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1` set, confirm the warning fires.

@@ -12,7 +12,7 @@ Add a post-solve diagnostic step that:
 4. Uploads the augmented bundle to S3 along with the original artifacts.
 5. Provides a `--skip-diagnostics` flag for cases where the user just wants a fast solve (smoke tests, mid-development iteration).
 
-The diagnostic battery to auto-run is exactly the four "headline" diagnostics from `docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md` §3:
+The diagnostic battery to auto-run is exactly the four "headline" diagnostics from `docs/agents/EE_DIAGNOSTIC_WORKFLOW.md` §3:
 
 - `_diag_arbitrage_quadsweep` — sanity check on quadrature wiring (~30s)
 - `_diag_invalid_cells --eval-mode next_finer` — per-cell breakdown if invalidity exists (~5 min)
@@ -45,7 +45,7 @@ Total marginal AWS wall-time: ~13–22 minutes on a 1.5–2.5 hour solve. Accept
 
 4. **`scripts/diagnostics/_diag_invalid_cells.py`** and **`scripts/diagnostics/_diag_gridpoint_ee.py`** — same pattern. Both accept `--bundle` (or positional bundle path), `--model-bundle`, `--eval-mode`, `--markdown-out`. Default eval mode for both: `next_finer`. Default wealth indices on `_diag_invalid_cells` is `[0, 15, 75, 134, 149]`; keep that default.
 
-5. **`docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md`** §3 (the investigative process) and §8 (quick-reference command sequence) — these document the exact CLI flags and the publication gates the manifest should report against.
+5. **`docs/agents/EE_DIAGNOSTIC_WORKFLOW.md`** §3 (the investigative process) and §8 (quick-reference command sequence) — these document the exact CLI flags and the publication gates the manifest should report against.
 
 6. **`lifecycle/policy_io.py`** — confirm where the bundle directory is and what files live in it. The auto-diagnostic step must not collide with `save_policy_bundle`'s own output.
 
@@ -163,7 +163,7 @@ Submit the implementation plan; only proceed with code once it's reviewed.
 
 - `scripts/run_solve.py` — launcher target
 - `scripts/diagnostics/_diag_*.py` — the diagnostics
-- `docs/workflows/EE_DIAGNOSTIC_WORKFLOW.md` — workflow + gates
+- `docs/agents/EE_DIAGNOSTIC_WORKFLOW.md` — workflow + gates
 - `lifecycle/policy_io.py` — bundle layout (`save_policy_bundle`, `load_policy_bundle`)
 - `docs/handoff/HANDOFF_EVAL_LOBATTO_PROPAGATION.md` — recently-completed example handoff in the same repo, similar shape
 

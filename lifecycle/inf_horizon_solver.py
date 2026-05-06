@@ -485,7 +485,12 @@ def run_infinite_horizon_solver(
 
     if run_smoke_test:
         # One warm-up call to JIT-compile the kernel before timing the loop.
-        _c, _s, _b = retirement_kernel(jnp.asarray(C_old), pension_zero, psi_one)
+        # Seeds the Newton init from the prepared (warm) S_old/B_old, matching
+        # the convention used inside the iteration loop below.
+        _c, _s, _b, _ni, _nb = retirement_kernel(
+            jnp.asarray(C_old), pension_zero, psi_one,
+            jnp.asarray(S_old), jnp.asarray(B_old),
+        )
         np.asarray(_c)  # block until ready
 
     # ---- Iteration ----
@@ -502,7 +507,17 @@ def run_infinite_horizon_solver(
     t_start = time.time()
     for it in range(max_iter):
         c_old_jnp = jnp.asarray(C_old)
-        c_new_jnp, s_new_jnp, b_new_jnp = retirement_kernel(c_old_jnp, pension_zero, psi_one)
+        # Newton init at each cell is gathered from the previous iteration's
+        # converged share policy at mid-wealth (the kernel's convention). This
+        # mirrors run_lifecycle_solver's use_backward_age_warm_start=True
+        # behavior in the time dimension. Cost: 2x extra device upload per
+        # iteration; gain: typically 3-8 Newton iters/cell once near the fixed
+        # point, vs much higher under cold init.
+        s_old_jnp = jnp.asarray(S_old)
+        b_old_jnp = jnp.asarray(B_old)
+        c_new_jnp, s_new_jnp, b_new_jnp, _ni_jnp, _nb_jnp = retirement_kernel(
+            c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
+        )
         C_new = np.asarray(c_new_jnp)
         S_new = np.asarray(s_new_jnp)
         B_new = np.asarray(b_new_jnp)
@@ -615,11 +630,19 @@ def compile_inner_kernel_smoke_test(
     ).astype(np.float64, copy=True)
     pension_zero = jnp.zeros(pc.n_z, dtype=jnp.float64)
     psi_one = jnp.ones(pc.n_z, dtype=jnp.float64)
+    # Smoke-test has no policy in hand to warm-start from, so seed from the
+    # canonical cold scalars (mirrors run_lifecycle_solver's
+    # use_backward_age_warm_start=False path).
+    init_a_s_arr = jnp.full(expected_shape, float(solver_config.init_alpha_s), dtype=jnp.float64)
+    init_a_b_arr = jnp.full(expected_shape, float(solver_config.init_alpha_b), dtype=jnp.float64)
 
     if verbose:
         print("Compiling JAX retirement kernel for the inf-horizon benchmark...")
     t0 = time.time()
-    c_new, s_new, b_new = retirement_kernel(jnp.asarray(C_old), pension_zero, psi_one)
+    c_new, s_new, b_new, _ni, _nb = retirement_kernel(
+        jnp.asarray(C_old), pension_zero, psi_one,
+        init_a_s_arr, init_a_b_arr,
+    )
     np.asarray(c_new)  # force completion
     elapsed = time.time() - t0
     if verbose:

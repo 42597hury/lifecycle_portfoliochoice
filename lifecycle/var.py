@@ -390,43 +390,43 @@ def build_nominal_system1_var_config(
 ):
     """
     Nominal bond system with no riskless asset.
-    columns = [y_1, spr, cy, rtb, xr, xb]
-    Default state: (cy, spr, rtb, y_1)   Default returns: (xr, xb)
+    columns = [y_1, spr, dp, rtb, xr, xb]
+    Default state: (dp, spr, rtb, y_1)   Default returns: (xr, xb)
 
     rtb is in the state block (post rtb-as-state migration). The restriction
     "lagged returns do not predict" applies only to {xr, xb}; lagged rtb is
-    freely estimated and captures inflation persistence (Phi[rtb, rtb] ~ +0.36).
+    freely estimated and captures inflation persistence.
 
-    Default state ordering rationale (cy, spr, rtb, y_1):
-      - cy at row 0: most orthogonal among the four state innovations
-        (mean |rho| = 0.17), giving a 100% pure cy axis-0 in the Cholesky
-        decomposition. Per-axis state_n_stds[0] is a clean cy knob.
-      - y_1 at row 3: M[xb, y_1] is the dominant entry of the return-on-state
-        projection M = Sigma_rs @ Sigma_ss^-1, so y_1 is the natural
-        refinement-target axis for bond-return integration accuracy.
-      - rtb in the middle: avoids the strongly correlated (spr, y_1) pair
-        (rho ~ -0.87) ending up adjacent. Mean adjacent |rho| under
-        (cy, spr, rtb, y_1) is 0.28 vs 0.52 under (cy, rtb, spr, y_1).
+    Default state ordering rationale (dp, spr, rtb, y_1) — same partition slot
+    used previously for cy. The orthogonality and refinement-target reasoning
+    referenced cy-specific innovation correlations; with dp the structure is
+    different but the slot ordering is preserved for continuity. The orthogonality
+    properties of dp's innovation should be re-evaluated if axis-by-axis tail
+    refinement is being tuned.
+      - dp at row 0: replaces cy as the slowest persistent state.
+      - y_1 at row 3: M[xb, y_1] dominant entry of M = Sigma_rs @ Sigma_ss^-1.
+      - rtb in the middle: avoids adjacent placement of strongly correlated
+        (spr, y_1).
 
     Data is at ANNUAL frequency. The VAR is estimated directly at annual
     frequency using the CCV constrained estimator (z_bar pinned to sample mean).
 
-    y_1  = 1-year nominal Treasury yield, end-of-year value (decimal)
-    spr  = yield spread: y_20 (AAA) - y_1
-    cy   = log earnings yield: -log(CAPE)
-    rtb  = real bill return: log(1+y_1_t) - pi_{t+1}   <-- now a state variable
-    xr   = excess nominal stock return over nominal bill
-    xb   = excess nominal bond return over nominal bill
+    y_1  = 1-year nominal short rate, January-of-year value (decimal log)
+    spr  = yield spread: y_n (Moody's AAA) - y_1
+    dp   = log dividend-price ratio: log(D) - log(P)
+    rtb  = real bill return: y_1[t-1] - pi[t]   <-- state variable
+    xr   = excess log stock return over nominal bill
+    xb   = excess log bond return over nominal bill (CLM constant-duration n=20)
 
-    With the default ordering, state_grid[:, 0] = cy, [:, 1] = spr,
+    With the default ordering, state_grid[:, 0] = dp, [:, 1] = spr,
     [:, 2] = rtb, [:, 3] = y_1.
 
-    Migration history: pre-2026-04-30 used (y_1, spr, cy) with state_indices
-    =(0, 1, 2). 2026-04-30 to 2026-05-06 used (cy, spr, y_1) with state_indices
-    =(2, 1, 0); rtb was a return-block variable. Post 2026-05-06 (this version)
-    is the rtb-as-state migration: rtb joins the state block at position 2.
+    Migration history: pre-2026-04-30 used (y_1, spr, cy). 2026-04-30 used
+    (cy, spr, y_1) with rtb in the return block. 2026-05-06 added rtb-as-state.
+    2026-05-07 (this version) replaced cy=-log(CAPE) on 1963-2025 with
+    dp=log(D)-log(P) on 1919-2011 (Option A: AAA-throughout, T=92 effective).
     """
-    columns = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
+    columns = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
     return build_var_config_from_dataset(
         csv_path=csv_path,
         columns=columns,
@@ -582,51 +582,54 @@ def build_iid_var_config(
 # =============================================================================
 # Estimated from var_dataset.csv using build_nominal_system1_var_config()
 #
-#   System   : Nominal Bond — No Riskless Asset (rtb-as-state, post 2026-05-06)
-#   Columns  : [y_1, spr, cy, rtb, xr, xb]
-#   States   : cy(2), spr(1), rtb(3), y_1(0)   Returns: xr(4), xb(5)
-#   Estimation: restricted constrained VAR(1) (CCV 2003)
+#   System   : Nominal Bond — No Riskless Asset (rtb-as-state, dp variable)
+#   Columns  : [y_1, spr, dp, rtb, xr, xb]
+#   States   : dp(2), spr(1), rtb(3), y_1(0)   Returns: xr(4), xb(5)
+#   Estimation: restricted constrained VAR(1) (CCV w8566 footnote 5)
 #               z_bar pinned to sample mean; only return lags (xr, xb)
-#               excluded — rtb lags now enter freely (inflation persistence
-#               channel; Phi[rtb, rtb] ~ +0.36).
+#               excluded — rtb lags enter freely (inflation persistence
+#               channel; Phi[rtb, rtb] ~ +0.47).
 #   Omega    : from restricted VAR residuals
 #   Frequency: ANNUAL (estimated directly on annual data)
-#   Sample   : 1963–2025, T=63 annual observations
-#   Data src : DGS1 (FRED), AAA (FRED Moody's), CPIAUCSL (FRED),
-#              Shiller ie_data (CAPE, RTRP)
+#   Sample   : 1920–2011, T=92 annual observations  (Option A: window
+#              shortened from spec's 1871–2011 to honor "Moody's AAA throughout"
+#              given AAA starts 1919-01; one year lost to inflation differencing)
+#   Data src : chap_26 (Shiller Ch.26 update — P, D, R, CPI Jan-of-year),
+#              FRED Moody's AAA (long-bond yield, Jan-of-year)
 #
-# All levels are end-of-year values; all returns are calendar-year.
-# These parameters are ready for the annual DP solver — no compounding needed.
+# CCV w8566 reference Table 2 (annual, 1890-1998, T=109): Phi[y, y]=0.92,
+# Phi[dp, dp]=0.84, Phi[rtb, rtb]=0.30, Phi[spr, spr]=0.82.
 # =============================================================================
 
-# Variable order: [y_1, spr, cy, rtb, xr, xb]
-_NOM_COLS   = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
-_STATE_IDX  = [2, 1, 3, 0]   # cy, spr, rtb, y_1
+# Variable order: [y_1, spr, dp, rtb, xr, xb]
+_NOM_COLS   = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
+_STATE_IDX  = [2, 1, 3, 0]   # dp, spr, rtb, y_1
 _RET_IDX    = [4, 5]         # xr, xb
 
 # --- Unconditional means (= sample means, pinned by CCV constrained estimator) ---
+# Estimated 2026-05-07 on data/var_dataset.csv (1920-2011, T=92, Option A).
 _Z_BAR = np.array([
-     +4.849047619047617e-02,   # y_1   = 4.85% 1-year Treasury yield
-     +1.992222222222219e-02,   # spr   = 1.99% yield spread (AAA - y_1)
-     -2.992866096159315e+00,   # cy    = -2.99  log earnings yield (-log CAPE)
-     +9.131332050837982e-03,   # rtb   = +0.91% real bill return
-     +5.547089589883376e-02,   # xr    = +5.55% excess stock return
-     +1.426793925807303e-02,   # xb    = +1.43% excess bond return
+    +4.402987766457664570e-02,   # y_1   = +4.40%   nominal short rate
+    +1.255104651539200658e-02,   # spr   = +1.26pp  yield spread (AAA - y_1)
+    -3.256591312095483914e+00,   # dp    = -3.257   log dividend-price ratio
+    +1.641233073311164012e-02,   # rtb   = +1.64%   real bill return
+    +5.184427359929520002e-02,   # xr    = +5.18%   excess stock return
+    +1.073210114487195208e-02,   # xb    = +1.07%   excess bond return
 ])
 
-# --- AR(1) coefficient matrix Phi  (annual, restricted: only xr/xb lag columns = 0) ---
-# Phi[i, j] = coefficient on lagged z_j in equation for z_i
+# --- AR(1) coefficient matrix Phi (annual, restricted: only xr/xb lag cols = 0) ---
+# Phi[i, j] = coefficient on lagged z_j in equation for z_i.
 # Return columns 4 (xr) and 5 (xb) are zero by restriction; column 3 (rtb) is
 # freely estimated.
 #
-#            L.y_1                    L.spr                    L.cy                     L.rtb                    L.xr   L.xb
+#            L.y_1                    L.spr                    L.dp                     L.rtb                    L.xr   L.xb
 _PHI = np.array([
-    [+7.627792816707006e-01, -1.557637754582728e-01, +1.059556478532121e-02, -1.036703273860744e-01, 0.0, 0.0],  # y_1
-    [+8.680000098273744e-02, +7.845162896547183e-01, -4.587938650872594e-03, +7.431993028907174e-02, 0.0, 0.0],  # spr
-    [+1.906873478050249e+00, +5.397020833548142e-01, +8.729941985846355e-01, -1.561623307414901e+00, 0.0, 0.0],  # cy
-    [+7.548784313156334e-01, +4.318651453255921e-01, -2.352979833188595e-02, +3.627030614834808e-01, 0.0, 0.0],  # rtb
-    [-2.536921427524994e+00, -1.489633363212004e+00, +1.306594819432753e-01, +8.245318309536527e-01, 0.0, 0.0],  # xr
-    [+1.238545517802672e+00, +4.197891124139656e+00, -4.774994082603825e-02, +2.506866251629467e-01, 0.0, 0.0],  # xb
+    [+9.299060056743475577e-01, +8.871811111637421809e-02, +1.309239276869196859e-03, -4.879196624450553993e-02, 0.0, 0.0],  # y_1
+    [+2.344008948027683989e-02, +6.570337478396850450e-01, -3.319193580131267474e-03, +2.526490968066123430e-02, 0.0, 0.0],  # spr
+    [-3.853543505103990130e-01, -2.154249268041942500e+00, +9.288388594467132942e-01, -6.009056673164093754e-01, 0.0, 0.0],  # dp
+    [+3.378214425295113510e-01, -4.876945057254646887e-01, +8.552260704384884301e-04, +4.716537319880246826e-01, 0.0, 0.0],  # rtb
+    [-7.091371152108977283e-02, +3.482547439595059302e+00, +1.162966599772504023e-01, +5.973033322200087779e-03, 0.0, 0.0],  # xr
+    [+3.491519517715134246e-01, +3.279032619175778152e+00, +1.821208810550401305e-02, +2.007972763738816169e-01, 0.0, 0.0],  # xb
 ])
 
 # --- Intercept vector c = (I - Phi) @ z_bar  (annual) ---
@@ -634,12 +637,12 @@ _CONST = (np.eye(6) - _PHI) @ _Z_BAR
 
 # --- Residual covariance matrix Omega  (annual, 6x6, full matrix) ---
 _OMEGA = np.array([
-    [+2.452785959691342e-04, -1.509707229467233e-04, +3.533596959366701e-04, -1.336153796241077e-04, -1.962617114097833e-04, -8.565803438336283e-04],  # y_1
-    [-1.509707229467233e-04, +1.252934686031851e-04, +7.523125287716998e-05, +5.018335393553157e-05, -1.793260503004063e-04, +2.502296204050261e-04],  # spr
-    [+3.533596959366701e-04, +7.523125287716998e-05, +2.694798640307919e-02, -1.113991745533754e-03, -2.564680872133918e-02, -3.891715971750045e-03],  # cy
-    [-1.336153796241077e-04, +5.018335393553157e-05, -1.113991745533754e-03, +3.241106409288332e-04, +8.052754033143213e-04, +7.193814310280438e-04],  # rtb
-    [-1.962617114097833e-04, -1.793260503004063e-04, -2.564680872133918e-02, +8.052754033143213e-04, +2.529120567267745e-02, +3.461822600731509e-03],  # xr
-    [-8.565803438336283e-04, +2.502296204050261e-04, -3.891715971750045e-03, +7.193814310280438e-04, +3.461822600731509e-03, +5.882474065416535e-03],  # xb
+    [+2.234920362525859695e-04, -1.661887167916548417e-04, -1.844912677731811845e-04, -1.313216553305527885e-04, +3.902042377503587406e-04, -5.253256292926793700e-04],  # y_1
+    [-1.661887167916548417e-04, +1.492291942678782772e-04, +2.968638876824434138e-04, +6.420969497128877726e-05, -5.544060097427062255e-04, +1.739181278562723740e-04],  # spr
+    [-1.844912677731811845e-04, +2.968638876824434138e-04, +2.073286760974539511e-02, +1.554822952480693467e-04, -2.066659106159631984e-02, -6.617591115692886836e-04],  # dp
+    [-1.313216553305527885e-04, +6.420969497128877726e-05, +1.554822952480693467e-04, +1.304450404909156085e-03, -7.527973037346545430e-04, +6.461715739749695131e-04],  # rtb
+    [+3.902042377503587406e-04, -5.544060097427062255e-04, -2.066659106159631984e-02, -7.527973037346545430e-04, +3.338076903150290903e-02, +1.467276318990530168e-03],  # xr
+    [-5.253256292926793700e-04, +1.739181278562723740e-04, -6.617591115692886836e-04, +6.461715739749695131e-04, +1.467276318990530168e-03, +3.279686436158545451e-03],  # xb
 ])
 
 
@@ -651,13 +654,15 @@ def build_nominal_system1_var_config_hardcoded():
 
     Parameters are at ANNUAL frequency — ready for the annual DP solver.
 
-    Estimated from data/var_dataset.csv (1963-2025, T=63) under the
-    rtb-as-state restriction. State (cy, spr, rtb, y_1); returns (xr, xb).
-    Reproduces the §4.1 PROPOSED numerical contract:
-      rtb R^2 = 0.6075;  Phi[rtb, rtb] = +0.3627;  cond(Sigma_r_cond) = 1.21.
+    Estimated from data/var_dataset.csv (1920-2011, T=92, Option A — see
+    docs/CCV_RETURN_IMPLEMENT.md §4.1) under the rtb-as-state restriction.
+    State (dp, spr, rtb, y_1); returns (xr, xb).
+      max |eig(Phi)| = 0.9493 (stationary)
+      R²(y_1)=0.78, R²(spr)=0.44, R²(dp)=0.90, R²(rtb)=0.41,
+      R²(xr)=0.13,  R²(xb)=0.41.
     """
-    print("Using HARDCODED VAR parameters (nominal System 1, annual, 6-var, rtb-as-state).")
-    print("  Estimated from data/var_dataset.csv (1963-2025, T=63).")
+    print("Using HARDCODED VAR parameters (nominal System 1, annual, 6-var, dp-state).")
+    print("  Estimated from data/var_dataset.csv (1920-2011, T=92, Option A).")
     return {
         "z_bar":                  _Z_BAR.copy(),
         "Phi":                    _PHI.copy(),
@@ -674,7 +679,7 @@ def build_nominal_system1_var_config_hardcoded():
         "max_abs_return_lag_coeff": 0.0,
         "estimation":             "restricted_constrained_hardcoded",
         "trend":                  "c",
-        "state_predictor_columns": ["cy", "spr", "rtb", "y_1"],
+        "state_predictor_columns": ["dp", "spr", "rtb", "y_1"],
         "residual_correlation":   None,
         "equation_r2":            None,
     }

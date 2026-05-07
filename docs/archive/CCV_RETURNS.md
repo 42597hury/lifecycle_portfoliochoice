@@ -57,10 +57,27 @@ where
 
 | symbol | meaning |
 |---|---|
-| `r_bill` | realised log nominal bill return (`= log(1+y₁)`) |
+| `r_bill` | realised log real bill return (= rtb) |
 | `xr`, `xb` | realised log excess returns over `r_bill` |
-| `σ²_xr`, `σ²_xb` | conditional variance of `xr`, `xb` after projecting out the state innovations |
-| `σ_xrxb` | conditional covariance of `xr` and `xb` |
+| `σ²_xr`, `σ²_xb` | **unconditional** variance of `xr`, `xb` innovations (= diagonal of `Sigma_rr`, the x×x sub-block of `Sigma_v`); see CCV_RETURN_IMPLEMENT.md §3.1.d |
+| `σ_xrxb` | **unconditional** covariance of `xr`, `xb` innovations (= `Sigma_rr[xr, xb]`) |
+
+**May-2026 Sigma_rr patch.** Pre-patch this document and the precompute path
+sourced these scalars from `Sigma_r_cond` (the inner-quadrature Cholesky
+residual `Sigma_rr - M·Sigma_ss·M'`), which is wrong: eq. (10) is a
+path-by-path identity over the **full** VAR innovation, so the variance
+correction must use the unconditional `Sigma_rr` block. The two differ
+materially on this calibration (Sigma_rr is ~3-30x larger than Sigma_r_cond
+along the xr diagonal). The patch is locked at `precompute.py:303-314` and
+guarded by `tests/test_sigma_rr_sourcing.py`. CCV_RETURN_IMPLEMENT.md §3.1.d
+is the authoritative theory derivation.
+
+**May-2026 partition change.** This document predates the rtb-as-state
+migration in which `rtb` moved from the return block to the state block.
+References to "the return block" in this archived doc include `rtb`
+implicitly; the current code has only `(xr, xb)` in the return block and
+`(y_1, spr, dp, rtb)` in the state block. CCV_RETURN_IMPLEMENT.md §2.2 and
+the var.py code mapping table reflect the current partition.
 
 The Jensen lift `+(½)α·σ²_x` arises from `E[exp(X)] = exp(E[X] + ½Var[X])`
 applied to each individual asset. The vol-drag `−(½)α'Σ_xx α` is the Itô

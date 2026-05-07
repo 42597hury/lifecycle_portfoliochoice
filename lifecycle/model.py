@@ -192,7 +192,7 @@ class SolverConfig(NamedTuple):
     # scalar (init_alpha_s, init_alpha_b). Terminal age is always cold.
     use_backward_age_warm_start: bool = True
 
-    # --- Cell-axis vmap chunking (single-GPU memory bounding) ---
+    # --- Cell-axis chunking (single-/multi-device memory bounding) ---
     # Splits the per-age vmap over (n_z * N_state) cells into this many
     # sequential chunks. Each chunk has fixed shape (chunk_size, ...) so XLA
     # traces the inner vmap once and reuses for all chunks. Per-chunk peak
@@ -200,8 +200,9 @@ class SolverConfig(NamedTuple):
     # memory bound independent of XLA's compilation choices.
     #
     # When 1: no chunking (default; matches today's behaviour, fastest dispatch).
-    # When > 1: K sequential vmap calls per age. Adds ~K kernel-launch
-    # dispatches per age but bounds memory.
+    # When > 1: K sequential chunk calls per age. Adds ~K kernel-launch
+    # dispatches per age but bounds memory. On pmap, each chunk is rounded up
+    # to a multiple of the device count before being sharded across devices.
     #
     # Heuristic for picking K on a single GPU:
     #   per_cell_memory_MB = n_state_quad * n_z * 2**n_state * n_w * 8 / 1e6
@@ -210,8 +211,7 @@ class SolverConfig(NamedTuple):
     # On GH200 (97 GB HBM, ~30 GB headroom for other state):
     #   target_HBM_budget = 60 GB → K = ceil(total_worst_case / 60_000)
     #
-    # Only the vmap-only (single-device) path honours this knob; the pmap
-    # multi-device path keeps its existing per-device padding.
+    # Both vmap-only and pmap dispatch paths honour this knob.
     cell_vmap_chunks: int = 1
 
     # --- Mixed precision toggle ---

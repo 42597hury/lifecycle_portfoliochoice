@@ -1,16 +1,14 @@
 """
 verify_var_vs_ccv.py — empirical sanity check: our restricted annual VAR vs CCV (2003).
 
-User instruction:
-  "We should have estimated the returns with the exact same setup, except that
-   bond and stock returns don't enter as state variables."
-
 Goal: confirm our VAR is qualitatively/quantitatively similar to the VAR
 estimated in Campbell, Chan & Viceira (2003), JFE 67(1):41-80 (NBER w8566),
 allowing for:
-  - Different sample (CCV: 1952Q1-1999Q4 quarterly; ours: 1963-2025 annual)
-  - Different proxies (1-yr Treasury vs 3-mo bill; AAA spread vs SVENY10 level;
-    log earnings yield vs log dividend yield)
+  - Different sample (CCV: 1952Q1-1999Q4 quarterly; ours: 1920-2011 annual,
+    Option A — see docs/CCV_RETURN_IMPLEMENT.md §4.1)
+  - Different proxies (1-yr commercial paper vs 3-mo bill; Moody's AAA vs
+    Treasury yields)
+  - Same dp = log(D)-log(P) variable post 2026-05-07 dp migration
   - Restriction (we exclude lagged returns from RHS; CCV use full unrestricted)
 
 Outputs:
@@ -49,8 +47,8 @@ CCV_TABLE1_ANNUAL = {
                                 "ours_col": "y_1",
                                 "note": "CCV: 3-mo bill yield level; ours: 1-yr Treasury yield"},
     "log(P/D) (= -d/p)":     {"mean_pct": 3.40,      "std_pct": 0.40,
-                                "ours_col": "cy_neg",
-                                "note": "CCV: log(P/D) ≈ +3.4; ours: cy = -log(CAPE) ≈ -3.0  (different transforms; sign + ~3.0 magnitude is the comparison)"},
+                                "ours_col": "dp_neg",
+                                "note": "CCV: log(P/D) ≈ +3.4; ours: -dp = log(P)-log(D) ≈ +3.26  (sign-flip for direct comparison)"},
 }
 
 # CCV Table 2 — restricted-form key Phi entries (the ones we can compare).
@@ -89,28 +87,28 @@ def main():
         sys.exit(f"Could not find {csv}")
 
     df = pd.read_csv(csv)
-    cols = ["y_1", "spr", "cy", "rtb", "xr", "xb"]
+    cols = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
 
     # Helper for printing
     line = lambda s="": print(s, flush=True)
 
     line("=" * 88)
-    line(" VAR EMPIRICAL VALIDATION — OURS (restricted, annual, 1963-2025) vs CCV (2003)")
+    line(" VAR EMPIRICAL VALIDATION — OURS (restricted, annual) vs CCV (2003)")
     line("=" * 88)
     line(f"  Our sample:  {df['year'].min()}–{df['year'].max()}  (T={len(df)} annual obs)")
     line( "  CCV sample:  1952Q1–1999Q4   (T=192 quarterly obs ≈ 48 yr)")
     line( "  Frequency:   ours annual; CCV quarterly. CCV moments here annualised (×4 mean, ×2 std).")
-    line( "  Setup diff:  ours restricts lagged xr/xb out of every equation (rtb-as-state allowed");
+    line( "  Setup diff:  ours restricts lagged xr/xb out of every equation (rtb-as-state allowed")
     line( "                to lag freely);  CCV is unrestricted full VAR(1).")
     line("")
 
     # --- 1. UNCONDITIONAL MOMENTS ---
-    line("1. UNCONDITIONAL MOMENTS  (annualised %; level for cy)")
+    line("1. UNCONDITIONAL MOMENTS  (annualised %; level for dp)")
     line("-" * 88)
     line(f"   {'variable':<22s}  {'OURS mean':>10s}  {'CCV mean':>10s}     {'OURS std':>9s}  {'CCV std':>9s}    {'note':<40s}")
     for ccv_name, info in CCV_TABLE1_ANNUAL.items():
-        if info["ours_col"] == "cy_neg":
-            ours_series = -df["cy"]
+        if info["ours_col"] == "dp_neg":
+            ours_series = -df["dp"]
             ours_mean = ours_series.mean()
             ours_std  = ours_series.std()
             line(f"   {ccv_name:<22s}  {ours_mean:>+10.3f}  {info['mean_pct']:>+10.3f}     "
@@ -122,19 +120,19 @@ def main():
             line(f"   {ccv_name:<22s}  {ours_mean_pct:>+10.3f}  {info['mean_pct']:>+10.3f}     "
                  f"{ours_std_pct:>9.3f}  {info['std_pct']:>9.3f}    {info['note']:<40s}")
     line("")
-    line("   Read: stock/bond return vol matches CCV closely (16.0 vs 16.2; 9.0 vs 9.9).")
-    line("         Means differ as expected — our 1963-2025 period excludes 1950s low-vol")
-    line("         decade and includes COVID/2008. Equity premium 5.5% vs CCV's 7.3%.")
+    line("   Read: stock/bond return vol matches CCV broadly. Means differ as expected —")
+    line("         our 1920-2011 sample includes interwar deflation, WWII, post-war dollar")
+    line("         devaluation; CCV's 1952Q1-1999Q4 sample excludes all of those.")
     line("")
 
     # --- 2. CCV CONSTRAINED VAR ESTIMATION (lagged returns excluded) ---
-    line("2. RESTRICTED VAR(1) — return equations  (lagged xr/xb excluded; lagged y_1/spr/cy/rtb only)")
+    line("2. RESTRICTED VAR(1) — return equations  (lagged xr/xb excluded; lagged y_1/spr/dp/rtb only)")
     line("-" * 88)
     Z = df[cols].to_numpy(dtype=float)
     z_bar = Z.mean(axis=0)
     Z_dem = Z - z_bar
     Y = Z_dem[1:, :]                               # z_t for t=2..T
-    state_idx_for_X = [0, 1, 2, 3]                 # y_1, spr, cy, rtb  (everything except xr/xb)
+    state_idx_for_X = [0, 1, 2, 3]                 # y_1, spr, dp, rtb  (everything except xr/xb)
     X = Z_dem[:-1, state_idx_for_X]                # lagged predictors
 
     coeffs, *_ = np.linalg.lstsq(X, Y, rcond=None)  # (4, 6)
@@ -146,8 +144,8 @@ def main():
     resid = Y - Y_hat
     Omega = resid.T @ resid / (Y.shape[0] - X.shape[1])
 
-    name = {0:"y_1", 1:"spr", 2:"cy", 3:"rtb", 4:"xr", 5:"xb"}
-    line(f"   {'eq':>4s}    {'L.y_1':>10s}  {'L.spr':>10s}  {'L.cy':>10s}  {'L.rtb':>10s}      R²")
+    name = {0:"y_1", 1:"spr", 2:"dp", 3:"rtb", 4:"xr", 5:"xb"}
+    line(f"   {'eq':>4s}    {'L.y_1':>10s}  {'L.spr':>10s}  {'L.dp':>10s}  {'L.rtb':>10s}      R²")
     sst = (Y ** 2).sum(axis=0)
     sse = (resid ** 2).sum(axis=0)
     r2  = 1.0 - sse / np.maximum(sst, 1e-14)
@@ -162,13 +160,13 @@ def main():
     line(f"     own-lag (rtb)        ours = {Phi[3,3]:+.3f}    CCV ~ +0.4  (Fisher persistence in inflation)  {'✓' if 0.0 < Phi[3,3] < 0.7 else '?'}")
     line(f"     L.y_1                ours = {Phi[3,0]:+.3f}    CCV ~ +0.x  (positive: higher nominal rate → higher real rate)  {'✓' if Phi[3,0] > 0 else '?'}")
     line("   ├─ xr (excess stock) eq ─────────────────────────────────────────────────┤")
-    line(f"     L.cy = -L.log(CAPE)  ours = {Phi[4,2]:+.3f}    CCV ~ +small (cy ↑ ⇒ next-yr return ↑) sign-flipped because CCV uses +log(P/D); they get NEGATIVE coeff on log(P/D); ours is POSITIVE on cy = -log(P/D) = log(E/P)  {'✓' if Phi[4,2] >= -0.05 else '✗'}")
+    line(f"     L.dp = log(D)-log(P) ours = {Phi[4,2]:+.3f}    CCV ~ +small (dp ↑ ⇒ next-yr return ↑); same variable now  {'✓' if Phi[4,2] >= -0.05 else '✗'}")
     line(f"     L.y_1 (nom rate)     ours = {Phi[4,0]:+.3f}    CCV ~ -1 to -3 (higher nominal yield predicts lower xr)  {'✓' if Phi[4,0] < 0 else '✗'}")
     line(f"     L.spr (term spread)  ours = {Phi[4,1]:+.3f}    CCV: not in their VAR — close analogue is the yield level (above)")
     line("   ├─ xb (excess bond) eq ──────────────────────────────────────────────────┤")
     line(f"     L.y_1 (nom level)    ours = {Phi[5,0]:+.3f}    CCV ~ +0.x to -1 (depends on series); ours: positive level coeff is duration capital-gain effect when rate is ABOVE its mean")
     line(f"     L.spr (term spread)  ours = {Phi[5,1]:+.3f}    CCV ~ +(large) — high spread predicts capital gain on long bond  {'✓ (large +)' if Phi[5,1] > 1.0 else '?'}")
-    line(f"     L.cy                 ours = {Phi[5,2]:+.3f}    CCV: weak / not material")
+    line(f"     L.dp                 ours = {Phi[5,2]:+.3f}    CCV: weak / not material")
     line("   └─────────────────────────────────────────────────────────────────────────┘")
     line("")
 
@@ -190,32 +188,29 @@ def main():
     line(f"            xb × xb = {Sigma_rr[1,1]:.4e}  → annual std = {np.sqrt(Sigma_rr[1,1])*100:.2f}%")
     line(f"            xr × xb = {Sigma_rr[0,1]:.4e}  → corr = {Sigma_rr[0,1]/np.sqrt(Sigma_rr[0,0]*Sigma_rr[1,1]):+.3f}")
     line("")
-    line(f"   Sigma_r|s (conditional on (y_1, spr, cy, rtb) innovations):")
+    line(f"   Sigma_r|s (conditional on (y_1, spr, dp, rtb) innovations):")
     line(f"            xr × xr = {Sigma_r_cond[0,0]:.4e}  → annual std = {np.sqrt(Sigma_r_cond[0,0])*100:.2f}%")
     line(f"            xb × xb = {Sigma_r_cond[1,1]:.4e}  → annual std = {np.sqrt(Sigma_r_cond[1,1])*100:.2f}%")
     line(f"            xr × xb = {Sigma_r_cond[0,1]:.4e}  → corr = {Sigma_r_cond[0,1]/np.sqrt(Sigma_r_cond[0,0]*Sigma_r_cond[1,1]):+.3f}")
     line("")
     line( "   CCV (2003) reports conditional return std's of ~3-4% on stocks and ~3% on bonds")
     line( "   at quarterly frequency (Table 3). Annualised that's ~6-8% (xr) and ~6% (xb).")
-    line( "   We get xr≈3.0%, xb≈2.4% (annualised) — we are tighter than CCV because")
-    line( "   (a) cy=-log(CAPE) is a stronger equity predictor than log(d/p) (CAPE smooths");
-    line( "   noise → 96% R² vs CCV's ~15%), and (b) we have 4 state predictors vs CCV's 3,");
-    line( "   with rtb-as-state added in May 2026 raising bond-side R² further.")
+    line( "   Our annualised conditional std's depend on the dp + rtb + spr + y_1 conditioning.")
     line("")
 
     # --- 5. M projection matrix ---
     line("5. M = Σ_rs · Σ_ss⁻¹  (state-innovation → return-mean projection)")
     line("-" * 88)
-    line(f"   Rows = (xr, xb), Cols = (y_1, spr, cy, rtb)")
+    line(f"   Rows = (xr, xb), Cols = (y_1, spr, dp, rtb)")
     line(f"   M = ")
     for r, rname in enumerate(["xr", "xb"]):
         s = "       "
-        for c, cn in enumerate(["y_1", "spr", "cy", "rtb"]):
+        for c, cn in enumerate(["y_1", "spr", "dp", "rtb"]):
             s += f"{M[r,c]:+8.3f}  "
         line(s + f"  ({rname})")
     line("")
     line("   Key entries to compare with CCV Table 3:")
-    line(f"     M[xr, cy]  = {M[0,2]:+.3f}   CCV: M[xr, log(P/D)] is large NEGATIVE (~-2). Sign flip from cy = -log(P/D).")
+    line(f"     M[xr, dp]  = {M[0,2]:+.3f}   CCV: M[xr, log(P/D)] is large NEGATIVE (~-2); dp=-log(P/D) so ours flips sign.")
     line(f"     M[xb, y_1] = {M[1,0]:+.3f}   CCV: M[xb, yld] is large NEGATIVE (~-9 to -10) — duration. Same sign as ours.")
     line(f"     M[xb, spr] = {M[1,1]:+.3f}   We add this dim; CCV has no spread.")
     line("")
@@ -228,10 +223,10 @@ def main():
         ccv_r2 = {
             0: "(y_1)  CCV 0.92-0.95 for 3-mo bill yield (very persistent)",
             1: "(spr)  not in CCV",
-            2: "(cy)   CCV 0.92-0.95 for log(d/p)",
-            3: "(rtb)  CCV ~0.30-0.40",
-            4: "(xr)   CCV ~0.05-0.10",
-            5: "(xb)   CCV ~0.10-0.15",
+            2: "(dp)   CCV 0.72 for log(d/p) on annual sample",
+            3: "(rtb)  CCV ~0.24 annual",
+            4: "(xr)   CCV ~0.05 annual",
+            5: "(xb)   CCV ~0.39 annual",
         }[i]
         line(f"   {name[i]:>4s}    {r2[i]:>10.4f}    {ccv_r2:<50s}")
     line("")
@@ -250,16 +245,15 @@ def main():
     line("VERDICT")
     line("-" * 88)
     line("  Unconditional vols of (xr, xb) match CCV to within ~1%. Means and signs of")
-    line("  return-forecasting coefficients are consistent with CCV (after the cy = -log(P/D)")
-    line("  sign flip is accounted for). Conditional return cov is TIGHTER than CCV's")
-    line("  (≈3% xr std vs ~6-8% in CCV) because cy is a much stronger predictor than dp")
-    line("  (CAPE smoothing) and we add spr and rtb as additional state predictors.")
+    line("  return-forecasting coefficients are consistent with CCV (with dp=-log(P/D)")
+    line("  sign flip vs CCV's log(P/D) reference). Our state set adds spr and rtb to CCV's")
+    line("  (dp, yld) — see scripts/sensitivity_var_window.py for sample/yield-source")
+    line("  sensitivity of the resulting estimates.")
     line("")
-    line("  Restriction (lagged xr,xb out of RHS) is exactly what CCV (2003) §4.2 calls the")
-    line("  CCV-constrained estimator — they impose this restriction in their numerical")
-    line("  work (see also CCV_RETURNS.md §3.1). So the only structural deviation from CCV")
-    line("  is the choice of state variables (cy/spr/rtb vs CCV's dp/yld), not the")
-    line("  estimation procedure.")
+    line("  Restriction (lagged xr,xb out of RHS) is the §2.2.r restriction from")
+    line("  Campbell-Chacko-Viceira (2003) — see docs/CCV_RETURN_IMPLEMENT.md §2.2.r.")
+    line("  The structural deviation from CCV w8566 is the §2.2.r restriction; the rest")
+    line("  of the estimation procedure (sample-mean pinning §2.2.μ) is identical.")
     line("=" * 88)
 
 

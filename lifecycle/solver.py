@@ -1569,7 +1569,14 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
     log_R_bill, log_x_s, log_x_b = _all_is_log_returns_numpy(pcj)
     state_grid_np = np.asarray(pcj.state_grid)
     N_state = state_grid_np.shape[0]
-    pad_n = math.ceil(N_state / n_dev) * n_dev
+    n_chunks = int(sc.cell_vmap_chunks)
+    if n_chunks == 1:
+        pad_n = math.ceil(N_state / n_dev) * n_dev
+    else:
+        raw_chunk_size = (N_state + n_chunks - 1) // n_chunks
+        chunk_size = ((raw_chunk_size + n_dev - 1) // n_dev) * n_dev
+        per_dev_chunk = chunk_size // n_dev
+        pad_n = chunk_size * n_chunks
 
     def pad0(arr, target_n):
         if arr.shape[0] == target_n:
@@ -1583,15 +1590,21 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
     log_x_b_p = pad0(log_x_b, pad_n)
     ann_p = pad0(np.asarray(pcj.annuity_factors), pad_n)
 
-    per_dev = pad_n // n_dev
+    if n_chunks == 1:
+        per_dev = pad_n // n_dev
 
-    def reshape_for_pmap(arr):
-        return arr.reshape((n_dev, per_dev) + arr.shape[1:])
+        def reshape_for_pmap(arr):
+            return arr.reshape((n_dev, per_dev) + arr.shape[1:])
 
-    log_R_bill_pm = jnp.asarray(reshape_for_pmap(log_R_bill_p))
-    log_x_s_pm = jnp.asarray(reshape_for_pmap(log_x_s_p))
-    log_x_b_pm = jnp.asarray(reshape_for_pmap(log_x_b_p))
-    ann_pm = jnp.asarray(reshape_for_pmap(ann_p))
+        log_R_bill_pm = jnp.asarray(reshape_for_pmap(log_R_bill_p))
+        log_x_s_pm = jnp.asarray(reshape_for_pmap(log_x_s_p))
+        log_x_b_pm = jnp.asarray(reshape_for_pmap(log_x_b_p))
+        ann_pm = jnp.asarray(reshape_for_pmap(ann_p))
+    else:
+        log_R_bill_flat = jnp.asarray(log_R_bill_p)
+        log_x_s_flat = jnp.asarray(log_x_s_p)
+        log_x_b_flat = jnp.asarray(log_x_b_p)
+        ann_flat = jnp.asarray(ann_p)
 
     @pmap
     def per_dev_solve(log_Rb_block, lxs_block, lxb_block, ann_block):
@@ -1607,6 +1620,35 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
         return vmap(per_i_s)(log_Rb_block, lxs_block, lxb_block, ann_block)
 
     def call(_unused_age_idx=None):
+        if n_chunks != 1:
+            chunk_results = []
+            for i in range(n_chunks):
+                start = i * chunk_size
+
+                def chunk_for_pmap(arr):
+                    return jnp.reshape(
+                        arr[start:start + chunk_size],
+                        (n_dev, per_dev_chunk) + arr.shape[1:],
+                    )
+
+                out = per_dev_solve(
+                    chunk_for_pmap(log_R_bill_flat),
+                    chunk_for_pmap(log_x_s_flat),
+                    chunk_for_pmap(log_x_b_flat),
+                    chunk_for_pmap(ann_flat),
+                )
+                out[0].block_until_ready()
+                chunk_results.append(out)
+
+            def collapse_chunk(k):
+                flat_chunks = [
+                    jnp.reshape(r[k], (chunk_size,) + r[k].shape[2:])
+                    for r in chunk_results
+                ]
+                return jnp.concatenate(flat_chunks, axis=0)[:N_state]
+
+            return tuple(collapse_chunk(k) for k in range(len(chunk_results[0])))
+
         (c_pm, as_pm, ab_pm,
          ni_pm, nb_pm) = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
 
@@ -1657,6 +1699,68 @@ def _build_chunked_index_arrays(n_z, N_state, n_chunks):
         )
 
     return jnp.asarray(z_idx_np), jnp.asarray(is_idx_np), n_cells, chunk_size
+
+
+def _build_chunked_pmap_index_arrays(n_z, N_state, n_chunks, n_dev):
+    """Build padded pmap-ready cell-index chunks.
+
+    Padding is appended only at the end of the flat cell axis, preserving the
+    existing pmap convention: duplicate the final real cell and trim it away
+    after solving. Each chunk is rounded to a multiple of ``n_dev`` so it can
+    be reshaped to ``(n_dev, per_dev)`` for pmap.
+    """
+    n_cells = n_z * N_state
+    raw_chunk_size = (n_cells + n_chunks - 1) // n_chunks
+    chunk_size = ((raw_chunk_size + n_dev - 1) // n_dev) * n_dev
+    per_dev = chunk_size // n_dev
+    n_cells_padded = chunk_size * n_chunks
+
+    cell_idx = np.arange(n_cells, dtype=np.int64)
+    z_idx_np = (cell_idx // N_state).astype(np.int64)
+    is_idx_np = (cell_idx % N_state).astype(np.int64)
+
+    pad_count = n_cells_padded - n_cells
+    if pad_count > 0:
+        z_idx_np = np.concatenate(
+            [z_idx_np, np.full(pad_count, z_idx_np[-1], dtype=np.int64)]
+        )
+        is_idx_np = np.concatenate(
+            [is_idx_np, np.full(pad_count, is_idx_np[-1], dtype=np.int64)]
+        )
+
+    z_chunks = z_idx_np.reshape(n_chunks, n_dev, per_dev)
+    is_chunks = is_idx_np.reshape(n_chunks, n_dev, per_dev)
+    return jnp.asarray(z_chunks), jnp.asarray(is_chunks), n_cells, chunk_size
+
+
+def _chunked_pmap_runner(pmap_chunk_fn, z_chunks_pm, is_chunks_pm,
+                         n_cells, chunk_size, n_chunks):
+    """Build a Python-level chunk loop around a pmap'd per-chunk solve.
+
+    The loop intentionally lives outside pmap/JIT. Each chunk gets one pmap
+    dispatch, then ``block_until_ready`` forces the chunk's intermediates to
+    be released before scheduling the next chunk.
+    """
+    def runner(*kernel_args):
+        chunk_results = []
+        for i in range(n_chunks):
+            out = pmap_chunk_fn(
+                z_chunks_pm[i], is_chunks_pm[i], *kernel_args,
+            )
+            out[0].block_until_ready()
+            chunk_results.append(out)
+        n_outs = len(chunk_results[0])
+
+        def collapse(k):
+            flat_chunks = [
+                jnp.reshape(r[k], (chunk_size,) + r[k].shape[2:])
+                for r in chunk_results
+            ]
+            return jnp.concatenate(flat_chunks, axis=0)[:n_cells]
+
+        return tuple(collapse(k) for k in range(n_outs))
+
+    return runner
 
 
 def _chunked_vmap_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
@@ -1842,16 +1946,22 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
     n_w = pcj.wealth_grid.shape[0]
     w_ref_idx = n_w // 2
 
-    n_cells = n_z * N_state
-    pad_n = math.ceil(n_cells / n_dev) * n_dev
-    per_dev = pad_n // n_dev
+    n_chunks = int(sc.cell_vmap_chunks)
+    if n_chunks == 1:
+        n_cells = n_z * N_state
+        pad_n = math.ceil(n_cells / n_dev) * n_dev
+        per_dev = pad_n // n_dev
 
-    cell_idx = np.arange(n_cells, dtype=np.int64)
-    cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
-    z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
-    is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
-    z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
-    is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+        cell_idx = np.arange(n_cells, dtype=np.int64)
+        cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
+        z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
+        is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
+        z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
+        is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+    else:
+        z_chunks_pm, is_chunks_pm, n_cells, chunk_size = (
+            _build_chunked_pmap_index_arrays(n_z, N_state, n_chunks, n_dev)
+        )
 
     @partial(pmap, in_axes=(0, 0, None, None, None, None, None))
     def per_dev_solve(
@@ -1874,7 +1984,25 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
             )
         return vmap(per_cell)(z_block, is_block)
 
+    if n_chunks != 1:
+        runner = _chunked_pmap_runner(
+            per_dev_solve, z_chunks_pm, is_chunks_pm, n_cells, chunk_size, n_chunks,
+        )
+
     def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+        if n_chunks != 1:
+            c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+                c_next_jnp, pension_next_by_z, psi_per_z,
+                init_a_s_arr, init_a_b_arr,
+            )
+            return (
+                jnp.reshape(c_flat, (n_z, N_state, -1)),
+                jnp.reshape(s_flat, (n_z, N_state, -1)),
+                jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(ni_flat, (n_z, N_state)),
+                jnp.reshape(nb_flat, (n_z, N_state)),
+            )
+
         (c_pm, as_pm, ab_pm,
          ni_pm, nb_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
@@ -2036,16 +2164,22 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
     n_w = pcj.wealth_grid.shape[0]
     w_ref_idx = n_w // 2
 
-    n_cells = n_z * N_state
-    pad_n = math.ceil(n_cells / n_dev) * n_dev
-    per_dev = pad_n // n_dev
+    n_chunks = int(sc.cell_vmap_chunks)
+    if n_chunks == 1:
+        n_cells = n_z * N_state
+        pad_n = math.ceil(n_cells / n_dev) * n_dev
+        per_dev = pad_n // n_dev
 
-    cell_idx = np.arange(n_cells, dtype=np.int64)
-    cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
-    z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
-    is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
-    z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
-    is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+        cell_idx = np.arange(n_cells, dtype=np.int64)
+        cell_idx_padded = np.concatenate([cell_idx, np.full(pad_n - n_cells, cell_idx[-1])])
+        z_idx_padded = (cell_idx_padded // N_state).astype(np.int64)
+        is_idx_padded = (cell_idx_padded % N_state).astype(np.int64)
+        z_pm = jnp.asarray(z_idx_padded.reshape(n_dev, per_dev))
+        is_pm = jnp.asarray(is_idx_padded.reshape(n_dev, per_dev))
+    else:
+        z_chunks_pm, is_chunks_pm, n_cells, chunk_size = (
+            _build_chunked_pmap_index_arrays(n_z, N_state, n_chunks, n_dev)
+        )
 
     @partial(pmap, in_axes=(0, 0, None, None, None, None, None, None))
     def per_dev_solve(
@@ -2094,10 +2228,28 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
 
         return vmap(per_cell)(z_block, is_block)
 
+    if n_chunks != 1:
+        runner = _chunked_pmap_runner(
+            per_dev_solve, z_chunks_pm, is_chunks_pm, n_cells, chunk_size, n_chunks,
+        )
+
     def call(
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
+        if n_chunks != 1:
+            c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+                c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
+                init_a_s_arr, init_a_b_arr,
+            )
+            return (
+                jnp.reshape(c_flat, (n_z, N_state, -1)),
+                jnp.reshape(s_flat, (n_z, N_state, -1)),
+                jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(ni_flat, (n_z, N_state)),
+                jnp.reshape(nb_flat, (n_z, N_state)),
+            )
+
         (c_pm, as_pm, ab_pm,
          ni_pm, nb_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,

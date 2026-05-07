@@ -6,34 +6,49 @@ fori_loop Newton, the diag histogram from this run pins p99 for tuning
 max_iter on the next cycle.
 
 Config rationale:
-    state_grid_sizes  = (6, 6, 6, 6)        # N_state = 1296
-    state_n_stds      = (2.0, 2.25, 2.0, 2.25)  # match 5^4 benchmark coverage
+    state_grid_sizes  = (6, 6, 6, 6)             # N_state = 1296
+    state_n_stds      = (2.0, 2.25, 2.0, 2.25)   # match 5^4 benchmark coverage
+    n_stds            = 2.25                     # z-axis (labour income) half-width
     n_z               = 11
     n_wealth          = 180,  wealth_min = 0.05
     n_savings         = 180
-    n_eps_nodes       = 4,    n_eta_nodes = 4    # retirement-only; not exercised
-    n_ret_nodes_1d    = (5, 5)                   # canonical
-    n_state_quad_nodes= (2, 3, 2, 3)             # reduced (matches 5^4 benchmark)
+    n_eps_nodes       = 4,    n_eta_nodes = 3    # retirement-only; not exercised here
+                                                  # (working-age multiplier 4*3=12 for next solve)
+    n_ret_nodes_1d    = (3, 3)                   # 9 nodes; tightened to make room
+    n_state_quad_nodes= (3, 3, 3, 5)             # K-bump on y_1 axis (the big win)
+    state_lobatto_Z   = (None, None, None, 2.93) # Lobatto only on bumped y_1 axis
+    ret_lobatto_Z     = None                     # K=3 GH > K=3 Lobatto on poly exactness
     youngest_age_to_solve = 67                   # retirement-only (33 ages)
     wealth_dynamics_spec  = "ccv_log"
     max_iter          = 100                      # first 6^4 run; calibrate after
-    delta_bequest     = 0.0                      # explicit; bequest motive off
-    gather_precision  = "f32"                    # ~1.5-2x wall, bit-identity verified
-    cell_vmap_chunks  = 1                        # 8x device sharding handles memory
-    ret_lobatto_Z     = None
-    state_lobatto_Z   = None
+    delta_bequest     = 0.0                      # standard CRRA bequest (no luxury shift)
+    gather_precision  = "f32"                    # ~1.4x wall, bit-identity verified
+    cell_vmap_chunks  = 8                        # 2x H100 with safety margin (45 GB peak)
 
 Numerical-accuracy note:
-    delta_bequest=0.0 makes b'(W) -> infinity as W -> 0, which can stress the
-    Newton solver near the low-wealth boundary. Lobatto tails OFF matches the
-    5^4 benchmark choices but provides no extra robustness in extreme cells.
-    If diag['total_newton_failures'] > 0, the first thing to try on a re-run is
-    state_lobatto_Z=(None, 7.0, None, 7.0); only after that, revisit delta.
+    delta_bequest=0.0 reduces the shifted bequest to standard CRRA b̄ * W^(1-γ);
+    b'(W) -> infinity as W -> 0 stresses Newton near the low-wealth boundary.
+    Lobatto tails OFF; arbitrage was clean at the prior (2,3,2,3)/(5,5) config so
+    the denser (3,3,3,3)/(4,4) here should be at least as clean. If
+    diag['total_newton_failures'] > 0, the first try is enabling Lobatto on a
+    state-axis pair (e.g. state_lobatto_Z=(None, 7.0, None, 7.0)); revisit delta
+    only after that.
 
-Memory budget on 8x H100/A100 80GB SXM (cell-axis sharded):
-    n_cells = 11 * 1296 = 14256, /8 = 1782 cells/device
-    per-cell c_corners at this quad ~ 9 MB (n_state_quad=36, n_w=180)
-    per-device working set ~ 16 GB (well under 80 GB HBM)
+Memory budget on 2x H100 / 8x H100 SXM (cell-axis sharded + chunked):
+    n_cells = 11 * 1296 = 14256
+    per-cell c_corners at this quad ~ 34 MB (n_state_quad=135, n_w=180)
+
+    On 2x H100 (cells/dev = 7128, cell_vmap_chunks=8):
+      per-chunk per-device working set = (7128/8) * 34 MB = ~30 GB analytical
+      (~45 GB with XLA 1.5x overhead; comfortable margin under 80 GB HBM)
+
+    On 8x H100 (cells/dev = 1782, cell_vmap_chunks=8 still active):
+      per-chunk per-device working set = (1782/8) * 34 MB = ~7.5 GB
+      (well under 80 GB HBM; chunks add negligible wall, kept for portability)
+
+    Without chunking (cell_vmap_chunks=1) the 2x H100 path would OOM
+    (7128 * 34 MB = 240 GB analytical with XLA overhead). chunks=4 was
+    borderline at 91 GB peak; chunks=8 gives 2x safety margin.
 
 Outputs:
     ./saved_runs/<bundle-name>/                — local bundle (npz + metadata)
@@ -59,17 +74,24 @@ from lifecycle.solver import run_lifecycle_solver
 from lifecycle.policy_io import save_policy_bundle
 from lifecycle.diagnostics import diagnose_terminal_portfolio_states
 
-BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid6x6x6x6_nz11_jax_benchmark"
+BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid6x6x6x6_nz11_y1lob_calib1"
 BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
 
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
     state_grid_sizes=(6, 6, 6, 6),
     state_n_stds=(2.0, 2.25, 2.0, 2.25),
-    n_ret_nodes_1d=(5, 5),
+    n_stds=2.25,
+    n_eta_nodes=3,
+    # K-bump on y_1 axis with Lobatto Z=2.93: targeted accuracy gain on the
+    # bond-yield axis where alpha sensitivity is highest. K=3 GH on the other
+    # state axes. Smolyak audit recommended this as "the big win" subset of
+    # the full (5,3,3,5) Lobatto config.
+    n_state_quad_nodes=(3, 3, 3, 5),
+    state_lobatto_Z=(None, None, None, 2.93),
+    # No Lobatto on ret: K=3 Lobatto would lose polynomial exactness vs K=3 GH.
+    n_ret_nodes_1d=(3, 3),
     ret_lobatto_Z=None,
-    n_state_quad_nodes=(2, 3, 2, 3),
-    state_lobatto_Z=None,
 )
 solver_config = CANONICAL_SOLVER._replace(
     wealth_dynamics_spec="ccv_log",
@@ -77,7 +99,7 @@ solver_config = CANONICAL_SOLVER._replace(
     max_iter_unconstrained=100,
     delta_bequest=0.0,
     gather_precision="f32",
-    cell_vmap_chunks=1,
+    cell_vmap_chunks=8,
 )
 solve_control = SolveControl(
     youngest_age_to_solve=67,

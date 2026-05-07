@@ -688,11 +688,12 @@ def get_state_quadrature(model, n_nodes=3, lobatto_Z=None):
 
     The Cholesky transform `v = L u` (lower-triangular) makes the per-axis
     K_per_dim[d] interpretable: under Cholesky factorization of Σ_ss with
-    state ordering (cy, spr, y_1) (default since 2026-04-30), axis 0 is
-    pure cy innovation, axis 1 is mostly spr innovation, axis 2 is
-    residual y_1 innovation. Refining K[2] is the targeted lever for
-    bond-return integration accuracy at high γ × |α| because
-    `M[xb, y_1] = -8.7` is the dominant v-channel for bond returns.
+    state ordering (dp, spr, rtb, y_1) (default since 2026-05-07), axis 0 is
+    pure dp innovation, axis 1 is mostly spr innovation, axis 2 is
+    residual rtb innovation, axis 3 is residual y_1 innovation. Refining
+    the y_1 axis is the targeted lever for bond-return integration accuracy
+    at high γ × |α| because `M[xb, y_1]` is the dominant v-channel for
+    bond returns.
 
     Parameters
     ----------

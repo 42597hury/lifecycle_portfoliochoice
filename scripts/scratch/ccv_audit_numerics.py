@@ -96,7 +96,7 @@ def main():
     _line(f"z_bar_ret (model.z_bar_ret): {np.asarray(model.z_bar_ret)}")
     _line(f"Implied state mean: {dict(zip(state_names, z_bar_state))}")
     _line(f"Implied ret mean:   {dict(zip(ret_names, z_bar_ret))}")
-    _line("(In our calibration: y_1=4.85%, spr=1.99%, cy=-2.99, rtb=0.91%, xr=5.55%, xb=1.43%)")
+    _line("(In Option A 1920-2011 calibration: y_1=4.40%, spr=1.26pp, dp=-3.26, rtb=1.64%, xr=5.18%, xb=1.07%)")
 
     _line("")
     _line("--- 4. CCV vol scalars actually consumed by the kernel ---")

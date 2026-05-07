@@ -3,7 +3,7 @@
 Mirrors `configs/sweep_main/01_base.py` but with a smaller state grid for
 faster local iteration. Inherits canonical economics + solver from
 `configs/_canonical.py`; overrides only `state_grid_sizes`. State vector is
-4D post rtb-as-state ((cy, spr, rtb, y_1)).
+4D ((dp, spr, rtb, y_1)).
 
 Run with:
     python scripts/run_solve.py configs/system_iv_5x5x5.py --no-upload

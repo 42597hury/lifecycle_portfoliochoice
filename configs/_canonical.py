@@ -62,10 +62,11 @@ CANONICAL_DISC = DiscretizationConfig(
     wealth_min=0.13,
     wealth_max=750.0,
     n_savings=180,
-    # Post rtb-as-state migration: state vector is (cy, spr, rtb, y_1).
-    # Axis 0 = cy (clean orthogonal knob), axis 1 = spr, axis 2 = rtb
-    # (inflation-surprise axis, between spr and y_1 to break their rho=-0.87
-    # adjacency), axis 3 = y_1 (bond-return refinement target).
+    # State vector is (dp, spr, rtb, y_1) (post 2026-05-07 dp migration).
+    # Axis 0 = dp (slow predictor), axis 1 = spr, axis 2 = rtb (inflation-surprise
+    # axis, between spr and y_1), axis 3 = y_1 (bond-return refinement target).
+    # Axis-specific n_stds tuned for cy; with dp the orthogonality structure
+    # differs and the per-axis allocation may benefit from re-tuning.
     state_grid_sizes=(7, 7, 7, 7),
     state_grid_mode="cholesky",
     state_n_stds=(2.0, 2.25, 2.0, 2.25),

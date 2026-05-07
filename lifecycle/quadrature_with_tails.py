@@ -295,8 +295,8 @@ def get_state_quadrature_with_axis_tails(model, K_per_dim, axis: int, Z: float):
     """State-innovation quadrature with prescribed tails on the chosen axis.
 
     Drop-in replacement for `discretization.get_state_quadrature(model, K_per_dim)`.
-    Under the default state ordering post rtb-as-state (cy, spr, rtb, y_1):
-        axis = 0  ->  prescribed tails on cy axis
+    Under the default state ordering (dp, spr, rtb, y_1) (post 2026-05-07 dp migration):
+        axis = 0  ->  prescribed tails on dp axis
         axis = 1  ->  prescribed tails on spr-purified axis
         axis = 2  ->  prescribed tails on rtb-purified axis (inflation surprise)
         axis = 3  ->  prescribed tails on y_1-purified axis  <-- bond driver

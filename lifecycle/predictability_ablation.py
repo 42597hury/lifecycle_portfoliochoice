@@ -12,7 +12,7 @@ from lifecycle.var import (
 )
 
 
-DEFAULT_TEMPLATE_STATE_NAMES = ("cy", "spr", "rtb", "y_1")
+DEFAULT_TEMPLATE_STATE_NAMES = ("dp", "spr", "rtb", "y_1")
 
 
 class PredictabilitySystemSpec(NamedTuple):
@@ -45,7 +45,7 @@ _SYSTEM_SPECS: dict[str, PredictabilitySystemSpec] = {
         code="III",
         label="system_iii_rtb_spr_y1",
         name="rtb plus spread plus y_1",
-        description="Rate-side predictability with inflation persistence; cy removed; state ordered (rtb, spr, y_1).",
+        description="Rate-side predictability with inflation persistence; dp removed; state ordered (rtb, spr, y_1).",
         builder=build_no_cy_var_config,
         state_names=("rtb", "spr", "y_1"),
     ),
@@ -53,9 +53,9 @@ _SYSTEM_SPECS: dict[str, PredictabilitySystemSpec] = {
         code="IV",
         label="system_iv_full_var",
         name="full VAR baseline",
-        description="Baseline lifecycle model with the full (cy, spr, rtb, y_1) state vector.",
+        description="Baseline lifecycle model with the full (dp, spr, rtb, y_1) state vector.",
         builder=build_nominal_system1_var_config,
-        state_names=("cy", "spr", "rtb", "y_1"),
+        state_names=("dp", "spr", "rtb", "y_1"),
     ),
 }
 

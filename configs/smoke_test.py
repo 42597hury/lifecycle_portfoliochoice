@@ -2,7 +2,7 @@
 
 Inherits canonical economics + solver from `configs/_canonical.py`;
 overrides discretization knobs hard for a 2-5 minute solve. State vector is
-4D post rtb-as-state ((cy, spr, rtb, y_1)); return block is (xr, xb).
+4D ((dp, spr, rtb, y_1)); return block is (xr, xb).
 
 Bundle name will be:
     system_iv_full_var_unconstrained_cholesky_grid3x3x3x3_nz5_smoke

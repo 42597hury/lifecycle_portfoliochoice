@@ -69,12 +69,11 @@ solver_config = CANONICAL_SOLVER._replace(
     cell_vmap_chunks=1,
 )
 
-solve_control = SolveControl(
-    youngest_age_to_solve=22,                     # full lifecycle
-    checkpoint_every_n_ages=10,
-    save_on_interrupt=True,
-    return_partial_on_interrupt=True,
-)
+# Note: SolveControl built per-run inside the loop — checkpoint_path needs to
+# be unique per (n_eta, n_eps) variant. Default auto-derived path uses only
+# (state_grid_sizes, n_z) and would collide across eta/eps variants at fixed
+# n_z, causing later runs to load+skip the earlier checkpoint without
+# resolving (the bug that bit the first attempted run of this sweep).
 
 print("=" * 70, flush=True)
 print("JAX SWEEP: System I (rtb-only) lifecycle full-solve, (n_eta, n_eps) sensitivity", flush=True)
@@ -103,6 +102,19 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
     print(f"  Bundle: {bundle_name}", flush=True)
     print(f"  S3:     {s3_uri or '(no S3 upload — S3_BUCKET not set)'}", flush=True)
     print("=" * 70, flush=True)
+
+    # Per-run SolveControl with unique checkpoint_path including n_eta/n_eps.
+    # Without this, all variants at fixed n_z share the same default
+    # checkpoint path and later runs short-circuit by loading the earlier
+    # bundle and reporting it as "complete" with zero Newton iters.
+    checkpoint_tag = f"jax_cholesky_grid7_nz{N_Z_FIXED}_eta{n_eta}eps{n_eps}_to_age22"
+    solve_control = SolveControl(
+        youngest_age_to_solve=22,
+        checkpoint_every_n_ages=10,
+        save_on_interrupt=True,
+        return_partial_on_interrupt=True,
+        checkpoint_path=os.path.join("saved_runs", "checkpoints", checkpoint_tag),
+    )
 
     # Override n_eta and n_eps in the template; n_z stays fixed
     template_disc = template_disc_base._replace(n_eta_nodes=n_eta, n_eps_nodes=n_eps)

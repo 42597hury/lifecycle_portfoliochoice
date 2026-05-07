@@ -2732,6 +2732,15 @@ def run_lifecycle_solver(
                         checkpoint_save_count=checkpoint_save_count,
                         checkpoint_path=checkpoint_path,
                     )
+                    # Histograms also at periodic checkpoints, so partial
+                    # bundles carry max_iter calibration data even when the
+                    # run is interrupted before the post-loop aggregator at
+                    # line 2784 can run. ~1ms cost per checkpoint.
+                    ni_diag_ck, nb_diag_ck = _build_iter_histograms(
+                        newton_iter_per_age, backtrack_iter_per_age, ages, solved_age_mask,
+                    )
+                    diag["newton_iter_histogram"] = ni_diag_ck
+                    diag["backtrack_iter_histogram"] = nb_diag_ck
                     # Materialise to NumPy at checkpoint boundary (single
                     # D->H pass for the slabs solved so far).
                     C_ckpt, S_ckpt, B_ckpt = _materialize_policy_lists(

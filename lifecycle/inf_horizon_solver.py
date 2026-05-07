@@ -571,64 +571,78 @@ def run_infinite_horizon_solver(
               f"(devices={n_dev}, max_iter={max_iter})...")
 
     t_start = time.time()
-    for it in range(max_iter):
-        c_old_jnp = jnp.asarray(C_old)
-        # Newton init at each cell is gathered from the previous iteration's
-        # converged share policy at mid-wealth (the kernel's convention). This
-        # mirrors run_lifecycle_solver's use_backward_age_warm_start=True
-        # behavior in the time dimension. Cost: 2x extra device upload per
-        # iteration; gain: typically 3-8 Newton iters/cell once near the fixed
-        # point, vs much higher under cold init.
-        s_old_jnp = jnp.asarray(S_old)
-        b_old_jnp = jnp.asarray(B_old)
-        c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp = retirement_kernel(
-            c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
-        )
-        C_new = np.asarray(c_new_jnp)
-        S_new = np.asarray(s_new_jnp)
-        B_new = np.asarray(b_new_jnp)
-        newton_iter_per_iter.append(np.asarray(ni_jnp))
-        backtrack_iter_per_iter.append(np.asarray(nb_jnp))
+    interrupted = False
+    # Mirrors lifecycle/solver.py:2642 / 2755-2758: on Ctrl-C, fall through to
+    # _build_diagnostics + return so the caller can save a partial bundle. The
+    # last fully-committed (C_old, S_old, B_old) and n_iter_done stay in sync
+    # because both update at the *end* of each iteration body.
+    try:
+        for it in range(max_iter):
+            c_old_jnp = jnp.asarray(C_old)
+            # Newton init at each cell is gathered from the previous iteration's
+            # converged share policy at mid-wealth (the kernel's convention). This
+            # mirrors run_lifecycle_solver's use_backward_age_warm_start=True
+            # behavior in the time dimension. Cost: 2x extra device upload per
+            # iteration; gain: typically 3-8 Newton iters/cell once near the fixed
+            # point, vs much higher under cold init.
+            s_old_jnp = jnp.asarray(S_old)
+            b_old_jnp = jnp.asarray(B_old)
+            c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp = retirement_kernel(
+                c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
+            )
+            C_new = np.asarray(c_new_jnp)
+            S_new = np.asarray(s_new_jnp)
+            B_new = np.asarray(b_new_jnp)
+            newton_iter_per_iter.append(np.asarray(ni_jnp))
+            backtrack_iter_per_iter.append(np.asarray(nb_jnp))
 
-        # Damped update.
-        if damping == 1.0:
-            C_next, S_next, B_next = C_new, S_new, B_new
-        else:
-            C_next = damping * C_new + (1.0 - damping) * C_old
-            S_next = damping * S_new + (1.0 - damping) * S_old
-            B_next = damping * B_new + (1.0 - damping) * B_old
-
-        policy_err, xi_err, share_err = _compute_metrics_numpy(
-            C_old, C_next, S_old, S_next, B_old, B_next, pc.wealth_grid, trim_wealth_points,
-        )
-        policy_supnorm_history.append(policy_err)
-        xi_supnorm_history.append(xi_err)
-        share_supnorm_history.append(share_err)
-
-        C_old, S_old, B_old = C_next, S_next, B_next
-        n_iter_done = it + 1
-        stop_err = max(xi_err, share_err)
-
-        if show_progress and progress_every > 0 and ((it + 1) % progress_every == 0):
-            if show_progress_probe:
-                probe_W = float(pc.wealth_grid[probe_w])
-                probe_c = float(C_old[probe_z, probe_s, probe_w])
-                probe_s_val = float(S_old[probe_z, probe_s, probe_w])
-                probe_b_val = float(B_old[probe_z, probe_s, probe_w])
-                _print_progress_line(
-                    it + 1, xi_err, share_err, stop_err,
-                    True, probe_W, probe_c / probe_W if probe_W > 0 else float("nan"),
-                    probe_s_val, probe_b_val, 1.0 - probe_s_val - probe_b_val,
-                )
+            # Damped update.
+            if damping == 1.0:
+                C_next, S_next, B_next = C_new, S_new, B_new
             else:
-                _print_progress_line(
-                    it + 1, xi_err, share_err, stop_err,
-                    False, 0.0, 0.0, 0.0, 0.0, 0.0,
-                )
+                C_next = damping * C_new + (1.0 - damping) * C_old
+                S_next = damping * S_new + (1.0 - damping) * S_old
+                B_next = damping * B_new + (1.0 - damping) * B_old
 
-        if it > 0 and stop_err < tol:
-            converged = True
-            break
+            policy_err, xi_err, share_err = _compute_metrics_numpy(
+                C_old, C_next, S_old, S_next, B_old, B_next, pc.wealth_grid, trim_wealth_points,
+            )
+            policy_supnorm_history.append(policy_err)
+            xi_supnorm_history.append(xi_err)
+            share_supnorm_history.append(share_err)
+
+            C_old, S_old, B_old = C_next, S_next, B_next
+            n_iter_done = it + 1
+            stop_err = max(xi_err, share_err)
+
+            if show_progress and progress_every > 0 and ((it + 1) % progress_every == 0):
+                if show_progress_probe:
+                    probe_W = float(pc.wealth_grid[probe_w])
+                    probe_c = float(C_old[probe_z, probe_s, probe_w])
+                    probe_s_val = float(S_old[probe_z, probe_s, probe_w])
+                    probe_b_val = float(B_old[probe_z, probe_s, probe_w])
+                    _print_progress_line(
+                        it + 1, xi_err, share_err, stop_err,
+                        True, probe_W, probe_c / probe_W if probe_W > 0 else float("nan"),
+                        probe_s_val, probe_b_val, 1.0 - probe_s_val - probe_b_val,
+                    )
+                else:
+                    _print_progress_line(
+                        it + 1, xi_err, share_err, stop_err,
+                        False, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    )
+
+            if it > 0 and stop_err < tol:
+                converged = True
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        if verbose:
+            print(
+                f"\n  Inf-horizon solve interrupted at iter {n_iter_done}. "
+                f"Returning partial output.",
+                flush=True,
+            )
 
     if show_progress and n_iter_done > 0:
         print()
@@ -646,7 +660,12 @@ def run_infinite_horizon_solver(
     )
 
     if verbose:
-        status = "converged" if converged else "hit max_iter"
+        if interrupted:
+            status = "interrupted"
+        elif converged:
+            status = "converged"
+        else:
+            status = "hit max_iter"
         print(
             f"Infinite-horizon solve {status} after {n_iter_done} iterations; "
             f"final stopping error = {diagnostics['final_stopping_supnorm']:.3e}; "

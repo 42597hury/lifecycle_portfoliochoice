@@ -1,7 +1,7 @@
 """Inf-horizon Sweep A: state-grid density sensitivity.
 
-Sweeps state_grid_sizes ∈ {(3,3,3,3), (4,4,4,4), (5,5,5,5), (6,6,6,6)} at
-fixed quadrature floor (state_quad=(3,3,3,4) with K-bump on y_1; ret=(4,4)).
+Sweeps state_grid_sizes ∈ {(3,3,3,3), (4,4,4,4), (5,5,5,5)} at fixed
+quadrature floor (state_quad=(3,3,3,4) with K-bump on y_1; ret=(4,4)).
 The bumped floor is conservative — ret-quad and y_1-axis state-quad both at
 4 — so any state-grid divergence we observe is attributable to the grid,
 not to under-resolved orthogonal quadratures.
@@ -11,20 +11,16 @@ Per-bundle path:
 
 Each bundle contains policy_arrays.npz, metadata.json, diagnostics.pkl with
 the post-fix per-savings Newton-iter histogram, full per-iter convergence
-trajectory, and (when the failure-count wiring lands)
-total_newton_failures.
+trajectory, and total_newton_failures (post the per-cell exit-code wiring).
 
-Wall projection on 8× A100 SXM4 (rough; first cell measures the truth):
-    g3 (3⁴ =   81 cells): ~5–7 min
-    g4 (4⁴ =  256 cells): ~8–12 min
-    g5 (5⁴ =  625 cells): ~12–19 min
-    g6 (6⁴ = 1296 cells): ~22–36 min
-    total: ~50–75 min ≈ ~$5–8
+Wall projection on 1× A100 SXM4 (rough; first cell measures the truth):
+    g3 (3⁴ =  81 cells): ~17 min
+    g4 (4⁴ = 256 cells): ~30 min
+    g5 (5⁴ = 625 cells): ~48 min
+    total: ~95 min ≈ 1.6 h ≈ ~$2
 
-(Faster than the 2× H100 projections in
-docs/handoff/HANDOFF_INF_HORIZON_SENSITIVITY_PROGRAM.md because of the
-~2.5× combined throughput on 8× A100; at the smallest cells, per-device
-launch overhead caps the speedup.)
+(g6 = 6⁴ dropped per user direction — adds ~90 min for marginal extra
+information beyond the g4-vs-g5 verdict.)
 """
 import os
 import shutil
@@ -51,7 +47,6 @@ SWEEP_CELLS = (
     ("g3", (3, 3, 3, 3)),
     ("g4", (4, 4, 4, 4)),
     ("g5", (5, 5, 5, 5)),
-    ("g6", (6, 6, 6, 6)),
 )
 
 # Bumped floor: ret nodes (4,4); state quad (3,3,3,4) with K-bump on y_1.

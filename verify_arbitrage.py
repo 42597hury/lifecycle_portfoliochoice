@@ -149,18 +149,82 @@ def _build_pc_from_bundle(bundle_path: Path, verbose: bool):
     return model, pc, disc_config, metadata
 
 
+_CONFIG_NAMES = {
+    "base_config", "BASE_CONFIG",
+    "disc_config", "disc_config_template", "DISC_CONFIG",
+}
+
+
+def _is_config_assign(stmt) -> bool:
+    """Whitelist: keep only assignments whose target is one of the known
+    config names. Skips ``model = build_model(...)``, ``pc = build_precompute(...)``,
+    and especially ``C, S, B, diag = run_lifecycle_solver(...)`` — none of
+    which are config definitions."""
+    import ast
+    if isinstance(stmt, ast.Assign):
+        names = []
+        for tgt in stmt.targets:
+            if isinstance(tgt, ast.Name):
+                names.append(tgt.id)
+            elif isinstance(tgt, (ast.Tuple, ast.List)):
+                for elt in tgt.elts:
+                    if isinstance(elt, ast.Name):
+                        names.append(elt.id)
+        return any(n in _CONFIG_NAMES for n in names)
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        return stmt.target.id in _CONFIG_NAMES
+    return False
+
+
+def _safe_load_config_module(config_path: Path) -> dict:
+    """Parse a .py file with AST and execute ONLY:
+      - top-level imports, AND
+      - top-level assignments whose target is in ``_CONFIG_NAMES``.
+
+    Function/class definitions, expression statements, control flow blocks,
+    and any other assignment (e.g. ``model =``, ``pc =``,
+    ``C, S, B, diag = run_lifecycle_solver(...)``) are skipped. This lets us
+    extract ``disc_config`` from a runner script
+    (e.g. ``verify_benchmark_bundle_6666.py``) without kicking off the
+    solve, save, or S3 upload that the script does at module top level.
+
+    Returns the resulting namespace dict.
+    """
+    import ast
+    source = config_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(config_path))
+
+    safe_body = [
+        stmt for stmt in tree.body
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) or _is_config_assign(stmt)
+    ]
+
+    safe_module = ast.Module(body=safe_body, type_ignores=[])
+    code = compile(safe_module, filename=str(config_path), mode="exec")
+    namespace: dict[str, Any] = {"__name__": "__cfg__", "__file__": str(config_path)}
+    exec(code, namespace)
+    return namespace
+
+
 def _build_pc_from_config(config_path: Path, verbose: bool):
-    spec = importlib.util.spec_from_file_location("cfg", config_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load config module {config_path}")
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    base_config = getattr(m, "base_config", None) or getattr(m, "BASE_CONFIG", None)
-    disc_config = getattr(m, "disc_config_template", None) or getattr(m, "DISC_CONFIG", None)
+    namespace = _safe_load_config_module(config_path)
+
+    base_config = (
+        namespace.get("base_config")
+        or namespace.get("BASE_CONFIG")
+    )
+    disc_config = (
+        namespace.get("disc_config")
+        or namespace.get("disc_config_template")
+        or namespace.get("DISC_CONFIG")
+    )
     if base_config is None or disc_config is None:
         raise ValueError(
-            f"Config {config_path} must define base_config and disc_config_template."
+            f"Config {config_path} must define one of "
+            f"(base_config / BASE_CONFIG) AND one of "
+            f"(disc_config / disc_config_template / DISC_CONFIG)."
         )
+
     var_config = build_nominal_system1_var_config_hardcoded()
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)

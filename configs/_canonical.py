@@ -72,8 +72,14 @@ CANONICAL_DISC = DiscretizationConfig(
     state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_z=11,
     n_stds=3.0,
+    # Income-shock quadrature density. Sensitivity sweep on System I
+    # (saved_runs/ablations/system_i_grid7_nz30_eta{3eps4,4eps5,6eps6}_calib1)
+    # showed policy variation under 0.5% across (3,4) → (4,5) → (6,6) at
+    # γ=5 and full-VAR baseline. (3,4) is the canonical default going
+    # forward; eps ≥ eta convention preserved. Override per-run if you want
+    # to revisit at different γ or different ablation system.
     n_eps_nodes=4,
-    n_eta_nodes=4,
+    n_eta_nodes=3,
     # Return block now (xr, xb) — n_ret_nodes_1d / ret_lobatto_Z drop the
     # leading rtb axis. Lobatto tails on both stock and bond residuals at
     # Z=7 sigma (the tail-correction setting validated against the bond-tail

@@ -30,11 +30,8 @@ pre-migration 3-D state era and does not transfer mechanically.
   optimal under a calibration the locked spec just declared wrong; they
   remain valid as system-validation artefacts but will be re-solved on the
   new VAR before any thesis figure is generated from them.
-- **Cholesky/quadrature mathematical-correctness audit**
-  (`docs/handoff/HANDOFF_CHOLESKY_QUADRATURE_AUDIT.md`): Phase A audit of
-  the two-stage Cholesky decomposition + tensor-product GH discretisation.
-  Findings will land in `docs/scans/CHOLESKY_QUAD_AUDIT_<DATE>.md` and may
-  trigger a retroactive re-run of recent entries here.
+- *(Cholesky/quadrature mathematical-correctness audit completed
+  2026-05-07 — GREEN, see Resolved below.)*
 
 ---
 
@@ -425,8 +422,21 @@ unchanged, support widths and dimensionality changed):
 
 ### Resolved
 
-- *(empty — fresh tracker; resolved findings will land here as cycles
-  complete and the patch journal accumulates)*
+- **Cholesky / VAR-innovation quadrature mathematical correctness
+  (2026-05-07).** Two-stage decomposition `v^(r) = M v^(s) + ε`,
+  `M = Σ_rs Σ_ss⁻¹`, `Σ_{r|cond} = Σ_rr − M Σ_ss Mᵀ` audited from first
+  principles. 82 / 82 numerical gates passed at machine epsilon
+  (≤ 5e-17 relative for second-moment recovery). Critical cross-block
+  test `Σ̂_rs = Σ_rs` clean to 2.08e-17. Schur complement, Cholesky
+  factor invariants, per-axis Cholesky labelling claim, K=1 fast path,
+  and `_validate_state_quadrature` post-rtb-as-state migration all
+  consistent. The 2026-05-06 `Sigma_rr` vs `Sigma_r_cond` separation
+  patch is honoured at every consumer site. **No bug found, no Phase B
+  work indicated.** Audit artefacts (handoff brief, scan report, log,
+  audit script) tossed after completion — the tracker entry is the
+  durable record. Any future doubt: re-derive the Schur complement and
+  re-run the moment-matching gates from scratch (one afternoon's work
+  on the canonical model).
 
 ### Still open
 

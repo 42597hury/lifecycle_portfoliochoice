@@ -157,16 +157,20 @@ gate2_pass = rel_C < TOL and rel_S < TOL and rel_B < TOL and (inf_C + inf_S + in
 
 print("\n[gate 3] HLO inspection of f32 retirement kernel ...")
 # Lower the JIT'd kernel to HLO text.
-# The kernel's call signature accepts (c_next, pension_next, psi, init_a_s, init_a_b).
-# We pass the same args we just used for solve_one_age('f32').
-# Build dummy args with correct shapes.
+# Post-chunking refactor, the inner JIT is `per_chunk(c_next, pension, psi,
+# init_a_s, init_a_b, z_chunk, is_chunk)` — the trailing two args are the
+# cell-index slices the K=1 fast-path supplies as `z_idx_padded[:n_cells]`
+# and `is_idx_padded[:n_cells]` (int64, shape (n_cells,)).
 pcj32 = _pc_to_jnp(pc, DELTA_BEQUEST)
 init_arr_shape = (pc.n_z, pc.N_state, pc.n_w)
+n_cells = pc.n_z * pc.N_state
 dummy_c = jnp.zeros(init_arr_shape, dtype=jnp.float64)
 dummy_pension = jnp.zeros(pc.n_z, dtype=jnp.float64)
 dummy_psi = jnp.ones(pc.n_z, dtype=jnp.float64)
 dummy_init_s = jnp.full(init_arr_shape, 0.5, dtype=jnp.float64)
 dummy_init_b = jnp.full(init_arr_shape, 0.4, dtype=jnp.float64)
+dummy_z_chunk = jnp.zeros(n_cells, dtype=jnp.int64)
+dummy_is_chunk = jnp.zeros(n_cells, dtype=jnp.int64)
 
 # The retirement_kernel returned by builder is `def call(...)` wrapping the JIT.
 # Find the @jit'd inner function in its closure (the one that has .lower).
@@ -181,6 +185,7 @@ if jitted is None:
 
 hlo_text = jitted.lower(
     dummy_c, dummy_pension, dummy_psi, dummy_init_s, dummy_init_b,
+    dummy_z_chunk, dummy_is_chunk,
 ).as_text()
 
 # Coarse counts (StableHLO/MLIR format: tensor<...xf32>, tensor<...xf64>).

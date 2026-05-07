@@ -467,11 +467,11 @@ You handle:
 ## 12. The user
 
 The user (`hugo@rybergs.net`, git user `42597hury`) is writing a thesis
-on lifecycle portfolio choice with predictability ablations. They're
+on lifecycle portfolio choice with predictability. They're
 technically sharp, want honest analysis (not glossy claims), and pay
 real money for GPU runs. Their priorities:
 
-1. **Economic accuracy** (publication-quality EE residuals)
+1. **Economic accuracy** (publication-quality)
 2. **Runtime** (so iteration cycles are practical)
 3. **Cost discipline** (Lambda runs are billable)
 4. **Honest framing** (push back on overclaims, even from yourself)
@@ -483,3 +483,122 @@ When they push back ("we gain nothing here right?"), they're usually
 right. Don't defend a position past one round of pushback.
 
 When they say "I trust this," ship.
+
+---
+
+## 13. Session state — last updated 2026-05-07
+
+> **This section is ephemeral.** Each session ends with a refresh of
+> what's in flight, what's deferred, and what the user is most likely to
+> ask about next. Future orchestrators: when you wrap a session, replace
+> this section with the new state. When the user comes back and asks
+> "what's next?", read this first.
+
+### Bundle production status
+
+- **Tonight's measured baseline:** 5⁴ retirement-only on 1× GH200 at
+  `max_iter=100`, reduced quad `(2,3,2,3)`. Wall: 273 s/age × 33 ages
+  = 150 min. Bundle in S3 + on laptop. Grid-EE ran on it: max log10|EE|
+  = -2.0 (1% worst cell), tighter than main v3 on every comparable
+  metric.
+- **Next bundle target:** 6⁴ retirement-or-full-solve. Config drafted
+  in `verify_benchmark_bundle_6666.py` (uncommitted) but user flagged
+  it "launches unnecessary legacy functions" — wants a stripped-down
+  runner before launch. **Open design question.**
+- **Hardware status:** Lambda 8× H100 / 8× A100 are *out of capacity*;
+  2× H100 SXM5 80GB available at $8.38/hr. User decided **not to launch
+  tonight**; waiting for 8× capacity OR willing to use 2× when the
+  config decision is settled.
+
+### Pending decisions waiting for user
+
+1. **Full-solve scope vs retirement-only.** User said "always measure
+   both retirement and working — looking for reasonable mean log EE on
+   full solve." Implies the next bundle should be a full lifecycle, not
+   retirement-only. **Cost implication:** ~6× wall multiplier vs
+   retirement-only (working-age `eta×eps` integration). Estimate band
+   on 2× H100: 12-25 hr / $100-200 cycle 1; 5-12 hr / $40-100 cycle 2
+   with calibrated `max_iter`. Total $140-290 for two cycles.
+2. **`n_eta × n_eps` quadrature density.** Canonical 4×4=16 vs reduced
+   3×3=9 saves 1.8× wall on working ages. Tradeoff: less accurate
+   income-shock integration → higher mean log|EE| in working cells.
+   User hasn't named the target log|EE| threshold yet.
+3. **Clean runner script.** User wants `verify_benchmark_bundle_6666.py`
+   stripped of legacy bits (likely the `diagnose_terminal_portfolio_states`
+   post-solve call). Hasn't specified what stays / what goes. **Likely
+   the first thing the user asks about next session.**
+
+### In-flight subagents
+
+- **Arbitrage agent**: revising `verify_arbitrage.py` (was structurally
+  wrong on first commit `cf28a27`; zero blast radius — nothing depends
+  on it yet). Status as of session end: under revision. Working tree
+  shows `M verify_arbitrage.py`.
+
+### Drafted handoffs ready to dispatch (not yet sent)
+
+| Handoff | Purpose | Status |
+|---|---|---|
+| `HANDOFF_RETURN_MODELLING_TRACE.md` | Theory-review prep: full pipeline trace + numerical reproduction + cross-block covariance documentation | Ready; high-priority for thesis correctness |
+| `HANDOFF_HLO_FUSION_AUDIT.md` | HLO inspection on retirement kernel inner loop | **Likely obsolete** — user reported HLO audit clean before session end. Confirm with user before dispatching. |
+| `HANDOFF_MULTI_GPU_CODE_AUDIT.md` | Phase A audit + Phase B chunking port | Phase A done (committed `0b1bd2e`); Phase B descoped per audit. Don't redispatch. |
+| `HANDOFF_INF_HORIZON_AUDIT.md` | Inf-horizon repair | **Done** — three commits landed (signature, warm-start, histograms). Don't redispatch. |
+| `HANDOFF_PORT_ARBITRAGE_DIAGNOSTIC.md` | Port arbitrage from main | Arbitrage agent dispatched + revising. Don't redispatch. |
+
+### Recently confirmed findings (don't re-investigate)
+
+- **Multi-GPU is shippable today** for 5⁴ through 7⁴. Bit-identical at
+  `n_dev=4` across all 38 ages. Chunking-on-pmap is YELLOW-by-design;
+  only matters at 11⁴+ on multi-GPU. Audit committed `0b1bd2e`.
+- **Arbitrage clean at 6⁴ × `(2,3,2,3)` × `n_ret=(5,5)` × Lobatto-OFF.**
+  The "if Newton fails, re-enable Lobatto first" diagnostic step is
+  now unnecessary for this config. δ=0 is the only remaining numerical-
+  robustness risk if Newton failures appear.
+- **HLO fusion audit is clean** (per user; report commit unclear, may
+  be in `docs/scans/hlo_dumps/` artifacts).
+- **donate_argnums is a non-win** for the lifecycle solver (zero gain
+  due to deferred-materialization design at solver.py:2529); marginally
+  helpful for inf-horizon but inf-horizon isn't on the critical workflow.
+- **`use_fori_newton=True` makes `max_iter` literal wall cost.** Calibrate
+  from real-bundle diag, not from 3⁴ smoke. Workflow note in
+  `GPU_TRIAL_FINDINGS.md`.
+
+### Things the user is likely to ask about first
+
+In approximate order of probability:
+
+1. **"What was next?"** → answer with this section's "Pending decisions"
+   (full-solve scope, eta×eps density, clean runner).
+2. **"Did Lambda capacity open up?"** → check Lambda's instance picker.
+   8× H100 / 8× A100 cycle frequently overnight on US/EU rotation.
+3. **"What's the current cost estimate for X?"** → §6 wall-time pattern;
+   anchor on tonight's 5⁴ measurement (273 s/age).
+4. **"Did agent X finish?"** → `git log --oneline -15` will show recent
+   commits. Cross-reference against the in-flight list above.
+5. **"Should we dispatch the return-modelling trace handoff now?"** →
+   yes; it's the highest-value pending dispatch for thesis correctness.
+
+### Working-tree state at session end
+
+```
+M verify_arbitrage.py         # arbitrage agent revising
+?? verify_benchmark_bundle_6666.py  # deferred per user
+?? docs/scans/hlo_dumps/      # 3.8 MB; orthogonal
+```
+
+Branch: `jax-rewrite`, 12 new commits this session, none pushed yet.
+
+### Background context the next orchestrator inherits
+
+- Tonight's session was about **measurement infrastructure** (EE
+  diagnostics, Newton histograms, multi-GPU validation, arbitrage
+  port). Next session is about **using that infrastructure** to produce
+  a publication-quality bundle.
+- The user's path to publication: 5⁴ baseline ✓ → **6⁴ full-solve as
+  calibration anchor (next)** → 7⁴ canonical full-solve (publication
+  artifact, ~$300-500 estimated). Each step is one full-solve cycle
+  + max_iter calibration cycle.
+- The user said HLO audit clean before saying "let's call it." Treat
+  micro-optimization at the arithmetic layer as **closed**. Remaining
+  wall headroom is at architectural level (multi-GPU dispatch,
+  max_iter dial, working-age quadrature density).

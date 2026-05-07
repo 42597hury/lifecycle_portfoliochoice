@@ -1237,9 +1237,11 @@ def _solve_terminal_at_i_s(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    n_iters_max = jnp.max(n_iters_egm)
-    n_backtrack_total = jnp.sum(n_backtrack_egm)
-    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
+    # happens there) so the histogram reflects only real Newton calls.
+    n_iters_per_s = n_iters_egm[1:]
+    n_backtrack_per_s = n_backtrack_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
 
 
 def _solve_retirement_at_cell(
@@ -1296,9 +1298,11 @@ def _solve_retirement_at_cell(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    n_iters_max = jnp.max(n_iters_egm)
-    n_backtrack_total = jnp.sum(n_backtrack_egm)
-    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
+    # happens there) so the histogram reflects only real Newton calls.
+    n_iters_per_s = n_iters_egm[1:]
+    n_backtrack_per_s = n_backtrack_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
 
 
 def _solve_working_at_cell(
@@ -1366,9 +1370,11 @@ def _solve_working_at_cell(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    n_iters_max = jnp.max(n_iters_egm)
-    n_backtrack_total = jnp.sum(n_backtrack_egm)
-    return c_w, a_s_w, a_b_w, n_iters_max, n_backtrack_total
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
+    # happens there) so the histogram reflects only real Newton calls.
+    n_iters_per_s = n_iters_egm[1:]
+    n_backtrack_per_s = n_backtrack_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
 
 
 def _all_is_log_returns_numpy(pcj):
@@ -1999,8 +2005,8 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
-                jnp.reshape(ni_flat, (n_z, N_state)),
-                jnp.reshape(nb_flat, (n_z, N_state)),
+                jnp.reshape(ni_flat, (n_z, N_state, -1)),
+                jnp.reshape(nb_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
@@ -2100,8 +2106,8 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
-                jnp.reshape(ni_flat, (n_z, N_state)),
-                jnp.reshape(nb_flat, (n_z, N_state)),
+                jnp.reshape(ni_flat, (n_z, N_state, -1)),
+                jnp.reshape(nb_flat, (n_z, N_state, -1)),
             )
         return call
 
@@ -2122,8 +2128,8 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
-            jnp.reshape(ni_flat, (n_z, N_state)),
-            jnp.reshape(nb_flat, (n_z, N_state)),
+            jnp.reshape(ni_flat, (n_z, N_state, -1)),
+            jnp.reshape(nb_flat, (n_z, N_state, -1)),
         )
 
     return call
@@ -2246,8 +2252,8 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
-                jnp.reshape(ni_flat, (n_z, N_state)),
-                jnp.reshape(nb_flat, (n_z, N_state)),
+                jnp.reshape(ni_flat, (n_z, N_state, -1)),
+                jnp.reshape(nb_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
@@ -2366,8 +2372,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
-                jnp.reshape(ni_flat, (n_z, N_state)),
-                jnp.reshape(nb_flat, (n_z, N_state)),
+                jnp.reshape(ni_flat, (n_z, N_state, -1)),
+                jnp.reshape(nb_flat, (n_z, N_state, -1)),
             )
         return call
 
@@ -2389,8 +2395,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
-            jnp.reshape(ni_flat, (n_z, N_state)),
-            jnp.reshape(nb_flat, (n_z, N_state)),
+            jnp.reshape(ni_flat, (n_z, N_state, -1)),
+            jnp.reshape(nb_flat, (n_z, N_state, -1)),
         )
 
     return call
@@ -2499,10 +2505,11 @@ def run_lifecycle_solver(
     age_max_foc = np.zeros(n_age)
     age_newton_fail = np.zeros(n_age, dtype=np.int64)
 
-    # Per-age Newton-iter / backtrack-iter counts, one entry per cell. Terminal
-    # is z-invariant, so its entries are (N_state,) — broadcast-equivalent to
-    # (n_z, N_state) for histogram aggregation. Lists hold device or host
-    # arrays; converted to NumPy at the histogram aggregation step at end.
+    # Per-age Newton-iter / backtrack-iter counts, one entry per (cell, savings).
+    # Terminal is z-invariant so its entries are (N_state, n_savings) —
+    # broadcast-equivalent to (n_z, N_state, n_savings) for histogram aggregation.
+    # Lists hold device or host arrays; converted to NumPy at the histogram
+    # aggregation step at end.
     newton_iter_per_age = [None] * n_age
     backtrack_iter_per_age = [None] * n_age
 
@@ -2864,9 +2871,12 @@ def _build_iter_histograms(newton_iter_per_age, backtrack_iter_per_age,
     """Aggregate Newton-iter and backtrack-iter counts into a diag-friendly dict.
 
     Each per-age entry is either ``None`` (unsolved) or a NumPy array of shape
-    ``(N_state,)`` (terminal) / ``(n_z, N_state)`` (non-terminal). All entries
-    flatten to 1-D and concatenate; per-age stats are computed on the
-    flattened slice.
+    ``(N_state, n_savings)`` (terminal) / ``(n_z, N_state, n_savings)``
+    (non-terminal). The savings axis is per-real-Newton-call (the s=0 anchor
+    is excluded); collapsing earlier (e.g. ``jnp.max`` over savings per cell)
+    saturates the histogram because the highest-savings Newton solves are
+    the ones that hit ``max_iter``. All entries flatten to 1-D and
+    concatenate; per-age stats are computed on the flattened slice.
 
     Returns a tuple ``(newton_diag, backtrack_diag)`` of dicts with keys
     ``p50``, ``p95``, ``p99``, ``max``, ``per_age_p99``, ``per_age_max``,

@@ -19,6 +19,11 @@ import numpy as np
 
 import jax  # noqa: E402
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER  # noqa: E402
 from lifecycle.model import DiscretizationConfig  # noqa: E402
 from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402

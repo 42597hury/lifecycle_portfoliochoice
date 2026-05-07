@@ -121,7 +121,7 @@ Replace **all of §6** ("After the trial / benchmark passes") with the structure
 
 ### 6.A) Same branch, larger CPU run
 
-Adapt `verify_smoke.py` to a bigger config or use `verify_canonical_small.py`
+Adapt `verify/smoke.py` to a bigger config or use `verify/canonical_small.py`
 (already in repo at `n_w=40, n_s=40, n_z=5, state=(3,3,3)`). Same `c8a.4xlarge`
 or `hpc8a.64xlarge` instance, no recipe change needed.
 
@@ -183,11 +183,11 @@ assert plats == ['cuda'], f'Expected CUDA only, got {plats}'
 "
 
 # 6. Run smoke
-echo "=== running verify_smoke.py at $(date -Is) ==="
-sudo -u ec2-user -E ./venv/bin/python verify_smoke.py
+echo "=== running verify/smoke.py at $(date -Is) ==="
+sudo -u ec2-user -E ./venv/bin/python verify/smoke.py
 SMOKE_EXIT=$?
 
-echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
+echo "=== verify/smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
 
 # 7. Auto-terminate on success
 if [ "$SMOKE_EXIT" -eq 0 ]; then

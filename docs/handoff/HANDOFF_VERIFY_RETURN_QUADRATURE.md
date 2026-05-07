@@ -478,7 +478,7 @@ expected and consistent with Gauss-Hermite limits.
 |------|-------|
 | Implementation under test | `discretization.py:get_return_quadrature` |
 | Sister Cholesky on state innovation | `discretization.py:get_state_quadrature` |
-| Existing moment-recovery test (scalar K) | `verify_discretization.ipynb` §A.4 |
+| Existing moment-recovery test (scalar K) | `verify/discretization.ipynb` §A.4 |
 | Existing per-axis tests | `tests/test_state_grid_modes.py::run_per_axis_n_ret_quad_checks` |
 | Production caller | `precompute.py:Precompute.__init__` |
 | Saved-bundle metadata convention | `policy_io.py:save_policy_bundle` |

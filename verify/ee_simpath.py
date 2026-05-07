@@ -1,4 +1,4 @@
-"""verify_ee_simpath.py -- Sim-path consumption-Euler diagnostic for saved bundles.
+"""verify/ee_simpath.py -- Sim-path consumption-Euler diagnostic for saved bundles.
 
 Ports scripts/diagnostics/_diag_euler_errors.py from the Numba `main` branch to
 the JAX branch with the right economics:
@@ -23,7 +23,7 @@ Pipeline:
 
 Usage
 -----
-    python verify_ee_simpath.py <bundle> [--eval-mode {same,next_finer,double}] \
+    python verify/ee_simpath.py <bundle> [--eval-mode {same,next_finer,double}] \
         [--n-simulations 5000] [--eval-households-per-age 256] [--seed 42]
 
 Output
@@ -74,7 +74,7 @@ LOG10_EE_FLOOR = -16.0
 
 
 # =============================================================================
-# Bundle loading + config rehydration (mirrors verify_ee_residuals.py)
+# Bundle loading + config rehydration (mirrors verify/ee_residuals.py)
 # =============================================================================
 
 def _resolve_bundle_path(bundle_arg: str) -> Path:
@@ -722,7 +722,7 @@ def main():
     if run_config is None:
         raise ValueError(
             "Bundle has no run_config; cannot rebuild precompute. "
-            "Re-solve with verify_benchmark_bundle.py."
+            "Re-solve with verify/benchmark_bundle.py."
         )
     base_config = run_config["base_config"]
     disc_solver = _rehydrate_disc_config(run_config["discretization_config"])

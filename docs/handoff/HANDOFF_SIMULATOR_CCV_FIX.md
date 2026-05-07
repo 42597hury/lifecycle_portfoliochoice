@@ -254,7 +254,7 @@ it is expected to be 0.
 Add a test that fixes the solver and simulator return formulas to give
 the same `R_p` at the same `(α_s, α_b, log_R_bill, log_x_s, log_x_b, σ)`.
 
-Path: `verify_ccv_solver_sim_parity.py` (top level, matching the
+Path: `verify/ccv_solver_sim_parity.py` (top level, matching the
 existing `verify_*.py` style — there is no `tests/` directory in this
 branch), or under `scripts/diagnostics/_diag_ccv_parity.py` if that's
 where the team wants it. Suggested content:
@@ -305,8 +305,8 @@ compile to the same arithmetic ops on the same σ-scalars.
 
 ### 4.2 End-to-end smoke (REQUIRED)
 
-Run [verify_smoke.py](../../verify_smoke.py) (or the canonical small
-cell of [verify_canonical_small.py](../../verify_canonical_small.py)).
+Run [verify/smoke.py](../../verify/smoke.py) (or the canonical small
+cell of [verify/canonical_small.py](../../verify/canonical_small.py)).
 Compare against the pre-patch reference run on the same seed:
 
 - `sim_R_port` should change (it was arithmetic, now CCV) — the per-age
@@ -401,8 +401,8 @@ test never hurts).
   kernel signature (~256), kernel-build call (~700), wealth-law
   block (~350-359), `R_port` upstream cleanup, `negative_frac`
   docstring note.
-- [ ] `verify_ccv_solver_sim_parity.py` (NEW) — parity unit test.
-- [ ] Re-run `verify_smoke.py` (or `verify_canonical_small.py`) and
+- [ ] `verify/ccv_solver_sim_parity.py` (NEW) — parity unit test.
+- [ ] Re-run `verify/smoke.py` (or `verify/canonical_small.py`) and
   confirm panel changes match the expected wedge sign/magnitude.
 - [ ] (Optional) `scripts/diagnostics/_diag_euler_errors.py` —
   pre/post residual comparison.

@@ -48,7 +48,7 @@ Saves ~30s and avoids typing secret keys. Worth adding to the recipe.
 
 ### Smoke results — clean pass
 
-`verify_smoke.py` (6 ages, `(3,3,3,3)` state, `n_z=5`, `n_w=20`):
+`verify/smoke.py` (6 ages, `(3,3,3,3)` state, `n_z=5`, `n_w=20`):
 
 | Metric | Value |
 |---|---|
@@ -64,7 +64,7 @@ Saves ~30s and avoids typing secret keys. Worth adding to the recipe.
 
 ### Benchmark attempt 1 — `9×9×9×9` OOM
 
-**Config:** `verify_benchmark_bundle.py` at `state_grid_sizes=(9,9,9,9)` → 6561 N_state, `n_z=11`, `n_w=180`, `n_s=180`, `n_state_quad=(3,4,3,4)=144`, `max_iter=400`, retirement-only 33 ages.
+**Config:** `verify/benchmark_bundle.py` at `state_grid_sizes=(9,9,9,9)` → 6561 N_state, `n_z=11`, `n_w=180`, `n_s=180`, `n_state_quad=(3,4,3,4)=144`, `max_iter=400`, retirement-only 33 ages.
 
 **Result:** OOM in the **terminal kernel**.
 ```
@@ -141,7 +141,7 @@ GPU instrumentation mid-run: `100% utilisation, 92.9 / 97.9 GB HBM`. Tight but s
    ssh ubuntu@<ip> 'tmux new-session -d -s bench "..."'
    ```
    tmux session lives independently of any SSH connection. Survives my Bash tool timeouts, network blips, anything.
-2. **Enable checkpointing every 5 ages** in `verify_benchmark_bundle.py`:
+2. **Enable checkpointing every 5 ages** in `verify/benchmark_bundle.py`:
    ```python
    solve_control = SolveControl(
        youngest_age_to_solve=67,
@@ -152,7 +152,7 @@ GPU instrumentation mid-run: `100% utilisation, 92.9 / 97.9 GB HBM`. Tight but s
    ```
    Worst-case loss now bounded at 5 × 273 = 23 min ≈ $0.75.
 
-**General lesson:** `verify_benchmark_bundle.py` (and any future production runner) should default to `checkpoint_every_n_ages` set to something non-None. The current default `None` makes the script unsuited for runs longer than ~5 minutes without manual override.
+**General lesson:** `verify/benchmark_bundle.py` (and any future production runner) should default to `checkpoint_every_n_ages` set to something non-None. The current default `None` makes the script unsuited for runs longer than ~5 minutes without manual override.
 
 ### Lobatto tails were OFF in this run
 
@@ -291,7 +291,7 @@ First quantitative correctness check on the JAX 5⁴ production bundle. **Grid-b
 ### Bugs / gotchas surfaced
 
 - **HIGH: solver/simulator CCV-vs-arithmetic mismatch** (see entry above).
-- **`verify_benchmark_bundle.py` had no default checkpointing** (`checkpoint_every_n_ages=None`). Long runs lost everything on death. Now patched for relaunch; should be fixed in the source.
+- **`verify/benchmark_bundle.py` had no default checkpointing** (`checkpoint_every_n_ages=None`). Long runs lost everything on death. Now patched for relaunch; should be fixed in the source.
 - **`max_iter` is real wall cost under fori_loop** — not "average iters used." Doubling `max_iter` doubles wall regardless of cell convergence behaviour. The original `max_iter=400` in the benchmark script was 4× more wasteful than needed; `max_iter=100` with backward-age warm-start is the right operating point.
 
 ### Performance characterization (calibrated tonight)
@@ -308,7 +308,7 @@ First quantitative correctness check on the JAX 5⁴ production bundle. **Grid-b
 2. **Simulator CCV fix unblocks all path-based diagnostics.** Prerequisite for using bundles for anything beyond grid-based EE residuals.
 3. **Default `checkpoint_every_n_ages=5`** should be the standard in production runner scripts.
 4. **Lobatto tails should be turned on** for publishable runs (currently off; see [HANDOFF_EVAL_LOBATTO_PROPAGATION.md](../handoff/HANDOFF_EVAL_LOBATTO_PROPAGATION.md)).
-5. **`verify_benchmark_bundle.py` should run under tmux/nohup** in any production launcher, not bare SSH.
+5. **`verify/benchmark_bundle.py` should run under tmux/nohup** in any production launcher, not bare SSH.
 
 ### Specific aarch64 + Lambda-Stack notes
 

@@ -11,13 +11,18 @@ Smoke gate (#2 in HANDOFF_MIXED_PRECISION_GATHER §6):
 import time
 import numpy as np
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig
 from lifecycle.var import build_nominal_system1_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 
-# Smoke config — same shape as verify_smoke.py so the gate matches.
+# Smoke config — same shape as verify/smoke.py so the gate matches.
 disc = DiscretizationConfig(
     n_wealth=20, wealth_min=0.13, wealth_max=200.0,
     n_savings=20,

@@ -1,4 +1,4 @@
-"""verify_arbitrage.py -- Discrete-cloud arbitrage check (pre-solve diagnostic).
+"""verify/arbitrage.py -- Discrete-cloud arbitrage check (pre-solve diagnostic).
 
 Spurious arbitrage is a discretization artifact: at some state corner i_s, the
 discrete (state x return) quadrature cloud admits a feasible portfolio that
@@ -39,12 +39,12 @@ strictly positive when the discretization mis-resolves the lognormal tails.
 Usage
 -----
     # Bundle path (uses bundle metadata.run_config to rebuild precompute):
-    python verify_arbitrage.py <bundle-name-or-path>
+    python verify/arbitrage.py <bundle-name-or-path>
 
     # Config module path (.py): import as module, read base_config +
     # disc_config_template; this is the pre-launch entry point that does
     # NOT need a saved bundle:
-    python verify_arbitrage.py configs/<some>.py
+    python verify/arbitrage.py configs/<some>.py
 
 Output
 ------
@@ -185,7 +185,7 @@ def _safe_load_config_module(config_path: Path) -> dict:
     and any other assignment (e.g. ``model =``, ``pc =``,
     ``C, S, B, diag = run_lifecycle_solver(...)``) are skipped. This lets us
     extract ``disc_config`` from a runner script
-    (e.g. ``verify_benchmark_bundle_6666.py``) without kicking off the
+    (e.g. ``verify/benchmark_bundle_6666.py``) without kicking off the
     solve, save, or S3 upload that the script does at module top level.
 
     Returns the resulting namespace dict.

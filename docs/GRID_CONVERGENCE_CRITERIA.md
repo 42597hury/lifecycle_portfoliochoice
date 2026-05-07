@@ -105,7 +105,7 @@ Rouwenhorst's (1995) method matches all five for *any* `n` ≥ 2 (Kopecky-Suen 2
 
 These tests are essentially free — you compute them once at precompute time. They detect (a) bugs in the discretization code, (b) failure modes when grids are too coarse or too narrow.
 
-**For your VAR.** The 3-D state VAR is more delicate. Gospodinov-Lkhagvasuren (2014) provide a direct extension of Rouwenhorst to VARs with the same moment-matching property, but most papers (including Catherine 2025) just use a tensor-product cholesky-axis grid plus Gauss-Hermite quadrature for the innovations — what you do. The diagnostic that matters then is whether `Pi_state @ E[s] = E[s]` (stationary distribution recovers the unconditional mean) and `Σ̂_state - Σ_state_target` is small. Your `verify_discretization.ipynb` already does the second of these (§A.5); ensure the first is also reported.
+**For your VAR.** The 3-D state VAR is more delicate. Gospodinov-Lkhagvasuren (2014) provide a direct extension of Rouwenhorst to VARs with the same moment-matching property, but most papers (including Catherine 2025) just use a tensor-product cholesky-axis grid plus Gauss-Hermite quadrature for the innovations — what you do. The diagnostic that matters then is whether `Pi_state @ E[s] = E[s]` (stationary distribution recovers the unconditional mean) and `Σ̂_state - Σ_state_target` is small. Your `verify/discretization.ipynb` already does the second of these (§A.5); ensure the first is also reported.
 
 ### 1.5 Quadrature: polynomial exactness vs integrand curvature
 
@@ -129,7 +129,7 @@ For γ = 6 and a one-standard-deviation move in returns of, say, 17%, `R_p^(1−
 | CRRA with γ ≥ 6, heavy-tailed shocks (kurtosis > 5) | n ≥ 9, or stratified rule |
 | CRRA with kurtosis > 50 (your eps shock) | Standard rules fail; use specialized rules or accept bias |
 
-The last row is your `n_eps` problem. Your `verify_discretization.ipynb` §C.5 already documented that `n_eps = 5` leaves > 50% relative error at γ = 8. This is a *known impossibility*: for a mixture with kurtosis 52, no low-order Gauss rule resolves the tail. Mitigation options (in order of cost):
+The last row is your `n_eps` problem. Your `verify/discretization.ipynb` §C.5 already documented that `n_eps = 5` leaves > 50% relative error at γ = 8. This is a *known impossibility*: for a mixture with kurtosis 52, no low-order Gauss rule resolves the tail. Mitigation options (in order of cost):
 
 1. **Reduce γ in the headline run** — your `Hypothesis_Specification.md` already plans γ ∈ {3, 5, 7, 10}; flag γ = 10 as having higher quadrature uncertainty.
 2. **Use a stratified GH rule** — dedicate a sub-rule to each component of the mixture, then combine. Older code did this; the move to Judd's rule sacrificed it for fewer nodes.
@@ -224,7 +224,7 @@ For the persistent income chain at each `n_z`, report:
 - `||π_disc · Pi − π_disc||_∞`
 - Conditional variance error averaged across origin states
 
-Same for the state VAR at each `state_grid_sizes`. Your `verify_discretization.ipynb` §A.5 already does most of this — just promote the numbers from "informational" to "gating."
+Same for the state VAR at each `state_grid_sizes`. Your `verify/discretization.ipynb` §A.5 already does most of this — just promote the numbers from "informational" to "gating."
 
 **Step 5. Boundary diagnostics.**
 
@@ -268,7 +268,7 @@ This is your most expensive dimension (cubic scaling) and the one with the weake
 
 ### 5.4 Return quadrature `n_ret_nodes_1d`
 
-Already analyzed extensively in your `verify_discretization.ipynb` §B.4 and the H1b investigation. The asymmetric `(K_rtb, K_xr, K_xb)` form is the right structure — Cocco-Gomes-Maenhout used a uniform 3 nodes per dim. Your finding that the bond residual axis (xb) was undersized at K=3 and that 5–7 helps is a *finer* analysis than CGM (2005) did. Document the per-axis choice; this is publishable methodological care, not over-engineering.
+Already analyzed extensively in your `verify/discretization.ipynb` §B.4 and the H1b investigation. The asymmetric `(K_rtb, K_xr, K_xb)` form is the right structure — Cocco-Gomes-Maenhout used a uniform 3 nodes per dim. Your finding that the bond residual axis (xb) was undersized at K=3 and that 5–7 helps is a *finer* analysis than CGM (2005) did. Document the per-axis choice; this is publishable methodological care, not over-engineering.
 
 ### 5.5 Income shock quadrature `n_eps`, `n_eta`
 

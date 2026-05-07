@@ -36,6 +36,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig, DELTA_BEQUEST
 from lifecycle.var import build_nominal_system1_var_config_hardcoded
@@ -203,7 +208,7 @@ print(f"  convert(f32->f64) count: {n_convert_f32_to_f64}")
 print(f"  convert(f64->f32) count: {n_convert_f64_to_f32}")
 
 # Save to disk for manual review.
-hlo_path = "verify_mixed_precision_hlo_f32.txt"
+hlo_path = "verify/mixed_precision_hlo_f32.txt"
 with open(hlo_path, "w", encoding="utf-8") as f:
     f.write(hlo_text)
 print(f"  HLO written to:          {hlo_path}")

@@ -22,7 +22,7 @@ and the rtb-as-state Sigma_r_cond drift-detector at
 [`lifecycle/precompute.py:680-692`](../../lifecycle/precompute.py#L680-L692));
 (2) run `diagnose_var_pre` + `diagnose_grids_pre` so state-grid coverage,
 quadrature moment recovery, and Cholesky-PD invariants all light up
-green; (3) run `verify_smoke.py` to exercise every kernel; (4) on the
+green; (3) run `verify/smoke.py` to exercise every kernel; (4) on the
 saved bundle, the post-solve `diagnose_terminal_portfolio_states` FOC
 residual must be ≤ `tol*scale ~ 1e-6` everywhere. The discretization
 docs ([`docs/notes/LOBATTO_CONFIG_TRACKER.md`](../notes/LOBATTO_CONFIG_TRACKER.md))
@@ -97,7 +97,7 @@ after solve. This is the order this checklist follows.
   Jensen lift cancellation breaks.
 - **How:** `diagnose_var_pre` Test 6
   ([`lifecycle/diagnostics.py:733-738`](../../lifecycle/diagnostics.py#L733-L738));
-  also Test 2 in `verify_discretization.ipynb` §A.4.
+  also Test 2 in `verify/discretization.ipynb` §A.4.
 - **Pass:** `max|mean| < 1e-10`.
 - **Severity:** BLOCKER.
 
@@ -109,7 +109,7 @@ after solve. This is the order this checklist follows.
   ([`lifecycle/diagnostics.py:740-746`](../../lifecycle/diagnostics.py#L740-L746));
   also Test 2 in
   [`docs/handoff/HANDOFF_VERIFY_RETURN_QUADRATURE.md`](../handoff/HANDOFF_VERIFY_RETURN_QUADRATURE.md)
-  and `verify_discretization.ipynb` §A.4.
+  and `verify/discretization.ipynb` §A.4.
 - **Pass:** `max|diff| < 1e-8` (reported), `< 1e-14` ideal.
 - **Severity:** BLOCKER.
 
@@ -119,7 +119,7 @@ after solve. This is the order this checklist follows.
 - **Why:** tensor-product GH preserves independence between v^s and ε
   by construction; if it doesn't recover Σ_rr, something is wrong with
   Cholesky factorisation.
-- **How:** `verify_discretization.ipynb` §A.5; documented in
+- **How:** `verify/discretization.ipynb` §A.5; documented in
   [`docs/notes/LOBATTO_CONFIG_TRACKER.md` §3.7](../notes/LOBATTO_CONFIG_TRACKER.md).
 - **Pass:** `< 4e-17` (empirically observed).
 - **Severity:** WARNING (informational regression-guard; covariance
@@ -132,7 +132,7 @@ after solve. This is the order this checklist follows.
   eigendecomposition. Regression-guard against accidental revert.
 - **How:** Test 7 in
   [`docs/handoff/HANDOFF_VERIFY_RETURN_QUADRATURE.md`](../handoff/HANDOFF_VERIFY_RETURN_QUADRATURE.md);
-  `verify_discretization.ipynb` §A.4.
+  `verify/discretization.ipynb` §A.4.
 - **Pass:** strict `< 1e-15` zeros on dropped axes.
 - **Severity:** WARNING.
 
@@ -218,7 +218,7 @@ after solve. This is the order this checklist follows.
 ### 1.17 n_eps integrand-error warning at high γ
 - **What:** at γ ≥ 5 the eps mixture (kurtosis ~52) is genuinely hard;
   even `n_eps = 5` leaves > 50% relative error on `E[exp(−γε)]`.
-- **Why:** documented in `verify_discretization.ipynb` §C.5 and
+- **Why:** documented in `verify/discretization.ipynb` §C.5 and
   [`docs/GRID_CONVERGENCE_CRITERIA.md` §5.5](../GRID_CONVERGENCE_CRITERIA.md).
 - **How:** sweep `n_eps ∈ {3, 5, 9}` and report bias estimate at the
   production γ.
@@ -518,7 +518,7 @@ after solve. This is the order this checklist follows.
 - **Why:** partial solves are valid (checkpoint + crash recovery) but
   not bundle-publishable.
 - **How:** print + check at
-  [`verify_benchmark_bundle.py:117-118`](../../verify_benchmark_bundle.py#L117-L118).
+  [`verify/benchmark_bundle.py:117-118`](../../verify/benchmark_bundle.py#L117-L118).
 - **Pass:** `complete` and all expected ages solved.
 - **Severity:** BLOCKER.
 
@@ -527,7 +527,7 @@ after solve. This is the order this checklist follows.
 - **Why:** under `use_fori_newton=True`, ALL `max_iter` iters run
   unconditionally, so failures = cells that didn't converge in
   `max_iter`. Cap-bound (alpha hit ±6) cells also surface here.
-- **How:** `verify_benchmark_bundle.py:119`. Configured wall-cost in
+- **How:** `verify/benchmark_bundle.py:119`. Configured wall-cost in
   [`docs/handoff/HANDOFF_NEWTON_FORI_LOOP_MASK.md`](../handoff/HANDOFF_NEWTON_FORI_LOOP_MASK.md).
   Canonical `max_iter` choice driven by §3 of
   [`docs/scans/COMPLEXITY_WALL_TIME_2026-05-06.md`](COMPLEXITY_WALL_TIME_2026-05-06.md).
@@ -621,8 +621,8 @@ after solve. This is the order this checklist follows.
   slices.
 - **Why:** silent NaN propagation in policies → simulator crashes
   much later, after expensive solve.
-- **How:** `verify_benchmark_bundle.py:122-130`,
-  `verify_canonical_small.py:64`, `verify_smoke.py:44`.
+- **How:** `verify/benchmark_bundle.py:122-130`,
+  `verify/canonical_small.py:64`, `verify/smoke.py:44`.
 - **Pass:** zero NaN, zero Inf.
 - **Severity:** BLOCKER.
 
@@ -631,7 +631,7 @@ after solve. This is the order this checklist follows.
 - **Why:** sanity that no α exploded past `alpha_min/alpha_max`. With
   cap ±6 expect simulated max ≈ 9.25 historically; cap-bound surfaces
   as Newton fail.
-- **How:** `verify_benchmark_bundle.py:131-139`, also
+- **How:** `verify/benchmark_bundle.py:131-139`, also
   [`docs/CONFIG.md` §2.6](../CONFIG.md).
 - **Pass:** within `[alpha_min, alpha_max]`; sanity reportable.
 - **Severity:** WARNING.
@@ -643,7 +643,7 @@ after solve. This is the order this checklist follows.
   non-converged warm-restart fallback as if it were a real interior
   solution". v4_lobatto regressed this with `worst_foc_resid = 0.67`.
 - **How:** called at
-  [`verify_benchmark_bundle.py:208-225`](../../verify_benchmark_bundle.py#L208-L225);
+  [`verify/benchmark_bundle.py:208-225`](../../verify/benchmark_bundle.py#L208-L225);
   function at
   [`lifecycle/diagnostics.py:1274-1441`](../../lifecycle/diagnostics.py#L1274-L1441).
 - **Pass:** `summary["n_fail"] == 0` and
@@ -666,7 +666,7 @@ after solve. This is the order this checklist follows.
 - **What:** JAX policy ≈ Numba policy on smoke at small-grid config.
 - **Why:** verifies JAX rewrite hasn't drifted from the Numba
   ground-truth on the same maths.
-- **How:** `verify_compare_jax.py` saves JAX policies to
+- **How:** `verify/compare_jax.py` saves JAX policies to
   `/tmp/jax_policies.npz`; pair with Numba branch's equivalent and
   compare.
 - **Pass:** `np.allclose(C_jax, C_numba, rtol=1e-5)`.
@@ -788,7 +788,7 @@ after solve. This is the order this checklist follows.
   ([`docs/scans/BUG_SCAN_2026-05-06.md` Item 9](BUG_SCAN_2026-05-06.md)).
 - **How:** `_check_runtime_platform()` warning in
   `lifecycle/__init__.py:151`; printed from solver banner at
-  [`verify_benchmark_bundle.py:94`](../../verify_benchmark_bundle.py#L94).
+  [`verify/benchmark_bundle.py:94`](../../verify/benchmark_bundle.py#L94).
 - **Pass:** banner prints expected GPU device count.
 - **Severity:** WARNING.
 
@@ -899,20 +899,20 @@ after solve. This is the order this checklist follows.
 - **Pass:** zero `[FAIL]` markers; warnings acceptable.
 - **Severity:** BLOCKER if any FAIL.
 
-### 11.2 `verify_smoke.py` — exercises every kernel at minimum config
+### 11.2 `verify/smoke.py` — exercises every kernel at minimum config
 - **What:** 6-age window 60..65 covers terminal + retirement + boundary
   + working. (3,3,3,3) state, n_z=5, n_w=20.
 - **Why:** catches kernel-shape bugs before the long run.
-- **How:** `python verify_smoke.py`.
+- **How:** `python verify/smoke.py`.
 - **Pass:** prints policy ranges, zero NaN, JAX devices ≥ 1.
 - **Severity:** BLOCKER pre-launch.
 
-### 11.3 `verify_canonical_small.py` — full lifecycle on tiny grids
+### 11.3 `verify/canonical_small.py` — full lifecycle on tiny grids
 - **What:** 78-age full lifecycle on (3,3,3,3) state, n_w=40, n_savings
   =40, n_z=5. Saves policies + simulation.
 - **Why:** smoke covers kernels; this covers the full backward sweep
   and end-to-end policy + simulation pipeline.
-- **How:** `python verify_canonical_small.py`.
+- **How:** `python verify/canonical_small.py`.
 - **Pass:** alpha ranges sane; simulator alive at terminal; median
   death age in expected window.
 - **Severity:** WARNING pre-launch (full-lifecycle dry run).
@@ -1001,10 +1001,10 @@ The recommended pre-flight ordering before launching a long solve:
    `_diag_arbitrage_quadsweep` on the candidate disc_config; verify
    T-Q1 max gap = 0 (§1.18).
 
-4. **Run `verify_smoke.py`.** 30-60 sec on JAX. Covers §6.1, §6.2,
+4. **Run `verify/smoke.py`.** 30-60 sec on JAX. Covers §6.1, §6.2,
    §11.2, and confirms §8.5 (GPU detection).
 
-5. **For new disc-config or new model: run `verify_canonical_small.py`.**
+5. **For new disc-config or new model: run `verify/canonical_small.py`.**
    ~7-12 min. Covers §11.3 + simulator parity.
 
 6. **For 4-D state runs at scale: HBM pre-flight (§8.1, §8.2).**
@@ -1019,7 +1019,7 @@ The recommended pre-flight ordering before launching a long solve:
    `max_iter` calibration (§5.5).
 
 8. **Post-solve: terminal-portfolio diagnostic (§6.3).** Already wired
-   into `verify_benchmark_bundle.py:208-225`.
+   into `verify/benchmark_bundle.py:208-225`.
 
 9. **Post-solve: bundle metadata round-trip (§6.4) + sim sanity (§4.8,
    §4.10, §11.3).**

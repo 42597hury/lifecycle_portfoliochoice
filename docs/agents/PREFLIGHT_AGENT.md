@@ -177,7 +177,7 @@ solver running over that cloud will tilt toward unhedged-bankruptcy
 positions that look risk-free under the cloud but blow up out-of-sample.
 
 ```bash
-python verify_arbitrage.py <config-path>
+python verify/arbitrage.py <config-path>
 ```
 
 The script accepts either a config `.py` (preferred for preflight — no
@@ -382,18 +382,18 @@ are expensive.
 
 ```bash
 # 1. Cheap NumPy scan: NaN/Inf, extreme alphas, tiny-savings fallback.
-python verify_invalid_cells.py <bundle-name-or-path>
+python verify/invalid_cells.py <bundle-name-or-path>
 
 # 2. Euler-equation residual at every solved (z, state, w) cell. Pass per
 #    HANDOFF_PORT_EE_DIAGNOSTIC.md §7 thresholds.
-python verify_ee_residuals.py <bundle-name-or-path> --use-relative
+python verify/ee_residuals.py <bundle-name-or-path> --use-relative
 ```
 
 Each writes a JSON summary into the bundle directory — `invalid_cells.json`,
 `ee_residuals.json` — with a `verdict` field readable by downstream
 automation.
 
-**The discrete-cloud arbitrage check (`verify_arbitrage.py`) is NOT a
+**The discrete-cloud arbitrage check (`verify/arbitrage.py`) is NOT a
 post-bundle gate** — it depends only on (model + discretization), not on
 solved policies. It belongs in Phase D of preflight (§4). Run it
 post-bundle only as a regression check (e.g. "did the bundle's saved
@@ -401,18 +401,18 @@ config match the one preflight signed off on"); the same script accepts a
 bundle path and rebuilds the precompute from `metadata.run_config`:
 
 ```bash
-python verify_arbitrage.py <bundle-name-or-path>     # regression-only
+python verify/arbitrage.py <bundle-name-or-path>     # regression-only
 ```
 
 **If any check fails:** investigate before consuming. Do NOT proceed to
 plotting, simulation, or thesis-figure work. The likely remediations:
 
-- `verify_invalid_cells.py` fails ⇒ bundle is structurally broken
+- `verify/invalid_cells.py` fails ⇒ bundle is structurally broken
   (NaN policies, extreme alphas at solved cells). Investigate the solve,
   do not re-use the bundle.
-- `verify_ee_residuals.py` fails ⇒ the solver did not converge at some
+- `verify/ee_residuals.py` fails ⇒ the solver did not converge at some
   cells. Investigate Newton iter counts, tolerance, and grid coverage.
-- `verify_arbitrage.py` fails post-bundle but passed in preflight ⇒ the
+- `verify/arbitrage.py` fails post-bundle but passed in preflight ⇒ the
   bundle was solved against a different config than the one preflight
   cleared (look for an unscheduled rebuild). If preflight was skipped,
   re-config with `ret_lobatto_Z` / `state_lobatto_Z` and re-solve.

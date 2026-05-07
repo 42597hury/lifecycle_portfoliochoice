@@ -281,7 +281,7 @@ Add a brief paragraph in the "What this trial validates" section noting that the
 ### 5.1 Local — confirm the cache works in isolation
 
 1. Wipe the existing cache: `rm -rf ~/.cache/jax_lifecycle`
-2. Run `python verify_smoke.py`. Expect a startup line:
+2. Run `python verify/smoke.py`. Expect a startup line:
    ```
    [lifecycle] JAX compilation cache: enabled at /home/<user>/.cache/jax_lifecycle (min_compile=1.0s, max_size=10.0 GB)
    ```
@@ -292,7 +292,7 @@ Add a brief paragraph in the "What this trial validates" section noting that the
 ### 5.2 Local — confirm env var override
 
 ```bash
-LIFECYCLE_JAX_CACHE_DIR=/tmp/jax_cache_test python verify_smoke.py
+LIFECYCLE_JAX_CACHE_DIR=/tmp/jax_cache_test python verify/smoke.py
 ```
 Should print the cache path as `/tmp/jax_cache_test`. Confirm that path exists and contains files after the run.
 
@@ -357,12 +357,12 @@ No test files touched (verification is via smoke timing, §5).
 - [ ] Replace the 3-line block at [lifecycle/__init__.py:72-74](../../lifecycle/__init__.py#L72-L74) with the `_configure_persistent_cache()` function from §4.1. Keep the existing `_configure_xla_devices()` and the `import jax as _jax` line above it untouched.
 - [ ] Add new file `lifecycle/_compile_cache_sync.py` exactly as in §4.2. Underscore prefix marks it as internal.
 - [ ] Update [docs/agents/AWS_TRIAL_JAX.md](../agents/AWS_TRIAL_JAX.md) §2 (Bootstrap script) and §3 (Success criteria) per §4.3. Mention `S3_CACHE_BUCKET` / `S3_CACHE_PREFIX` env vars and the hardware-keyed prefix convention from §6.2.
-- [ ] Run `verify_smoke.py` twice locally (first run wipes cache via `rm -rf ~/.cache/jax_lifecycle`). Confirm:
+- [ ] Run `verify/smoke.py` twice locally (first run wipes cache via `rm -rf ~/.cache/jax_lifecycle`). Confirm:
   - First run prints `[lifecycle] JAX compilation cache: enabled at ...`
   - Second run wall time is materially shorter (compile portion drops by 80-95%).
   - `du -sh ~/.cache/jax_lifecycle/` reports a non-trivial size after run 1.
-- [ ] Run `LIFECYCLE_JAX_CACHE_DIR="" python verify_smoke.py` once, confirm the disable path prints the expected `DISABLED` line.
-- [ ] (Optional) Run `LIFECYCLE_JAX_CACHE_DIR=/tmp/jax_test python verify_smoke.py`, confirm path shows in print and files appear at that path.
+- [ ] Run `LIFECYCLE_JAX_CACHE_DIR="" python verify/smoke.py` once, confirm the disable path prints the expected `DISABLED` line.
+- [ ] (Optional) Run `LIFECYCLE_JAX_CACHE_DIR=/tmp/jax_test python verify/smoke.py`, confirm path shows in print and files appear at that path.
 - [ ] Single commit with message:
   ```
   jax cache: env-var configurable + S3 sync helper for cross-launch reuse

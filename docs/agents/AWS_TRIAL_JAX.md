@@ -96,12 +96,12 @@ if [ -n "${S3_CACHE_BUCKET:-}" ]; then
 fi
 
 # 4. Run smoke
-echo "=== running verify_smoke.py at $(date -Is) ==="
+echo "=== running verify/smoke.py at $(date -Is) ==="
 sudo -u ec2-user --preserve-env=LIFECYCLE_JAX_CACHE_DIR \
-    ./venv/bin/python verify_smoke.py
+    ./venv/bin/python verify/smoke.py
 SMOKE_EXIT=$?
 
-echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
+echo "=== verify/smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
 
 # 5. (Optional) upload log to S3 if you have a bucket configured
 # aws s3 cp /var/log/jax-trial.log s3://hugo-thesis-runs/jax-trial/$(date +%Y%m%dT%H%M%S).log
@@ -162,7 +162,7 @@ The alpha ranges are bit-identical (to ~1e-12) to a Windows-laptop run on the sa
 
 ## 5. Benchmark mode — match a specific Numba bundle
 
-To benchmark JAX wall time against a Numba reference run, use `verify_benchmark_bundle.py` instead of `verify_smoke.py`. It mirrors `configs/run_ccv_wide9_gh_k4.py` (the most recent retirement-only bundle on `main`):
+To benchmark JAX wall time against a Numba reference run, use `verify/benchmark_bundle.py` instead of `verify/smoke.py`. It mirrors `configs/run_ccv_wide9_gh_k4.py` (the most recent retirement-only bundle on `main`):
 
 - `state_grid_sizes=(9,9,9)`, `n_z=11`, `n_w=180`, `n_s=180`
 - `n_ret_nodes_1d=(3,5,5)`, `n_state_quad_nodes=(3,4,4)`
@@ -176,8 +176,8 @@ Do NOT run the benchmark on `c8a.xlarge` — the precompute + per-cell c_corners
 **Replace step 4 of the bootstrap script** with:
 
 ```bash
-echo "=== running verify_benchmark_bundle.py at $(date -Is) ==="
-sudo -u ec2-user ./venv/bin/python verify_benchmark_bundle.py
+echo "=== running verify/benchmark_bundle.py at $(date -Is) ==="
+sudo -u ec2-user ./venv/bin/python verify/benchmark_bundle.py
 ```
 
 **Expected wall on `hpc8a.64xlarge`:**
@@ -206,7 +206,7 @@ Capture that block + the per-age progress lines for the report.
 
 ### 6.A) Same branch, larger CPU run
 
-Adapt `verify_smoke.py` to a bigger config or use `verify_canonical_small.py`
+Adapt `verify/smoke.py` to a bigger config or use `verify/canonical_small.py`
 (already in repo at `n_w=40, n_s=40, n_z=5, state=(3,3,3)`). Same `c8a.4xlarge`
 or `hpc8a.64xlarge` instance, no recipe change needed. Expect ~10–20 min wall
 on `hpc8a.64xlarge`, ~30–50 min on `c8a.4xlarge`. Still no S3 upload — pull
@@ -275,11 +275,11 @@ assert plats == ['cuda'], f'Expected CUDA only, got {plats}'
 "
 
 # 6. Run smoke
-echo "=== running verify_smoke.py at $(date -Is) ==="
-sudo -u ec2-user -E ./venv/bin/python verify_smoke.py
+echo "=== running verify/smoke.py at $(date -Is) ==="
+sudo -u ec2-user -E ./venv/bin/python verify/smoke.py
 SMOKE_EXIT=$?
 
-echo "=== verify_smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
+echo "=== verify/smoke.py exited with $SMOKE_EXIT at $(date -Is) ==="
 
 # 7. Auto-terminate on success
 if [ "$SMOKE_EXIT" -eq 0 ]; then

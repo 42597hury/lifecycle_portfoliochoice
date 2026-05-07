@@ -60,7 +60,7 @@ The audit report should still document:
 2. For each kernel builder pair (terminal/retirement/working × pmap/vmap_only), confirm:
    - `gather_dtype` is resolved from `mp` config and used identically in both variants.
    - The mixed-fp32-gather+fp64-arithmetic boundary is at the same point in both code paths.
-3. The mixed-precision verify script ([verify_mixed_precision.py](../../verify_mixed_precision.py) or [verify_mixed_precision_tiny.py](../../verify_mixed_precision_tiny.py)) currently runs at `n_dev=1`. **Optional: add a multi-device smoke** by setting `XLA_FLAGS=--xla_force_host_platform_device_count=2` and re-running tiny gate; confirm fp32-gather + fp64-FOC bit-identity holds across the pmap dispatch boundary.
+3. The mixed-precision verify script ([verify/mixed_precision.py](../../verify/mixed_precision.py) or [verify/mixed_precision_tiny.py](../../verify/mixed_precision_tiny.py)) currently runs at `n_dev=1`. **Optional: add a multi-device smoke** by setting `XLA_FLAGS=--xla_force_host_platform_device_count=2` and re-running tiny gate; confirm fp32-gather + fp64-FOC bit-identity holds across the pmap dispatch boundary.
 
 ### C. Warm-start arrays under sharding
 
@@ -90,7 +90,7 @@ This is the **single most important sanity check** in Phase A — it actually ex
 
 1. Unset `LIFECYCLE_DISABLE_VIRTUAL_CPUS` (or set it to `0`).
 2. Set `XLA_FLAGS=--xla_force_host_platform_device_count=4`. (Not 2 — odd-vs-even might mask edge cases.)
-3. Run [verify_smoke.py](../../verify_smoke.py).
+3. Run [verify/smoke.py](../../verify/smoke.py).
 4. Expected stdout:
    ```
    Cell-batching pattern: pmap+vmap (4 devices)
@@ -170,26 +170,26 @@ Run each gate sequentially. If any fails, do not proceed to the next.
 
 **Gate 1 — single-device chunks=1 bit-identity:**
 ```bash
-LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify_smoke.py
+LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify/smoke.py
 # Capture alphas. Set cell_vmap_chunks=1 explicitly.
 ```
 Compare to baseline (pre-this-change). Bit-identity required.
 
 **Gate 2 — single-device chunks=4 bit-identity vs chunks=1:**
 ```bash
-LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify_chunking.py
+LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify/chunking.py
 ```
 This script already exercises chunking on the vmap-only path; should still pass post-change.
 
 **Gate 3 — n_dev=4 chunks=1 bit-identity vs single-device chunks=1:**
 ```bash
-XLA_FLAGS=--xla_force_host_platform_device_count=4 python verify_smoke.py
+XLA_FLAGS=--xla_force_host_platform_device_count=4 python verify/smoke.py
 # cell_vmap_chunks=1, expect "pmap+vmap (4 devices)" in stdout
 ```
 Alphas should match the Gate 1 single-device run bit-identically.
 
 **Gate 4 — n_dev=4 chunks=4 bit-identity vs n_dev=4 chunks=1:**
-Modify verify_smoke.py temporarily (or write a new verify_pmap_chunking.py mirroring verify_chunking.py) to set `cell_vmap_chunks=4`. Run with `XLA_FLAGS=--xla_force_host_platform_device_count=4`. Alphas match Gate 3 bit-identically. **This is the headline gate** — proves chunking under pmap doesn't break correctness.
+Modify verify/smoke.py temporarily (or write a new verify_pmap_chunking.py mirroring verify/chunking.py) to set `cell_vmap_chunks=4`. Run with `XLA_FLAGS=--xla_force_host_platform_device_count=4`. Alphas match Gate 3 bit-identically. **This is the headline gate** — proves chunking under pmap doesn't break correctness.
 
 **Gate 5 — memory test on n_dev=4 chunks=4:**
 Optional but recommended: monitor RSS during Gate 4 vs Gate 3. Peak RSS at chunks=4 should be ~lower than chunks=1 (4× chunks = ~1/4 peak working set). Confirms the memory bound actually bites.
@@ -226,7 +226,7 @@ If all checks come back GREEN or YELLOW, the report ends with: *"Cleared for Pha
 - [ ] (B) Audit mixed-precision threading in all three pmap kernel builders.
 - [ ] (C) Audit warm-start array sharding (`init_a_s_arr`, `init_a_b_arr`) in retirement + working pmap builders.
 - [ ] (D) Audit cell-axis padding strip in collapse logic for all three.
-- [ ] (E) Run `XLA_FLAGS=--xla_force_host_platform_device_count=4 python verify_smoke.py`. Confirm `pmap+vmap (4 devices)` prints and alphas match `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1` smoke bit-identically.
+- [ ] (E) Run `XLA_FLAGS=--xla_force_host_platform_device_count=4 python verify/smoke.py`. Confirm `pmap+vmap (4 devices)` prints and alphas match `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1` smoke bit-identically.
 - [ ] (F) Light check on cache headroom and S3 sync.
 - [ ] Write `docs/scans/MULTI_GPU_AUDIT_2026-05-07.md` with per-check verdicts.
 - [ ] Commit Phase A separately:
@@ -251,7 +251,7 @@ If all checks come back GREEN or YELLOW, the report ends with: *"Cleared for Pha
 - [ ] Thread `gather_dtype` (mixed precision) through the chunked pmap path identically to chunked vmap-only.
 - [ ] Thread Newton-iter histogram (`n_iters_max`, `n_backtrack_total`) through chunked pmap path identically.
 - [ ] Run **Gate 1**: single-device chunks=1, bit-identity vs pre-change.
-- [ ] Run **Gate 2**: single-device chunks=4 via `verify_chunking.py`, bit-identity vs chunks=1.
+- [ ] Run **Gate 2**: single-device chunks=4 via `verify/chunking.py`, bit-identity vs chunks=1.
 - [ ] Run **Gate 3**: n_dev=4 chunks=1, bit-identity vs Gate 1.
 - [ ] Run **Gate 4**: n_dev=4 chunks=4 (via temporary edit or new `verify_pmap_chunking.py`), bit-identity vs Gate 3. **Headline gate.**
 - [ ] (Optional) **Gate 5**: RSS profiling at chunks=4 vs chunks=1, confirm peak working set drops.

@@ -9,6 +9,11 @@ solver._ccv_log_return_and_grad must agree to machine precision.
 import numpy as np
 import jax.numpy as jnp
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from lifecycle.solver import _ccv_log_return_and_grad
 
 

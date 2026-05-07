@@ -146,7 +146,7 @@ No math change. <Or: math affected because <reason>.>
 
 For each commit:
 - Show the user the diff before pushing if the change is non-trivial (>30 LOC).
-- Run `verify_smoke.py` after each fix to confirm regular run_lifecycle_solver still works (don't break the main path while fixing the side path).
+- Run `verify/smoke.py` after each fix to confirm regular run_lifecycle_solver still works (don't break the main path while fixing the side path).
 - If a fix surfaces ambiguity (e.g. "warm-start init for an inf-horizon iteration is conceptually different from age-step warm-start — what semantics do we want?"), pause and ask.
 
 ---
@@ -174,7 +174,7 @@ For each commit:
 
 ### Phase B — Conditional implementation (only after approval)
 - [ ] Apply approved fixes one logical commit at a time.
-- [ ] Run `verify_smoke.py` after each fix to confirm no regression on the main path.
+- [ ] Run `verify/smoke.py` after each fix to confirm no regression on the main path.
 - [ ] Push.
 
 ---

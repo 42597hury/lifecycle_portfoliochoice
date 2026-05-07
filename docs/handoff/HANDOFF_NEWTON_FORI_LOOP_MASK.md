@@ -271,7 +271,7 @@ The diagnostic `n_iter` returned by `newton_2d_with_line_search` should be the a
 
 In the `while_loop` version, a cell that converges in 3 iters does 3 iters of work. In the `fori_loop` version, it does `max_iter` iters of work (mostly identity-masked but still computing foc_fn). Concrete implication:
 
-- Smoke uses `max_iter=100`. Smoke wall on GPU: barely changes (small problem, dispatch dominates anyway). Smoke wall on CPU **with `use_fori_newton=True`**: 2-5× regression. **Set `use_fori_newton=False` in `verify_smoke.py` if running on CPU.**
+- Smoke uses `max_iter=100`. Smoke wall on GPU: barely changes (small problem, dispatch dominates anyway). Smoke wall on CPU **with `use_fori_newton=True`**: 2-5× regression. **Set `use_fori_newton=False` in `verify/smoke.py` if running on CPU.**
 - Benchmark uses `max_iter=400`. With `use_fori_newton=True` on GPU: this is the wall cost. Tune `max_iter` to be ~3-5× the 99th-percentile observed iter count. With backward-age warm-start, that's ~30-50; without, ~100-200.
 - Canonical default `max_iter=5000` is **catastrophic** under fori_loop+mask. Override to ≤ 200 in any production run that uses `use_fori_newton=True`.
 

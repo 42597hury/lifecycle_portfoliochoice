@@ -1,4 +1,4 @@
-"""verify_ee_residuals.py -- Euler-equation residual diagnostic for saved policy bundles.
+"""verify/ee_residuals.py -- Euler-equation residual diagnostic for saved policy bundles.
 
 Loads a saved policy bundle, rebuilds the precompute the solver used, then re-evaluates
 the FOC at every solved cell using the same FOC kernels (retirement_foc_jac_ccv /
@@ -7,15 +7,15 @@ JSON summary alongside the bundle at ``<bundle>/ee_residuals.json``.
 
 Usage
 -----
-    python verify_ee_residuals.py <bundle-name-or-path>
+    python verify/ee_residuals.py <bundle-name-or-path>
 
 Examples
 --------
     # Bundle name resolved under ./saved_runs/
-    python verify_ee_residuals.py system_iv_full_var_unconstrained_cholesky_grid9x9x9x9_nz11_jax_benchmark
+    python verify/ee_residuals.py system_iv_full_var_unconstrained_cholesky_grid9x9x9x9_nz11_jax_benchmark
 
     # Or full path
-    python verify_ee_residuals.py saved_runs/system_iv_full_var_..._jax_benchmark
+    python verify/ee_residuals.py saved_runs/system_iv_full_var_..._jax_benchmark
 
 Output
 ------
@@ -144,7 +144,7 @@ def _rebuild_model_and_pc(metadata: dict, verbose: bool = False):
         raise ValueError(
             "Bundle metadata has no 'run_config'. Cannot rebuild the precompute. "
             "This bundle was saved without configuration metadata (older format). "
-            "Re-solve with the current verify_benchmark_bundle.py."
+            "Re-solve with the current verify/benchmark_bundle.py."
         )
     base_config = run_config.get("base_config")
     if base_config is None:

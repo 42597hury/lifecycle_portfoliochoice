@@ -5,7 +5,7 @@
 
 **Why we need this:** Lobatto adds ±Zσ tail nodes specifically to prevent quadrature-induced spurious arbitrages (cells where the discrete integrator finds a "free lunch" portfolio that doesn't actually exist in continuous returns). Without a test, we don't know if a given bundle has arbitrage. With a test, we can decide whether Lobatto needs to be turned on for a given config — instead of always-on (wasteful) or always-off (dangerous).
 
-**Companion to** the EE diagnostic (`verify_ee_residuals.py`) ported recently. Same structural template; same code-archaeology source on `main`.
+**Companion to** the EE diagnostic (`verify/ee_residuals.py`) ported recently. Same structural template; same code-archaeology source on `main`.
 
 **Effort:** ~1-1.5 days (port + adapt + integrate). Parallels the EE port closely.
 
@@ -15,11 +15,11 @@
 
 Produce **two new artifacts** plus an integration touch-up:
 
-1. **`verify_arbitrage.py`** — loads a saved policy bundle, evaluates per-cell arbitrage gap (the integrator's apparent expected excess return at any feasible portfolio that the model says shouldn't exist), and reports per-age statistics + a JSON summary.
-2. **`verify_invalid_cells.py`** — loads a saved policy bundle and flags cells that are NaN, have extreme α (e.g., `|α_s| > 20` or `|α_b| > 50`), or have implausible `α_s + α_b + α_bill ≠ 1` violations beyond float tolerance.
-3. **Integration into `docs/agents/PREFLIGHT_AGENT.md`** — wire these checks (plus the existing `verify_ee_residuals.py`) into the preflight protocol so any bundle gets characterised before it goes to downstream analysis.
+1. **`verify/arbitrage.py`** — loads a saved policy bundle, evaluates per-cell arbitrage gap (the integrator's apparent expected excess return at any feasible portfolio that the model says shouldn't exist), and reports per-age statistics + a JSON summary.
+2. **`verify/invalid_cells.py`** — loads a saved policy bundle and flags cells that are NaN, have extreme α (e.g., `|α_s| > 20` or `|α_b| > 50`), or have implausible `α_s + α_b + α_bill ≠ 1` violations beyond float tolerance.
+3. **Integration into `docs/agents/PREFLIGHT_AGENT.md`** — wire these checks (plus the existing `verify/ee_residuals.py`) into the preflight protocol so any bundle gets characterised before it goes to downstream analysis.
 
-**Naming convention:** the EE port chose `verify_ee_residuals.py`. Mirror that — `verify_arbitrage.py`, `verify_invalid_cells.py`. (Reasonable to combine into a single `verify_bundle_health.py` if the agent prefers, but keep them separable so a user can run just one if they want.)
+**Naming convention:** the EE port chose `verify/ee_residuals.py`. Mirror that — `verify/arbitrage.py`, `verify/invalid_cells.py`. (Reasonable to combine into a single `verify_bundle_health.py` if the agent prefers, but keep them separable so a user can run just one if they want.)
 
 ---
 
@@ -41,7 +41,7 @@ Produce **two new artifacts** plus an integration touch-up:
 
 - **Simulator-path-based variants** (`_diag_simpath_worst_cells.py` from `main`). Depends on simulator being CCV-correct, which it now is, but adds another diagnostic axis. Defer.
 - **Visualisation / plotting.** JSON output only.
-- **Auto-running from `verify_benchmark_bundle.py`.** Add later via a separate handoff that wires post-solve diagnostics together.
+- **Auto-running from `verify/benchmark_bundle.py`.** Add later via a separate handoff that wires post-solve diagnostics together.
 - **Modifying `lifecycle/quadrature_with_tails.py`** or any solver-side code. Pure read-only diagnostic.
 - **The arbitrage *fix* (turning on Lobatto)** — this handoff produces the *test*. If the test reports arbitrage, that's the user's signal to rerun with Lobatto, separately tracked in `HANDOFF_EVAL_LOBATTO_PROPAGATION.md`.
 
@@ -49,7 +49,7 @@ Produce **two new artifacts** plus an integration touch-up:
 
 - **Use existing CCV machinery.** Don't re-derive R_p formulas. Import and call solver kernels.
 - **No solver-side code changes.** Pure diagnostic; read-only on the bundle.
-- **Memory-bounded.** Use the chunk-outside-JIT pattern that the EE diagnostic already established (`_chunked_vmap_two` from `verify_ee_residuals.py`). Don't repeat the OOM lesson.
+- **Memory-bounded.** Use the chunk-outside-JIT pattern that the EE diagnostic already established (`_chunked_vmap_two` from `verify/ee_residuals.py`). Don't repeat the OOM lesson.
 - **Adapted for 4-D state and CCV.** The `main` branch's diagnostic was 3-D + arithmetic returns; this port must use 4-D + CCV log returns end-to-end.
 
 ---
@@ -89,7 +89,7 @@ For initial port: compute the arbitrage gap **at the solved policy** for each ce
 
 ### What invalid-cells checks
 
-`verify_invalid_cells.py` is simpler. For each cell:
+`verify/invalid_cells.py` is simpler. For each cell:
 
 - `c` finite? `α_s, α_b` finite?
 - `c > min_consumption`? If `c <= tiny_savings`, this is the documented tiny-savings fallback — flag separately.
@@ -103,10 +103,10 @@ Per-age count of cells in each category. JSON output. Pass = zero NaN, zero extr
 
 ## 4. Implementation outline
 
-### 4.1 `verify_arbitrage.py` — structural template
+### 4.1 `verify/arbitrage.py` — structural template
 
 ```python
-"""verify_arbitrage.py — Spurious-arbitrage check for saved policy bundles.
+"""verify/arbitrage.py — Spurious-arbitrage check for saved policy bundles.
 
 Loads a bundle, evaluates per-cell arbitrage gap = min_quad R_p(α) - E[R_bill]
 at the solved (α_s, α_b). Reports per-age stats and saves JSON summary alongside
@@ -137,20 +137,20 @@ from lifecycle.solver import (
     DELTA_BEQUEST,
 )
 
-# Use the same chunk-outside-JIT pattern as verify_ee_residuals.py:
+# Use the same chunk-outside-JIT pattern as verify/ee_residuals.py:
 # - `_chunked_arbitrage_runner` factored helper with for-loop in Python land
 # - Each chunk is its own @jit'd computation
 # - .block_until_ready() between chunks if needed
 ```
 
-Reuse `_build_step_log_returns` and `_build_step_state_brackets` to avoid re-deriving the rtb-from-state-vector logic. The `verify_ee_residuals.py` agent already established the imports and pattern — copy the bundle-loading + precompute-rebuild scaffolding.
+Reuse `_build_step_log_returns` and `_build_step_state_brackets` to avoid re-deriving the rtb-from-state-vector logic. The `verify/ee_residuals.py` agent already established the imports and pattern — copy the bundle-loading + precompute-rebuild scaffolding.
 
-### 4.2 Memory pattern — copy from `verify_ee_residuals.py`
+### 4.2 Memory pattern — copy from `verify/ee_residuals.py`
 
 The EE diagnostic agent had the same memory issue tonight (chunks-inside-JIT bug → 68 GB allocation). After fix, it uses Python-level chunk loop with per-chunk `@jit`. **Mirror that exactly.** Don't repeat the lesson.
 
 ```python
-# Pseudocode mirroring _chunked_vmap_two from verify_ee_residuals.py
+# Pseudocode mirroring _chunked_vmap_two from verify/ee_residuals.py
 @jit
 def per_chunk_arbitrage(z_chunk, is_chunk, C_t, S_t, B_t, ...):
     def per_cell(z_idx, i_s):
@@ -167,7 +167,7 @@ def per_age(...):
     return concatenate(chunk_results)[:n_cells]
 ```
 
-### 4.3 `verify_invalid_cells.py` — much simpler
+### 4.3 `verify/invalid_cells.py` — much simpler
 
 Doesn't need precompute or quadrature. Pure NumPy on the loaded `(C, S, B)` arrays:
 
@@ -192,9 +192,9 @@ After implementation, update the preflight protocol to include:
 
 Run all three diagnostics in sequence:
 
-1. `python verify_invalid_cells.py <bundle-name>` — must pass (zero NaN, zero extreme-α)
-2. `python verify_arbitrage.py <bundle-name>` — must pass (max gap < 1e-6)
-3. `python verify_ee_residuals.py <bundle-name> --use-relative` — must pass (max < 1e-2)
+1. `python verify/invalid_cells.py <bundle-name>` — must pass (zero NaN, zero extreme-α)
+2. `python verify/arbitrage.py <bundle-name>` — must pass (max gap < 1e-6)
+3. `python verify/ee_residuals.py <bundle-name> --use-relative` — must pass (max < 1e-2)
 
 If any fail: investigate before treating the bundle as valid. Do NOT skip; do NOT
 proceed to plotting or simulation analysis with a non-passing bundle.
@@ -208,8 +208,8 @@ The exact placement in the preflight doc is the agent's call — add it as its o
 
 ## 5. Verification gates
 
-1. **`verify_invalid_cells.py`** runs cleanly on tonight's 5⁴ bundle. Reports zero anomalies (we already know `total_newton_failures=0` and policies looked sane).
-2. **`verify_arbitrage.py`** runs cleanly on tonight's 5⁴ bundle. Reports per-age max gap. **Initial expectation is uncertain** — Lobatto is OFF in tonight's bundle, so spurious arbitrage might exist. The point is to *measure* it.
+1. **`verify/invalid_cells.py`** runs cleanly on tonight's 5⁴ bundle. Reports zero anomalies (we already know `total_newton_failures=0` and policies looked sane).
+2. **`verify/arbitrage.py`** runs cleanly on tonight's 5⁴ bundle. Reports per-age max gap. **Initial expectation is uncertain** — Lobatto is OFF in tonight's bundle, so spurious arbitrage might exist. The point is to *measure* it.
 3. **Both scripts produce JSON output** in the bundle dir, mirror format of `ee_residuals.json`.
 4. **`docs/agents/PREFLIGHT_AGENT.md`** updated with the three-step health-check section. Cross-references to all three scripts.
 5. **Memory test** at production scale: each script processes the full 5⁴ bundle without OOM on the laptop (use the chunk-outside-JIT pattern).
@@ -235,9 +235,9 @@ With it:
 
 - [ ] Read `git show main:scripts/diagnostics/_diag_arbitrage_quadsweep.py` for structure
 - [ ] Read `git show main:scripts/diagnostics/_diag_invalid_cells.py` for structure
-- [ ] Read `verify_ee_residuals.py` (current branch, post chunk-fix) for the chunk-outside-JIT pattern + precompute rebuild scaffolding
-- [ ] Implement `verify_arbitrage.py` per §4.1 + §4.2
-- [ ] Implement `verify_invalid_cells.py` per §4.3
+- [ ] Read `verify/ee_residuals.py` (current branch, post chunk-fix) for the chunk-outside-JIT pattern + precompute rebuild scaffolding
+- [ ] Implement `verify/arbitrage.py` per §4.1 + §4.2
+- [ ] Implement `verify/invalid_cells.py` per §4.3
 - [ ] Test both on tonight's 5⁴ bundle (`saved_runs/system_iv_full_var_unconstrained_cholesky_grid5x5x5x5_nz11_jax_benchmark/`)
 - [ ] Confirm both produce `<bundle>/arbitrage.json` and `<bundle>/invalid_cells.json` in the same format style as `ee_residuals.json`
 - [ ] Update `docs/agents/PREFLIGHT_AGENT.md` with the unified health-check section per §4.4
@@ -256,15 +256,15 @@ vector. Uses solver-internal CCV kernels (_ccv_log_return_and_grad,
 _build_step_log_returns) so residuals are graded against the same math
 the solver used.
 
-Memory pattern: chunk-outside-JIT (mirrors verify_ee_residuals.py's
+Memory pattern: chunk-outside-JIT (mirrors verify/ee_residuals.py's
 post-fix pattern). Per-chunk peak HBM bounded by user-chosen K.
 
 Outputs:
-- verify_arbitrage.py + <bundle>/arbitrage.json
-- verify_invalid_cells.py + <bundle>/invalid_cells.json
+- verify/arbitrage.py + <bundle>/arbitrage.json
+- verify/invalid_cells.py + <bundle>/invalid_cells.json
 
 Updated docs/agents/PREFLIGHT_AGENT.md to require all three bundle-
-health checks (these two + verify_ee_residuals.py) before any downstream
+health checks (these two + verify/ee_residuals.py) before any downstream
 analysis on a saved bundle. Preflight is the gate that makes the
 diagnostics actually get run.
 
@@ -283,7 +283,7 @@ The `main` branch's `_diag_arbitrage_quadsweep.py` swept α over a grid (e.g., `
 
 ### 8.2 Bundle's `youngest_age_to_solve` skip
 
-If the bundle is retirement-only (`youngest_age_to_solve=67`), only ages ≥ 67 have valid policies. The script must skip earlier ages (they're NaN). `verify_ee_residuals.py` already does this — copy the pattern.
+If the bundle is retirement-only (`youngest_age_to_solve=67`), only ages ≥ 67 have valid policies. The script must skip earlier ages (they're NaN). `verify/ee_residuals.py` already does this — copy the pattern.
 
 ### 8.3 No simulator dependence
 
@@ -291,19 +291,19 @@ This handoff explicitly does NOT depend on the simulator. Path-based diagnostics
 
 ### 8.4 Lobatto-off caveat for tonight's bundle
 
-Tonight's bundle was solved with `ret_lobatto_Z = state_lobatto_Z = None`. **This is precisely the case where spurious arbitrage is most likely.** If `verify_arbitrage.py` reports gap > 0 for some cells, that's not a bug in the diagnostic — it's the bundle revealing that Lobatto should have been on. Document the result, don't try to "fix" it via the diagnostic.
+Tonight's bundle was solved with `ret_lobatto_Z = state_lobatto_Z = None`. **This is precisely the case where spurious arbitrage is most likely.** If `verify/arbitrage.py` reports gap > 0 for some cells, that's not a bug in the diagnostic — it's the bundle revealing that Lobatto should have been on. Document the result, don't try to "fix" it via the diagnostic.
 
 ### 8.5 Memory at 4-D + n_z=11 + n_state_quad=36
 
-The arbitrage diagnostic's per-cell working set is similar to the EE diagnostic's (both evaluate FOC-style quad sums). Use the same chunk size logic — `_build_padded_cell_indices` from `verify_ee_residuals.py` with default `chunk_size=2048` (or whatever the EE agent landed on after their fix).
+The arbitrage diagnostic's per-cell working set is similar to the EE diagnostic's (both evaluate FOC-style quad sums). Use the same chunk size logic — `_build_padded_cell_indices` from `verify/ee_residuals.py` with default `chunk_size=2048` (or whatever the EE agent landed on after their fix).
 
 ---
 
 ## 9. Ordering against the queue
 
-When the agent picks this up, the EE port (`verify_ee_residuals.py`) and chunking fix should already be done — both provide the working pattern this port mirrors. Don't start before:
+When the agent picks this up, the EE port (`verify/ee_residuals.py`) and chunking fix should already be done — both provide the working pattern this port mirrors. Don't start before:
 
-- ✅ EE agent's chunk-outside-JIT fix in `verify_ee_residuals.py` is committed
+- ✅ EE agent's chunk-outside-JIT fix in `verify/ee_residuals.py` is committed
 - ✅ Float agent's solver-side `_chunked_vmap_cells` fix is committed (so `lifecycle/solver.py` is in known-good state for the diagnostic to import from)
 
 After both are in: this handoff can run in parallel with anything else (it doesn't touch `lifecycle/solver.py` or any in-flight code).

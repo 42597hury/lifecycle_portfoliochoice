@@ -153,7 +153,7 @@ User reads these numbers off the run, then sets `max_iter` and `max_backtrack_it
 
 ### A.4 Validation
 
-Run smoke (`verify_smoke.py`) with the change. Expected:
+Run smoke (`verify/smoke.py`) with the change. Expected:
 - New stats appear in stdout summary and in `diagnostics` dict.
 - p99 should be much smaller than `max_iter=100` (probably 10-30 for Newton, 2-5 for backtrack).
 - No regression in alphas (math unchanged).
@@ -201,16 +201,16 @@ If NOT plumbed through (i.e., something hardcodes 10 somewhere): make it configu
 
 For both changes:
 
-1. Run `verify_smoke.py`. Expected stdout addition:
+1. Run `verify/smoke.py`. Expected stdout addition:
    ```
    Newton iters: p50=4  p95=12  p99=23  max=47
    Backtrack iters: p50=0  p95=2  p99=3  max=7
    ```
-2. After tonight's bundle lands and the change is in place, **also run** `python verify_benchmark_bundle.py` (post-change) to get production-scale measurements. The numbers above are smoke-scale; production p99 might be a bit higher (more cells, longer tail).
+2. After tonight's bundle lands and the change is in place, **also run** `python verify/benchmark_bundle.py` (post-change) to get production-scale measurements. The numbers above are smoke-scale; production p99 might be a bit higher (more cells, longer tail).
 
 Once production p99 is known, the user updates:
-- `verify_smoke.py` → `max_iter=2 × p99_observed`
-- `verify_benchmark_bundle.py` → same
+- `verify/smoke.py` → `max_iter=2 × p99_observed`
+- `verify/benchmark_bundle.py` → same
 - `SolverConfig` defaults → reflects the new recommendation
 
 ---
@@ -226,7 +226,7 @@ Once production p99 is known, the user updates:
 - [ ] Modify `run_lifecycle_solver` to collect, aggregate, and add to `diagnostics` dict.
 - [ ] Add stdout print of histograms in verbose-1 summary.
 - [ ] Verify `max_backtrack_iter` is already a SolverConfig field (likely yes).
-- [ ] Run `verify_smoke.py` — confirm stats appear, alphas unchanged.
+- [ ] Run `verify/smoke.py` — confirm stats appear, alphas unchanged.
 - [ ] Commit message:
   ```
   diagnostics: expose Newton + backtrack iter histograms in diag output

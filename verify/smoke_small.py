@@ -1,8 +1,8 @@
-"""Reduced smoke (faster than verify_smoke.py) for chunking-fix gating.
+"""Reduced smoke (faster than verify/smoke.py) for chunking-fix gating.
 
-Matches verify_smoke.py's structure (6-age window 60-65 covers terminal +
+Matches verify/smoke.py's structure (6-age window 60-65 covers terminal +
 retire + work-to-retire boundary + working) but uses the smaller state
-grid + quad config from verify_chunking.py so the run finishes in ~3-5
+grid + quad config from verify/chunking.py so the run finishes in ~3-5
 min on local CPU instead of ~25 min.
 
 Same scope as a verify_smoke run for regression purposes: each of the
@@ -20,6 +20,11 @@ import numpy as np
 
 import jax  # noqa: E402
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER  # noqa: E402
 from lifecycle.model import DiscretizationConfig  # noqa: E402
 from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402
@@ -31,7 +36,7 @@ assert len(jax.devices()) == 1, (
     "Set LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 before any lifecycle import."
 )
 
-# Smaller config than verify_smoke.py — same shape that verify_chunking uses.
+# Smaller config than verify/smoke.py — same shape that verify_chunking uses.
 small_disc = DiscretizationConfig(
     n_wealth=15, wealth_min=0.13, wealth_max=200.0,
     n_savings=15,
@@ -45,7 +50,7 @@ small_disc = DiscretizationConfig(
     n_state_quad_nodes=(2, 2, 2, 2),
 )
 
-# Same age window as verify_smoke.py: 60..65 covers terminal + retire +
+# Same age window as verify/smoke.py: 60..65 covers terminal + retire +
 # work-to-retire boundary + working.
 small_base = dict(BASE_CONFIG)
 small_base.update(start_age=60, retire_age=63, terminal_age=65)

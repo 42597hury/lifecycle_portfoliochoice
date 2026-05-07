@@ -11,7 +11,7 @@
 
 ## 1. Goal
 
-Produce **a parameterized wall-time formula** for `verify_benchmark_bundle.py`-style runs of the lifecycle solver, plus a **table of projected walls** across the configurations the user is considering for thesis runs. The formula must:
+Produce **a parameterized wall-time formula** for `verify/benchmark_bundle.py`-style runs of the lifecycle solver, plus a **table of projected walls** across the configurations the user is considering for thesis runs. The formula must:
 
 1. Take config knobs as inputs (grid sizes, n_z, n_w, n_s, quadrature counts, max_iter, n_age).
 2. Take hardware as input (fp64 TFLOPS, HBM bandwidth, HBM size).

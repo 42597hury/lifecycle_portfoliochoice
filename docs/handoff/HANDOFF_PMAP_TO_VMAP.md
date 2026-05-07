@@ -337,11 +337,11 @@ The CPU path (multi-core, virtual devices, `n_dev == cpu_count`) is **unchanged*
 ```bash
 # Before this change is applied: capture baseline
 git stash
-python verify_smoke.py 2>&1 | tee /tmp/smoke_baseline.txt
+python verify/smoke.py 2>&1 | tee /tmp/smoke_baseline.txt
 git stash pop
 
 # After change: re-run
-python verify_smoke.py 2>&1 | tee /tmp/smoke_after.txt
+python verify/smoke.py 2>&1 | tee /tmp/smoke_after.txt
 
 # Compare alpha ranges
 grep "alpha_s range\|alpha_b range" /tmp/smoke_baseline.txt /tmp/smoke_after.txt
@@ -354,7 +354,7 @@ The two outputs must match to all printed digits. If they don't: regression in t
 The pmap path only kicks in when `n_dev > 1`. To exercise the new vmap-only path on local CPU, force a single virtual device:
 
 ```bash
-LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify_smoke.py
+LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify/smoke.py
 ```
 
 This sets `len(jax.devices()) == 1`, dispatcher routes to vmap-only path. Verify:
@@ -455,12 +455,12 @@ No new files. No `model.py` change. No test file changes.
 
 - [ ] (Optional but recommended) Add the cell-batching pattern log line per §4.5.
 
-- [ ] Run `python verify_smoke.py` (multi-core CPU, exercises pmap path). Confirm:
+- [ ] Run `python verify/smoke.py` (multi-core CPU, exercises pmap path). Confirm:
   - `Status: complete`, `Policy sanity: PASS`.
   - Alpha ranges match the pre-change baseline to printed precision.
   - (If §4.5 added) Log shows `Cell-batching pattern: pmap+vmap (N devices)`.
 
-- [ ] Run `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify_smoke.py` (single-device CPU, exercises vmap-only path). Confirm:
+- [ ] Run `LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 python verify/smoke.py` (single-device CPU, exercises vmap-only path). Confirm:
   - Same correctness criteria.
   - Alpha ranges match the multi-core run within 1e-9.
   - (If §4.5 added) Log shows `Cell-batching pattern: vmap-only (single-device)`.

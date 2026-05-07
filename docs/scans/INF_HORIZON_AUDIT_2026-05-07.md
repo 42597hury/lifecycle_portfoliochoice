@@ -174,7 +174,7 @@ The handoff names `verify_runtime_platform()` as something `run_lifecycle_solver
 
 The handoff's example invocation referenced `SYSTEM_I/II/III/IV, build_system_disc_config, build_system_var_config`. Those names do not exist in the module — the actual exported entrypoint is `prepare_predictability_system(system_code, *, csv_path, disc_config_template)` at [lifecycle/predictability_ablation.py:237](../../lifecycle/predictability_ablation.py#L237), which takes the canonical 4-D `disc_config_template` and projects it onto each system's state cardinality.
 
-Smoke-build (12-CPU host, tiny 4-D template `(2,3,2,3)` matching `verify_smoke.py`):
+Smoke-build (12-CPU host, tiny 4-D template `(2,3,2,3)` matching `verify/smoke.py`):
 
 | System | state_names | N_state | Result |
 | --- | --- | --- | --- |
@@ -204,7 +204,7 @@ LIFECYCLE PORTFOLIO SOLVER  (JAX, EGM + 2D Newton)
   wall: 21.5s
 ```
 
-Solver completes on a 1-D state. The rtb-as-state migration did NOT break axis-cardinality flexibility. Newton iterations did saturate the aggressive `max_iter=30` cap (this matches `verify_smoke.py`-style smokes; max_iter is set tight on purpose to keep wall time low — not a correctness signal at this granularity). **GREEN.**
+Solver completes on a 1-D state. The rtb-as-state migration did NOT break axis-cardinality flexibility. Newton iterations did saturate the aggressive `max_iter=30` cap (this matches `verify/smoke.py`-style smokes; max_iter is set tight on purpose to keep wall time low — not a correctness signal at this granularity). **GREEN.**
 
 ---
 
@@ -212,7 +212,7 @@ Solver completes on a 1-D state. The rtb-as-state migration did NOT break axis-c
 
 `grep -l "inf_horizon\|run_infinite_horizon\|prepare_predictability_system\|predictability_ablation"` over `verify_*.py` and `scripts/`:
 
-- `verify_benchmark_bundle.py`: only mentions `predictability_ablation` as a metadata-snapshot string for the saved bundle — does NOT call into the module.
+- `verify/benchmark_bundle.py`: only mentions `predictability_ablation` as a metadata-snapshot string for the saved bundle — does NOT call into the module.
 - No `verify_*.py` invokes `run_infinite_horizon_solver`, `compile_inner_kernel_smoke_test`, or `prepare_predictability_system`.
 - `inf_horizon_benchmark.ipynb` and `main.ipynb` are the only consumers; both are notebooks not exercised by the verify path.
 
@@ -232,7 +232,7 @@ Suggested commit ladder, smallest blast radius first:
    - Choice point (B.1): pass `jnp.asarray(S_old)/B_old` (tracks each iteration's policy) OR pass constant `init_alpha_s/init_alpha_b` arrays. **Ask user.**
    - The unused `n_iters_max` / `n_backtrack_total` outputs can be discarded with `_, _` until step 3.
    - Validation: `compile_inner_kernel_smoke_test` runs without TypeError; tiny 5-iteration loop converges.
-2. **`verify_smoke.py` regression check.** No code change to the smoke; just confirm the main lifecycle path is untouched.
+2. **`verify/smoke.py` regression check.** No code change to the smoke; just confirm the main lifecycle path is untouched.
 3. **Newton-iter histogram into diagnostics.** Capture `ni_t/nb_t` per iteration; expose `newton_iter_p99`, `n_backtrack_total_p99` in `diagnostics`. Optional but cheap and aligns with the lifecycle solver's diagnostics surface.
 4. **(Out of scope) Add `verify_inf_horizon.py`** to lock in regression coverage. This is its own handoff.
 

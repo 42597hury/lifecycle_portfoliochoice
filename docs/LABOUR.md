@@ -454,7 +454,7 @@ matching low-order moments.
 The audit script
 [tests/audit_judd_economist.py](tests/audit_judd_economist.py) and the
 notebook section §C.4–C.5 of
-[verify_discretization.ipynb](verify_discretization.ipynb) measure (ii)
+[verify/discretization.ipynb](verify/discretization.ipynb) measure (ii)
 directly against a 400-point reference. Production guidance reads off
 those numbers.
 

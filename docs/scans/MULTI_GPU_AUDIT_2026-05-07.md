@@ -73,7 +73,7 @@ The terminal kernel ([solver.py:1556](../../lifecycle/solver.py#L1556) pmap, [so
 
 ### Optional follow-up
 
-The handoff suggested re-running `verify_mixed_precision_tiny.py` at `XLA_FLAGS=--xla_force_host_platform_device_count=2` to confirm fp32-gather + fp64-FOC bit-identity holds across the pmap dispatch boundary. Skipped here because (E) already shows the broader smoke is bit-identical at default `gather_precision='f64'`; mixed-precision multi-device check can be folded into Phase B's first verify run if desired. Estimated additional effort: <30 min on the Lambda instance.
+The handoff suggested re-running `verify/mixed_precision_tiny.py` at `XLA_FLAGS=--xla_force_host_platform_device_count=2` to confirm fp32-gather + fp64-FOC bit-identity holds across the pmap dispatch boundary. Skipped here because (E) already shows the broader smoke is bit-identical at default `gather_precision='f64'`; mixed-precision multi-device check can be folded into Phase B's first verify run if desired. Estimated additional effort: <30 min on the Lambda instance.
 
 ---
 
@@ -141,14 +141,14 @@ The padding scheme does waste up to (n_dev - 1) × Newton solves per age on dupl
 ```
 XLA_FLAGS=--xla_force_host_platform_device_count=4
 LIFECYCLE_DISABLE_VIRTUAL_CPUS=0
-python verify_smoke.py
+python verify/smoke.py
 ```
 
 Then a fresh single-device baseline (after deleting the n_dev=4 checkpoint to force a true re-solve):
 
 ```
 LIFECYCLE_DISABLE_VIRTUAL_CPUS=1
-python verify_smoke.py
+python verify/smoke.py
 ```
 
 ### Results
@@ -226,11 +226,11 @@ To reproduce (E) on this branch:
 ```powershell
 $env:XLA_FLAGS = "--xla_force_host_platform_device_count=4"
 $env:LIFECYCLE_DISABLE_VIRTUAL_CPUS = "0"
-python verify_smoke.py
+python verify/smoke.py
 mv saved_runs/checkpoints/jax_cholesky_grid2x3x2x3_nz3_to_age62 saved_runs/checkpoints/jax_cholesky_grid2x3x2x3_nz3_to_age62.ndev4
 $env:LIFECYCLE_DISABLE_VIRTUAL_CPUS = "1"
 Remove-Item Env:XLA_FLAGS
-python verify_smoke.py
+python verify/smoke.py
 # then bit-compare the two policy_arrays.npz files on solved ages
 ```
 

@@ -214,13 +214,13 @@ from textbook CCV.
 - `cell_vmap_chunks` (memory bound for big problems; only matters at 11⁴+ on multi-GPU per audit)
 
 **Verify scripts (the gates):**
-- `verify_smoke.py` — 38-age window via SolveControl, 5-15s wall, exercises every kernel
-- `verify_chunking.py` — chunking bit-identity gate
-- `verify_mixed_precision_tiny.py` — fp32 gather bit-identity gate; HLO dump pattern lives here
-- `verify_arbitrage.py` + `verify_invalid_cells.py` — discrete-arbitrage check (precompute-level, no GPU needed)
-- `verify_ee_residuals.py` — grid-EE diagnostic
-- `verify_ee_simpath.py` — sim-path EE diagnostic (the headline thesis number)
-- `verify_benchmark_bundle.py` — production runner (5⁴/9⁴; legacy, may include unwanted post-solve diagnostics)
+- `verify/smoke.py` — 38-age window via SolveControl, 5-15s wall, exercises every kernel
+- `verify/chunking.py` — chunking bit-identity gate
+- `verify/mixed_precision_tiny.py` — fp32 gather bit-identity gate; HLO dump pattern lives here
+- `verify/arbitrage.py` + `verify/invalid_cells.py` — discrete-arbitrage check (precompute-level, no GPU needed)
+- `verify/ee_residuals.py` — grid-EE diagnostic
+- `verify/ee_simpath.py` — sim-path EE diagnostic (the headline thesis number)
+- `verify/benchmark_bundle.py` — production runner (5⁴/9⁴; legacy, may include unwanted post-solve diagnostics)
 
 ---
 
@@ -240,7 +240,7 @@ cat ~/.aws/credentials | ssh ubuntu@<lambda-ip> 'mkdir -p ~/.aws && cat > ~/.aws
 
 **ALWAYS run long compute under tmux on Lambda:**
 ```bash
-ssh ubuntu@<ip> 'tmux new-session -d -s bench "cd lifecycle_portfoliochoice && source venv/bin/activate && python verify_benchmark_bundle.py 2>&1 | tee run.log"'
+ssh ubuntu@<ip> 'tmux new-session -d -s bench "cd lifecycle_portfoliochoice && source venv/bin/activate && python verify/benchmark_bundle.py 2>&1 | tee run.log"'
 ```
 Bare `python ... &` will die on SSH SIGHUP and you lose the run.
 
@@ -502,7 +502,7 @@ When they say "I trust this," ship.
   = -2.0 (1% worst cell), tighter than main v3 on every comparable
   metric.
 - **Next bundle target:** 6⁴ retirement-or-full-solve. Config drafted
-  in `verify_benchmark_bundle_6666.py` (uncommitted) but user flagged
+  in `verify/benchmark_bundle_6666.py` (uncommitted) but user flagged
   it "launches unnecessary legacy functions" — wants a stripped-down
   runner before launch. **Open design question.**
 - **Hardware status:** Lambda 8× H100 / 8× A100 are *out of capacity*;
@@ -523,17 +523,17 @@ When they say "I trust this," ship.
    3×3=9 saves 1.8× wall on working ages. Tradeoff: less accurate
    income-shock integration → higher mean log|EE| in working cells.
    User hasn't named the target log|EE| threshold yet.
-3. **Clean runner script.** User wants `verify_benchmark_bundle_6666.py`
+3. **Clean runner script.** User wants `verify/benchmark_bundle_6666.py`
    stripped of legacy bits (likely the `diagnose_terminal_portfolio_states`
    post-solve call). Hasn't specified what stays / what goes. **Likely
    the first thing the user asks about next session.**
 
 ### In-flight subagents
 
-- **Arbitrage agent**: revising `verify_arbitrage.py` (was structurally
+- **Arbitrage agent**: revising `verify/arbitrage.py` (was structurally
   wrong on first commit `cf28a27`; zero blast radius — nothing depends
   on it yet). Status as of session end: under revision. Working tree
-  shows `M verify_arbitrage.py`.
+  shows `M verify/arbitrage.py`.
 
 ### Drafted handoffs ready to dispatch (not yet sent)
 
@@ -581,8 +581,8 @@ In approximate order of probability:
 ### Working-tree state at session end
 
 ```
-M verify_arbitrage.py         # arbitrage agent revising
-?? verify_benchmark_bundle_6666.py  # deferred per user
+M verify/arbitrage.py         # arbitrage agent revising
+?? verify/benchmark_bundle_6666.py  # deferred per user
 ?? docs/scans/hlo_dumps/      # 3.8 MB; orthogonal
 ```
 

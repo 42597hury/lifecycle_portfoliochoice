@@ -4,7 +4,7 @@
 # Wraps a lifecycle-solver run with cache-aware S3 plumbing:
 #   1. Pull the JAX persistent compilation cache from S3 (idempotent — skip
 #      if local cache already non-empty).
-#   2. Run the solver script (default: verify_benchmark_bundle.py). The solver
+#   2. Run the solver script (default: verify/benchmark_bundle.py). The solver
 #      itself uploads the policy bundle to S3 if S3_BUCKET is set.
 #   3. Push the (now-populated) JAX cache back to S3 on success.
 #   4. Archive the run log to S3.
@@ -15,7 +15,7 @@
 #
 # Required env vars:
 #   S3_BUCKET                  S3 bucket for cache, bundle, log
-#                              (also picked up by verify_benchmark_bundle.py
+#                              (also picked up by verify/benchmark_bundle.py
 #                              for its own bundle upload)
 #
 # Optional env vars:
@@ -24,7 +24,7 @@
 #   CACHE_TIER                 default: auto-detected (gpu-h100-sxm5,
 #                              gpu-h100-pcie, gpu-a100, gpu-v100, gpu-other,
 #                              cpu). Override to force a specific prefix.
-#   RUN_SCRIPT                 default: verify_benchmark_bundle.py
+#   RUN_SCRIPT                 default: verify/benchmark_bundle.py
 #   CACHE_VERSION              default: v1. Bump to invalidate stale cache
 #                              after a JAX upgrade.
 #
@@ -48,7 +48,7 @@ command -v aws >/dev/null 2>&1 || {
 # --- Defaults ---
 AWS_REGION="${AWS_REGION:-eu-north-1}"
 LIFECYCLE_JAX_CACHE_DIR="${LIFECYCLE_JAX_CACHE_DIR:-$HOME/.cache/jax_lifecycle}"
-RUN_SCRIPT="${RUN_SCRIPT:-verify_benchmark_bundle.py}"
+RUN_SCRIPT="${RUN_SCRIPT:-verify/benchmark_bundle.py}"
 CACHE_VERSION="${CACHE_VERSION:-v1}"
 
 # --- Auto-detect hardware tier (if not overridden) ---

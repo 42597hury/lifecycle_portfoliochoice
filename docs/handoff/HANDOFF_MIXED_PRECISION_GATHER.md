@@ -29,7 +29,7 @@ Reduce numerical precision to fp32 **only** at sites where:
 - Modify `lifecycle/solver.py` to introduce explicit fp32 cast at the gather + multilinear-interp boundary, then cast back to fp64 before CRRA/FOC arithmetic.
 - Add `SolverConfig.gather_precision: str = "f64"` field with values `{"f64", "f32"}`. Default `"f64"` = current behaviour, no regression.
 - Modify `lifecycle/_interp_c_and_mpc_at_cell` and the `c_corners` gather sites in `_solve_retirement_at_cell` and `_solve_working_at_cell` to honour the precision flag.
-- Add `verify_mixed_precision.py` smoke + alpha-range comparison test.
+- Add `verify/mixed_precision.py` smoke + alpha-range comparison test.
 
 ### Out of scope (do not implement)
 
@@ -204,7 +204,7 @@ static = (sc.tol, sc.max_iter, ..., bool(sc.use_fori_newton), gather_dtype)
 
 ### 5.5 Validation
 
-Add `verify_mixed_precision.py`:
+Add `verify/mixed_precision.py`:
 
 ```python
 """Verify fp32 gather + fp64 FOC produces alphas within 1e-4 of all-fp64."""
@@ -282,10 +282,10 @@ Document this in the report — XLA sometimes elides "useless" casts and unifies
 
 ## 6. Verification gates (in order)
 
-1. **Default unchanged.** `python verify_smoke.py` with `gather_precision="f64"` (default) produces identical alphas to the pre-change baseline. Bit-identical (1e-12 tolerance).
-2. **Smoke fp32 agreement.** `python verify_mixed_precision.py` passes — relative error < 1e-4 on smoke config, no NaN.
+1. **Default unchanged.** `python verify/smoke.py` with `gather_precision="f64"` (default) produces identical alphas to the pre-change baseline. Bit-identical (1e-12 tolerance).
+2. **Smoke fp32 agreement.** `python verify/mixed_precision.py` passes — relative error < 1e-4 on smoke config, no NaN.
 3. **HLO inspection.** Cast boundary visible in the JIT'd HLO; fp32 in gather, fp64 in FOC.
-4. **Larger-config check.** Run `verify_canonical_small.py` (or equivalent) at fp32; confirm alpha ranges sane and no NaN. (~10 min on local CPU; no GPU needed.)
+4. **Larger-config check.** Run `verify/canonical_small.py` (or equivalent) at fp32; confirm alpha ranges sane and no NaN. (~10 min on local CPU; no GPU needed.)
 5. **No tail-cell pathology.** Spot-check alphas at extreme states (top wealth, bottom z, edge state-grid points). Compare fp32 vs fp64 — relative error should still be < 1e-4 even at edges.
 
 If any gate fails, the agent should report and stop. Don't proceed to canonical-scale runs without fixing the gate failure.
@@ -335,11 +335,11 @@ The agent commits this report **before** implementing. User reviews. User confir
 - [ ] Modify `_interp_c_and_mpc_at_cell` per §5.3.
 - [ ] Plumb `gather_dtype` through kernel builders and `_solve_*_at_cell` per §5.4.
 - [ ] Apply gather casts at the c_corners gather sites in `_solve_retirement_at_cell` and `_solve_working_at_cell` (and any others identified during review).
-- [ ] Write `verify_mixed_precision.py` per §5.5.
-- [ ] Run gate 1 (`verify_smoke.py` default unchanged) — must pass bit-identical.
-- [ ] Run gate 2 (`verify_mixed_precision.py`) — must pass relative tolerance.
+- [ ] Write `verify/mixed_precision.py` per §5.5.
+- [ ] Run gate 1 (`verify/smoke.py` default unchanged) — must pass bit-identical.
+- [ ] Run gate 2 (`verify/mixed_precision.py`) — must pass relative tolerance.
 - [ ] Run gate 3 (HLO inspection) — document boundary visible in HLO.
-- [ ] Run gate 4 (`verify_canonical_small.py`) — alphas sane, no NaN.
+- [ ] Run gate 4 (`verify/canonical_small.py`) — alphas sane, no NaN.
 - [ ] Run gate 5 (tail-cell spot check) — relative error <1e-4 at edges.
 - [ ] Commit:
   ```

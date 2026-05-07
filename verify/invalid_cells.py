@@ -1,4 +1,4 @@
-"""verify_invalid_cells.py -- Cheap NumPy-level health check on a saved policy bundle.
+"""verify/invalid_cells.py -- Cheap NumPy-level health check on a saved policy bundle.
 
 Loads a bundle and flags cells that are NaN/Inf, have extreme alphas, or whose
 savings collapsed to the documented ``tiny_savings`` design-fallback. Reports
@@ -6,12 +6,12 @@ per-age counts and saves ``<bundle>/invalid_cells.json``.
 
 Usage
 -----
-    python verify_invalid_cells.py <bundle-name-or-path>
+    python verify/invalid_cells.py <bundle-name-or-path>
 
 Examples
 --------
-    python verify_invalid_cells.py system_iv_full_var_unconstrained_cholesky_grid5x5x5x5_nz11_jax_benchmark
-    python verify_invalid_cells.py saved_runs/system_iv_full_var_..._jax_benchmark
+    python verify/invalid_cells.py system_iv_full_var_unconstrained_cholesky_grid5x5x5x5_nz11_jax_benchmark
+    python verify/invalid_cells.py saved_runs/system_iv_full_var_..._jax_benchmark
 
 Pass criterion
 --------------
@@ -50,7 +50,7 @@ DEFAULT_EXTREME_ALPHA_B = 50.0
 
 
 # =============================================================================
-# Bundle path resolution (mirrors verify_ee_residuals.py)
+# Bundle path resolution (mirrors verify/ee_residuals.py)
 # =============================================================================
 
 def _resolve_bundle_path(bundle_arg: str) -> Path:
@@ -66,7 +66,7 @@ def _resolve_bundle_path(bundle_arg: str) -> Path:
 
 
 # =============================================================================
-# Solved-age mask (mirrors verify_ee_residuals.py)
+# Solved-age mask (mirrors verify/ee_residuals.py)
 # =============================================================================
 
 def _solved_mask_from_metadata(metadata: dict, n_age: int) -> np.ndarray | None:
@@ -228,7 +228,7 @@ def _wealth_grid_from_metadata(metadata: dict) -> np.ndarray | None:
         return None
     # Solver builds wealth_grid as linspace(wealth_min, wealth_max, n_wealth);
     # this matches lifecycle/precompute's construction (same as in
-    # verify_ee_residuals.py's pcj.wealth_grid).
+    # verify/ee_residuals.py's pcj.wealth_grid).
     return np.linspace(float(w_min), float(w_max), int(n_w), dtype=np.float64)
 
 
@@ -278,7 +278,7 @@ def main() -> int:
     if wealth_grid is None:
         print(
             "  NOTE: wealth grid not in metadata; tiny_savings count will be 0. "
-            "Re-save bundle with current verify_benchmark_bundle.py to populate.",
+            "Re-save bundle with current verify/benchmark_bundle.py to populate.",
             flush=True,
         )
 

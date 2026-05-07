@@ -115,9 +115,9 @@ All entries **agreed**. Spot-checks of the math:
 ### Verification gates — agreed in order
 
 1. Default unchanged (`gather_precision="f64"` bit-identical).
-2. `verify_mixed_precision.py` smoke: max relative error on (C, S, B) < 1e-4, no NaN.
+2. `verify/mixed_precision.py` smoke: max relative error on (C, S, B) < 1e-4, no NaN.
 3. HLO inspection: f32 ops in gather/interp section, f64 ops in CRRA/FOC; `convert(f64←f32)` op visible at the boundary right before any `**(-gamma)`.
-4. `verify_canonical_small.py` at fp32: alphas sane, no NaN.
+4. `verify/canonical_small.py` at fp32: alphas sane, no NaN.
 5. Tail-cell spot check at edges (top wealth, bottom z, edge state-grid points): rel err < 1e-4.
 
 If any gate fails, stop and report.

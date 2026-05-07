@@ -371,7 +371,7 @@ Tempting: `lax.scan` over chunks would be a single trace boundary instead of K. 
 
 ### 5.11 Chunks-outside-JIT is load-bearing — verify before trusting
 
-If you ever refactor or simplify the chunk dispatch, **the for-loop must stay in Python, outside any `@jit`-traced function.** A clean-looking refactor that moves the loop inside `@jit` (e.g. into an `all_cells` wrapper, or into `lax.scan`/`lax.fori_loop`) will pass `verify_chunking.py`'s bit-identity tests and silently break the memory bound. The runtime memory test in `verify_chunking.py` (post-fix) is the gate that catches this regression — run it at production scale on the next GPU launch and confirm `nvidia-smi` peak HBM tracks `chunk_size * per_cell + persistent_state`, not the unchunked worst case.
+If you ever refactor or simplify the chunk dispatch, **the for-loop must stay in Python, outside any `@jit`-traced function.** A clean-looking refactor that moves the loop inside `@jit` (e.g. into an `all_cells` wrapper, or into `lax.scan`/`lax.fori_loop`) will pass `verify/chunking.py`'s bit-identity tests and silently break the memory bound. The runtime memory test in `verify/chunking.py` (post-fix) is the gate that catches this regression — run it at production scale on the next GPU launch and confirm `nvidia-smi` peak HBM tracks `chunk_size * per_cell + persistent_state`, not the unchunked worst case.
 
 ### 5.10 Heuristic for choosing `cell_vmap_chunks` (document for users)
 
@@ -397,7 +397,7 @@ These are conservative; users can tune down if they see consistent under-utilisa
 The whole reason for this change is dispatch refactoring with no math change. Verify:
 
 ```python
-# verify_chunking.py (or add to existing test file)
+# verify/chunking.py (or add to existing test file)
 import numpy as np
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig, SolveControl
@@ -405,7 +405,7 @@ from lifecycle.var import build_nominal_system1_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 
-# Same tiny config as verify_smoke.py
+# Same tiny config as verify/smoke.py
 disc = DiscretizationConfig(
     n_wealth=20, wealth_min=0.13, wealth_max=200.0,
     n_savings=20,
@@ -457,7 +457,7 @@ Bit-identity proves the math is unchanged but says nothing about whether chunkin
 3. Asserts K=4 peak RSS ≤ ~K=1 peak RSS / 2 (generous margin — the absolute bound is per-chunk-working-memory + persistent-state).
 4. As a fallback when `psutil` isn't available, asserts that a config 4× the bit-identity smoke runs successfully at K=4 — proving at minimum that the chunking call path doesn't crash on a non-trivial workload.
 
-This sits in the same `verify_chunking.py` file as the bit-identity tests. Both run on local CPU and form the pre-commit gate.
+This sits in the same `verify/chunking.py` file as the bit-identity tests. Both run on local CPU and form the pre-commit gate.
 
 ### 6.2 Production-scale smoke
 
@@ -496,7 +496,7 @@ This is a **post-merge production verification**, not a pre-commit gate. The bit
 |---|---|---|
 | [lifecycle/model.py](../../lifecycle/model.py) | Add `cell_vmap_chunks: int = 1` to `SolverConfig` with docstring | ~10 |
 | [lifecycle/solver.py](../../lifecycle/solver.py) | Add `_chunked_vmap_runner` helper; modify three `*_vmap_only` builders so each chunk is its own `@jit` and the chunk loop runs in Python (in `call()`); add validation in `run_lifecycle_solver` | ~80-100 net |
-| `verify_chunking.py` (new) | Bit-identity test from §6.1 | ~50 |
+| `verify/chunking.py` (new) | Bit-identity test from §6.1 | ~50 |
 | (no changes to docs/handoff/, no changes to scripts/) | — | — |
 
 Total: ~140-160 lines net across 3 files (one new).
@@ -513,9 +513,9 @@ Total: ~140-160 lines net across 3 files (one new).
   - Terminal: inline Python chunk loop (different chunked-arg signature than retire/work).
   - Retirement + Working: use `_chunked_vmap_runner`. Restructure `per_cell` to take the kernel args positionally; define `per_chunk` as a separate `@jit` wrapping `vmap(per_cell, in_axes=(0, 0, None, ...))`. Keep the `n_chunks == 1` fast path (single `@jit'd vmap`, no runner wrapper).
 - [ ] Add validation `if n_chunks < 1: raise ValueError(...)` in `run_lifecycle_solver`.
-- [ ] Write `verify_chunking.py` per §6.1.
-- [ ] Run `python verify_chunking.py`. Expected: all three deltas ≤ 1e-10.
-- [ ] Run `python verify_smoke.py` to confirm no regression at default `cell_vmap_chunks=1`.
+- [ ] Write `verify/chunking.py` per §6.1.
+- [ ] Run `python verify/chunking.py`. Expected: all three deltas ≤ 1e-10.
+- [ ] Run `python verify/smoke.py` to confirm no regression at default `cell_vmap_chunks=1`.
 - [ ] Commit:
   ```
   solver: cell-axis vmap chunking for memory-bounded single-GPU runs
@@ -536,7 +536,7 @@ Total: ~140-160 lines net across 3 files (one new).
   on the 6-age smoke. 5⁴ runs at default chunks=1 unchanged.
   ```
 - [ ] Push to `jax-rewrite`. No PR review required unless reviewer requests.
-- [ ] Report back with the commit SHA and confirmation that verify_chunking.py + verify_smoke.py both pass. Stop.
+- [ ] Report back with the commit SHA and confirmation that verify/chunking.py + verify/smoke.py both pass. Stop.
 
 ---
 

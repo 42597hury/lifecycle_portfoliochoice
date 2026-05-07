@@ -7,6 +7,11 @@ quadrature; the wider age window catches more kernel paths than a 6-age slice.
 import time
 import numpy as np
 
+# --- path bootstrap (verify/ subdir) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+# --- end path bootstrap ---
+
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig, SolveControl
 from lifecycle.var import build_nominal_system1_var_config_hardcoded

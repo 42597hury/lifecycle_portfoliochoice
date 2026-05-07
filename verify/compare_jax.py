@@ -8,7 +8,7 @@ from lifecycle.var import build_nominal_system1_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 
-# Tiny 6-age config — identical to verify_smoke.py.
+# Tiny 6-age config — identical to verify/smoke.py.
 disc = DiscretizationConfig(
     n_wealth=20, wealth_min=0.13, wealth_max=200.0,
     n_savings=20,

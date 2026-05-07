@@ -298,7 +298,7 @@ For each finding, note location and whether the rtb-as-state handoff §3-§5 cap
 **What to look for:**
 - If two solver processes share the same `LIFECYCLE_JAX_CACHE_DIR`, do they race on writes? JAX uses internal file locking — verify by checking the cache config.
 - If `gpu_run.sh` is invoked twice on the same instance (overlapping), do the cache pull/push race? `aws s3 sync` is atomic per file but not per directory.
-- The `verify_benchmark_bundle.py` writes a bundle to `./saved_runs/<name>/`. If two runs use the same name (e.g., re-running after a crash), does the second corrupt the first?
+- The `verify/benchmark_bundle.py` writes a bundle to `./saved_runs/<name>/`. If two runs use the same name (e.g., re-running after a crash), does the second corrupt the first?
 
 **Severity criteria:**
 - MEDIUM: a foreseeable concurrent-runs scenario that produces a corrupted bundle

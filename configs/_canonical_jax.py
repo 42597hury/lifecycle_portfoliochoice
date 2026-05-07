@@ -15,7 +15,7 @@ Why a separate file (and not editing _canonical.py):
     See ``HANDOFF_NEWTON_FORI_LOOP_MASK.md`` and §3 of
     ``HANDOFF_COMPLEXITY_WALL_TIME_ESTIMATOR.md``.
   - ``_canonical.py`` remains the source of truth for the Numba reference path
-    (``verify_benchmark_bundle.py``) and existing sweep cells. New JAX sweep
+    (``verify/benchmark_bundle.py``) and existing sweep cells. New JAX sweep
     cells import from this file instead.
 
 Exports (mirrors ``_canonical.py`` so sweep cells only swap the import path):

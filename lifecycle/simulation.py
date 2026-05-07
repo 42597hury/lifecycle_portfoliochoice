@@ -348,7 +348,7 @@ def _build_simulate_kernel(
 
         # CCV log portfolio return (Campbell-Viceira w8566 eq. 10).
         # Must agree node-by-node with solver._ccv_log_return_and_grad —
-        # verified in verify_ccv_solver_sim_parity.py.
+        # verified in verify/ccv_solver_sim_parity.py.
         log_R_port = (
             log_R_bill
             + a_s_t * log_x_s + a_b_t * log_x_b

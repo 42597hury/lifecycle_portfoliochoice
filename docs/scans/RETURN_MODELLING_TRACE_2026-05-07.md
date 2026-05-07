@@ -505,11 +505,11 @@ The simulator carries the matching paper-reference comment at
 [`simulation.py:349-351`](../../lifecycle/simulation.py#L349-L351):
 > "CCV log portfolio return (Campbell-Viceira w8566 eq. 10). Must agree
 > node-by-node with solver._ccv_log_return_and_grad — verified in
-> verify_ccv_solver_sim_parity.py."
+> verify/ccv_solver_sim_parity.py."
 
 ### 6.4 Solver / simulator parity
 
-[`verify_ccv_solver_sim_parity.py`](../../verify_ccv_solver_sim_parity.py)
+[`verify/ccv_solver_sim_parity.py`](../../verify/ccv_solver_sim_parity.py)
 is a 1000-trial randomised parity check; it asserts solver and simulator
 agree on `R_p` to `1e-12` at every random `(α, log_R_bill, log_x_s,
 log_x_b, σ²_xr, σ²_xb, σ_xrxb)` realisation. The simulator block

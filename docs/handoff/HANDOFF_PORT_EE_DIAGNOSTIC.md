@@ -1,9 +1,9 @@
 # Handoff: Port Euler-Equation Residual Diagnostic from Numba `main`
 
 **Branch:** `jax-rewrite`
-**Status when this doc was written:** the post-solve diagnostic in `verify_benchmark_bundle.py` only runs `diagnose_terminal_portfolio_states` (terminal age FOC sanity check). **No all-ages Euler-equation residual diagnostic exists in the JAX branch.** The Numba `main` branch had `scripts/diagnostics/_diag_euler_errors.py` and friends — those got deleted in handoff 1 along with the rest of `scripts/`.
+**Status when this doc was written:** the post-solve diagnostic in `verify/benchmark_bundle.py` only runs `diagnose_terminal_portfolio_states` (terminal age FOC sanity check). **No all-ages Euler-equation residual diagnostic exists in the JAX branch.** The Numba `main` branch had `scripts/diagnostics/_diag_euler_errors.py` and friends — those got deleted in handoff 1 along with the rest of `scripts/`.
 
-**Target deployment:** agent ports the EE-residual logic from `main`'s `_diag_euler_errors.py` to the JAX branch, **adapting the economic features for rtb-as-state + CCV log returns + 4-D state**. Output: a `verify_ee_residuals.py` script that loads a saved policy bundle and reports per-age residual statistics.
+**Target deployment:** agent ports the EE-residual logic from `main`'s `_diag_euler_errors.py` to the JAX branch, **adapting the economic features for rtb-as-state + CCV log returns + 4-D state**. Output: a `verify/ee_residuals.py` script that loads a saved policy bundle and reports per-age residual statistics.
 
 **Effort:** 1-2 days. The math/structure is portable from `main`; the JAX branch's specific FOC functions (`retirement_foc_jac_ccv`, `working_foc_jac_ccv`) are already written and can be reused for the residual computation.
 
@@ -13,7 +13,7 @@
 
 ## 1. Goal
 
-Produce `verify_ee_residuals.py` that:
+Produce `verify/ee_residuals.py` that:
 
 1. **Loads** a saved policy bundle from `./saved_runs/<bundle-name>/`.
 2. **Re-evaluates the FOC** at every solved (or a sampled subset of) cell, using the same precompute machinery the solver used.
@@ -32,14 +32,14 @@ Output should answer: "is this bundle a valid solver output, or did Newton fail 
 - Grid-based EE residual computation: at every cell `(t, z_idx, state_idx, w_idx)`, evaluate the FOC at the solved policy and report residual norm.
 - Per-age aggregation: histogram, percentile stats, fail count above threshold.
 - Save JSON output to bundle directory.
-- Run from command line: `python verify_ee_residuals.py <bundle-name>` or with `--bundle-path`.
+- Run from command line: `python verify/ee_residuals.py <bundle-name>` or with `--bundle-path`.
 
 ### Out of scope
 
 - **Simulation-path-based EE check.** Depends on the simulator, which is being fixed for CCV correctness in another handoff. Add as follow-up after the simulator fix lands.
 - **Higher-order quadrature accuracy check.** That's a "is the solver's quadrature dense enough" question — separate handoff (the quadrature sensitivity study).
 - **Plotting / visualisation.** JSON output only; visualisation is downstream.
-- **Auto-running from `verify_benchmark_bundle.py`.** Add later; for now run manually after the bundle lands.
+- **Auto-running from `verify/benchmark_bundle.py`.** Add later; for now run manually after the bundle lands.
 
 ### Hard constraints
 
@@ -276,7 +276,7 @@ For tonight's bundle (`max_iter=100`, backward-age warm-start), expectation: med
 ## 8. Implementation checklist
 
 - [ ] Read `main` branch's `_diag_euler_errors.py` and `_diag_gridpoint_ee.py` for structure (via `git show main:scripts/diagnostics/_diag_euler_errors.py` if needed).
-- [ ] Create `verify_ee_residuals.py` at repo root.
+- [ ] Create `verify/ee_residuals.py` at repo root.
 - [ ] Argparse: accept `bundle-path` as positional or `--bundle-name` (default looks up `./saved_runs/<name>/`).
 - [ ] Load bundle via `lifecycle/policy_io.py`.
 - [ ] Rebuild precompute from bundle metadata.
@@ -285,7 +285,7 @@ For tonight's bundle (`max_iter=100`, backward-age warm-start), expectation: med
 - [ ] Aggregate per-age stats + global stats.
 - [ ] Save JSON to bundle dir.
 - [ ] Print stdout summary.
-- [ ] Test on a tiny smoke bundle first (run `verify_smoke.py`, then `verify_ee_residuals.py system_iv_..._smoke`).
+- [ ] Test on a tiny smoke bundle first (run `verify/smoke.py`, then `verify/ee_residuals.py system_iv_..._smoke`).
 - [ ] Run on tonight's bundle when it lands. Report findings.
 
 ---

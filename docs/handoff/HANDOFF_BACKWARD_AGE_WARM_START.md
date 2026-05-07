@@ -192,7 +192,7 @@ The existing default is intentionally conservative. `0.1` for stocks and `0.4` f
 
 ## 6. Verification plan (do NOT skip)
 
-1. **Smoke (`verify_smoke.py`) — must run before commit.** Toggle `use_backward_age_warm_start = True` (default after this change). Expected output:
+1. **Smoke (`verify/smoke.py`) — must run before commit.** Toggle `use_backward_age_warm_start = True` (default after this change). Expected output:
    - `Status: complete  (6/6 ages solved)`
    - `Policy sanity: PASS`
    - `alpha_s range`: should match the warm-on-savings baseline `[-1.038, 3.082]` to **at least 1e-5** (better than the current cold-init smoke output of `[-1.038, 3.077]`, because the per-cell init is much closer to the optimum than the canonical scalar).
@@ -204,7 +204,7 @@ The existing default is intentionally conservative. `0.1` for stocks and `0.4` f
 
 3. **Newton-iteration count.** Add (or use existing) `total_newton_iters` aggregate to diagnostics. With backward-age warm-start it should drop by **3–5×** vs cold-init smoke. Report the number in the commit message.
 
-4. **Bigger config.** `verify_canonical_small.py` (n_w=40, n_s=40, n_z=5, state=3,3,3) is the right pre-AWS check. Should run in ~5–10 min locally and produce no NaN/Inf.
+4. **Bigger config.** `verify/canonical_small.py` (n_w=40, n_s=40, n_z=5, state=3,3,3) is the right pre-AWS check. Should run in ~5–10 min locally and produce no NaN/Inf.
 
 5. **Bit-comparison against original warm-on-savings.** If you can resurrect commit before the warm-start kill (`git show e21fc50:lifecycle/solver.py`), run smoke against it and compare alpha arrays. Element-wise `max(abs(diff))` should be < 1e-7. (Equivalent inits, different convergence path within Newton tolerance — the difference is just FOC-tolerance noise.)
 
@@ -238,7 +238,7 @@ The existing default is intentionally conservative. `0.1` for stocks and `0.4` f
   - For each non-terminal age, fetch `S_list[t+1], B_list[t+1]` and pass them to the kernel call.
   - If `sc.use_backward_age_warm_start == False`, build constant arrays `jnp.full((n_z, N_state, n_w), sc.init_alpha_s)` (and `init_alpha_b`) once before the loop and use those instead.
 - [ ] Update each kernel's docstring to reflect the new args.
-- [ ] Run `verify_smoke.py` and confirm §6 acceptance criteria.
+- [ ] Run `verify/smoke.py` and confirm §6 acceptance criteria.
 - [ ] Add the smoke alpha ranges + total-Newton-iter count to the commit message.
 - [ ] No new tests are required, but if there's an existing toggle-style test, add a case with `use_backward_age_warm_start=False` to it.
 
@@ -248,6 +248,6 @@ The existing default is intentionally conservative. `0.1` for stocks and `0.4` f
 
 - `lifecycle/solver.py` — kernel builders + age loop in `run_lifecycle_solver`
 - `lifecycle/model.py` — one new `SolverConfig` field
-- (no test file changes required; `verify_smoke.py` and `verify_benchmark_bundle.py` are the verification gates)
+- (no test file changes required; `verify/smoke.py` and `verify/benchmark_bundle.py` are the verification gates)
 
 That's it. Single-commit-able change. ~80–120 net lines of solver.py edits.

@@ -46,7 +46,7 @@ def _configure_xla_devices():
     On AWS p4d/p5 instances the standard recipe is::
 
         export LIFECYCLE_DISABLE_VIRTUAL_CPUS=1
-        python verify_smoke.py    # JAX picks up the GPU automatically
+        python verify/smoke.py    # JAX picks up the GPU automatically
     """
     if "XLA_FLAGS" in _os.environ:
         return

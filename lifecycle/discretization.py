@@ -305,6 +305,14 @@ def build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="ch
 
 def discretize_income_ar1_mixture(rho, p, mu1, sigma1, mu2, sigma2, N, n_stds=3):
     """Discretize persistent income AR(1) with mixture-normal innovations."""
+    if N == 1:
+        # Degenerate single-state Markov chain — always stays in mean state.
+        # Used by the inf-horizon benchmark, where pension=0 and psi=1 make z
+        # mathematically inert (all z-slices produce identical policies). NOT a
+        # valid choice for the lifecycle solver: setting n_z=1 there silently
+        # zeros out the persistent-income variation in the working-age FOC.
+        return np.array([0.0]), np.array([[1.0]])
+
     mu_eta = p * mu1 + (1.0 - p) * mu2
     var_eta = p * (sigma1 ** 2 + (mu1 - mu_eta) ** 2) + (1.0 - p) * (sigma2 ** 2 + (mu2 - mu_eta) ** 2)
     std_z = np.sqrt(var_eta / max(1e-14, 1.0 - rho ** 2))

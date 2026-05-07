@@ -347,7 +347,11 @@ def build_precompute(model, disc_config=None, verbose=True):
     eps_nodes, eps_weights = get_eps_quadrature_corrected(model, n_nodes=disc_config.n_eps_nodes)
     eta_nodes, eta_weights = get_eta_quadrature_mixture(model, n_nodes=disc_config.n_eta_nodes)
 
-    dz = z_grid[1] - z_grid[0]
+    # n_z=1 is inf-horizon-only (z is mathematically inert there). Working-age
+    # bracket_uniform never fires under inf-horizon; dz=0 is a placeholder that
+    # would only propagate NaN if the lifecycle working kernel were ever called
+    # at n_z=1, which is unsupported by design.
+    dz = z_grid[1] - z_grid[0] if z_grid.size > 1 else 0.0
 
     # --- Deterministic age-earnings profile ---
     log_det_profile = (model.b0

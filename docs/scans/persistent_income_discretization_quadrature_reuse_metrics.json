@@ -1,0 +1,131 @@
+{
+  "reference_bundle": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz70_calib1",
+  "reference_n_z": 70,
+  "reference_shape": [
+    78,
+    70,
+    7,
+    180
+  ],
+  "runs": [
+    {
+      "method": "quadrature",
+      "n_z": 10,
+      "bundle": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz10_calib1",
+      "wall_sec": 33.50471258163452,
+      "solve_status": "complete",
+      "metrics": {
+        "C": {
+          "sup": 1.5331486096812306,
+          "rms": 0.26040593893688035,
+          "p99": 1.179687670296274,
+          "sup_rel": 0.2831327631939043
+        },
+        "S": {
+          "sup": 0.3740330954101593,
+          "rms": 0.04300481447065513,
+          "p99": 0.2308569121095207,
+          "sup_rel": 0.34174556754448615
+        },
+        "B": {
+          "sup": 0.30352185306402685,
+          "rms": 0.035071853593757696,
+          "p99": 0.18779985571516097,
+          "sup_rel": 0.419093120964258
+        }
+      }
+    },
+    {
+      "method": "quadrature",
+      "n_z": 15,
+      "bundle": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz15_calib1",
+      "wall_sec": 42.86964988708496,
+      "solve_status": "complete",
+      "metrics": {
+        "C": {
+          "sup": 0.7655020877658387,
+          "rms": 0.10758434188519254,
+          "p99": 0.49233888717682245,
+          "sup_rel": 0.10012592527794259
+        },
+        "S": {
+          "sup": 0.18014141023471364,
+          "rms": 0.01724861919912851,
+          "p99": 0.0967720719518403,
+          "sup_rel": 0.16863139197328889
+        },
+        "B": {
+          "sup": 0.14526958444624016,
+          "rms": 0.014044556313581959,
+          "p99": 0.07866168854126654,
+          "sup_rel": 0.20785249838157907
+        }
+      }
+    },
+    {
+      "method": "quadrature",
+      "n_z": 30,
+      "bundle": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz30_calib1",
+      "wall_sec": 72.42657780647278,
+      "solve_status": "complete",
+      "metrics": {
+        "C": {
+          "sup": 0.2663520364697618,
+          "rms": 0.034309086589613916,
+          "p99": 0.16066628477847303,
+          "sup_rel": 0.028726709958809313
+        },
+        "S": {
+          "sup": 0.057797085152639927,
+          "rms": 0.005201690675621166,
+          "p99": 0.029209306830543576,
+          "sup_rel": 0.057654663633836936
+        },
+        "B": {
+          "sup": 0.04625603418592261,
+          "rms": 0.004231342685688922,
+          "p99": 0.02374356588033595,
+          "sup_rel": 0.07241255908442991
+        }
+      }
+    }
+  ],
+  "pi_z_transition_diagnostics": {
+    "10": {
+      "z_min": -4.206737068500236,
+      "z_max": 4.206737068500236,
+      "max_abs_row_sum_error": 2.220446049250313e-16,
+      "max_abs_conditional_mean_bias": 0.12732537551359924,
+      "median_abs_conditional_mean_bias": 0.10960222982603113,
+      "left_edge_mean_bias": -0.03786063361456904,
+      "right_edge_mean_bias": -0.0934947015501848
+    },
+    "15": {
+      "z_min": -4.206737068500236,
+      "z_max": 4.206737068500236,
+      "max_abs_row_sum_error": 1.1102230246251565e-16,
+      "max_abs_conditional_mean_bias": 0.13324526173200812,
+      "median_abs_conditional_mean_bias": 0.09814502379307671,
+      "left_edge_mean_bias": -0.03759998805370568,
+      "right_edge_mean_bias": -0.06695349102516435
+    },
+    "30": {
+      "z_min": -4.206737068500236,
+      "z_max": 4.206737068500236,
+      "max_abs_row_sum_error": 6.8833827526759706e-15,
+      "max_abs_conditional_mean_bias": 0.09144375558885098,
+      "median_abs_conditional_mean_bias": 0.038562788692172084,
+      "left_edge_mean_bias": 0.09144375558885098,
+      "right_edge_mean_bias": -0.06134239650247242
+    },
+    "70": {
+      "z_min": -4.206737068500236,
+      "z_max": 4.206737068500236,
+      "max_abs_row_sum_error": 1.1324274851176597e-14,
+      "max_abs_conditional_mean_bias": 0.08365168510625853,
+      "median_abs_conditional_mean_bias": 0.0014805782251698374,
+      "left_edge_mean_bias": 0.08365168510625853,
+      "right_edge_mean_bias": -0.06119418215824446
+    }
+  }
+}

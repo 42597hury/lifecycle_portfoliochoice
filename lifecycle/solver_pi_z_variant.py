@@ -299,6 +299,7 @@ def _solve_working_at_cell_pi_z(
         a_b_egm,
         n_iters_egm,
         n_backtrack_egm,
+        exit_code_egm,
     ) = _base._egm_scan_cell(
         foc_factory,
         s_grid,
@@ -324,7 +325,8 @@ def _solve_working_at_cell_pi_z(
     )
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
+    exit_code_per_s = exit_code_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
 
 
 def _build_per_age_working_kernel_pi_z(
@@ -466,7 +468,7 @@ def _build_per_age_working_kernel_pi_z_pmap(
         init_a_b_arr,
     ):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
                 c_next_jnp,
                 income_next_table,
                 pension_next_by_z,
@@ -480,9 +482,10 @@ def _build_per_age_working_kernel_pi_z_pmap(
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
-        c_pm, as_pm, ab_pm, ni_pm, nb_pm = per_dev_solve(
+        c_pm, as_pm, ab_pm, ni_pm, nb_pm, ec_pm = per_dev_solve(
             z_pm,
             is_pm,
             c_next_jnp,
@@ -503,6 +506,7 @@ def _build_per_age_working_kernel_pi_z_pmap(
             collapse(ab_pm),
             collapse(ni_pm),
             collapse(nb_pm),
+            collapse(ec_pm),
         )
 
     return call
@@ -630,7 +634,7 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
             init_a_s_arr,
             init_a_b_arr,
         ):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
                 c_next_jnp,
                 income_next_table,
                 pension_next_by_z,
@@ -646,6 +650,7 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
         return call
@@ -662,7 +667,7 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
         init_a_s_arr,
         init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
             c_next_jnp,
             income_next_table,
             pension_next_by_z,
@@ -676,6 +681,7 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
             jnp.reshape(b_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
+            jnp.reshape(ec_flat, (n_z, N_state, -1)),
         )
 
     return call

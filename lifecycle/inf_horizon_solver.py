@@ -24,6 +24,7 @@ import numpy as np
 
 from lifecycle.model import DELTA_BEQUEST, SolverConfig
 from lifecycle.solver import (
+    EC_INTERIOR,
     ModelParams,
     _build_per_age_retirement_kernel,
     _pc_to_jnp,
@@ -56,9 +57,9 @@ def _print_progress_line(
 ) -> None:
     """Render one compact progress line in-place for long notebook/script runs.
 
-    The Newton-failure column from the Numba era is gone — the JAX kernel does
-    not expose per-cell exit codes. The diagnostics dict still reports
-    ``total_newton_failures = 0`` for downstream API compatibility.
+    The Newton-failure column from the Numba era is gone — the per-iteration
+    failure count is recorded in the diagnostics dict instead
+    (``newton_failures_per_iter``); ``total_newton_failures`` is the sum.
     """
     line = (
         f"\rih iter {iter_idx:4d} | xi {xi_err:.2e} | share {share_err:.2e} | stop {stop_err:.2e}"
@@ -410,9 +411,10 @@ def _build_iter_histograms_per_iter(newton_iter_per_iter, backtrack_iter_per_ite
 
 def _build_diagnostics(
     model, pc, solver_config, C, S, B,
-    converged, n_iter_done, total_newton_failures,
+    converged, n_iter_done,
     policy_supnorm_history, xi_supnorm_history, share_supnorm_history,
     newton_iter_per_iter, backtrack_iter_per_iter,
+    newton_failures_per_iter,
     tol, damping, trim_wealth_points, used_warm_start,
 ):
     policy_hist = np.asarray(policy_supnorm_history[:n_iter_done], dtype=np.float64).copy()
@@ -423,6 +425,11 @@ def _build_diagnostics(
         newton_iter_per_iter[:n_iter_done],
         backtrack_iter_per_iter[:n_iter_done],
     )
+
+    failures_per_iter_arr = np.asarray(
+        newton_failures_per_iter[:n_iter_done], dtype=np.int64
+    ).copy()
+    total_newton_failures = int(failures_per_iter_arr.sum()) if failures_per_iter_arr.size else 0
 
     diagnostics: dict[str, Any] = {
         "converged": bool(converged),
@@ -439,7 +446,8 @@ def _build_diagnostics(
         "final_xi_supnorm": float(xi_hist[-1]) if n_iter_done else float("nan"),
         "final_share_supnorm": float(share_hist[-1]) if n_iter_done else float("nan"),
         "final_stopping_supnorm": float(max(xi_hist[-1], share_hist[-1])) if n_iter_done else float("nan"),
-        "total_newton_failures": int(total_newton_failures),
+        "total_newton_failures": total_newton_failures,
+        "newton_failures_per_iter": failures_per_iter_arr,
         "newton_iter_histogram": ni_hist,
         "backtrack_iter_histogram": nb_hist,
         "newton_iter_p99": float(ni_hist["p99"]),
@@ -547,7 +555,7 @@ def run_infinite_horizon_solver(
         # One warm-up call to JIT-compile the kernel before timing the loop.
         # Seeds the Newton init from the prepared (warm) S_old/B_old, matching
         # the convention used inside the iteration loop below.
-        _c, _s, _b, _ni, _nb = retirement_kernel(
+        _c, _s, _b, _ni, _nb, _ec = retirement_kernel(
             jnp.asarray(C_old), pension_zero, psi_one,
             jnp.asarray(S_old), jnp.asarray(B_old),
         )
@@ -563,6 +571,10 @@ def run_infinite_horizon_solver(
     # histogram"] (modulo per_age_* -> per_iter_* key rename).
     newton_iter_per_iter = []
     backtrack_iter_per_iter = []
+    # Per-iteration Newton failure count (cells where Newton did not converge
+    # within max_iter — exit_code != EC_INTERIOR). Summed into
+    # ``total_newton_failures`` for the diagnostics dict.
+    newton_failures_per_iter: list[int] = []
     converged = False
     n_iter_done = 0
 
@@ -587,7 +599,7 @@ def run_infinite_horizon_solver(
             # point, vs much higher under cold init.
             s_old_jnp = jnp.asarray(S_old)
             b_old_jnp = jnp.asarray(B_old)
-            c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp = retirement_kernel(
+            c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp, ec_jnp = retirement_kernel(
                 c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
             )
             C_new = np.asarray(c_new_jnp)
@@ -595,6 +607,8 @@ def run_infinite_horizon_solver(
             B_new = np.asarray(b_new_jnp)
             newton_iter_per_iter.append(np.asarray(ni_jnp))
             backtrack_iter_per_iter.append(np.asarray(nb_jnp))
+            ec_iter = np.asarray(ec_jnp)
+            newton_failures_per_iter.append(int(np.sum(ec_iter != EC_INTERIOR)))
 
             # Damped update.
             if damping == 1.0:
@@ -650,12 +664,12 @@ def run_infinite_horizon_solver(
     diagnostics = _build_diagnostics(
         model, pc, solver_config, C_old, S_old, B_old,
         converged, n_iter_done,
-        0,                              # total_newton_failures: kernel doesn't expose per-cell exits
         np.asarray(policy_supnorm_history),
         np.asarray(xi_supnorm_history),
         np.asarray(share_supnorm_history),
         newton_iter_per_iter,
         backtrack_iter_per_iter,
+        newton_failures_per_iter,
         tol, damping, trim_wealth_points, used_warm_start=used_warm_start,
     )
 
@@ -728,7 +742,7 @@ def compile_inner_kernel_smoke_test(
     if verbose:
         print("Compiling JAX retirement kernel for the inf-horizon benchmark...")
     t0 = time.time()
-    c_new, s_new, b_new, _ni, _nb = retirement_kernel(
+    c_new, s_new, b_new, _ni, _nb, _ec = retirement_kernel(
         jnp.asarray(C_old), pension_zero, psi_one,
         init_a_s_arr, init_a_b_arr,
     )

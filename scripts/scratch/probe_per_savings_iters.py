@@ -116,7 +116,7 @@ def per_is_egm_full(i_s):
         return foc_fn
 
     (x_egm, c_egm, a_s_egm, a_b_egm,
-     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
+     n_iters_egm, n_backtrack_egm, _exit_code_egm) = _egm_scan_cell(
         foc_factory, s_grid,
         sc.init_alpha_s, sc.init_alpha_b,
         mp.gamma, mp.beta,

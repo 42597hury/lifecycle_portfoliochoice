@@ -106,9 +106,10 @@ def solve_one_age(gather_precision):
     Returns (C, S, B) for age 64 (shape (n_z, N_state, n_w)).
     """
     pcj, mp, sc, terminal_kernel, retirement_kernel = build_runner(gather_precision)
-    # Terminal age (z-invariant by construction). Kernel returns 5 values
-    # (c, s, b, n_iters_max, n_backtrack_total) per current solver.py.
-    c_T, s_T, b_T, _ni_T, _nb_T = terminal_kernel()
+    # Terminal age (z-invariant by construction). Kernel returns 6 values
+    # (c, s, b, n_iters_per_s, n_backtrack_per_s, exit_code_per_s) per
+    # current solver.py.
+    c_T, s_T, b_T, _ni_T, _nb_T, _ec_T = terminal_kernel()
     c_T_zb = jnp.broadcast_to(c_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
     s_T_zb = jnp.broadcast_to(s_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
     b_T_zb = jnp.broadcast_to(b_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
@@ -118,7 +119,7 @@ def solve_one_age(gather_precision):
     psi_t = jnp.asarray(pc.survival_probs_2d)[pc.n_age - 2, :]   # age 64 row
     pension_next = pension_table[pc.n_age - 1, :]                 # age 65 row
 
-    c_64, s_64, b_64, _ni_64, _nb_64 = retirement_kernel(
+    c_64, s_64, b_64, _ni_64, _nb_64, _ec_64 = retirement_kernel(
         c_T_zb, pension_next, psi_t, s_T_zb, b_T_zb,
     )
     # Block until done so timing is meaningful.

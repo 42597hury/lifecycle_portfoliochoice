@@ -1148,16 +1148,18 @@ def _egm_scan_cell(
     fail to converge if ``max_iter`` is too tight — bump max_iter and
     track ``newton_failures`` post-hoc.
 
-    Returns ``(x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm)``
-    each shape ``(n_savings + 1,)``, with the first entry being the egm_anchor
-    at s = 0 (iter counts padded with 0 there).
+    Returns ``(x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm,
+    exit_code_egm)`` each shape ``(n_savings + 1,)``, with the first entry being
+    the egm_anchor at s = 0 (iter / backtrack counts padded with 0 there;
+    exit_code padded with ``EC_INTERIOR`` since the anchor is not a real Newton
+    call and downstream slices it off at ``[1:]``).
     """
     def per_savings_point(s_val):
         foc_fn = foc_factory(s_val)
         _, _, _, _, _, e0 = foc_fn(0.0, 0.0)
         scale = jnp.maximum(jnp.abs(e0), 1e-30)
 
-        (a_s_opt, a_b_opt, V_dot, _exit_code, _err,
+        (a_s_opt, a_b_opt, V_dot, exit_code, _err,
          n_iter_used, n_bt_total) = newton_2d_with_line_search(
             foc_fn, init_a_s, init_a_b, scale,
             tol, max_iter, max_backtrack_iter,
@@ -1173,9 +1175,9 @@ def _egm_scan_cell(
         a_s_out = jnp.where(tiny, init_a_s, a_s_opt)
         a_b_out = jnp.where(tiny, init_a_b, a_b_opt)
         x_out = c_out + s_val
-        return x_out, c_out, a_s_out, a_b_out, n_iter_used, n_bt_total
+        return x_out, c_out, a_s_out, a_b_out, n_iter_used, n_bt_total, exit_code
 
-    x_arr, c_arr, a_s_arr, a_b_arr, ni_arr, nb_arr = vmap(per_savings_point)(s_grid)
+    x_arr, c_arr, a_s_arr, a_b_arr, ni_arr, nb_arr, ec_arr = vmap(per_savings_point)(s_grid)
 
     x_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=x_arr.dtype), x_arr])
     c_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=c_arr.dtype), c_arr])
@@ -1183,7 +1185,11 @@ def _egm_scan_cell(
     a_b_egm = jnp.concatenate([jnp.array([0.0], dtype=a_b_arr.dtype), a_b_arr])
     n_iters_egm = jnp.concatenate([jnp.array([0], dtype=ni_arr.dtype), ni_arr])
     n_backtrack_egm = jnp.concatenate([jnp.array([0], dtype=nb_arr.dtype), nb_arr])
-    return x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm
+    exit_code_egm = jnp.concatenate(
+        [jnp.array([EC_INTERIOR], dtype=ec_arr.dtype), ec_arr]
+    )
+    return (x_egm, c_egm, a_s_egm, a_b_egm,
+            n_iters_egm, n_backtrack_egm, exit_code_egm)
 
 
 def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid):
@@ -1227,7 +1233,7 @@ def _solve_terminal_at_i_s(
         return foc_fn
 
     (x_egm, c_egm, a_s_egm, a_b_egm,
-     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
+     n_iters_egm, n_backtrack_egm, exit_code_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1237,11 +1243,13 @@ def _solve_terminal_at_i_s(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
-    # happens there) so the histogram reflects only real Newton calls.
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
+    # no Newton solve happens there) so diagnostics reflect only real Newton
+    # calls.
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
+    exit_code_per_s = exit_code_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
 
 
 def _solve_retirement_at_cell(
@@ -1288,7 +1296,7 @@ def _solve_retirement_at_cell(
         return foc_fn
 
     (x_egm, c_egm, a_s_egm, a_b_egm,
-     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
+     n_iters_egm, n_backtrack_egm, exit_code_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1298,11 +1306,13 @@ def _solve_retirement_at_cell(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
-    # happens there) so the histogram reflects only real Newton calls.
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
+    # no Newton solve happens there) so diagnostics reflect only real Newton
+    # calls.
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
+    exit_code_per_s = exit_code_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
 
 
 def _solve_working_at_cell(
@@ -1360,7 +1370,7 @@ def _solve_working_at_cell(
         return foc_fn
 
     (x_egm, c_egm, a_s_egm, a_b_egm,
-     n_iters_egm, n_backtrack_egm) = _egm_scan_cell(
+     n_iters_egm, n_backtrack_egm, exit_code_egm) = _egm_scan_cell(
         foc_factory, s_grid, init_a_s, init_a_b,
         gamma, beta,
         tol, max_iter, max_backtrack_iter,
@@ -1370,11 +1380,13 @@ def _solve_working_at_cell(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
-    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks; no Newton solve
-    # happens there) so the histogram reflects only real Newton calls.
+    # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
+    # no Newton solve happens there) so diagnostics reflect only real Newton
+    # calls.
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s
+    exit_code_per_s = exit_code_egm[1:]
+    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
 
 
 def _all_is_log_returns_numpy(pcj):
@@ -1656,7 +1668,7 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
             return tuple(collapse_chunk(k) for k in range(len(chunk_results[0])))
 
         (c_pm, as_pm, ab_pm,
-         ni_pm, nb_pm) = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
+         ni_pm, nb_pm, ec_pm) = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
 
         # Stay on device — caller threads jnp arrays through to the next kernel.
         def collapse(a):
@@ -1665,7 +1677,7 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
-            collapse(ni_pm), collapse(nb_pm),
+            collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
     return call
@@ -1997,7 +2009,7 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
                 c_next_jnp, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
             )
@@ -2007,10 +2019,11 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
-         ni_pm, nb_pm) = per_dev_solve(
+         ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2022,7 +2035,7 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
-            collapse(ni_pm), collapse(nb_pm),
+            collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
     return call
@@ -2097,7 +2110,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
         def call(c_next_jnp, pension_next_by_z, psi_per_z,
                   init_a_s_arr, init_a_b_arr):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
                 c_next_jnp, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
                 z_full, is_full,
@@ -2108,6 +2121,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
         return call
 
@@ -2120,7 +2134,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z,
               init_a_s_arr, init_a_b_arr):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
             c_next_jnp, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2130,6 +2144,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
             jnp.reshape(b_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
+            jnp.reshape(ec_flat, (n_z, N_state, -1)),
         )
 
     return call
@@ -2244,7 +2259,7 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
         init_a_s_arr, init_a_b_arr,
     ):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
                 c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
             )
@@ -2254,10 +2269,11 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
-         ni_pm, nb_pm) = per_dev_solve(
+         ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2268,7 +2284,7 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
-            collapse(ni_pm), collapse(nb_pm),
+            collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
     return call
@@ -2363,7 +2379,7 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         ):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat = per_chunk(
+            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
                 c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
                 z_full, is_full,
@@ -2374,6 +2390,7 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
+                jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
         return call
 
@@ -2387,7 +2404,7 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat = runner(
+        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2397,6 +2414,7 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             jnp.reshape(b_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
+            jnp.reshape(ec_flat, (n_z, N_state, -1)),
         )
 
     return call
@@ -2512,6 +2530,10 @@ def run_lifecycle_solver(
     # aggregation step at end.
     newton_iter_per_age = [None] * n_age
     backtrack_iter_per_age = [None] * n_age
+    # Per-age exit codes feed the scalar ``age_newton_fail[t]`` count below;
+    # the per-(cell, savings) array itself is not retained because the
+    # diagnostic dict only exposes the scalar sum (per the handoff spec —
+    # richer per-cell histograms are an explicit follow-up).
 
     checkpoint_path = solve_control.checkpoint_path
     youngest_age_to_solve = solve_control.youngest_age_to_solve
@@ -2595,7 +2617,7 @@ def run_lifecycle_solver(
     if not solved_age_mask[-1]:
         if verbose >= 1:
             print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
-        c_T, s_T, b_T, ni_T, nb_T = terminal_kernel()
+        c_T, s_T, b_T, ni_T, nb_T, ec_T = terminal_kernel()
         # Broadcast across z (terminal policy is z-invariant — bequest only).
         # jnp.broadcast_to stays on device. On the pmap path (n_dev > 1) the
         # next kernel reads it via in_axes=None and materialises lazily; on
@@ -2607,9 +2629,10 @@ def run_lifecycle_solver(
         B_list[-1] = jnp.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w))
         # Terminal iter counts are (N_state,) — z-invariant. Materialise to
         # NumPy now (~5KB) so the orchestrator's aggregator never holds a
-        # device array for them.
+        # device array for them. Exit codes are also (N_state, n_savings).
         newton_iter_per_age[-1] = np.asarray(ni_T)
         backtrack_iter_per_age[-1] = np.asarray(nb_T)
+        age_newton_fail[-1] = int(np.sum(np.asarray(ec_T) != EC_INTERIOR))
         solved_age_mask[-1] = True
         if verbose >= 1:
             # Small reduction (~5KB transfer) for the print line; cheap.
@@ -2671,7 +2694,7 @@ def run_lifecycle_solver(
 
             if age >= retire_age:
                 pension_next = pension_table_jnp[t + 1, :]
-                c_t, s_t, b_t, ni_t, nb_t = retirement_kernel(
+                c_t, s_t, b_t, ni_t, nb_t, ec_t = retirement_kernel(
                     c_next_jnp, pension_next, psi_t, init_a_s_arr, init_a_b_arr,
                 )
                 label = "RETIRE"
@@ -2680,14 +2703,14 @@ def run_lifecycle_solver(
                 if use_pen:
                     pension_next = pension_table_jnp[t + 1, :]
                     income_table = jnp.zeros((n_z, pc.n_eta, pc.n_eps))   # ignored on this branch
-                    c_t, s_t, b_t, ni_t, nb_t = boundary_kernel(
+                    c_t, s_t, b_t, ni_t, nb_t, ec_t = boundary_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
                 else:
                     pension_next = pension_dummy_z_jnp
                     income_table = working_income_next_jnp[t + 1]  # (n_z, n_eta, n_eps)
-                    c_t, s_t, b_t, ni_t, nb_t = working_kernel(
+                    c_t, s_t, b_t, ni_t, nb_t, ec_t = working_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
@@ -2701,6 +2724,7 @@ def run_lifecycle_solver(
             # so device memory isn't pinned by the histogram aggregator.
             newton_iter_per_age[t] = np.asarray(ni_t)
             backtrack_iter_per_age[t] = np.asarray(nb_t)
+            age_newton_fail[t] = int(np.sum(np.asarray(ec_t) != EC_INTERIOR))
             solved_age_mask[t] = True
 
             if verbose >= 1:

@@ -2574,7 +2574,15 @@ def run_lifecycle_solver(
             print(f"  WARNING: SCF wealth probe unavailable ({exc}); using grid midpoint.")
 
     i_z_med = n_z // 2
-    i_s_med = N_state // 2
+    # Pick per-axis midpoints, not the flat-index midpoint. For a state
+    # grid of shape (n0, n1, n2, n3) (e.g. (6,6,6,6)), N_state // 2 unravels
+    # to (n0//2, 0, 0, 0) in C-order — which means cy at center but spr/rtb/
+    # y_1 pinned to axis index 0 (extreme tail). The probe values were then
+    # corner-cell readings, not state-grid-center readings, masking the
+    # correct mean-state economics under noisy tail-cell extremes.
+    state_axis_sizes = tuple(g.shape[0] for g in pc.state_bracket_grids)
+    mid_per_axis = tuple(n // 2 for n in state_axis_sizes)
+    i_s_med = int(np.ravel_multi_index(mid_per_axis, state_axis_sizes))
 
     # ---- Terminal age ----
     if not solved_age_mask[-1]:
@@ -2605,7 +2613,7 @@ def run_lifecycle_solver(
     # ---- Backward induction header ----
     if verbose >= 1:
         print(f"\n{'='*100}")
-        print(f"  Live policy probe: z=z_grid[{i_z_med}], state midpoint, wealth={progress_wealth_label}")
+        print(f"  Live policy probe: z=z_grid[{i_z_med}], state per-axis center {mid_per_axis} (i_s={i_s_med}), wealth={progress_wealth_label}")
         hdr = (f" {'Age':>3}  {'Phase':<6} {'Time':>6}  "
                f"{'alpha_s':>7}  {'alpha_b':>7}  {'a_bill':>7}  {'W':>6}  {'c/W':>5}")
         print(hdr)

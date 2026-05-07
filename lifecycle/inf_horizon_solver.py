@@ -260,7 +260,16 @@ def _resolve_progress_probe_indices(
     if progress_probe_wealth is None:
         return False, 0, 0, 0
     i_z = pc.n_z // 2 if progress_probe_z_idx is None else int(progress_probe_z_idx)
-    i_s = pc.N_state // 2 if progress_probe_state_idx is None else int(progress_probe_state_idx)
+    if progress_probe_state_idx is None:
+        # Per-axis midpoint, not flat-index midpoint. flat // 2 unravels to
+        # (n0//2, 0, 0, ..., 0) in C-order — center on axis 0 but axis-zero
+        # tails on the rest. Use ravel_multi_index of (n_k//2,) per axis to
+        # actually probe the state-grid center.
+        state_axis_sizes = tuple(g.shape[0] for g in pc.state_bracket_grids)
+        mid_per_axis = tuple(n // 2 for n in state_axis_sizes)
+        i_s = int(np.ravel_multi_index(mid_per_axis, state_axis_sizes))
+    else:
+        i_s = int(progress_probe_state_idx)
     if i_z < 0 or i_z >= pc.n_z:
         raise ValueError(f"progress_probe_z_idx must lie in [0, {pc.n_z - 1}]")
     if i_s < 0 or i_s >= pc.N_state:

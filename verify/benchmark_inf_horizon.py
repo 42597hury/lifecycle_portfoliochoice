@@ -3,13 +3,14 @@
 Solves the no-income, no-mortality, no-bequest stationary Merton-with-VAR
 benchmark by fixed-point iteration of the JAX retirement kernel. With pension=0
 and psi=1 across all z, all income states produce identical policies — so n_z
-can be set to its minimum (2 works in build_precompute; 1 hits an IndexError).
+is set to 1 (the minimum). The discretization N=1 guard added 2026-05-07
+makes this work; build_precompute previously failed at z_grid[1]-z_grid[0].
 
 Config rationale:
     state_grid_sizes  = (8, 8, 8, 8)             # N_state = 4096
     state_n_stds      = (2.0, 2.25, 2.0, 2.25)
     n_stds            = 2.25                     # z-axis (no income, but precompute needs it)
-    n_z               = 2                        # minimum supported by build_precompute
+    n_z               = 1                        # z is inert under pension=0/psi=1
     n_wealth          = 180,  wealth_min = 0.05
     n_savings         = 180
     n_state_quad_nodes= (3, 3, 3, 5)             # K-bump on y_1 axis
@@ -20,17 +21,17 @@ Config rationale:
     max_iter (Newton) = 100                      # per fixed-point iter
     delta_bequest     = 0.0                      # also forced to 0 by inf-horizon (b_bar=0)
     gather_precision  = "f32"
-    cell_vmap_chunks  = 1                        # n_z=2 keeps memory comfortable
+    cell_vmap_chunks  = 1                        # n_z=1 keeps memory comfortable
 
 Memory budget on 2x H100 SXM (cell-axis sharded):
-    n_cells = 2 * 4096 = 8192, /2 = 4096 cells/device
-    per-cell c_corners = 135 * 2 * 16 * 180 * 8 = 6.2 MB
-    per-device working set ~ 4096 * 6.2 MB = 25 GB (well under 80 GB)
+    n_cells = 1 * 4096 = 4096, /2 = 2048 cells/device
+    per-cell c_corners = 135 * 1 * 16 * 180 * 8 = 3.1 MB
+    per-device working set ~ 2048 * 3.1 MB = 6.3 GB (well under 80 GB)
 
 Wall projection:
     Per fixed-point iteration ~ one retirement-kernel call.
-    8192 cells / 14256 cells (6^4 baseline) = 0.57x scaling -> ~195s/iter.
-    Convergence in ~25-30 iters at tol=1e-5 -> total ~85-100 min on 2x H100.
+    4096 cells / 14256 cells (6^4 baseline) = 0.29x scaling -> ~98s/iter.
+    Convergence in ~25-30 iters at tol=1e-5 -> total ~42-50 min on 2x H100.
 
 Outputs:
     ./saved_runs/<bundle-name>/                — local bundle (npz + metadata)
@@ -52,15 +53,15 @@ from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
 
-BUNDLE_NAME = "system_iv_inf_horizon_grid8x8x8x8_nz2_y1lob_calib1"
-BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
+BUNDLE_NAME = "system_iv_inf_horizon_grid8x8x8x8_nz1_y1lob_calib1"
+BUNDLE_DIR = os.path.join("saved_runs", "inf_horizon", BUNDLE_NAME)
 
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
     state_grid_sizes=(8, 8, 8, 8),
     state_n_stds=(2.0, 2.25, 2.0, 2.25),
     n_stds=2.25,
-    n_z=2,
+    n_z=1,
     n_eta_nodes=3,
     n_state_quad_nodes=(3, 3, 3, 5),
     state_lobatto_Z=(None, None, None, 2.93),
@@ -195,7 +196,7 @@ print(f"  Saved local bundle: {bundle_path}", flush=True)
 
 s3_bucket = os.environ.get("S3_BUCKET")
 if s3_bucket:
-    s3_uri = f"s3://{s3_bucket}/saved_runs/{BUNDLE_NAME}/"
+    s3_uri = f"s3://{s3_bucket}/saved_runs/inf_horizon/{BUNDLE_NAME}/"
     print(f"\n  S3_BUCKET set; uploading to {s3_uri}", flush=True)
     rc = subprocess.run(
         ["aws", "s3", "sync", BUNDLE_DIR, s3_uri,

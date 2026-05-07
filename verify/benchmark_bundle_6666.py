@@ -75,7 +75,7 @@ from lifecycle.policy_io import save_policy_bundle
 from lifecycle.diagnostics import diagnose_terminal_portfolio_states
 
 BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid6x6x6x6_nz11_y1lob_calib1"
-BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
+BUNDLE_DIR = os.path.join("saved_runs", "full", BUNDLE_NAME)
 
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
@@ -231,7 +231,7 @@ print(f"  Saved local bundle: {bundle_path}", flush=True)
 
 s3_bucket = os.environ.get("S3_BUCKET")
 if s3_bucket:
-    s3_uri = f"s3://{s3_bucket}/saved_runs/{BUNDLE_NAME}/"
+    s3_uri = f"s3://{s3_bucket}/saved_runs/full/{BUNDLE_NAME}/"
     print(f"\n  S3_BUCKET set; uploading to {s3_uri}", flush=True)
     rc = subprocess.run(
         ["aws", "s3", "sync", BUNDLE_DIR, s3_uri,

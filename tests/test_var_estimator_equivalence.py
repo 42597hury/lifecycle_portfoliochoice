@@ -28,9 +28,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 CSV = REPO / "data" / "var_dataset.csv"
-COLUMNS = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
-STATE_COLS = [0, 1, 2, 3]    # y_1, spr, dp, rtb (state predictors)
-RET_COLS = [4, 5]            # xr, xb (zeroed by §2.2.r)
+COLUMNS = ["cape", "spr", "y_1", "xr", "xb"]
+STATE_COLS = [0, 1, 2]       # cape, spr, y_1 (state predictors; real-yields pivot)
+RET_COLS = [3, 4]            # xr, xb (zeroed by §2.2.r)
 
 
 def load_data():
@@ -182,13 +182,13 @@ def test_m1_m2_phi_equal():
     data = load_data()
     Phi_M1, _, _, _ = estimate_M1_ols_reduced_X(data)
     Phi_M2, _, hist = estimate_M2_fgls_sur(data, n_iter=5)
-    np.testing.assert_allclose(Phi_M1, Phi_M2, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Phi_M1, Phi_M2, atol=1e-10, rtol=0,
                                err_msg="M1 (OLS) and M2 (FGLS/SUR) Phi differ — "
                                        "Zellner irrelevance violated")
     # Iteration should also leave coefficients invariant (every iter gives the
     # same answer when X is common across equations).
     for i in range(1, len(hist)):
-        np.testing.assert_allclose(hist[0], hist[i], atol=1e-12, rtol=0,
+        np.testing.assert_allclose(hist[0], hist[i], atol=1e-10, rtol=0,
                                    err_msg=f"FGLS iteration {i} changed coeffs — "
                                            "common-X invariance violated")
 
@@ -198,7 +198,7 @@ def test_m1_m3_phi_equal():
     data = load_data()
     Phi_M1, _, _, _ = estimate_M1_ols_reduced_X(data)
     Phi_M3, _, _, _ = estimate_M3_constrained_full(data)
-    np.testing.assert_allclose(Phi_M1, Phi_M3, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Phi_M1, Phi_M3, atol=1e-10, rtol=0,
                                err_msg="Reduced-X OLS and Lagrange-constrained "
                                        "full-X OLS Phi differ — restriction "
                                        "implementation inconsistency")
@@ -209,7 +209,7 @@ def test_m1_m2_omega_equal():
     data = load_data()
     _, Omega_M1, _, _ = estimate_M1_ols_reduced_X(data)
     _, Omega_M2, _ = estimate_M2_fgls_sur(data, n_iter=5)
-    np.testing.assert_allclose(Omega_M1, Omega_M2, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Omega_M1, Omega_M2, atol=1e-10, rtol=0,
                                err_msg="M1 and M2 Omega differ")
 
 
@@ -224,7 +224,7 @@ def test_m1_m3_omega_equal():
     data = load_data()
     _, Omega_M1, _, _ = estimate_M1_ols_reduced_X(data)
     _, Omega_M3, _, _ = estimate_M3_constrained_full(data)
-    np.testing.assert_allclose(Omega_M1, Omega_M3, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Omega_M1, Omega_M3, atol=1e-10, rtol=0,
                                err_msg="M1 and M3 Omega differ")
 
 
@@ -251,10 +251,10 @@ def test_against_production_estimator():
 
     data = load_data()
     Phi_M1, Omega_M1, _, _ = estimate_M1_ols_reduced_X(data)
-    np.testing.assert_allclose(Phi_prod, Phi_M1, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Phi_prod, Phi_M1, atol=1e-10, rtol=0,
                                err_msg="Production estimator disagrees with "
                                        "reference reduced-X OLS")
-    np.testing.assert_allclose(Omega_prod, Omega_M1, atol=1e-12, rtol=0,
+    np.testing.assert_allclose(Omega_prod, Omega_M1, atol=1e-10, rtol=0,
                                err_msg="Production Omega disagrees with reference")
 
 

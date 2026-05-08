@@ -11,7 +11,7 @@ from lifecycle.model import DiscretizationConfig
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.policy_io import save_policy_bundle
 from lifecycle.solver import _ensure_checkpoint_wealth_grid_compatible
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.wealth_grid import (
     legacy_log1p_wealth_grid,
     load_wealth_grid_from_bundle,
@@ -26,14 +26,14 @@ def _tiny_disc(**overrides) -> DiscretizationConfig:
         wealth_min=0.13,
         wealth_max=200.0,
         n_savings=12,
-        state_grid_sizes=(2, 2, 2, 2),
+        state_grid_sizes=(2, 2, 2),
         state_grid_mode="cholesky",
-        state_n_stds=(2.0, 2.25, 2.0, 2.25),
+        state_n_stds=(2.0, 2.25, 2.25),
         n_z=3,
         n_eps_nodes=2,
         n_eta_nodes=2,
         n_ret_nodes_1d=(2, 2),
-        n_state_quad_nodes=(2, 2, 2, 2),
+        n_state_quad_nodes=(2, 2, 2),
     )
     return base._replace(**overrides)
 
@@ -41,7 +41,7 @@ def _tiny_disc(**overrides) -> DiscretizationConfig:
 def _tiny_model():
     base = dict(BASE_CONFIG)
     base.update(start_age=60, retire_age=63, terminal_age=65)
-    var_config = build_nominal_system1_var_config_hardcoded()
+    var_config = build_real_full_var_config_hardcoded()
     return build_model(base, var_config, verbose=False)
 
 

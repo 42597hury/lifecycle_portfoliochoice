@@ -60,10 +60,10 @@ def test_sigma_rr_differs_from_sigma_r_cond_at_runtime():
     """
     import sys
     sys.path.insert(0, str(REPO))
-    from lifecycle.var import build_nominal_system1_var_config_hardcoded
+    from lifecycle.var import build_real_full_var_config_hardcoded
     from lifecycle.var import partition_var
 
-    cfg = build_nominal_system1_var_config_hardcoded()
+    cfg = build_real_full_var_config_hardcoded()
     parts = partition_var(
         cfg["Phi"],
         cfg["Omega"],

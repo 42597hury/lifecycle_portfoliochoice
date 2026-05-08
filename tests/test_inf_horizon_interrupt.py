@@ -26,27 +26,30 @@ sys.path.insert(0, str(REPO))
 
 from configs._canonical import BASE_CONFIG
 from lifecycle.model import DiscretizationConfig, SolverConfig
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle import inf_horizon_solver as ihs
 from lifecycle.policy_io import save_policy_bundle, load_policy_bundle
 
 
 def _tiny_model_pc():
-    """Smallest config that exercises the inf-horizon kernel on CPU."""
+    """Smallest config that exercises the inf-horizon kernel on CPU.
+
+    Real-yields pivot: 3-axis state vector (cape, spr, y_1).
+    """
     disc = DiscretizationConfig(
         n_wealth=10, wealth_min=0.13, wealth_max=200.0,
         n_savings=10,
-        state_grid_sizes=(2, 2, 2, 2),
+        state_grid_sizes=(2, 2, 2),
         state_grid_mode="cholesky",
-        state_n_stds=(2.0, 2.25, 2.0, 2.25),
+        state_n_stds=(2.0, 2.25, 2.25),
         n_z=1,
         n_eps_nodes=2,
         n_eta_nodes=2,
         n_ret_nodes_1d=(2, 2),
-        n_state_quad_nodes=(2, 2, 2, 2),
+        n_state_quad_nodes=(2, 2, 2),
     )
-    var_config = build_nominal_system1_var_config_hardcoded()
+    var_config = build_real_full_var_config_hardcoded()
     model = build_model(BASE_CONFIG, var_config, verbose=False)
     pc = build_precompute(model, disc, verbose=False)
     return model, pc

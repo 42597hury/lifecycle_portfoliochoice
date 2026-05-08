@@ -29,7 +29,7 @@ from lifecycle.policy_io import load_policy_bundle  # noqa: E402
 from lifecycle.precompute import build_model, build_precompute  # noqa: E402
 from lifecycle.predictability_ablation import get_predictability_system_spec  # noqa: E402
 from lifecycle.simulation import simulate_lifecycle  # noqa: E402
-from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402
+from lifecycle.var import build_real_full_var_config_hardcoded  # noqa: E402
 from lifecycle.wealth_grid import (  # noqa: E402
     disc_config_with_bundle_wealth_grid,
     legacy_log1p_wealth_grid,
@@ -174,11 +174,17 @@ def _build_var_config(run_config: dict[str, Any]) -> dict[str, Any]:
     system = pab.get("system_code")
     if system is not None:
         spec = get_predictability_system_spec(system)
-        var_config, _var_res, _var_data = spec.builder(
+        # Real-yields pivot: spec carries builder_name (late-bound) instead
+        # of a callable. Resolve via importlib so this script works on any
+        # spec produced by the new ablation module.
+        import importlib
+        var_module = importlib.import_module("lifecycle.var")
+        builder = getattr(var_module, spec.builder_name)
+        var_config, _var_res, _var_data = builder(
             csv_path=str(REPO / "data" / "var_dataset.csv")
         )
         return var_config
-    return build_nominal_system1_var_config_hardcoded()
+    return build_real_full_var_config_hardcoded()
 
 
 def _build_model_pc(bundle: Path, metadata: dict[str, Any]):

@@ -1,17 +1,17 @@
 """
-Synthesize metadata.json for the System I ablation bundles.
+Synthesize metadata.json for ablation bundles missing run_config metadata.
 
-The ablation sweep ships only `policy_arrays.npz` + `diagnostics.pkl` (no
-metadata.json). `verify/ee_simpath.py` requires `metadata["run_config"]` with
-base_config / discretization_config / solver_config to rebuild the
-precompute, so we construct a minimal-but-faithful metadata.json from:
+LEGACY-ONLY (pre 2026-05-08 real-yields pivot): the ablation bundles this
+script targets ship only `policy_arrays.npz` + `diagnostics.pkl` and were
+solved against the 4-axis nominal model. Even with synthesized metadata,
+the pivot's diagnostic consumers will reject these bundles via
+verify/_diag_helpers.build_bundle_var_config (see legacy detection there).
 
-  - `disc_config` and `solver_config` saved verbatim in diagnostics.pkl
-  - `BASE_CONFIG` from configs._canonical (the calibration these runs used;
-    confirmed match against the sister sweep on saved_runs/system_iv...)
-  - `wealth_dynamics_spec` from the solver_config inside diagnostics.pkl
-
-Idempotent: skips bundles that already have metadata.json.
+Kept for the case where you check out the pre-pivot revision of this repo
+and want to feed `verify/ee_simpath.py` (pre-pivot) the legacy ablation
+bundles. On the post-pivot branch the script still runs idempotently and
+writes metadata.json, but downstream reload will surface a clear "legacy
+bundle" error rather than producing residuals.
 
 Usage:
     python scripts/analysis/synth_metadata_for_ablation.py

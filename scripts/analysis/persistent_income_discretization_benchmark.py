@@ -49,15 +49,17 @@ REFERENCE_NZ = 70
 
 
 def _template_disc(n_z: int):
+    # 3-axis (cape, spr, y_1) template post real-yields pivot. System 1
+    # projection keeps only the y_1 entry (last axis).
     return CANONICAL_DISC._replace(
         wealth_min=0.05,
-        state_grid_sizes=(7, 7, 7, 7),
-        state_n_stds=(2.0, 2.25, 2.0, 2.25),
+        state_grid_sizes=(7, 7, 7),
+        state_n_stds=(2.0, 2.25, 2.25),
         n_stds=2.25,
         n_z=int(n_z),
         n_eta_nodes=3,
         n_eps_nodes=4,
-        n_state_quad_nodes=(3, 3, 3, 5),
+        n_state_quad_nodes=(3, 3, 5),
         state_lobatto_Z=None,
         n_ret_nodes_1d=(3, 3),
         ret_lobatto_Z=None,
@@ -86,9 +88,9 @@ def _solve_control():
 
 def bundle_name(method: str, n_z: int) -> str:
     if method == "quadrature":
-        return f"system_i_grid7_nz{n_z}_calib1"
+        return f"system_1_grid7_nz{n_z}_calib1"
     if method == "pi_z":
-        return f"system_i_grid7_nz{n_z}_pi_z_calib1"
+        return f"system_1_grid7_nz{n_z}_pi_z_calib1"
     raise ValueError(f"Unknown method {method!r}")
 
 
@@ -199,7 +201,7 @@ def pi_z_transition_diagnostics(n_z_values: list[int], n_stds: float) -> dict[st
 def solve_one(method: str, n_z: int, bundle_dir: Path, overwrite: bool) -> dict[str, Any]:
     template_disc = _template_disc(n_z)
     meta = prepare_predictability_system(
-        "I",
+        "1",
         csv_path=str(CSV_PATH),
         disc_config_template=template_disc,
     )

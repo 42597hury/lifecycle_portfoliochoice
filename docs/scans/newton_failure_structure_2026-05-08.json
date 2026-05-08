@@ -1,0 +1,686 @@
+[
+  {
+    "label": "S1_w180_log",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w180_log_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      180
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 65.60590434074402,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 2426760,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 44.0,
+    "backtrack_p99": 89.0,
+    "backtrack_max": 121,
+    "total_fail": 236915,
+    "fail_rate": 0.09762605284412137,
+    "age_fail_head": [
+      2779,
+      2849,
+      2856,
+      2828,
+      2926
+    ],
+    "age_fail_tail": [
+      4333,
+      4375,
+      4459,
+      4298,
+      308
+    ],
+    "age_fail_argmax": 75,
+    "age_fail_max": 4459
+  },
+  {
+    "label": "S1_w180_bakh",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w180_bakh_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      180
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 65.61621499061584,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 2426760,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 41.0,
+    "backtrack_p99": 90.0,
+    "backtrack_max": 121,
+    "total_fail": 147231,
+    "fail_rate": 0.060669781931464176,
+    "age_fail_head": [
+      1757,
+      1855,
+      1841,
+      1925,
+      1897
+    ],
+    "age_fail_tail": [
+      2821,
+      3570,
+      4158,
+      5411,
+      308
+    ],
+    "age_fail_argmax": 76,
+    "age_fail_max": 5411
+  },
+  {
+    "label": "S1_w90_log",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w90_log_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      90
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 90,
+    "wall_time_sec": 37.61300349235535,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 1213380,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 44.0,
+    "backtrack_p99": 89.0,
+    "backtrack_max": 121,
+    "total_fail": 120232,
+    "fail_rate": 0.09908849659628476,
+    "age_fail_head": [
+      1498,
+      1512,
+      1533,
+      1512,
+      1470
+    ],
+    "age_fail_tail": [
+      2226,
+      2079,
+      2198,
+      2177,
+      154
+    ],
+    "age_fail_argmax": 73,
+    "age_fail_max": 2226
+  },
+  {
+    "label": "S1_w90_bakh",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w90_bakh_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      90
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 90,
+    "wall_time_sec": 37.66717553138733,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 1213380,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 41.0,
+    "backtrack_p99": 89.0,
+    "backtrack_max": 121,
+    "total_fail": 75271,
+    "fail_rate": 0.0620341525325949,
+    "age_fail_head": [
+      938,
+      924,
+      910,
+      910,
+      896
+    ],
+    "age_fail_tail": [
+      1533,
+      1925,
+      1988,
+      2751,
+      154
+    ],
+    "age_fail_argmax": 76,
+    "age_fail_max": 2751
+  },
+  {
+    "label": "S1_w60_log",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w60_log_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      60
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 60,
+    "wall_time_sec": 28.783533811569214,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 808920,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 44.0,
+    "backtrack_p99": 89.0,
+    "backtrack_max": 120,
+    "total_fail": 81221,
+    "fail_rate": 0.10040671512634129,
+    "age_fail_head": [
+      945,
+      952,
+      952,
+      910,
+      917
+    ],
+    "age_fail_tail": [
+      1463,
+      1393,
+      1589,
+      1456,
+      105
+    ],
+    "age_fail_argmax": 75,
+    "age_fail_max": 1589
+  },
+  {
+    "label": "S1_w120_log",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_i_grid7_nz25_w120_log_calib1",
+    "shape": [
+      78,
+      25,
+      7,
+      120
+    ],
+    "max_iter": 30,
+    "max_backtrack_iter": 5,
+    "tol": 1e-07,
+    "n_z": 25,
+    "state_grid_sizes": [
+      7
+    ],
+    "n_state_quad_nodes": [
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 120,
+    "wall_time_sec": 45.83824610710144,
+    "newton_p50": 2.0,
+    "newton_p95": 30.0,
+    "newton_p99": 30.0,
+    "newton_max": 30,
+    "newton_n_cells": 1617840,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 44.0,
+    "backtrack_p99": 89.0,
+    "backtrack_max": 121,
+    "total_fail": 158858,
+    "fail_rate": 0.0981914157147802,
+    "age_fail_head": [
+      1904,
+      1869,
+      1855,
+      1848,
+      1960
+    ],
+    "age_fail_tail": [
+      2814,
+      2926,
+      2898,
+      2905,
+      203
+    ],
+    "age_fail_argmax": 74,
+    "age_fail_max": 2926
+  },
+  {
+    "label": "S2_7x7_sq3x3_rq3x3",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_ii_grid7x7_nz15_sq3x3_rq3x3_calib1",
+    "shape": [
+      78,
+      15,
+      49,
+      180
+    ],
+    "max_iter": 100,
+    "max_backtrack_iter": 10,
+    "tol": 1e-07,
+    "n_z": 15,
+    "state_grid_sizes": [
+      7,
+      7
+    ],
+    "n_state_quad_nodes": [
+      3,
+      3
+    ],
+    "n_ret_nodes_1d": [
+      3,
+      3
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 581.3883140087128,
+    "newton_p50": 100.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 56644,
+    "backtrack_p50": 1251.0,
+    "backtrack_p95": 1634.8499999999985,
+    "backtrack_p99": 2443.0,
+    "backtrack_max": 3079,
+    "total_fail": 0,
+    "fail_rate": 0.0,
+    "age_fail_head": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_tail": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_argmax": 0,
+    "age_fail_max": 0
+  },
+  {
+    "label": "S2_7x7_sq4x4_rq3x3",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_ii_grid7x7_nz15_sq4x4_rq3x3_calib1",
+    "shape": [
+      78,
+      15,
+      49,
+      180
+    ],
+    "max_iter": 100,
+    "max_backtrack_iter": 10,
+    "tol": 1e-07,
+    "n_z": 15,
+    "state_grid_sizes": [
+      7,
+      7
+    ],
+    "n_state_quad_nodes": [
+      4,
+      4
+    ],
+    "n_ret_nodes_1d": [
+      3,
+      3
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 979.727534532547,
+    "newton_p50": 100.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 56644,
+    "backtrack_p50": 1264.0,
+    "backtrack_p95": 1641.0,
+    "backtrack_p99": 2468.5699999999997,
+    "backtrack_max": 3083,
+    "total_fail": 0,
+    "fail_rate": 0.0,
+    "age_fail_head": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_tail": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_argmax": 0,
+    "age_fail_max": 0
+  },
+  {
+    "label": "S2_7x7_sq3x5_rq3x3",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_ii_grid7x7_nz15_sq3x5_rq3x3_calib1",
+    "shape": [
+      78,
+      15,
+      49,
+      180
+    ],
+    "max_iter": 100,
+    "max_backtrack_iter": 10,
+    "tol": 1e-07,
+    "n_z": 15,
+    "state_grid_sizes": [
+      7,
+      7
+    ],
+    "n_state_quad_nodes": [
+      3,
+      5
+    ],
+    "n_ret_nodes_1d": [
+      3,
+      3
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 934.1950800418854,
+    "newton_p50": 100.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 56644,
+    "backtrack_p50": 1262.0,
+    "backtrack_p95": 1644.0,
+    "backtrack_p99": 2457.5699999999997,
+    "backtrack_max": 3085,
+    "total_fail": 0,
+    "fail_rate": 0.0,
+    "age_fail_head": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_tail": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_argmax": 0,
+    "age_fail_max": 0
+  },
+  {
+    "label": "S2_7x7_sq3x3_rq4x4",
+    "kind": "lifecycle",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\ablations\\system_ii_grid7x7_nz15_sq3x3_rq4x4_calib1",
+    "shape": [
+      78,
+      15,
+      49,
+      180
+    ],
+    "max_iter": 100,
+    "max_backtrack_iter": 10,
+    "tol": 1e-07,
+    "n_z": 15,
+    "state_grid_sizes": [
+      7,
+      7
+    ],
+    "n_state_quad_nodes": [
+      3,
+      3
+    ],
+    "n_ret_nodes_1d": [
+      4,
+      4
+    ],
+    "n_savings": 180,
+    "wall_time_sec": 975.4152076244354,
+    "newton_p50": 100.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 56644,
+    "backtrack_p50": 1270.0,
+    "backtrack_p95": 1646.8499999999985,
+    "backtrack_p99": 2441.0,
+    "backtrack_max": 3109,
+    "total_fail": 0,
+    "fail_rate": 0.0,
+    "age_fail_head": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_tail": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "age_fail_argmax": 0,
+    "age_fail_max": 0
+  },
+  {
+    "label": "S4_inf_5x5x5x5_axis1",
+    "kind": "inf",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\inf_horizon\\system_iv_inf_axisbump_run1_sq3333_rq33_calib1",
+    "shape": [
+      1,
+      625,
+      180
+    ],
+    "max_iter": null,
+    "max_backtrack_iter": null,
+    "tol": null,
+    "n_z": null,
+    "state_grid_sizes": null,
+    "n_state_quad_nodes": null,
+    "n_ret_nodes_1d": null,
+    "n_savings": null,
+    "wall_time_sec": null,
+    "newton_p50": 1.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 6975000,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 42.0,
+    "backtrack_p99": 125.0,
+    "backtrack_max": 500,
+    "total_fail": 511961,
+    "fail_rate": 0.07339942652329749,
+    "age_fail_head": null,
+    "age_fail_tail": null,
+    "age_fail_argmax": null,
+    "age_fail_max": null
+  },
+  {
+    "label": "S4_inf_3x3x3x3",
+    "kind": "inf",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\inf_horizon\\system_iv_inf_grid_g3_quad3334_ret44_calib1",
+    "shape": [
+      1,
+      81,
+      180
+    ],
+    "max_iter": null,
+    "max_backtrack_iter": null,
+    "tol": null,
+    "n_z": null,
+    "state_grid_sizes": null,
+    "n_state_quad_nodes": null,
+    "n_ret_nodes_1d": null,
+    "n_savings": null,
+    "wall_time_sec": null,
+    "newton_p50": 1.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 1195560,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 21.0,
+    "backtrack_p99": 96.0,
+    "backtrack_max": 401,
+    "total_fail": 104162,
+    "fail_rate": 0.08712402556124327,
+    "age_fail_head": null,
+    "age_fail_tail": null,
+    "age_fail_argmax": null,
+    "age_fail_max": null
+  },
+  {
+    "label": "S4_inf_4x4x4x4",
+    "kind": "inf",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\inf_horizon\\system_iv_inf_grid_g4_quad3334_ret44_calib1",
+    "shape": [
+      1,
+      256,
+      180
+    ],
+    "max_iter": null,
+    "max_backtrack_iter": null,
+    "tol": null,
+    "n_z": null,
+    "state_grid_sizes": null,
+    "n_state_quad_nodes": null,
+    "n_ret_nodes_1d": null,
+    "n_savings": null,
+    "wall_time_sec": null,
+    "newton_p50": 1.0,
+    "newton_p95": 100.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 4469760,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 19.0,
+    "backtrack_p99": 97.0,
+    "backtrack_max": 401,
+    "total_fail": 270835,
+    "fail_rate": 0.06059273876002291,
+    "age_fail_head": null,
+    "age_fail_tail": null,
+    "age_fail_argmax": null,
+    "age_fail_max": null
+  },
+  {
+    "label": "S4_inf_5x5x5x5",
+    "kind": "inf",
+    "path": "C:\\Users\\carlh\\Projekt\\thesisscripts_JAX\\saved_runs\\inf_horizon\\system_iv_inf_grid_g5_quad3334_ret44_calib1",
+    "shape": [
+      1,
+      625,
+      180
+    ],
+    "max_iter": null,
+    "max_backtrack_iter": null,
+    "tol": null,
+    "n_z": null,
+    "state_grid_sizes": null,
+    "n_state_quad_nodes": null,
+    "n_ret_nodes_1d": null,
+    "n_savings": null,
+    "wall_time_sec": null,
+    "newton_p50": 1.0,
+    "newton_p95": 84.0,
+    "newton_p99": 100.0,
+    "newton_max": 100,
+    "newton_n_cells": 11250000,
+    "backtrack_p50": 0.0,
+    "backtrack_p95": 21.0,
+    "backtrack_p99": 100.0,
+    "backtrack_max": 401,
+    "total_fail": 568421,
+    "fail_rate": 0.05052631111111111,
+    "age_fail_head": null,
+    "age_fail_tail": null,
+    "age_fail_argmax": null,
+    "age_fail_max": null
+  }
+]

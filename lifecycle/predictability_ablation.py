@@ -1,18 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import inspect
 from typing import Any, Callable, NamedTuple
 
 from lifecycle.model import DiscretizationConfig
-from lifecycle.var import (
-    build_iid_var_config,
-    build_no_cy_var_config,
-    build_nominal_system1_var_config,
-    build_rtb_y1_var_config,
-)
 
 
-DEFAULT_TEMPLATE_STATE_NAMES = ("dp", "spr", "rtb", "y_1")
+DEFAULT_TEMPLATE_STATE_NAMES = ("cape", "spr", "y_1")
 
 
 class PredictabilitySystemSpec(NamedTuple):
@@ -20,77 +15,93 @@ class PredictabilitySystemSpec(NamedTuple):
     label: str
     name: str
     description: str
-    builder: Callable[..., tuple[dict[str, Any], Any, Any]]
+    builder_name: str
     state_names: tuple[str, ...]
 
 
 _SYSTEM_SPECS: dict[str, PredictabilitySystemSpec] = {
-    "I": PredictabilitySystemSpec(
-        code="I",
-        label="system_i_iid",
-        name="iid returns",
-        description="No return predictability; rtb is iid in the single-axis state, returns are iid.",
-        builder=build_iid_var_config,
-        state_names=("rtb",),
+    "1": PredictabilitySystemSpec(
+        code="1",
+        label="system_1_real",
+        name="real bill yield only",
+        description=(
+            "Single-axis real-yields state on y_1 (real bill yield). "
+            "No spread or CAPE. Bill return is state-determined; "
+            "stock and bond returns load on y_1 alone."
+        ),
+        builder_name="build_real_system1_var_config",
+        state_names=("y_1",),
     ),
-    "II": PredictabilitySystemSpec(
-        code="II",
-        label="system_ii_rtb_y1",
-        name="rtb plus y_1",
-        description="Inflation-persistence channel (rtb) plus the short rate; state is ordered (rtb, y_1).",
-        builder=build_rtb_y1_var_config,
-        state_names=("rtb", "y_1"),
+    "2": PredictabilitySystemSpec(
+        code="2",
+        label="system_2_real",
+        name="bill yield plus spread",
+        description=(
+            "Two-axis real-yields state on (spr, y_1) with y_1 at the "
+            "K-bump end. Adds the term-spread channel on top of System 1; "
+            "no CAPE."
+        ),
+        builder_name="build_real_system2_var_config",
+        state_names=("spr", "y_1"),
     ),
-    "III": PredictabilitySystemSpec(
-        code="III",
-        label="system_iii_rtb_spr_y1",
-        name="rtb plus spread plus y_1",
-        description="Rate-side predictability with inflation persistence; dp removed; state ordered (rtb, spr, y_1).",
-        builder=build_no_cy_var_config,
-        state_names=("rtb", "spr", "y_1"),
-    ),
-    "IV": PredictabilitySystemSpec(
-        code="IV",
-        label="system_iv_full_var",
-        name="full VAR baseline",
-        description="Baseline lifecycle model with the full (dp, spr, rtb, y_1) state vector.",
-        builder=build_nominal_system1_var_config,
-        state_names=("dp", "spr", "rtb", "y_1"),
+    "full": PredictabilitySystemSpec(
+        code="full",
+        label="full_system_real",
+        name="full real-yields system",
+        description=(
+            "Three-axis real-yields state on (cape, spr, y_1) with y_1 at "
+            "the K-bump end. CAPE drives stock-return predictability; "
+            "the bond predictor uses (y_1, spr); the bill is state-"
+            "determined."
+        ),
+        builder_name="build_real_full_var_config",
+        state_names=("cape", "spr", "y_1"),
     ),
 }
 
 
 _SYSTEM_ALIASES = {
-    "i": "I",
-    "1": "I",
-    "system_i": "I",
-    "system_1": "I",
-    "iid": "I",
-    "iid_returns": "I",
-    "no_predictability": "I",
-    "ii": "II",
-    "2": "II",
-    "system_ii": "II",
-    "system_2": "II",
-    "rtb_y1": "II",
-    "rtb_y_1": "II",
-    "iii": "III",
-    "3": "III",
-    "system_iii": "III",
-    "system_3": "III",
-    "no_cy": "III",
-    "rtb_spr_y1": "III",
-    "rtb_spread_y1": "III",
-    "rate_side": "III",
-    "iv": "IV",
-    "4": "IV",
-    "system_iv": "IV",
-    "system_4": "IV",
-    "baseline": "IV",
-    "full": "IV",
-    "full_var": "IV",
-    "full_predictability": "IV",
+    # System 1 (real bill yield only)
+    "1": "1",
+    "system_1": "1",
+    "system_1_real": "1",
+    "real_bill": "1",
+    "y_1": "1",
+    "y1": "1",
+    # System 2 (bill + spread)
+    "2": "2",
+    "system_2": "2",
+    "system_2_real": "2",
+    "bill_spr": "2",
+    "spr_y_1": "2",
+    "spr_y1": "2",
+    # Full system (cape + spr + y_1)
+    "full": "full",
+    "system_full": "full",
+    "full_system": "full",
+    "full_system_real": "full",
+    "all": "full",
+    "cape_spr_y_1": "full",
+    "cape_spr_y1": "full",
 }
+
+
+# Old (pre-pivot) system codes that are explicitly rejected. The 4-axis
+# nominal model with Roman-numeral systems (I/II/III/IV) was deleted in
+# the real-yields pivot; calling code that still passes these is a bug
+# that must be fixed at the call site rather than silently re-routed to
+# a same-numbered new-model system that has different state variables.
+_RETIRED_SYSTEM_CODES = frozenset({
+    "i", "system_i", "iid", "iid_returns", "no_predictability",
+    "ii", "system_ii", "rtb_y1", "rtb_y_1",
+    "iii", "system_iii", "no_cy", "rtb_spr_y1", "rtb_spread_y1", "rate_side",
+    "iv", "system_iv", "baseline", "full_var", "full_predictability",
+    # 3 (System III) was a 4-axis nominal sub-system — System 3 does not
+    # exist in the real-yields pivot.
+    "3", "system_3",
+    # 4 was an alias for System IV. The new "full" code is "full".
+    "4", "system_4",
+})
 
 
 def _normalize_system_code(system: str | int) -> str:
@@ -102,18 +113,45 @@ def _normalize_system_code(system: str | int) -> str:
         while "__" in key:
             key = key.replace("__", "_")
 
+    if key in _RETIRED_SYSTEM_CODES:
+        raise ValueError(
+            f"Predictability system {system!r} was retired in the real-yields "
+            "pivot. The new model has three systems: '1' (y_1 only), "
+            "'2' (spr + y_1), 'full' (cape + spr + y_1). Update the call site "
+            "explicitly — old and new same-numbered systems have different "
+            "state variables and are not compatible."
+        )
+
     code = _SYSTEM_ALIASES.get(key)
     if code is None:
         raise ValueError(
-            "Unknown predictability system "
-            f"{system!r}. Choose one of I, II, III, IV."
+            f"Unknown predictability system {system!r}. Choose one of "
+            "'1', '2', 'full'."
         )
     return code
 
 
 def get_predictability_system_spec(system: str | int) -> PredictabilitySystemSpec:
-    """Return the canonical metadata for System I/II/III/IV."""
+    """Return the canonical metadata for System 1 / 2 / Full."""
     return _SYSTEM_SPECS[_normalize_system_code(system)]
+
+
+def _resolve_builder(builder_name: str) -> Callable[..., tuple[dict[str, Any], Any, Any]]:
+    """Late-bind a VAR builder from lifecycle.var.
+
+    Resolved at call time rather than import time so this module imports
+    cleanly while lifecycle/var.py is mid-rewrite for the real-yields pivot.
+    """
+    var_module = importlib.import_module("lifecycle.var")
+    try:
+        return getattr(var_module, builder_name)
+    except AttributeError as exc:
+        raise ImportError(
+            f"lifecycle.var has no builder named {builder_name!r}. "
+            "The real-yields VAR config must export "
+            "build_real_system1_var_config, build_real_system2_var_config, "
+            "and build_real_full_var_config."
+        ) from exc
 
 
 def _project_axis_tuple(
@@ -166,35 +204,13 @@ def project_predictability_disc_config(
     *,
     template_state_names: tuple[str, ...] = DEFAULT_TEMPLATE_STATE_NAMES,
 ) -> DiscretizationConfig:
-    """Project a baseline discretization config onto a lower-dimensional state vector."""
-    if target_state_names == ("rtb",):
-        # System I: rtb is iid in a single-axis state. Use a small grid since
-        # there's no persistence; the axis still needs >1 node so the solver
-        # can read the rtb realisation off the state vector.
-        rtb_size = _project_axis_setting(
-            disc_config_template.state_grid_sizes,
-            template_state_names,
-            ("rtb",),
-            "state_grid_sizes",
-        )
-        rtb_n_stds = _project_axis_setting(
-            disc_config_template.state_n_stds,
-            template_state_names,
-            ("rtb",),
-            "state_n_stds",
-        )
-        rtb_quad = _project_axis_setting(
-            disc_config_template.n_state_quad_nodes,
-            template_state_names,
-            ("rtb",),
-            "n_state_quad_nodes",
-        )
-        return disc_config_template._replace(
-            state_grid_sizes=rtb_size,
-            state_n_stds=rtb_n_stds,
-            n_state_quad_nodes=rtb_quad,
-        )
+    """Project a baseline 3-axis discretization config onto a sub-system.
 
+    All three real-yields systems are persistent (no iid axis), so projection
+    is uniform: pick the matching axis settings out of the 3-axis template
+    by name. The returned config has ``state_grid_sizes``, ``state_n_stds``,
+    and ``n_state_quad_nodes`` of length ``len(target_state_names)``.
+    """
     return disc_config_template._replace(
         state_grid_sizes=_project_axis_tuple(
             disc_config_template.state_grid_sizes,
@@ -242,15 +258,15 @@ def prepare_predictability_system(
     template_state_names: tuple[str, ...] = DEFAULT_TEMPLATE_STATE_NAMES,
     builder_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Build the selected ablation VAR and the matching discretization config.
+    """Build the selected real-yields VAR and the matching discretization config.
 
-    The baseline 3D `disc_config_template` stays user-owned; this helper only
-    projects its state-axis settings onto the selected System I/II/III/IV.
+    The 3-axis ``disc_config_template`` stays user-owned; this helper only
+    projects its state-axis settings onto the selected System 1 / 2 / Full.
     """
     spec = get_predictability_system_spec(system)
+    builder = _resolve_builder(spec.builder_name)
     var_config, var_res, var_data = _call_builder(
-        spec.builder,
+        builder,
         csv_path=csv_path,
         builder_kwargs={} if builder_kwargs is None else dict(builder_kwargs),
     )
@@ -260,7 +276,7 @@ def prepare_predictability_system(
     observed_state_names = tuple(variable_names[i] for i in state_indices)
     if observed_state_names != spec.state_names:
         raise ValueError(
-            f"{spec.builder.__name__} returned state_names={observed_state_names}, "
+            f"{builder.__name__} returned state_names={observed_state_names}, "
             f"expected {spec.state_names}"
         )
 
@@ -274,10 +290,13 @@ def prepare_predictability_system(
         "system_code": spec.code,
         "system_label": spec.label,
         "system_name": spec.name,
-        "system_title": f"System {spec.code} ({spec.name})",
+        "system_title": (
+            "Full System (real)" if spec.code == "full"
+            else f"System {spec.code} (real, {spec.name})"
+        ),
         "system_description": spec.description,
         "state_names": observed_state_names,
-        "var_builder_name": spec.builder.__name__,
+        "var_builder_name": builder.__name__,
         "var_config": var_config,
         "var_res": var_res,
         "var_data": var_data,

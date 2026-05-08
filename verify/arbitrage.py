@@ -57,15 +57,27 @@ Pass criteria
 - CONCERNING:  max in [1e-6, 1e-4]                (consider Lobatto)
 - FAIL:        max > 1e-4                          (Lobatto required)
 
-The thresholds match the post-rtb-as-state Sigma_r_cond rank-drift gate
-(``1e-5``) order of magnitude — anything above ~1e-6 means the cloud is
-materially mis-resolving the tails relative to where solver convergence
-checks operate.
+The thresholds match the post-pivot Sigma_r_cond rank-drift gate (``1e-5``)
+order of magnitude — anything above ~1e-6 means the cloud is materially
+mis-resolving the tails relative to where solver convergence checks operate.
+
+Real-yields pivot (2026-05-08) note
+-----------------------------------
+In the new 3-axis (cape, spr, y_1) real-yields model the bill return is
+deterministic given the current state: ``R_bill_{t+1} = exp(y_1_t)``, with
+NO shock channel into the bill leg. The cloud is therefore constant across
+both ``k_v`` and ``k_r`` on the bill, and the (R_stock, R_bond) cloud is a
+fixed translation of the (X_s, X_b) excess-return cloud. The convex-hull
+test is unchanged in interpretation — it asks whether the origin is in the
+hull of the discrete (X_s, X_b) cloud at each state corner. Axis-aligned
+``bill_dominates_*`` pairs become a strict-inequality check on the (now
+single-valued) bill against the min/max of the risky asset's cloud, which
+is the strictest possible per-corner statement and remains economically
+meaningful as a sanity gate.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 import time
@@ -76,7 +88,7 @@ sys.path.insert(0, ".")
 
 import numpy as np
 
-from lifecycle.model import DiscretizationConfig, SolverConfig
+from lifecycle.model import DiscretizationConfig
 from lifecycle.policy_io import load_policy_bundle
 from lifecycle.wealth_grid import disc_config_with_bundle_wealth_grid
 from lifecycle.precompute import build_model, build_precompute
@@ -378,8 +390,9 @@ def _convex_hull_arbitrage_gap(
     sin = np.sin(angles)
     # proj[i_s, n, a] = cos[a] * Xs[i_s, n] + sin[a] * Xb[i_s, n]
     # min over nodes per (i_s, angle), then max over angles per i_s.
-    # Memory for the full (N_state, n_nodes, n_angles) tensor can be large at
-    # 9^4 x 36 x 25 x 720 ~ 8 GB in float64; chunk over angles to bound peak.
+    # Memory for the full (N_state, n_nodes, n_angles) tensor can grow large
+    # on dense grids (e.g. 7^3 state x 36 state-quad x 25 ret-quad x 720
+    # angles ~ 470 MB float64); chunk over angles to bound peak.
     N_state = Xs.shape[0]
     gap = np.full(N_state, -np.inf, dtype=np.float64)
     chunk = 64

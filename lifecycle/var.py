@@ -378,308 +378,209 @@ def build_var_config_from_dataset(
     return var_config, fit_obj, data
 
 
-def build_nominal_system1_var_config(
-    csv_path="data/var_dataset.csv",
-    state_indices=(2, 1, 3, 0),
-    return_indices=(4, 5),
-    y_1_index_in_state=3,
-    spr_index_in_state=1,
-    rtb_index_in_state=2,
+def _read_var_sample_means(csv_path, cols):
+    """Read sample means of given columns from var_dataset.csv (for scalar fallbacks)."""
+    data = _load_var_dataset(csv_path=csv_path, columns=cols)
+    return {c: float(data[c].mean()) for c in cols}
+
+
+# =============================================================================
+# REAL-YIELD VAR BUILDERS  (post 2026-05-08 rebuild)
+# =============================================================================
+# Three systems on the new real-yield CSV with columns
+#     [cape, spr, y_1, xr, xb]
+#
+# All systems use the same restricted constrained estimator:
+#   §2.2.r — Phi_1[:, ret_cols] = 0 by construction
+#   §2.2.μ — Phi_0 = (I − Phi_1) μ̂_y (mean-pinning via demean+OLS+back-solve)
+#
+#   Full system   state = (cape, spr, y_1)         3-state    HEADLINE
+#   System 2      state = (spr, y_1)               2-state
+#   System 1      state = (y_1,)                   1-state
+#
+# State ordering convention: the slowest persistent state goes first
+# (cape), the fast-mean-reverting yield-curve refinement target goes last
+# (y_1). System 2 follows the same convention with cape removed.
+# =============================================================================
+
+DEFAULT_CSV_PATH = "data/var_dataset.csv"
+
+
+def build_real_full_var_config(
+    csv_path=DEFAULT_CSV_PATH,
     trend="c",
     estimation="restricted",
 ):
-    """
-    Nominal bond system with no riskless asset.
-    columns = [y_1, spr, dp, rtb, xr, xb]
-    Default state: (dp, spr, rtb, y_1)   Default returns: (xr, xb)
+    """HEADLINE: Full real-yield system. State = (cape, spr, y_1), returns = (xr, xb).
 
-    rtb is in the state block (post rtb-as-state migration). The restriction
-    "lagged returns do not predict" applies only to {xr, xb}; lagged rtb is
-    freely estimated and captures inflation persistence.
+    Columns in CSV: [cape, spr, y_1, xr, xb] (positions 0..4).
+    State indices: [0, 1, 2] (cape at row 0, spr at row 1, y_1 at row 2).
+    Return indices: [3, 4].
 
-    Default state ordering rationale (dp, spr, rtb, y_1) — same partition slot
-    used previously for cy. The orthogonality and refinement-target reasoning
-    referenced cy-specific innovation correlations; with dp the structure is
-    different but the slot ordering is preserved for continuity. The orthogonality
-    properties of dp's innovation should be re-evaluated if axis-by-axis tail
-    refinement is being tuned.
-      - dp at row 0: replaces cy as the slowest persistent state.
-      - y_1 at row 3: M[xb, y_1] dominant entry of M = Sigma_rs @ Sigma_ss^-1.
-      - rtb in the middle: avoids adjacent placement of strongly correlated
-        (spr, y_1).
+    Restrictions imposed by the estimator:
+      §2.2.r: lagged xr, xb columns of Phi are zero exactly.
+      §2.2.μ: Phi_0 = (I − Phi_1) μ̂_y by mean-pinning.
 
-    Data is at ANNUAL frequency. The VAR is estimated directly at annual
-    frequency using the CCV constrained estimator (z_bar pinned to sample mean).
+    Real-yield setup: y_1 and spr are constructed via Fisher decomposition
+    using Homer-Sylla (2005) backward weighted inflation expectation for
+    the bill leg and a static AR(1) cumulative-20 forecast for the bond
+    leg. See data/build_var_dataset.py.
 
-    y_1  = 1-year nominal short rate, January-of-year value (decimal log)
-    spr  = yield spread: y_n (Moody's AAA) - y_1
-    dp   = log dividend-price ratio: log(D) - log(P)
-    rtb  = real bill return: y_1[t-1] - pi[t]   <-- state variable
-    xr   = excess log stock return over nominal bill
-    xb   = excess log bond return over nominal bill (CLM constant-duration n=20)
+    cape = -log(Shiller CAPE), Jan-of-year, from ie_data.xls. Equity predictor.
 
-    With the default ordering, state_grid[:, 0] = dp, [:, 1] = spr,
-    [:, 2] = rtb, [:, 3] = y_1.
-
-    Migration history: pre-2026-04-30 used (y_1, spr, cy). 2026-04-30 used
-    (cy, spr, y_1) with rtb in the return block. 2026-05-06 added rtb-as-state.
-    2026-05-07 (this version) replaced cy=-log(CAPE) on 1963-2025 with
-    dp=log(D)-log(P) on 1919-2011 (Option A: AAA-throughout, T=92 effective).
-    """
-    columns = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
-    return build_var_config_from_dataset(
-        csv_path=csv_path,
-        columns=columns,
-        state_indices=state_indices,
-        return_indices=return_indices,
-        y_1_index_in_state=y_1_index_in_state,
-        spr_index_in_state=spr_index_in_state,
-        rtb_index_in_state=rtb_index_in_state,
-        trend=trend,
-        estimation=estimation,
-    )
-
-
-def _read_y1_spread_sample_means(csv_path):
-    """Read sample means of y_1 and spread from the VAR dataset."""
-    data = _load_var_dataset(csv_path=csv_path, columns=["y_1", "spr"])
-    return float(data["y_1"].mean()), float(data["spr"].mean())
-
-
-def build_no_cy_var_config(
-    csv_path="data/var_dataset.csv",
-    columns=("y_1", "spr", "rtb", "xr", "xb"),
-    state_indices=(2, 1, 0),
-    trend="c",
-    estimation="restricted",
-):
-    """Build the System III var_config: rtb, spread, and y_1 predict returns; cy dropped.
-
-    Post rtb-as-state migration: state vector is (rtb, spr, y_1) — rtb at row 0
-    (most orthogonal of the three state innovations; mean |rho|=0.385), spr in
-    the middle, y_1 at the refinement-target end. Returns are (xr, xb).
-
-    Returns the same tuple shape as the existing baseline builder:
-    `(var_config, fit_details, data)`.
-    """
-    state_idx_list = list(state_indices)
-    column_at_state_pos = [columns[i] for i in state_idx_list]
-    spr_pos = column_at_state_pos.index("spr")
-    y_1_pos = column_at_state_pos.index("y_1")
-    rtb_pos = column_at_state_pos.index("rtb")
-
-    return build_var_config_from_dataset(
-        csv_path=csv_path,
-        columns=list(columns),
-        state_indices=state_idx_list,
-        return_indices=(3, 4),
-        y_1_index_in_state=y_1_pos,
-        spr_index_in_state=spr_pos,
-        rtb_index_in_state=rtb_pos,
-        trend=trend,
-        estimation=estimation,
-    )
-
-
-def build_rtb_y1_var_config(
-    csv_path="data/var_dataset.csv",
-    columns=("y_1", "rtb", "xr", "xb"),
-    trend="c",
-    estimation="restricted",
-):
-    """Build the System II var_config: rtb and y_1 predict returns.
-
-    Post rtb-as-state migration: state vector is (rtb, y_1) — rtb at row 0
-    (more orthogonal of the two state innovations), y_1 at the refinement-target
-    end. Returns are (xr, xb). Spread is supplied as a scalar fallback equal to
-    its sample mean (used by the bequest annuity factor).
+    rtb_index_in_state is None: the bill is real-risk-free in this setup;
+    the solver should read log_R_bill from y_1 directly (handled by the
+    solver-rebuild, not this VAR layer).
 
     Returns `(var_config, fit_details, data)`.
     """
-    _, spr_mean = _read_y1_spread_sample_means(csv_path)
-
-    columns = list(columns)
-    rtb_pos = columns.index("rtb")
-    y_1_pos = columns.index("y_1")
-
+    columns = ["cape", "spr", "y_1", "xr", "xb"]
     return build_var_config_from_dataset(
         csv_path=csv_path,
         columns=columns,
-        state_indices=(rtb_pos, y_1_pos),  # rtb -> state row 0, y_1 -> row 1
-        return_indices=(2, 3),
+        state_indices=(0, 1, 2),               # cape, spr, y_1
+        return_indices=(3, 4),                 # xr, xb
+        y_1_index_in_state=2,                  # y_1 at state row 2
+        spr_index_in_state=1,                  # spr at state row 1
+        rtb_index_in_state=None,               # bill is real-risk-free; no rtb state
+        trend=trend,
+        estimation=estimation,
+    )
+
+
+def build_real_system2_var_config(
+    csv_path=DEFAULT_CSV_PATH,
+    trend="c",
+    estimation="restricted",
+):
+    """System 2 ablation: state = (spr, y_1), returns = (xr, xb). cape dropped.
+
+    Columns loaded from CSV: ["spr", "y_1", "xr", "xb"] (positions 0..3).
+    State indices: [0, 1] (spr at row 0, y_1 at row 1).
+    Return indices: [2, 3].
+
+    cape is dropped from the VAR. Equity predictability is reduced to whatever
+    spr and y_1 capture jointly. Used as an ablation system to study
+    portfolio choice when the dp/cape channel for stock-return prediction
+    is removed.
+    """
+    columns = ["spr", "y_1", "xr", "xb"]
+    return build_var_config_from_dataset(
+        csv_path=csv_path,
+        columns=columns,
+        state_indices=(0, 1),                  # spr, y_1
+        return_indices=(2, 3),                 # xr, xb
         y_1_index_in_state=1,
-        spr_index_in_state=None,
-        rtb_index_in_state=0,
-        spr_scalar_fallback=spr_mean,
+        spr_index_in_state=0,
+        rtb_index_in_state=None,
         trend=trend,
         estimation=estimation,
     )
 
 
-def build_iid_var_config(
-    csv_path="data/var_dataset.csv",
-    return_columns=("xr", "xb"),
+def build_real_system1_var_config(
+    csv_path=DEFAULT_CSV_PATH,
+    trend="c",
+    estimation="restricted",
 ):
-    """Build the System I var_config: iid returns; rtb is iid in the state block.
+    """System 1 ablation: state = (y_1,), returns = (xr, xb). spr and cape dropped.
 
-    Post rtb-as-state migration: rtb cannot live in the return block any more
-    because the solver/simulator read rtb from the next-period state vector.
-    System I encodes "no predictability" by setting Phi to zero — rtb is then
-    an iid draw around its sample mean with variance Sigma_rr[rtb, rtb], which
-    matches the iid-returns interpretation.
+    Columns loaded: ["y_1", "xr", "xb"] (positions 0..2).
+    State indices: [0] (y_1).
+    Return indices: [1, 2].
 
-    State = (rtb,). Returns = (xr, xb). Phi = 0; Omega = sample covariance.
-    Spread and y_1 are scalar fallbacks (sample means) for the bequest annuity.
-
-    Returns `(var_config, fit_details, data)`.
+    Most reduced ablation: only the real short rate predicts. spread is
+    supplied as a scalar fallback (sample mean) for the bequest annuity
+    factor in lifecycle.precompute.
     """
-    data = _load_var_dataset(
+    means = _read_var_sample_means(csv_path, ["spr"])
+    columns = ["y_1", "xr", "xb"]
+    return build_var_config_from_dataset(
         csv_path=csv_path,
-        columns=["y_1", "spr", "rtb", *return_columns],
+        columns=columns,
+        state_indices=(0,),                    # y_1 only
+        return_indices=(1, 2),                 # xr, xb
+        y_1_index_in_state=0,
+        spr_index_in_state=None,               # spr supplied as scalar fallback
+        rtb_index_in_state=None,
+        spr_scalar_fallback=means["spr"],
+        trend=trend,
+        estimation=estimation,
     )
-    full_cols = ["rtb", *return_columns]
-    full_data = data[full_cols].to_numpy()
-    z_bar_full = full_data.mean(axis=0)
-    Sigma_full = np.cov(full_data, rowvar=False, ddof=1)
-    y_1_mean, spr_mean = _read_y1_spread_sample_means(csv_path)
-
-    n = len(full_cols)  # rtb + n_ret
-    Phi = np.zeros((n, n), dtype=float)
-    Omega = np.array(Sigma_full, dtype=float)
-    z_bar = np.array(z_bar_full, dtype=float)
-    const = (np.eye(n) - Phi) @ z_bar
-
-    var_config = {
-        "z_bar": z_bar,
-        "Phi": Phi,
-        "Omega": Omega,
-        "variable_names": list(full_cols),
-        "const": const,
-        "residual_correlation": None,
-        "equation_r2": None,
-        "state_indices": [0],            # rtb at state row 0
-        "return_indices": list(range(1, n)),
-        "y_1_index_in_state": None,      # y_1 not on the grid
-        "spr_index_in_state": None,
-        "rtb_index_in_state": 0,
-        "y_1_scalar_fallback": y_1_mean,
-        "spr_scalar_fallback": spr_mean,
-        "max_abs_return_lag_coeff": 0.0,
-        "estimation": "iid_system_I",
-        "trend": "sample_mean_cov",
-        "state_predictor_columns": ["rtb"],
-    }
-    fit_details = {
-        "residuals": full_data - z_bar_full,
-        "n_obs_effective": len(full_data),
-        "dof": len(full_data) - 1,
-    }
-    return var_config, fit_details, data
 
 
 # =============================================================================
-# HARDCODED VAR PARAMETERS  (fallback if var_dataset.csv is unavailable)
+# HARDCODED FALLBACK PARAMETERS for the FULL system
 # =============================================================================
-# Estimated from var_dataset.csv using build_nominal_system1_var_config()
+# Estimated from data/var_dataset.csv (1920-2011, T=92) under the headline
+# real-yield setup (Homer-Sylla bill expectation + AR(1) cumulative bond
+# expectation, lambda_n = 0).
 #
-#   System   : Nominal Bond — No Riskless Asset (rtb-as-state, dp variable)
-#   Columns  : [y_1, spr, dp, rtb, xr, xb]
-#   States   : dp(2), spr(1), rtb(3), y_1(0)   Returns: xr(4), xb(5)
-#   Estimation: restricted constrained VAR(1) (CCV w8566 footnote 5)
-#               z_bar pinned to sample mean; only return lags (xr, xb)
-#               excluded — rtb lags enter freely (inflation persistence
-#               channel; Phi[rtb, rtb] ~ +0.47).
-#   Omega    : from restricted VAR residuals
-#   Frequency: ANNUAL (estimated directly on annual data)
-#   Sample   : 1920–2011, T=92 annual observations  (Option A: window
-#              shortened from spec's 1871–2011 to honor "Moody's AAA throughout"
-#              given AAA starts 1919-01; one year lost to inflation differencing)
-#   Data src : chap_26 (Shiller Ch.26 update — P, D, R, CPI Jan-of-year),
-#              FRED Moody's AAA (long-bond yield, Jan-of-year)
-#
-# CCV w8566 reference Table 2 (annual, 1890-1998, T=109): Phi[y, y]=0.92,
-# Phi[dp, dp]=0.84, Phi[rtb, rtb]=0.30, Phi[spr, spr]=0.82.
+#   Columns         : [cape, spr, y_1, xr, xb]
+#   State indices   : [0, 1, 2]    (cape, spr, y_1)
+#   Return indices  : [3, 4]       (xr, xb)
+#   Restrictions    : §2.2.r (lagged xr, xb -> 0) + §2.2.μ (mean-pinned)
+#   Stationarity    : max |eig(Phi)| = 0.9525
+#   R² by equation  : cape=0.80, spr=0.67, y_1=0.62, xr=0.07, xb=0.25
 # =============================================================================
 
-# Variable order: [y_1, spr, dp, rtb, xr, xb]
-_NOM_COLS   = ["y_1", "spr", "dp", "rtb", "xr", "xb"]
-_STATE_IDX  = [2, 1, 3, 0]   # dp, spr, rtb, y_1
-_RET_IDX    = [4, 5]         # xr, xb
+_FULL_COLS  = ["cape", "spr", "y_1", "xr", "xb"]
+_STATE_IDX  = [0, 1, 2]
+_RET_IDX    = [3, 4]
 
-# --- Unconditional means (= sample means, pinned by CCV constrained estimator) ---
-# Estimated 2026-05-07 on data/var_dataset.csv (1920-2011, T=92, Option A).
 _Z_BAR = np.array([
-    +4.402987766457664570e-02,   # y_1   = +4.40%   nominal short rate
-    +1.255104651539200658e-02,   # spr   = +1.26pp  yield spread (AAA - y_1)
-    -3.256591312095483914e+00,   # dp    = -3.257   log dividend-price ratio
-    +1.641233073311164012e-02,   # rtb   = +1.64%   real bill return
+    -2.727442332889471910e+00,   # cape  = -log(Shiller CAPE)
+    +2.341884578426967067e-02,   # spr   = +2.34pp  real spread
+    +1.263250569328265918e-02,   # y_1   = +1.26%   real short yield
     +5.184427359929520002e-02,   # xr    = +5.18%   excess stock return
-    +1.073210114487195208e-02,   # xb    = +1.07%   excess bond return
+    +2.143529218902298986e-02,   # xb    = +2.14%   excess real bond return
 ])
 
-# --- AR(1) coefficient matrix Phi (annual, restricted: only xr/xb lag cols = 0) ---
-# Phi[i, j] = coefficient on lagged z_j in equation for z_i.
-# Return columns 4 (xr) and 5 (xb) are zero by restriction; column 3 (rtb) is
-# freely estimated.
-#
-#            L.y_1                    L.spr                    L.dp                     L.rtb                    L.xr   L.xb
+# Phi[i, j] = coefficient on lagged z_j in equation for z_i. Restricted: xr, xb columns = 0.
 _PHI = np.array([
-    [+9.299060056743475577e-01, +8.871811111637421809e-02, +1.309239276869196859e-03, -4.879196624450553993e-02, 0.0, 0.0],  # y_1
-    [+2.344008948027683989e-02, +6.570337478396850450e-01, -3.319193580131267474e-03, +2.526490968066123430e-02, 0.0, 0.0],  # spr
-    [-3.853543505103990130e-01, -2.154249268041942500e+00, +9.288388594467132942e-01, -6.009056673164093754e-01, 0.0, 0.0],  # dp
-    [+3.378214425295113510e-01, -4.876945057254646887e-01, +8.552260704384884301e-04, +4.716537319880246826e-01, 0.0, 0.0],  # rtb
-    [-7.091371152108977283e-02, +3.482547439595059302e+00, +1.162966599772504023e-01, +5.973033322200087779e-03, 0.0, 0.0],  # xr
-    [+3.491519517715134246e-01, +3.279032619175778152e+00, +1.821208810550401305e-02, +2.007972763738816169e-01, 0.0, 0.0],  # xb
+    [+8.832144696639269155e-01, -2.775343935654446259e-01, +1.595080358125571668e-02, +0.000000000000000000e+00, +0.000000000000000000e+00],  # cape
+    [+7.334869933878162239e-04, +9.099185412730056433e-01, +1.763557433593782864e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # spr
+    [-5.067987491988315898e-04, +3.745633199622572240e-02, +7.993772820498267206e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # y_1
+    [+9.556619861421875028e-02, -6.266992437178200426e-01, -1.155295325295173203e+00, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xr
+    [+3.712368145963413301e-04, +1.436352743475807214e+00, +1.898838846619773368e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xb
 ])
 
-# --- Intercept vector c = (I - Phi) @ z_bar  (annual) ---
-_CONST = (np.eye(6) - _PHI) @ _Z_BAR
+_CONST = (np.eye(5) - _PHI) @ _Z_BAR
 
-# --- Residual covariance matrix Omega  (annual, 6x6, full matrix) ---
 _OMEGA = np.array([
-    [+2.234920362525859695e-04, -1.661887167916548417e-04, -1.844912677731811845e-04, -1.313216553305527885e-04, +3.902042377503587406e-04, -5.253256292926793700e-04],  # y_1
-    [-1.661887167916548417e-04, +1.492291942678782772e-04, +2.968638876824434138e-04, +6.420969497128877726e-05, -5.544060097427062255e-04, +1.739181278562723740e-04],  # spr
-    [-1.844912677731811845e-04, +2.968638876824434138e-04, +2.073286760974539511e-02, +1.554822952480693467e-04, -2.066659106159631984e-02, -6.617591115692886836e-04],  # dp
-    [-1.313216553305527885e-04, +6.420969497128877726e-05, +1.554822952480693467e-04, +1.304450404909156085e-03, -7.527973037346545430e-04, +6.461715739749695131e-04],  # rtb
-    [+3.902042377503587406e-04, -5.544060097427062255e-04, -2.066659106159631984e-02, -7.527973037346545430e-04, +3.338076903150290903e-02, +1.467276318990530168e-03],  # xr
-    [-5.253256292926793700e-04, +1.739181278562723740e-04, -6.617591115692886836e-04, +6.461715739749695131e-04, +1.467276318990530168e-03, +3.279686436158545451e-03],  # xb
+    [+3.743240230977754046e-02, +1.061954486414440563e-03, -6.472767250849701618e-04, -3.455844145214870961e-02, -4.494915301210509161e-03],  # cape
+    [+1.061954486414440563e-03, +3.624013083062108446e-04, -3.463957515682325548e-04, -8.782016414966449785e-04, -1.995354939761590017e-04],  # spr
+    [-6.472767250849701618e-04, -3.463957515682325548e-04, +3.805285847057932633e-04, +5.319354214209602843e-04, -3.278827790411425113e-04],  # y_1
+    [-3.455844145214870961e-02, -8.782016414966449785e-04, +5.319354214209602843e-04, +3.495782907063437611e-02, +3.775511638115449861e-03],  # xr
+    [-4.494915301210509161e-03, -1.995354939761590017e-04, -3.278827790411425113e-04, +3.775511638115449861e-03, +5.905398985233042790e-03],  # xb
 ])
 
 
-def build_nominal_system1_var_config_hardcoded():
-    """
-    Fallback: return var_config using hardcoded parameter estimates.
-    Use when var_dataset.csv is unavailable.
-    Identical structure to build_nominal_system1_var_config() output.
+def build_real_full_var_config_hardcoded():
+    """Fallback for the full headline system when var_dataset.csv is unavailable.
 
-    Parameters are at ANNUAL frequency — ready for the annual DP solver.
-
-    Estimated from data/var_dataset.csv (1920-2011, T=92, Option A — see
-    docs/CCV_RETURN_IMPLEMENT.md §4.1) under the rtb-as-state restriction.
-    State (dp, spr, rtb, y_1); returns (xr, xb).
-      max |eig(Phi)| = 0.9493 (stationary)
-      R²(y_1)=0.78, R²(spr)=0.44, R²(dp)=0.90, R²(rtb)=0.41,
-      R²(xr)=0.13,  R²(xb)=0.41.
+    Real-yield setup, state = (cape, spr, y_1), returns = (xr, xb).
+    Estimated from data/var_dataset.csv (1920-2011, T=92).
+      max |eig(Phi)| = 0.9525, R²(xb) = 0.247.
     """
-    print("Using HARDCODED VAR parameters (nominal System 1, annual, 6-var, dp-state).")
-    print("  Estimated from data/var_dataset.csv (1920-2011, T=92, Option A).")
+    print("Using HARDCODED VAR parameters (FULL real-yield system, 5-var, 1920-2011 T=92).")
     return {
         "z_bar":                  _Z_BAR.copy(),
         "Phi":                    _PHI.copy(),
         "Omega":                  _OMEGA.copy(),
         "const":                  _CONST.copy(),
-        "variable_names":         list(_NOM_COLS),
+        "variable_names":         list(_FULL_COLS),
         "state_indices":          list(_STATE_IDX),
         "return_indices":         list(_RET_IDX),
-        "y_1_index_in_state":     3,
+        "y_1_index_in_state":     2,
         "spr_index_in_state":     1,
-        "rtb_index_in_state":     2,
+        "rtb_index_in_state":     None,
         "y_1_scalar_fallback":    None,
         "spr_scalar_fallback":    None,
         "max_abs_return_lag_coeff": 0.0,
         "estimation":             "restricted_constrained_hardcoded",
         "trend":                  "c",
-        "state_predictor_columns": ["dp", "spr", "rtb", "y_1"],
+        "state_predictor_columns": ["cape", "spr", "y_1"],
         "residual_correlation":   None,
         "equation_r2":            None,
     }

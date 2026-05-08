@@ -11,17 +11,23 @@ Exports:
   - CANONICAL_DISC       (DiscretizationConfig — discretization)
   - CANONICAL_SOLVER     (SolverConfig — numerical solver)
 
+Real-yields pivot (2026-05-08):
+  The 4-axis nominal model (System I/II/III/IV on rtb-as-state) has been
+  retired. The new canonical is the 3-axis real-yields Full System with
+  state vector (cape, spr, y_1). System 1 / System 2 ablations select a
+  subset of axes via configs.predictability_ablation.
+
 See `docs/CONFIG.md` for the rationale behind every value.
 """
 
 from lifecycle.model import DiscretizationConfig, SolverConfig, SolveControl
 
-PREDICTABILITY_SYSTEM = "IV"
+PREDICTABILITY_SYSTEM = "full"
 
 
 # ── Economics ───────────────────────────────────────────────────────────────
 # NOTE: bequest spec is the shifted (luxury) form b̄·(W/A + δ)^{1-γ}/(1-γ);
-# the shift parameter DELTA_BEQUEST is defined in lifecycle/model.py.
+# the shift parameter δ now lives entirely on CANONICAL_SOLVER.delta_bequest.
 gamma, beta, b_bar = 5.0, 0.96, 10
 start_age, retire_age, terminal_age = 22, 67, 99
 b0, b1, b2, b3 = -6.142, 0.3040, -0.051, 0.002586
@@ -47,66 +53,70 @@ BASE_CONFIG = {
 
 
 # ── Discretization ──────────────────────────────────────────────────────────
-# state_n_stds: u-space half-width per axis in cholesky mode.
-#   Per-axis coverage = 2*Phi(n_d) - 1; joint = product.
-#   Current value (2.0, 2.25, 2.25) -> per-axis (95.5%, 97.6%, 97.6%),
-#   joint ~91%. Earlier value (0.6, 1.75, 2.0) gave joint ~40% and
-#   produced unusable simulator moments — do not regress to it.
-#   Production-grade 99% per-axis would need (~2.93, ~2.93, ~2.93).
-# wealth_min: explicit so it can never silently inherit a stale model.py
-#   default. Raised to 0.05 on 2026-05-03 to skip the EGM constrained
-#   region (see docs/STATE_SPACE.md §wealth_min and
-#   docs/agents/EE_DIAGNOSTIC_WORKFLOW.md). precompute.py reads this directly.
+# State vector is (cape, spr, y_1) for the Full System; System 1 / System 2
+# slice this template via project_predictability_disc_config (cape and/or
+# spr dropped, the same ordering preserved).
+#
+#   Axis 0 = cape  (slow equity-yield predictor)
+#   Axis 1 = spr   (term spread)
+#   Axis 2 = y_1   (real bill yield; bond-return refinement target, K-bump)
+#
+# state_grid_sizes / state_n_stds: PLACEHOLDERS per the real-yields pivot
+#   handoff. Validate before production by re-running the System I / Full
+#   sensitivity sweeps on the new VAR (analog of the old grid+nstd sweeps,
+#   but on (cape, spr, y_1) instead of (dp, spr, rtb, y_1)). The current
+#   defaults follow the handoff suggestion of (5,5,5) and (2.0, 2.25, 2.25).
+#
+# n_state_quad_nodes=(3, 3, 5): K-bump preserved on the y_1 axis (last),
+#   the long-standing bond-return refinement convention (M[xb, y_1] is the
+#   dominant entry of M = Sigma_rs Sigma_ss^-1).
+#
+# state_lobatto_Z / ret_lobatto_Z = None: prescribed-tails Lobatto removed
+#   on every axis; standard Gauss-Hermite throughout.
+#
+# n_ret_nodes_1d=(4, 4): bumped from (3, 3) per the per-axis quadrature
+#   sensitivity finding (verify/inf_horizon_sweep_axis_bumps).
+#
+# n_z=11, n_eps_nodes=4, n_eta_nodes=3: validated under the System I
+#   nz / eta-eps sensitivity sweeps (carry over from the legacy canonical).
+#
+# wealth_min: kept at 0.13 (skips the EGM constrained region, see
+#   docs/STATE_SPACE.md §wealth_min).
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
     wealth_min=0.13,
     wealth_max=750.0,
     n_savings=180,
-    # State vector is (dp, spr, rtb, y_1) (post 2026-05-07 dp migration).
-    # Axis 0 = dp (slow predictor), axis 1 = spr, axis 2 = rtb (inflation-surprise
-    # axis, between spr and y_1), axis 3 = y_1 (bond-return refinement target).
-    # Axis-specific n_stds tuned for cy; with dp the orthogonality structure
-    # differs and the per-axis allocation may benefit from re-tuning.
-    state_grid_sizes=(7, 7, 7, 7),
+    state_grid_sizes=(5, 5, 5),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=11,
     n_stds=3.0,
-    # Income-shock quadrature density. Sensitivity sweep on System I
-    # (saved_runs/ablations/system_i_grid7_nz30_eta{3eps4,4eps5,6eps6}_calib1)
-    # showed policy variation under 0.5% across (3,4) → (4,5) → (6,6) at
-    # γ=5 and full-VAR baseline. (3,4) is the canonical default going
-    # forward; eps ≥ eta convention preserved. Override per-run if you want
-    # to revisit at different γ or different ablation system.
     n_eps_nodes=4,
     n_eta_nodes=3,
-    # Return block now (xr, xb) — n_ret_nodes_1d / ret_lobatto_Z drop the
-    # leading rtb axis. Lobatto tails on both stock and bond residuals at
-    # Z=7 sigma (the tail-correction setting validated against the bond-tail
-    # discrete-free-lunch evidence). State-axis Lobatto: tails on rtb and
-    # y_1 (the inflation-surprise and bond-return refinement axes).
-    n_ret_nodes_1d=(5, 5),
-    ret_lobatto_Z=(7.0, 7.0),
-    n_state_quad_nodes=(3, 5, 3, 5),
-    state_lobatto_Z=(None, 7.0, None, 7.0),
+    n_ret_nodes_1d=(4, 4),
+    ret_lobatto_Z=None,
+    n_state_quad_nodes=(3, 3, 5),
+    state_lobatto_Z=None,
 )
 
 
 # ── Numerical solver ────────────────────────────────────────────────────────
-# Tuned. Do not change knobs other than alpha_min/alpha_max without rerunning
-# the small-bundle smoke. See docs/CONFIG.md §2 for the "why" on each
-# override of the model.py defaults.
-# alpha_min/alpha_max: numerical leverage cap (unconstrained branch only).
-#   Box projection (alpha_s, alpha_b) in [alpha_min, alpha_max]^2 inside the
-#   unconstrained Newton. Canonical ±6 is a real cap (prior production hit
-#   max simulated |alpha| ~9.25 at gamma=5, 7x7x7 wide-support). Cap-bound
-#   cells surface as EC_NEWTON_FAIL in diagnostics['total_newton_failures'].
 # tol=1e-6: per docs/scans/NEWTON_FAILURE_STRUCTURE_2026-05-08.md, tol=1e-7
 #   was unreachable at high-savings cells where FOC residual scale falls
 #   below fp64 precision relative to tol*scale. Loosening to 1e-6 declares
 #   those structurally-doomed cells as converged without changing actual
-#   policy precision (1e-7 was unreachable anyway). Drops Newton fail rate
-#   from ~10-15% to ~3-6% at zero wall cost.
+#   policy precision.
+# init_alpha_s=0.85, init_alpha_b=0.44: warm starts at the long-run mean
+#   portfolio under Full-System carryover; revisit after the new VAR's
+#   stationary alphas are characterized.
+# delta_bequest=0.0: drop the luxury-bequest shifter. The pivot baseline
+#   is the un-shifted bequest; the shifter can be dialled back per-run if
+#   the cliff at zero wealth is binding in production.
+# gather_precision="f32": fp32 c_corners gather + interpolation; cast back
+#   to fp64 BEFORE FOC / Newton arithmetic. Captures memory-bandwidth
+#   savings without touching policy precision (verified to ~1e-4 relative
+#   agreement vs f64 on prior canonicals).
 CANONICAL_SOLVER = SolverConfig(
     tol=1e-6,
     max_iter=8000,
@@ -114,7 +124,8 @@ CANONICAL_SOLVER = SolverConfig(
     init_alpha_b=0.44,
     step_damp_unconstrained=0.3,
     use_line_search=True,
-    delta_bequest=0.001,
+    delta_bequest=0.0,
+    gather_precision="f32",
 )
 
 

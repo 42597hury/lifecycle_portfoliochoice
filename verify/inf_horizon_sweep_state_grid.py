@@ -1,26 +1,15 @@
 """Inf-horizon Sweep A: state-grid density sensitivity.
 
-Sweeps state_grid_sizes ∈ {(3,3,3,3), (4,4,4,4), (5,5,5,5)} at fixed
-quadrature floor (state_quad=(3,3,3,4) with K-bump on y_1; ret=(4,4)).
-The bumped floor is conservative — ret-quad and y_1-axis state-quad both at
-4 — so any state-grid divergence we observe is attributable to the grid,
-not to under-resolved orthogonal quadratures.
+Post real-yields pivot (2026-05-08): 3-axis state (cape, spr, y_1).
+
+Sweeps state_grid_sizes in {(3,3,3), (4,4,4), (5,5,5)} at fixed quadrature
+floor (state_quad=(3,3,4) with K-bump on y_1; ret=(4,4)). The bumped floor
+is conservative — ret-quad and y_1-axis state-quad both at 4 — so any
+state-grid divergence we observe is attributable to the grid, not to
+under-resolved orthogonal quadratures.
 
 Per-bundle path:
-    saved_runs/inf_horizon/system_iv_inf_grid_g{N}_quad3334_ret44_calib1/
-
-Each bundle contains policy_arrays.npz, metadata.json, diagnostics.pkl with
-the post-fix per-savings Newton-iter histogram, full per-iter convergence
-trajectory, and total_newton_failures (post the per-cell exit-code wiring).
-
-Wall projection on 1× A100 SXM4 (rough; first cell measures the truth):
-    g3 (3⁴ =  81 cells): ~17 min
-    g4 (4⁴ = 256 cells): ~30 min
-    g5 (5⁴ = 625 cells): ~48 min
-    total: ~95 min ≈ 1.6 h ≈ ~$2
-
-(g6 = 6⁴ dropped per user direction — adds ~90 min for marginal extra
-information beyond the g4-vs-g5 verdict.)
+    saved_runs/inf_horizon/full_system_inf_grid_g{N}_quad334_ret44_calib1/
 """
 import os
 import shutil
@@ -32,7 +21,7 @@ import time
 import numpy as np
 
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
@@ -40,17 +29,18 @@ from lifecycle.policy_io import save_policy_bundle
 
 # =============================================================================
 # Sweep cells — state grid varies; everything else held to the bumped floor.
+# Axes (post real-yields pivot): (cape, spr, y_1).
 # =============================================================================
 
 SWEEP_CELLS = (
     # tag,        state_grid_sizes
-    ("g3", (3, 3, 3, 3)),
-    ("g4", (4, 4, 4, 4)),
-    ("g5", (5, 5, 5, 5)),
+    ("g3", (3, 3, 3)),
+    ("g4", (4, 4, 4)),
+    ("g5", (5, 5, 5)),
 )
 
-# Bumped floor: ret nodes (4,4); state quad (3,3,3,4) with K-bump on y_1.
-N_STATE_QUAD = (3, 3, 3, 4)
+# Bumped floor: ret nodes (4,4); state quad (3,3,4) with K-bump on y_1.
+N_STATE_QUAD = (3, 3, 4)
 N_RET_NODES = (4, 4)
 STATE_LOBATTO_Z = None
 RET_LOBATTO_Z = None
@@ -68,7 +58,7 @@ def make_disc(state_grid_sizes):
         n_wealth=180,
         n_savings=180,
         state_grid_sizes=state_grid_sizes,
-        state_n_stds=(2.0, 2.25, 2.0, 2.25),
+        state_n_stds=(2.0, 2.25, 2.25),
         n_stds=2.25,
         n_z=1,
         n_eta_nodes=3,
@@ -105,7 +95,7 @@ print(f"\nJAX devices: {len(jax.devices())} -> {jax.devices()}", flush=True)
 
 print("\nBuilding shared model + VAR config...", flush=True)
 t0 = time.time()
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 print(f"  Model build wall: {time.time() - t0:.1f}s", flush=True)
 
@@ -116,7 +106,7 @@ def run_one_cell(tag, state_grid_sizes):
     print("=" * 70, flush=True)
 
     bundle_name = (
-        f"system_iv_inf_grid_{tag}_quad"
+        f"full_system_inf_grid_{tag}_quad"
         f"{''.join(str(k) for k in N_STATE_QUAD)}_"
         f"ret{N_RET_NODES[0]}{N_RET_NODES[1]}_calib1"
     )
@@ -201,8 +191,10 @@ def run_one_cell(tag, state_grid_sizes):
             "damping": IH_DAMPING,
         },
         "predictability_ablation": {
-            "system_label": "system_iv_full_var",
-            "system_title": "System IV (full VAR baseline)",
+            "system_code": "full",
+            "system_label": "full_system_real",
+            "system_title": "Full System (real)",
+            "state_names": ["cape", "spr", "y_1"],
         },
         "sweep": {
             "name": "inf_horizon_state_grid_sweep_A",

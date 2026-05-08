@@ -24,7 +24,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER  # noqa: E402
 from lifecycle.model import DiscretizationConfig  # noqa: E402
-from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402
+from lifecycle.var import build_real_full_var_config_hardcoded  # noqa: E402
 from lifecycle.precompute import build_model, build_precompute  # noqa: E402
 from lifecycle.solver import run_lifecycle_solver  # noqa: E402
 
@@ -34,23 +34,24 @@ assert len(jax.devices()) == 4, (
     "Run in a fresh process so XLA_FLAGS takes effect before JAX import."
 )
 
+# Post real-yields pivot: 3-axis state vector (cape, spr, y_1).
 tiny_disc = DiscretizationConfig(
     n_wealth=6, wealth_min=0.13, wealth_max=50.0,
     n_savings=6,
-    state_grid_sizes=(2, 2, 2, 2),
+    state_grid_sizes=(2, 2, 2),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=3,
     n_eps_nodes=2,
     n_eta_nodes=2,
     n_ret_nodes_1d=(2, 2),
-    n_state_quad_nodes=(1, 1, 1, 1),
+    n_state_quad_nodes=(1, 1, 1),
 )
 
 tiny_base = dict(BASE_CONFIG)
 tiny_base.update(start_age=62, retire_age=64, terminal_age=65)
 
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(tiny_base, var_config, verbose=False)
 pc = build_precompute(model, tiny_disc, verbose=False)
 

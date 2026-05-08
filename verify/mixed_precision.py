@@ -18,24 +18,25 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 
 # Smoke config — same shape as verify/smoke.py so the gate matches.
+# Post real-yields pivot: 3-axis state vector (cape, spr, y_1).
 disc = DiscretizationConfig(
     n_wealth=20, wealth_min=0.13, wealth_max=200.0,
     n_savings=20,
-    state_grid_sizes=(3, 3, 3, 3),
+    state_grid_sizes=(3, 3, 3),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=5, n_eps_nodes=3, n_eta_nodes=3,
     n_ret_nodes_1d=(3, 3),
-    n_state_quad_nodes=(2, 3, 2, 3),
+    n_state_quad_nodes=(2, 3, 3),
 )
 base = dict(BASE_CONFIG)
 base.update(start_age=60, retire_age=63, terminal_age=65)
-var = build_nominal_system1_var_config_hardcoded()
+var = build_real_full_var_config_hardcoded()
 model = build_model(base, var, verbose=False)
 pc = build_precompute(model, disc, verbose=False)
 

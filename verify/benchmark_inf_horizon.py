@@ -1,20 +1,21 @@
-"""8x8x8x8 infinite-horizon (stationary Bellman) benchmark on multi-GPU.
+"""8x8x8 infinite-horizon (stationary Bellman) benchmark on the Full real-yields system.
 
 Solves the no-income, no-mortality, no-bequest stationary Merton-with-VAR
 benchmark by fixed-point iteration of the JAX retirement kernel. With pension=0
 and psi=1 across all z, all income states produce identical policies — so n_z
-is set to 1 (the minimum). The discretization N=1 guard added 2026-05-07
-makes this work; build_precompute previously failed at z_grid[1]-z_grid[0].
+is set to 1 (the minimum).
+
+Post real-yields pivot (2026-05-08): state vector is 3-axis (cape, spr, y_1).
 
 Config rationale:
-    state_grid_sizes  = (8, 8, 8, 8)             # N_state = 4096
-    state_n_stds      = (2.0, 2.25, 2.0, 2.25)
+    state_grid_sizes  = (8, 8, 8)                # N_state = 512
+    state_n_stds      = (2.0, 2.25, 2.25)        # cape, spr, y_1
     n_stds            = 2.25                     # z-axis (no income, but precompute needs it)
     n_z               = 1                        # z is inert under pension=0/psi=1
     n_wealth          = 180,  wealth_min = 0.05
     n_savings         = 180
-    n_state_quad_nodes= (3, 3, 3, 5)             # K-bump on y_1 axis
-    state_lobatto_Z   = (None, None, None, 2.93) # Lobatto on bumped y_1 axis
+    n_state_quad_nodes= (3, 3, 5)                # K-bump on y_1 axis (last)
+    state_lobatto_Z   = (None, None, 2.93)       # Lobatto on bumped y_1 axis
     n_ret_nodes_1d    = (3, 3)                   # 9 nodes
     ret_lobatto_Z     = None
     n_eps_nodes       = 4, n_eta_nodes = 3       # not exercised in inf-horizon
@@ -22,16 +23,6 @@ Config rationale:
     delta_bequest     = 0.0                      # also forced to 0 by inf-horizon (b_bar=0)
     gather_precision  = "f32"
     cell_vmap_chunks  = 1                        # n_z=1 keeps memory comfortable
-
-Memory budget on 2x H100 SXM (cell-axis sharded):
-    n_cells = 1 * 4096 = 4096, /2 = 2048 cells/device
-    per-cell c_corners = 135 * 1 * 16 * 180 * 8 = 3.1 MB
-    per-device working set ~ 2048 * 3.1 MB = 6.3 GB (well under 80 GB)
-
-Wall projection:
-    Per fixed-point iteration ~ one retirement-kernel call.
-    4096 cells / 14256 cells (6^4 baseline) = 0.29x scaling -> ~98s/iter.
-    Convergence in ~25-30 iters at tol=1e-5 -> total ~42-50 min on 2x H100.
 
 Outputs:
     ./saved_runs/<bundle-name>/                — local bundle (npz + metadata)
@@ -48,23 +39,23 @@ import numpy as np
 
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
 from lifecycle.model import SolverConfig
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
 
-BUNDLE_NAME = "system_iv_inf_horizon_grid8x8x8x8_nz1_y1lob_calib1"
+BUNDLE_NAME = "full_system_inf_horizon_grid8x8x8_nz1_y1lob_calib1"
 BUNDLE_DIR = os.path.join("saved_runs", "inf_horizon", BUNDLE_NAME)
 
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(8, 8, 8, 8),
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_grid_sizes=(8, 8, 8),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_stds=2.25,
     n_z=1,
     n_eta_nodes=3,
-    n_state_quad_nodes=(3, 3, 3, 5),
-    state_lobatto_Z=(None, None, None, 2.93),
+    n_state_quad_nodes=(3, 3, 5),
+    state_lobatto_Z=(None, None, 2.93),
     n_ret_nodes_1d=(3, 3),
     ret_lobatto_Z=None,
 )
@@ -85,13 +76,13 @@ IH_DAMPING = 1.0          # full Bellman update; lower if divergence appears
 IH_PROGRESS_EVERY = 1     # log every iter
 
 print("=" * 70, flush=True)
-print("JAX BENCHMARK: 8x8x8x8 infinite-horizon stationary Bellman", flush=True)
-print("System IV state (cy, spr, rtb, y_1); no income, no mortality, no bequest.", flush=True)
+print("JAX BENCHMARK: 8x8x8 infinite-horizon stationary Bellman", flush=True)
+print("Full real-yields state (cape, spr, y_1); no income, no mortality, no bequest.", flush=True)
 print("=" * 70, flush=True)
 
 print("\nBuilding model + precompute...", flush=True)
 t0 = time.time()
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, disc_config, verbose=True)
 print(f"Setup wall: {time.time() - t0:.1f}s", flush=True)
@@ -177,8 +168,10 @@ run_config_snapshot = {
         "damping": IH_DAMPING,
     },
     "predictability_ablation": {
-        "system_label": "system_iv_full_var",
-        "system_title": "System IV (full VAR baseline)",
+        "system_code": "full",
+        "system_label": "full_system_real",
+        "system_title": "Full System (real)",
+        "state_names": ["cape", "spr", "y_1"],
     },
     "bundle_name": BUNDLE_NAME,
     "wall_time_seconds": float(wall),

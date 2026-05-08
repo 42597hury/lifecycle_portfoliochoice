@@ -27,7 +27,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER  # noqa: E402
 from lifecycle.model import DiscretizationConfig  # noqa: E402
-from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402
+from lifecycle.var import build_real_full_var_config_hardcoded  # noqa: E402
 from lifecycle.precompute import build_model, build_precompute  # noqa: E402
 from lifecycle.solver import run_lifecycle_solver  # noqa: E402
 
@@ -36,18 +36,18 @@ assert len(jax.devices()) == 1, (
     "Set LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 before any lifecycle import."
 )
 
-# Smaller config than verify/smoke.py — same shape that verify_chunking uses.
+# Smaller config than verify/smoke.py — 3-axis post pivot.
 small_disc = DiscretizationConfig(
     n_wealth=15, wealth_min=0.13, wealth_max=200.0,
     n_savings=15,
-    state_grid_sizes=(2, 2, 2, 2),
+    state_grid_sizes=(2, 2, 2),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=4,
     n_eps_nodes=2,
     n_eta_nodes=2,
     n_ret_nodes_1d=(2, 2),
-    n_state_quad_nodes=(2, 2, 2, 2),
+    n_state_quad_nodes=(2, 2, 2),
 )
 
 # Same age window as verify/smoke.py: 60..65 covers terminal + retire +
@@ -55,7 +55,7 @@ small_disc = DiscretizationConfig(
 small_base = dict(BASE_CONFIG)
 small_base.update(start_age=60, retire_age=63, terminal_age=65)
 
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(small_base, var_config, verbose=False)
 pc = build_precompute(model, small_disc, verbose=False)
 

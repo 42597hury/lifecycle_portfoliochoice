@@ -1,13 +1,12 @@
-"""6x6x6x6 retirement-only benchmark on multi-GPU.
+"""6x6x6 retirement-only benchmark on multi-GPU (Full real-yields system).
 
-Sized to be the calibration anchor between the 5^4 baseline (273 s/age on
-1x GH200) and the 7^4 publication target. With backward-age warm-start +
-fori_loop Newton, the diag histogram from this run pins p99 for tuning
-max_iter on the next cycle.
+Sized to be the calibration anchor for the 3-axis pivot. With backward-age
+warm-start + fori_loop Newton, the diag histogram from this run pins p99
+for tuning max_iter on the next cycle.
 
 Config rationale:
-    state_grid_sizes  = (6, 6, 6, 6)             # N_state = 1296
-    state_n_stds      = (2.0, 2.25, 2.0, 2.25)   # match 5^4 benchmark coverage
+    state_grid_sizes  = (6, 6, 6)                # N_state = 216
+    state_n_stds      = (2.0, 2.25, 2.25)        # cape, spr, y_1
     n_stds            = 2.25                     # z-axis (labour income) half-width
     n_z               = 11
     n_wealth          = 180,  wealth_min = 0.05
@@ -15,12 +14,12 @@ Config rationale:
     n_eps_nodes       = 4,    n_eta_nodes = 3    # retirement-only; not exercised here
                                                   # (working-age multiplier 4*3=12 for next solve)
     n_ret_nodes_1d    = (3, 3)                   # 9 nodes; tightened to make room
-    n_state_quad_nodes= (3, 3, 3, 5)             # K-bump on y_1 axis (the big win)
-    state_lobatto_Z   = (None, None, None, 2.93) # Lobatto only on bumped y_1 axis
+    n_state_quad_nodes= (3, 3, 5)                # K-bump on y_1 axis (the big win)
+    state_lobatto_Z   = (None, None, 2.93)       # Lobatto only on bumped y_1 axis
     ret_lobatto_Z     = None                     # K=3 GH > K=3 Lobatto on poly exactness
     youngest_age_to_solve = 67                   # retirement-only (33 ages)
     wealth_dynamics_spec  = "ccv_log"
-    max_iter          = 100                      # first 6^4 run; calibrate after
+    max_iter          = 100                      # first 6^3 real run; calibrate after
     delta_bequest     = 0.0                      # standard CRRA bequest (no luxury shift)
     gather_precision  = "f32"                    # ~1.4x wall, bit-identity verified
     cell_vmap_chunks  = 8                        # 2x H100 with safety margin (45 GB peak)
@@ -68,27 +67,26 @@ import numpy as np
 
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
 from lifecycle.model import SolveControl
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 from lifecycle.policy_io import save_policy_bundle
 from lifecycle.diagnostics import diagnose_terminal_portfolio_states
 
-BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid6x6x6x6_nz11_y1lob_calib1"
+BUNDLE_NAME = "full_system_grid6x6x6_nz11_y1lob_calib1"
 BUNDLE_DIR = os.path.join("saved_runs", "full", BUNDLE_NAME)
 
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(6, 6, 6, 6),
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_grid_sizes=(6, 6, 6),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_stds=2.25,
     n_eta_nodes=3,
-    # K-bump on y_1 axis with Lobatto Z=2.93: targeted accuracy gain on the
-    # bond-yield axis where alpha sensitivity is highest. K=3 GH on the other
-    # state axes. Smolyak audit recommended this as "the big win" subset of
-    # the full (5,3,3,5) Lobatto config.
-    n_state_quad_nodes=(3, 3, 3, 5),
-    state_lobatto_Z=(None, None, None, 2.93),
+    # K-bump on y_1 axis (last axis) with Lobatto Z=2.93: targeted accuracy
+    # gain on the bond-yield axis where alpha sensitivity is highest. K=3 GH
+    # on the other state axes (cape, spr).
+    n_state_quad_nodes=(3, 3, 5),
+    state_lobatto_Z=(None, None, 2.93),
     # No Lobatto on ret: K=3 Lobatto would lose polynomial exactness vs K=3 GH.
     n_ret_nodes_1d=(3, 3),
     ret_lobatto_Z=None,
@@ -109,13 +107,13 @@ solve_control = SolveControl(
 )
 
 print("=" * 70, flush=True)
-print("JAX BENCHMARK: 6x6x6x6 retirement-only run", flush=True)
-print("Calibration anchor between 5^4 baseline and 7^4 publication target.", flush=True)
+print("JAX BENCHMARK: 6x6x6 retirement-only run (Full real-yields system)", flush=True)
+print("Calibration anchor for the post-pivot 3-axis grid.", flush=True)
 print("=" * 70, flush=True)
 
 print("\nBuilding model + precompute...", flush=True)
 t0 = time.time()
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, disc_config, verbose=True)
 print(f"Setup wall: {time.time() - t0:.1f}s", flush=True)
@@ -213,8 +211,10 @@ run_config_snapshot = {
     "solver_config": solver_config._asdict(),
     "solve_control": solve_control._asdict(),
     "predictability_ablation": {
-        "system_label": "system_iv_full_var",
-        "system_title": "System IV (full VAR baseline)",
+        "system_code": "full",
+        "system_label": "full_system_real",
+        "system_title": "Full System (real)",
+        "state_names": ["cape", "spr", "y_1"],
     },
     "bundle_name": BUNDLE_NAME,
     "wall_time_seconds": float(wall),

@@ -43,7 +43,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig, DELTA_BEQUEST
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import (
     _pc_to_jnp,
@@ -55,19 +55,20 @@ from lifecycle.solver import (
 
 
 # ---- Tiny config (much smaller than verify_smoke) ----
+# Post real-yields pivot: 3-axis state vector (cape, spr, y_1).
 disc = DiscretizationConfig(
     n_wealth=10, wealth_min=0.13, wealth_max=200.0,
     n_savings=10,
-    state_grid_sizes=(2, 2, 2, 2),
+    state_grid_sizes=(2, 2, 2),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=3, n_eps_nodes=2, n_eta_nodes=2,
     n_ret_nodes_1d=(2, 2),
-    n_state_quad_nodes=(2, 2, 2, 2),
+    n_state_quad_nodes=(2, 2, 2),
 )
 base = dict(BASE_CONFIG)
 base.update(start_age=63, retire_age=63, terminal_age=65)
-var = build_nominal_system1_var_config_hardcoded()
+var = build_real_full_var_config_hardcoded()
 model = build_model(base, var, verbose=False)
 pc = build_precompute(model, disc, verbose=False)
 

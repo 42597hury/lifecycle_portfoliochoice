@@ -14,28 +14,27 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER
 from lifecycle.model import DiscretizationConfig, SolveControl
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 
 tiny_disc = DiscretizationConfig(
     n_wealth=12, wealth_min=0.13, wealth_max=200.0,
     n_savings=12,
-    # Post rtb-as-state: 4-D state vector (cy, spr, rtb, y_1).
-    state_grid_sizes=(2, 3, 2, 3),
+    # Post real-yields pivot: 3-axis state vector (cape, spr, y_1).
+    state_grid_sizes=(2, 3, 3),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=3,
     n_eps_nodes=2,
     n_eta_nodes=2,
     n_ret_nodes_1d=(2, 2),
-    # Kept asymmetric on purpose: rtb-as-state migration touched per-axis
-    # node-count handling, so (2,3,2,3) catches "assumes uniform" bugs that
-    # a symmetric (2,2,2,2) would silently mask.
-    n_state_quad_nodes=(2, 3, 2, 3),
+    # Kept asymmetric on purpose: per-axis node-count handling can hide
+    # "assumes uniform" bugs that a symmetric (2,2,2) would silently mask.
+    n_state_quad_nodes=(2, 3, 3),
 )
 
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, tiny_disc, verbose=False)
 

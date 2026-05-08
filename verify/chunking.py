@@ -26,7 +26,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG, CANONICAL_SOLVER  # noqa: E402
 from lifecycle.model import DiscretizationConfig  # noqa: E402
-from lifecycle.var import build_nominal_system1_var_config_hardcoded  # noqa: E402
+from lifecycle.var import build_real_full_var_config_hardcoded  # noqa: E402
 from lifecycle.precompute import build_model, build_precompute  # noqa: E402
 from lifecycle.solver import run_lifecycle_solver  # noqa: E402
 
@@ -35,25 +35,26 @@ assert len(jax.devices()) == 1, (
     "Make sure LIFECYCLE_DISABLE_VIRTUAL_CPUS=1 is set before any lifecycle import."
 )
 
-# Small config: n_z=4, state grid 2x2x2x2 -> N_state=16; n_cells = 64.
-# Chunk values 2, 4, 8 all divide 64 evenly; chunks=7 forces padding.
+# Small config: n_z=4, state grid 2x2x2 -> N_state=8; n_cells = 32.
+# Post pivot 3-axis state (cape, spr, y_1).
+# chunks=4 divides 32 evenly; chunks=7 forces padding (chunk_size=ceil(32/7)=5).
 tiny_disc = DiscretizationConfig(
     n_wealth=15, wealth_min=0.13, wealth_max=200.0,
     n_savings=15,
-    state_grid_sizes=(2, 2, 2, 2),
+    state_grid_sizes=(2, 2, 2),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_n_stds=(2.0, 2.25, 2.25),
     n_z=4,
     n_eps_nodes=3,
     n_eta_nodes=3,
     n_ret_nodes_1d=(2, 2),
-    n_state_quad_nodes=(2, 2, 2, 2),
+    n_state_quad_nodes=(2, 2, 2),
 )
 
 tiny_base = dict(BASE_CONFIG)
 tiny_base.update(start_age=60, retire_age=63, terminal_age=65)
 
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(tiny_base, var_config, verbose=False)
 pc = build_precompute(model, tiny_disc, verbose=False)
 

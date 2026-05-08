@@ -1,28 +1,22 @@
 """Inf-horizon Sweep B/C combined: per-axis quadrature bump sensitivity.
 
-Holds state grid at 5⁴ (the safe-enough cell from Sweep A's analysis)
-and varies one quadrature axis at a time to isolate which axis bumps
-materially change the policy.
+Holds state grid at 5x5x5 (the post-pivot 3-axis cube — analog of the old
+5^4 baseline) and varies one quadrature axis at a time to isolate which
+axis bumps materially change the policy.
 
-Cells:
-    1. (3,3,3,3) state / (3,3) ret  — cheap baseline
-    2. (3,3,3,5) state / (3,3) ret  — y_1 (axis 3) state bump
-    3. (5,3,3,3) state / (3,3) ret  — dp (axis 0) state bump
-    4. (3,5,3,3) state / (3,3) ret  — spr (axis 1) state bump
-    5. (3,3,3,3) state / (3,5) ret  — xb (axis 1) ret bump
-    6. (3,3,3,3) state / (5,3) ret  — xr (axis 0) ret bump
+Cells (post real-yields pivot, axes (cape, spr, y_1)):
+    1. (3,3,3) state / (3,3) ret  — cheap baseline
+    2. (3,3,5) state / (3,3) ret  — y_1 (axis 2) state bump
+    3. (5,3,3) state / (3,3) ret  — cape (axis 0) state bump
+    4. (3,5,3) state / (3,3) ret  — spr (axis 1) state bump
+    5. (3,3,3) state / (3,5) ret  — xb (axis 1) ret bump
+    6. (3,3,3) state / (5,3) ret  — xr (axis 0) ret bump
 
-All cells share shape (1, 625, 180) — direct element-wise pairwise
+All cells share shape (1, 125, 180) — direct element-wise pairwise
 sup-norm comparison vs cell 1, no interpolation needed.
 
 Per-bundle path:
-    saved_runs/inf_horizon/system_iv_inf_axisbump_run<N>_<sq>_<rq>_calib1/
-
-Wall projection on 1× GH200 (rough; first cell measures the truth):
-    Cell 1: ~16 min
-    Cells 2-6: ~27 min each = ~135 min
-    Compile (~6 distinct kernel shapes): ~7 min
-    Total: ~158 min ≈ 2.6 h ≈ ~$5
+    saved_runs/inf_horizon/full_system_inf_axisbump_run<N>_<sq>_<rq>_calib1/
 """
 import os
 import shutil
@@ -34,27 +28,28 @@ import time
 import numpy as np
 
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
 
 
 # =============================================================================
-# Sweep cells — state grid fixed at 5⁴; one quadrature axis bumped per run.
+# Sweep cells — state grid fixed at 5x5x5; one quadrature axis bumped per run.
+# Axes (post real-yields pivot): (cape, spr, y_1).
 # =============================================================================
 
 # (run_tag, state_quad, ret_quad, purpose)
 SWEEP_CELLS = (
-    ("run1_sq3333_rq33", (3, 3, 3, 3), (3, 3), "cheap baseline"),
-    ("run2_sq3335_rq33", (3, 3, 3, 5), (3, 3), "y_1 state bump"),
-    ("run3_sq5333_rq33", (5, 3, 3, 3), (3, 3), "dp state bump"),
-    ("run4_sq3533_rq33", (3, 5, 3, 3), (3, 3), "spr state bump"),
-    ("run5_sq3333_rq35", (3, 3, 3, 3), (3, 5), "xb ret bump"),
-    ("run6_sq3333_rq53", (3, 3, 3, 3), (5, 3), "xr ret bump"),
+    ("run1_sq333_rq33", (3, 3, 3), (3, 3), "cheap baseline"),
+    ("run2_sq335_rq33", (3, 3, 5), (3, 3), "y_1 state bump"),
+    ("run3_sq533_rq33", (5, 3, 3), (3, 3), "cape state bump"),
+    ("run4_sq353_rq33", (3, 5, 3), (3, 3), "spr state bump"),
+    ("run5_sq333_rq35", (3, 3, 3), (3, 5), "xb ret bump"),
+    ("run6_sq333_rq53", (3, 3, 3), (5, 3), "xr ret bump"),
 )
 
-STATE_GRID_SIZES = (5, 5, 5, 5)
+STATE_GRID_SIZES = (5, 5, 5)
 STATE_LOBATTO_Z = None
 RET_LOBATTO_Z = None
 
@@ -74,7 +69,7 @@ def make_disc(state_quad, ret_quad):
         n_wealth=180,
         n_savings=180,
         state_grid_sizes=STATE_GRID_SIZES,
-        state_n_stds=(2.0, 2.25, 2.0, 2.25),
+        state_n_stds=(2.0, 2.25, 2.25),
         n_stds=2.25,
         n_z=1,
         n_eta_nodes=3,
@@ -110,7 +105,7 @@ print(f"\nJAX devices: {len(jax.devices())} -> {jax.devices()}", flush=True)
 
 print("\nBuilding shared model + VAR config...", flush=True)
 t0 = time.time()
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 print(f"  Model build wall: {time.time() - t0:.1f}s", flush=True)
 
@@ -120,7 +115,7 @@ def run_one_cell(tag, state_quad, ret_quad, purpose):
     print(f"CELL {tag}: state_quad={state_quad} ret_quad={ret_quad}  ({purpose})", flush=True)
     print("=" * 70, flush=True)
 
-    bundle_name = f"system_iv_inf_axisbump_{tag}_calib1"
+    bundle_name = f"full_system_inf_axisbump_{tag}_calib1"
     bundle_dir = os.path.join("saved_runs", "inf_horizon", bundle_name)
 
     disc_config = make_disc(state_quad, ret_quad)
@@ -196,8 +191,10 @@ def run_one_cell(tag, state_quad, ret_quad, purpose):
             "damping": IH_DAMPING,
         },
         "predictability_ablation": {
-            "system_label": "system_iv_full_var",
-            "system_title": "System IV (full VAR baseline)",
+            "system_code": "full",
+            "system_label": "full_system_real",
+            "system_title": "Full System (real)",
+            "state_names": ["cape", "spr", "y_1"],
         },
         "sweep": {
             "name": "inf_horizon_axis_bump_sweep",

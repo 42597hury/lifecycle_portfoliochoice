@@ -1,19 +1,19 @@
-"""Benchmark JAX retirement-only solve against the Numba reference bundle.
+"""Benchmark JAX retirement-only solve on the post-pivot Full real-yields system.
 
-Mirrors thesisscripts/configs/run_ccv_wide9_gh_k4.py — the most recent bundle
-at the time of writing (system_iv_full_var_unconstrained_cholesky_grid9x9x9_nz11_ccv_wide9_gh_k4).
-That run took 1341.9s = 22.4 min on Numba (likely c6i.4xlarge / 16 vCPU).
+Numba reference: legacy 4-axis 9x9x9x9 run, 1341.9s = 22.4 min on c6i.4xlarge.
+The 3-axis pivot lowers cells per age (729 vs 6561), so wall here is much
+shorter; this script is now mostly a smoke / wall-budget anchor.
 
-Config (post rtb-as-state — state vector is 4-D (cy, spr, rtb, y_1)):
-    state_grid_sizes = (9, 9, 9, 9)            # N_state = 6561
-    state_n_stds     = (2.93, 2.93, 2.93, 2.93)
+Config (3-axis real-yields state vector (cape, spr, y_1)):
+    state_grid_sizes = (9, 9, 9)               # N_state = 729
+    state_n_stds     = (2.93, 2.93, 2.93)
     n_z              = 11
     n_wealth         = 180,  wealth_min = 0.05
     n_savings        = 180
     n_eps_nodes      = 4,    n_eta_nodes = 4
     n_ret_nodes_1d   = (5, 5)                  # (xr, xb) only; 25 return quad points
-    n_state_quad_nodes = (3, 4, 3, 4)          # 144 state quad points
-    youngest_age_to_solve = 67  →  retirement-only (33 ages: 67..99)
+    n_state_quad_nodes = (3, 4, 5)             # K-bump on y_1 axis (last)
+    youngest_age_to_solve = 67  ->  retirement-only (33 ages: 67..99)
     wealth_dynamics_spec = "ccv_log"
     max_iter = 400                              # tighter than canonical 8000
 
@@ -35,25 +35,25 @@ import numpy as np
 
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
 from lifecycle.model import SolveControl
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 from lifecycle.policy_io import save_policy_bundle
 from lifecycle.diagnostics import diagnose_terminal_portfolio_states
 
-BUNDLE_NAME = "system_iv_full_var_unconstrained_cholesky_grid9x9x9x9_nz11_jax_benchmark"
+BUNDLE_NAME = "full_system_grid9x9x9_nz11_jax_benchmark"
 BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
 
-# 4-D state grid post rtb-as-state. axes are (cy, spr, rtb, y_1); 9-points
-# per axis matches the previous CCV-wide setting on the three retained axes
-# and adds a matching width on the new rtb axis.
+# 3-axis state grid post real-yields pivot. Axes are (cape, spr, y_1); the
+# old (dp, spr, rtb, y_1) 4-axis cube collapses to (cape, spr, y_1) with
+# y_1 carrying the bond-return refinement K-bump on the last axis.
 disc_config = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(9, 9, 9, 9),
-    state_n_stds=(2.93, 2.93, 2.93, 2.93),
+    state_grid_sizes=(9, 9, 9),
+    state_n_stds=(2.93, 2.93, 2.93),
     n_ret_nodes_1d=(5, 5),
     ret_lobatto_Z=None,
-    n_state_quad_nodes=(3, 4, 3, 4),
+    n_state_quad_nodes=(3, 4, 5),
     state_lobatto_Z=None,
 )
 solver_config = CANONICAL_SOLVER._replace(
@@ -74,13 +74,13 @@ solve_control = SolveControl(
 )
 
 print("=" * 70, flush=True)
-print("JAX BENCHMARK: 9x9x9x9 retirement-only run", flush=True)
-print(f"Numba reference: 1341.9s = 22.4 min", flush=True)
+print("JAX BENCHMARK: 9x9x9 retirement-only run (Full real-yields system)", flush=True)
+print("Numba reference (legacy 4-axis 9^4): 1341.9s = 22.4 min", flush=True)
 print("=" * 70, flush=True)
 
 print("\nBuilding model + precompute...", flush=True)
 t0 = time.time()
-var_config = build_nominal_system1_var_config_hardcoded()
+var_config = build_real_full_var_config_hardcoded()
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, disc_config, verbose=True)
 print(f"Setup wall: {time.time() - t0:.1f}s", flush=True)
@@ -168,8 +168,10 @@ run_config_snapshot = {
     "solver_config": solver_config._asdict(),
     "solve_control": solve_control._asdict(),
     "predictability_ablation": {
-        "system_label": "system_iv_full_var",
-        "system_title": "System IV (full VAR baseline)",
+        "system_code": "full",
+        "system_label": "full_system_real",
+        "system_title": "Full System (real)",
+        "state_names": ["cape", "spr", "y_1"],
     },
     "bundle_name": BUNDLE_NAME,
     "wall_time_seconds": float(wall),

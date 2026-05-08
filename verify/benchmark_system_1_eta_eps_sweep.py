@@ -1,32 +1,22 @@
-"""System II (rtb, y_1) lifecycle full-solve quadrature sensitivity sweep.
+"""System 1 (real bill yield only) lifecycle full-solve sensitivity sweep over (n_eta, n_eps).
 
-Sweeps 4 (state_quad, ret_quad) configurations at fixed n_z=15 to characterize
-policy sensitivity to quadrature density in the 2-D-state ablation system.
+Post real-yields pivot (2026-05-08): System 1 state = (y_1,); spr and cape
+are dropped. The template is the 3-axis Full template (cape, spr, y_1);
+prepare_predictability_system projects out cape and spr.
+
+Sweeps the working-age income-shock quadrature density at fixed n_z=30 to
+characterize policy sensitivity to the income-quadrature resolution.
+Convention: n_eps >= n_eta (transitory shocks have more support than
+persistent shock innovations in this model).
 
 Sweep:
-  Run 1: state_quad=(3,3), ret=(3,3)   - baseline (81 quad pts/cell)
-  Run 2: state_quad=(4,4), ret=(3,3)   - uniform state refinement (144 pts)
-  Run 3: state_quad=(3,3), ret=(4,4)   - ret refinement (144 pts)
-  Run 4: state_quad=(3,5), ret=(3,3)   - y_1-axis refinement only (135 pts)
+  (n_eta, n_eps) = (3, 4) | eta * eps = 12 (baseline)
+  (n_eta, n_eps) = (4, 5) | eta * eps = 20
+  (n_eta, n_eps) = (6, 6) | eta * eps = 36
 
-Other knobs fixed across all 4 runs:
-  System II  (state = rtb + y_1)
-  n_z = 15
-  (n_eta, n_eps) = (3, 4)               - System I sweep showed this is adequate
-  state_lobatto_Z = None                - plain GH; no Lobatto on any axis
-  ret_lobatto_Z   = None
-  delta_bequest = 0.0
-  gather_precision = "f32"
-  cell_vmap_chunks = 1
-  youngest_age_to_solve = 22            - full lifecycle
-  per-run unique checkpoint_path        - prevents the cross-run reload bug
-
-Per-run wall on 2x H100 (estimated): 12-22 min depending on quadrature density.
-Total sweep wall: ~78 min, ~$11.
-
-Outputs:
-  saved_runs/ablations/system_ii_grid7x7_nz15_sq<NSQ>_rq<NRQ>_calib1/
-  s3://${S3_BUCKET}/saved_runs/ablations/<bundle-name>/
+Outputs (one per (eta, eps) pair):
+  saved_runs/ablations/system_1_grid7_nz30_eta<E>eps<P>_calib1/
+  s3://${S3_BUCKET}/saved_runs/ablations/system_1_grid7_nz30_eta<E>eps<P>_calib1/
 """
 import os
 import shutil
@@ -45,32 +35,30 @@ from lifecycle.policy_io import save_policy_bundle
 from lifecycle.predictability_ablation import prepare_predictability_system
 
 CSV_PATH = "data/var_dataset.csv"
-N_Z_FIXED = 15
 
-# (state_quad_template_4tuple, ret_quad_2tuple) — state quad axes are
-# (cy, spr, rtb, y_1) at the template; project_predictability_disc_config
-# will pick the (rtb, y_1) entries for System II.
-QUAD_SWEEP = (
-    # (label, state_quad_template, ret_quad)
-    ("sq3x3_rq3x3", (3, 3, 3, 3), (3, 3)),
-    ("sq4x4_rq3x3", (4, 4, 4, 4), (3, 3)),
-    ("sq3x3_rq4x4", (3, 3, 3, 3), (4, 4)),
-    ("sq3x5_rq3x3", (3, 3, 3, 5), (3, 3)),  # K-bump on y_1 axis only
+# (n_eta, n_eps) — eps >= eta always
+ETA_EPS_SWEEP = (
+    (3, 4),
+    (4, 5),
+    (6, 6),
 )
 
 ABLATIONS_DIR = os.path.join("saved_runs", "ablations")
+N_Z_FIXED = 30                                    # high-res z grid
 
-# Template config — state axes are (cy, spr, rtb, y_1) at template; System II
-# projection keeps (rtb, y_1) and drops the others.
+# Template config — only state_grid_sizes, state_n_stds, n_state_quad_nodes
+# get projected by prepare_predictability_system. n_eta/n_eps are not
+# projected (they're eta/eps-axis quadrature, not state-axis).
+# Template axes (cape, spr, y_1); System 1 keeps only y_1 (last axis).
 template_disc_base = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(7, 7, 7, 7),                # System II projects to (7, 7)
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_grid_sizes=(7, 7, 7),                   # y_1 axis -> projects to (7,)
+    state_n_stds=(2.0, 2.25, 2.25),
     n_stds=2.25,
     n_z=N_Z_FIXED,
-    n_eps_nodes=4,
-    n_eta_nodes=3,
-    state_lobatto_Z=None,                         # plain GH on all state axes
+    n_state_quad_nodes=(3, 3, 5),                 # y_1 axis -> projects to (5,) (K-bump)
+    state_lobatto_Z=None,
+    n_ret_nodes_1d=(3, 3),
     ret_lobatto_Z=None,
 )
 
@@ -83,10 +71,16 @@ solver_config = CANONICAL_SOLVER._replace(
     cell_vmap_chunks=1,
 )
 
+# Note: SolveControl built per-run inside the loop — checkpoint_path needs to
+# be unique per (n_eta, n_eps) variant. Default auto-derived path uses only
+# (state_grid_sizes, n_z) and would collide across eta/eps variants at fixed
+# n_z, causing later runs to load+skip the earlier checkpoint without
+# resolving (the bug that bit the first attempted run of this sweep).
+
 print("=" * 70, flush=True)
-print("JAX SWEEP: System II (rtb, y_1) lifecycle full-solve, quadrature sensitivity", flush=True)
+print("JAX SWEEP: System 1 (real bill yield only) lifecycle full-solve, (n_eta, n_eps) sensitivity", flush=True)
 print(f"Fixed n_z = {N_Z_FIXED}", flush=True)
-print(f"4 quad configs: {[label for label, _, _ in QUAD_SWEEP]}", flush=True)
+print(f"(n_eta, n_eps) values: {ETA_EPS_SWEEP}", flush=True)
 print("=" * 70, flush=True)
 
 import jax
@@ -97,19 +91,25 @@ print(flush=True)
 sweep_results = []
 sweep_t0 = time.time()
 
-for label, state_quad_template, ret_quad in QUAD_SWEEP:
-    bundle_name = f"system_ii_grid7x7_nz{N_Z_FIXED}_{label}_calib1"
+for n_eta, n_eps in ETA_EPS_SWEEP:
+    bundle_name = f"system_1_grid7_nz{N_Z_FIXED}_eta{n_eta}eps{n_eps}_calib1"
     bundle_dir = os.path.join(ABLATIONS_DIR, bundle_name)
     s3_uri = None
     s3_bucket = os.environ.get("S3_BUCKET")
     if s3_bucket:
         s3_uri = f"s3://{s3_bucket}/saved_runs/ablations/{bundle_name}/"
 
-    # Per-run unique checkpoint path so different (sq, rq) variants don't
-    # collide (the bug from the eta-eps sweep).
-    checkpoint_tag = (
-        f"jax_cholesky_grid7x7_nz{N_Z_FIXED}_{label}_to_age22"
-    )
+    print("=" * 70, flush=True)
+    print(f"  RUN: (n_eta, n_eps) = ({n_eta}, {n_eps}) | product = {n_eta * n_eps}", flush=True)
+    print(f"  Bundle: {bundle_name}", flush=True)
+    print(f"  S3:     {s3_uri or '(no S3 upload — S3_BUCKET not set)'}", flush=True)
+    print("=" * 70, flush=True)
+
+    # Per-run SolveControl with unique checkpoint_path including n_eta/n_eps.
+    # Without this, all variants at fixed n_z share the same default
+    # checkpoint path and later runs short-circuit by loading the earlier
+    # bundle and reporting it as "complete" with zero Newton iters.
+    checkpoint_tag = f"jax_cholesky_grid7_nz{N_Z_FIXED}_eta{n_eta}eps{n_eps}_to_age22"
     solve_control = SolveControl(
         youngest_age_to_solve=22,
         checkpoint_every_n_ages=10,
@@ -118,20 +118,10 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
         checkpoint_path=os.path.join("saved_runs", "checkpoints", checkpoint_tag),
     )
 
-    print("=" * 70, flush=True)
-    print(f"  RUN: {label}", flush=True)
-    print(f"  state_quad (template) = {state_quad_template}, ret_quad = {ret_quad}", flush=True)
-    print(f"  Bundle: {bundle_name}", flush=True)
-    print(f"  S3:     {s3_uri or '(no S3 upload — S3_BUCKET not set)'}", flush=True)
-    print("=" * 70, flush=True)
-
-    # Override quadrature in the template
-    template_disc = template_disc_base._replace(
-        n_state_quad_nodes=state_quad_template,
-        n_ret_nodes_1d=ret_quad,
-    )
+    # Override n_eta and n_eps in the template; n_z stays fixed
+    template_disc = template_disc_base._replace(n_eta_nodes=n_eta, n_eps_nodes=n_eps)
     meta = prepare_predictability_system(
-        "II",
+        "1",
         csv_path=CSV_PATH,
         disc_config_template=template_disc,
     )
@@ -142,8 +132,9 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
     print(f"\n  state_names      = {state_names}", flush=True)
     print(f"  state_grid_sizes = {disc_config.state_grid_sizes}", flush=True)
     print(f"  n_state_quad     = {disc_config.n_state_quad_nodes}", flush=True)
-    print(f"  n_ret_nodes_1d   = {disc_config.n_ret_nodes_1d}", flush=True)
     print(f"  n_z              = {disc_config.n_z}", flush=True)
+    print(f"  n_eta            = {disc_config.n_eta_nodes}", flush=True)
+    print(f"  n_eps            = {disc_config.n_eps_nodes}", flush=True)
 
     print("\n  Building model + precompute...", flush=True)
     t0 = time.time()
@@ -171,7 +162,7 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
     nih = diag.get("newton_iter_histogram", {}) or {}
     bth = diag.get("backtrack_iter_histogram", {}) or {}
 
-    print(f"\n  RESULT {label}", flush=True)
+    print(f"\n  RESULT (n_eta, n_eps) = ({n_eta}, {n_eps})", flush=True)
     print(f"    Solve wall    : {solve_wall:.1f}s = {solve_wall/60:.2f} min", flush=True)
     print(f"    Ages solved   : {ages_solved}", flush=True)
     print(f"    NaN check     : C={nan_c}", flush=True)
@@ -198,6 +189,7 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
             flush=True,
         )
 
+    # Save bundle
     if os.path.exists(bundle_dir):
         print(f"  (overwriting existing {bundle_dir})", flush=True)
         shutil.rmtree(bundle_dir)
@@ -218,10 +210,9 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
         "bundle_name": bundle_name,
         "wall_time_seconds": float(solve_wall),
         "solver_kind": "lifecycle_full",
-        "sweep_dimension": "state_ret_quad",
-        "label": label,
-        "state_quad_template": list(state_quad_template),
-        "ret_quad": list(ret_quad),
+        "sweep_dimension": "n_eta_n_eps",
+        "n_eta_value": n_eta,
+        "n_eps_value": n_eps,
     }
 
     bundle_path = save_policy_bundle(
@@ -246,9 +237,9 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
         )
 
     sweep_results.append({
-        "label": label,
-        "state_quad": disc_config.n_state_quad_nodes,
-        "ret_quad": disc_config.n_ret_nodes_1d,
+        "n_eta": n_eta,
+        "n_eps": n_eps,
+        "product": n_eta * n_eps,
         "wall_sec": solve_wall,
         "ages_solved": ages_solved,
         "newton_p99": nih.get("p99"),
@@ -266,14 +257,14 @@ print("SWEEP COMPLETE", flush=True)
 print("=" * 70, flush=True)
 print(f"  Total wall: {sweep_total_wall:.1f}s = {sweep_total_wall/60:.2f} min", flush=True)
 print(flush=True)
-print(f"  {'label':<14}  {'state_q':>8}  {'ret_q':>6}  {'wall(s)':>8}  {'ages':>5}  "
+print(f"  {'eta':>3}  {'eps':>3}  {'prod':>4}  {'wall(s)':>8}  {'ages':>5}  "
       f"{'p99 N':>6}  {'alpha_s_range':>20}  {'alpha_b_range':>20}", flush=True)
 for r in sweep_results:
     a_s = f"[{r['alpha_s_range'][0]:.2f},{r['alpha_s_range'][1]:.2f}]" if r["alpha_s_range"] else "?"
     a_b = f"[{r['alpha_b_range'][0]:.2f},{r['alpha_b_range'][1]:.2f}]" if r["alpha_b_range"] else "?"
     p99 = r['newton_p99'] if r['newton_p99'] is not None else "?"
     print(
-        f"  {r['label']:<14}  {str(r['state_quad']):>8}  {str(r['ret_quad']):>6}  "
+        f"  {r['n_eta']:>3}  {r['n_eps']:>3}  {r['product']:>4}  "
         f"{r['wall_sec']:>8.1f}  {r['ages_solved']:>5}  {p99:>6}  "
         f"{a_s:>20}  {a_b:>20}",
         flush=True,

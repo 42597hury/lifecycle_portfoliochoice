@@ -1,21 +1,28 @@
-"""System I (rtb-only) lifecycle full-solve sensitivity sweep over (n_eta, n_eps).
+"""System 1 (real bill yield only) lifecycle full-solve sensitivity sweep over n_z.
 
-Sweeps the working-age income-shock quadrature density at fixed n_z=30 to
-characterize policy sensitivity to the income-quadrature resolution.
-Convention: n_eps >= n_eta (transitory shocks have more support than
-persistent shock innovations in this model).
+Post real-yields pivot (2026-05-08): System 1 state = (y_1,); spr and cape
+are dropped. The template here is the 3-axis Full template (cape, spr, y_1);
+prepare_predictability_system projects out cape and spr and keeps y_1.
 
-Sweep:
-  (n_eta, n_eps) = (3, 4) | eta * eps = 12 (baseline, matches earlier sweep)
-  (n_eta, n_eps) = (4, 5) | eta * eps = 20
-  (n_eta, n_eps) = (6, 6) | eta * eps = 36
+Sweeps n_z in {10, 15, 30, 70} to characterize policy sensitivity to the
+labour-income-state discretization in the simplest predictability system
+(System 1: state vector = (y_1,), real bill yield only). Each run produces
+a separate bundle in saved_runs/ablations/.
 
-Per-run wall on 2x H100 (estimated): 4-9 min depending on (eta, eps).
-Total sweep wall: ~19 min, ~$2.60.
+System 1 is the smallest of the three ablation systems:
+  - state_names: ('y_1',) -- 1-D state
+  - n_state_quad: projects to (5,) under K-bump -- much cheaper per-cell
+    FOC than the Full system
+  - VAR builder restricts to real-bill-yield-only predictability
 
-Outputs (one per (eta, eps) pair):
-  saved_runs/ablations/system_i_grid7_nz30_eta<E>eps<P>_calib1/
-  s3://${S3_BUCKET}/saved_runs/ablations/system_i_grid7_nz30_eta<E>eps<P>_calib1/
+Folder convention:
+  saved_runs/full/        -- Full-system publication artifacts
+  saved_runs/ablations/   -- System 1 / 2 + parameter sweeps
+  saved_runs/inf_horizon/ -- stationary Bellman benchmarks
+
+Outputs (one per n_z):
+  saved_runs/ablations/system_1_grid7_nz<N>_calib1/
+  s3://${S3_BUCKET}/saved_runs/ablations/system_1_grid7_nz<N>_calib1/
 """
 import os
 import shutil
@@ -34,28 +41,21 @@ from lifecycle.policy_io import save_policy_bundle
 from lifecycle.predictability_ablation import prepare_predictability_system
 
 CSV_PATH = "data/var_dataset.csv"
-
-# (n_eta, n_eps) — eps >= eta always
-ETA_EPS_SWEEP = (
-    (3, 4),
-    (4, 5),
-    (6, 6),
-)
-
+N_Z_SWEEP = (10, 15, 30, 70)
 ABLATIONS_DIR = os.path.join("saved_runs", "ablations")
-N_Z_FIXED = 30                                    # high-res z grid
 
-# Template config — only state_grid_sizes, state_n_stds, n_state_quad_nodes
-# get projected by prepare_predictability_system. n_eta/n_eps are not
-# projected (they're eta/eps-axis quadrature, not state-axis).
+# Template config — only state_grid_sizes, state_n_stds, n_state_quad_nodes get
+# projected by prepare_predictability_system. n_z is the variable we sweep.
+# Template axes (cape, spr, y_1); System 1 keeps only y_1 (last axis).
 template_disc_base = CANONICAL_DISC._replace(
     wealth_min=0.05,
-    state_grid_sizes=(7, 7, 7, 7),                # rtb axis -> projects to (7,)
-    state_n_stds=(2.0, 2.25, 2.0, 2.25),
+    state_grid_sizes=(7, 7, 7),                   # y_1 axis -> projects to (7,)
+    state_n_stds=(2.0, 2.25, 2.25),
     n_stds=2.25,
-    n_z=N_Z_FIXED,
-    n_state_quad_nodes=(3, 3, 3, 5),              # rtb axis -> projects to (3,)
-    state_lobatto_Z=None,
+    n_eta_nodes=3,
+    n_eps_nodes=4,
+    n_state_quad_nodes=(3, 3, 5),                 # y_1 axis -> projects to (5,) (K-bump)
+    state_lobatto_Z=None,                         # off; not applicable to 1-D state
     n_ret_nodes_1d=(3, 3),
     ret_lobatto_Z=None,
 )
@@ -66,19 +66,19 @@ solver_config = CANONICAL_SOLVER._replace(
     max_iter_unconstrained=100,
     delta_bequest=0.0,
     gather_precision="f32",
-    cell_vmap_chunks=1,
+    cell_vmap_chunks=1,                           # System 1 cells are tiny; no chunking needed
 )
 
-# Note: SolveControl built per-run inside the loop — checkpoint_path needs to
-# be unique per (n_eta, n_eps) variant. Default auto-derived path uses only
-# (state_grid_sizes, n_z) and would collide across eta/eps variants at fixed
-# n_z, causing later runs to load+skip the earlier checkpoint without
-# resolving (the bug that bit the first attempted run of this sweep).
+solve_control = SolveControl(
+    youngest_age_to_solve=22,                     # full lifecycle (no slicing)
+    checkpoint_every_n_ages=10,
+    save_on_interrupt=True,
+    return_partial_on_interrupt=True,
+)
 
 print("=" * 70, flush=True)
-print("JAX SWEEP: System I (rtb-only) lifecycle full-solve, (n_eta, n_eps) sensitivity", flush=True)
-print(f"Fixed n_z = {N_Z_FIXED}", flush=True)
-print(f"(n_eta, n_eps) values: {ETA_EPS_SWEEP}", flush=True)
+print("JAX SWEEP: System 1 (real bill yield only) lifecycle full-solve, n_z sensitivity", flush=True)
+print(f"n_z values: {N_Z_SWEEP}", flush=True)
 print("=" * 70, flush=True)
 
 import jax
@@ -89,8 +89,8 @@ print(flush=True)
 sweep_results = []
 sweep_t0 = time.time()
 
-for n_eta, n_eps in ETA_EPS_SWEEP:
-    bundle_name = f"system_i_grid7_nz{N_Z_FIXED}_eta{n_eta}eps{n_eps}_calib1"
+for n_z in N_Z_SWEEP:
+    bundle_name = f"system_1_grid7_nz{n_z}_calib1"
     bundle_dir = os.path.join(ABLATIONS_DIR, bundle_name)
     s3_uri = None
     s3_bucket = os.environ.get("S3_BUCKET")
@@ -98,28 +98,15 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
         s3_uri = f"s3://{s3_bucket}/saved_runs/ablations/{bundle_name}/"
 
     print("=" * 70, flush=True)
-    print(f"  RUN: (n_eta, n_eps) = ({n_eta}, {n_eps}) | product = {n_eta * n_eps}", flush=True)
+    print(f"  RUN: n_z = {n_z}", flush=True)
     print(f"  Bundle: {bundle_name}", flush=True)
     print(f"  S3:     {s3_uri or '(no S3 upload — S3_BUCKET not set)'}", flush=True)
     print("=" * 70, flush=True)
 
-    # Per-run SolveControl with unique checkpoint_path including n_eta/n_eps.
-    # Without this, all variants at fixed n_z share the same default
-    # checkpoint path and later runs short-circuit by loading the earlier
-    # bundle and reporting it as "complete" with zero Newton iters.
-    checkpoint_tag = f"jax_cholesky_grid7_nz{N_Z_FIXED}_eta{n_eta}eps{n_eps}_to_age22"
-    solve_control = SolveControl(
-        youngest_age_to_solve=22,
-        checkpoint_every_n_ages=10,
-        save_on_interrupt=True,
-        return_partial_on_interrupt=True,
-        checkpoint_path=os.path.join("saved_runs", "checkpoints", checkpoint_tag),
-    )
-
-    # Override n_eta and n_eps in the template; n_z stays fixed
-    template_disc = template_disc_base._replace(n_eta_nodes=n_eta, n_eps_nodes=n_eps)
+    # Project the template config onto System 1 and override n_z
+    template_disc = template_disc_base._replace(n_z=n_z)
     meta = prepare_predictability_system(
-        "I",
+        "1",
         csv_path=CSV_PATH,
         disc_config_template=template_disc,
     )
@@ -131,8 +118,6 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
     print(f"  state_grid_sizes = {disc_config.state_grid_sizes}", flush=True)
     print(f"  n_state_quad     = {disc_config.n_state_quad_nodes}", flush=True)
     print(f"  n_z              = {disc_config.n_z}", flush=True)
-    print(f"  n_eta            = {disc_config.n_eta_nodes}", flush=True)
-    print(f"  n_eps            = {disc_config.n_eps_nodes}", flush=True)
 
     print("\n  Building model + precompute...", flush=True)
     t0 = time.time()
@@ -160,7 +145,7 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
     nih = diag.get("newton_iter_histogram", {}) or {}
     bth = diag.get("backtrack_iter_histogram", {}) or {}
 
-    print(f"\n  RESULT (n_eta, n_eps) = ({n_eta}, {n_eps})", flush=True)
+    print(f"\n  RESULT n_z={n_z}", flush=True)
     print(f"    Solve wall    : {solve_wall:.1f}s = {solve_wall/60:.2f} min", flush=True)
     print(f"    Ages solved   : {ages_solved}", flush=True)
     print(f"    NaN check     : C={nan_c}", flush=True)
@@ -208,9 +193,8 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
         "bundle_name": bundle_name,
         "wall_time_seconds": float(solve_wall),
         "solver_kind": "lifecycle_full",
-        "sweep_dimension": "n_eta_n_eps",
-        "n_eta_value": n_eta,
-        "n_eps_value": n_eps,
+        "sweep_dimension": "n_z",
+        "n_z_value": n_z,
     }
 
     bundle_path = save_policy_bundle(
@@ -235,9 +219,7 @@ for n_eta, n_eps in ETA_EPS_SWEEP:
         )
 
     sweep_results.append({
-        "n_eta": n_eta,
-        "n_eps": n_eps,
-        "product": n_eta * n_eps,
+        "n_z": n_z,
         "wall_sec": solve_wall,
         "ages_solved": ages_solved,
         "newton_p99": nih.get("p99"),
@@ -255,16 +237,15 @@ print("SWEEP COMPLETE", flush=True)
 print("=" * 70, flush=True)
 print(f"  Total wall: {sweep_total_wall:.1f}s = {sweep_total_wall/60:.2f} min", flush=True)
 print(flush=True)
-print(f"  {'eta':>3}  {'eps':>3}  {'prod':>4}  {'wall(s)':>8}  {'ages':>5}  "
-      f"{'p99 N':>6}  {'alpha_s_range':>20}  {'alpha_b_range':>20}", flush=True)
+print(f"  {'n_z':>5}  {'wall(s)':>8}  {'ages':>5}  {'p99 N':>6}  "
+      f"{'alpha_s_range':>20}  {'alpha_b_range':>20}", flush=True)
 for r in sweep_results:
     a_s = f"[{r['alpha_s_range'][0]:.2f},{r['alpha_s_range'][1]:.2f}]" if r["alpha_s_range"] else "?"
     a_b = f"[{r['alpha_b_range'][0]:.2f},{r['alpha_b_range'][1]:.2f}]" if r["alpha_b_range"] else "?"
     p99 = r['newton_p99'] if r['newton_p99'] is not None else "?"
     print(
-        f"  {r['n_eta']:>3}  {r['n_eps']:>3}  {r['product']:>4}  "
-        f"{r['wall_sec']:>8.1f}  {r['ages_solved']:>5}  {p99:>6}  "
-        f"{a_s:>20}  {a_b:>20}",
+        f"  {r['n_z']:>5}  {r['wall_sec']:>8.1f}  {r['ages_solved']:>5}  "
+        f"{p99:>6}  {a_s:>20}  {a_b:>20}",
         flush=True,
     )
 print("\n=== ALL DONE ===", flush=True)

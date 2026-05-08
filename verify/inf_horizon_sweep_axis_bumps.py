@@ -59,7 +59,10 @@ STATE_LOBATTO_Z = None
 RET_LOBATTO_Z = None
 
 # Inf-horizon convergence parameters
-IH_TOL = 1e-5
+# tol=1e-4 is the economically meaningful floor: tighter than this is sub-cent
+# precision in normalized units, looser would lose the ability to resolve
+# ~1e-3 differences between sensitivity-sweep bundles.
+IH_TOL = 1e-4
 IH_MAX_ITER = 100
 IH_DAMPING = 1.0
 IH_PROGRESS_EVERY = 1

@@ -251,7 +251,7 @@ def _build_simulate_kernel(
     rho, pz, mu_eta1, sigma_eta1, sigma_eta2, mu_eta2_eff,
     pe, mu_eps1, sigma_eps1, sigma_eps2, mu_eps2_eff,
     n_age, n_z, n_ret, n_state,
-    rtb_idx, xr_pos, xb_pos,
+    y_1_idx, xr_pos, xb_pos,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     use_mc_returns,
 ):
@@ -262,9 +262,9 @@ def _build_simulate_kernel(
     are baked in at trace time. Generic over n_state via the static
     ``corner_offsets`` table and ``strides`` array.
 
-    Post rtb-as-state migration: realised ``log_R_bill`` ( = rtb_{t+1}) is
-    read from the next-period state vector at ``rtb_idx``; the return block
-    carries (xr, xb) only.
+    Real-yields pivot: realised ``log_R_bill_{t+1} = s_t[y_1_idx]`` is read
+    off the CURRENT-period state (deterministic given s_t, no v^s draw on
+    the bill leg). The return block still carries (xr, xb).
     """
     n_corners = 1 << int(n_state)
 
@@ -328,9 +328,13 @@ def _build_simulate_kernel(
         z_innov = lax.dynamic_slice(n, (n_ret + 2,), (n_state,))
         v_s = L_ss @ z_innov
 
-        # ----- Next-period state vector (carries the realised rtb) -----
+        # ----- Real bill rate: deterministic given current state -----
+        # Real-yields pivot: log_R_bill_{t+1} = s_t[y_1_idx]. No dependence
+        # on the v^s draw — the bill is risk-free given s_t.
+        log_R_bill = s_t[y_1_idx]
+
+        # ----- Next-period state vector (carries forward to t+1) -----
         s_next = Phi_0_state + Phi_11 @ s_t + v_s              # (n_state,)
-        log_R_bill = s_next[rtb_idx]                           # rtb_{t+1}
 
         # ----- Conditional return mean for (xr, xb) given (s_t, v^s) -----
         base_mu_r = const_r + A_r @ s_t                        # (n_ret,)
@@ -427,7 +431,8 @@ def _build_simulate_kernel(
             "state_coords": s_t,
         }
 
-        # Carry forward — s_next was already computed above (rtb-as-state)
+        # Carry forward the next-period state vector (s_next was computed
+        # for the carry; the bill rate has already been read off s_t).
         carry_next = (z_next, s_next, x_next, alive_next, income_next, t_idx + 1)
         return carry_next, out
 
@@ -548,9 +553,9 @@ def simulate_lifecycle(
             f"return_draw_mode must be 'monte_carlo' or 'quadrature', got '{return_draw_mode}'."
         )
     n_state_int = int(model.n_state)
-    if n_state_int < 1 or n_state_int > 4:
+    if n_state_int < 1 or n_state_int > 3:
         raise NotImplementedError(
-            f"JAX simulator supports n_state in {{1, 2, 3, 4}} (got {n_state_int})."
+            f"JAX simulator supports n_state in {{1, 2, 3}} (got {n_state_int})."
         )
 
     retire_age_idx = model.retire_age - model.start_age
@@ -676,7 +681,12 @@ def simulate_lifecycle(
         strides_np[d] = s
         s *= axis_sizes[d]
 
-    rtb_idx = int(model.rtb_index_in_state)
+    if model.y_1_index_in_state is None:
+        raise ValueError(
+            "Real-yields simulator requires y_1_index_in_state on the "
+            "state grid (the real bill is pinned to y_1_t); model has it None."
+        )
+    y_1_idx = int(model.y_1_index_in_state)
     xr_pos = int(model.ret_names.index("xr"))
     xb_pos = int(model.ret_names.index("xb"))
 
@@ -716,7 +726,7 @@ def simulate_lifecycle(
         mu_eps2_eff=jnp.float64(mu_eps2_eff),
         n_age=int(n_age), n_z=int(pc.n_z), n_ret=int(n_ret),
         n_state=n_state_int,
-        rtb_idx=rtb_idx, xr_pos=xr_pos, xb_pos=xb_pos,
+        y_1_idx=y_1_idx, xr_pos=xr_pos, xb_pos=xb_pos,
         sigma2_xr=jnp.float64(pc.sigma2_xr),
         sigma2_xb=jnp.float64(pc.sigma2_xb),
         sigma_xrxb=jnp.float64(pc.sigma_xrxb),

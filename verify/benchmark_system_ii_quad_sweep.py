@@ -230,6 +230,7 @@ for label, state_quad_template, ret_quad in QUAD_SWEEP:
         diagnostics=diag,
         run_config=run_config_snapshot,
         overwrite=True,
+        wealth_grid=pc.wealth_grid,
     )
     print(f"\n  Saved local bundle: {bundle_path}", flush=True)
 

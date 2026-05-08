@@ -89,7 +89,10 @@ def test_inf_horizon_completes_and_saves_bundle(tmp_path):
     assert diag["converged"] is False  # tol unreachable in 3 iters
 
     bundle_dir = tmp_path / "gate1_bundle"
-    out = save_policy_bundle(bundle_dir, C, S, B, diagnostics=diag, overwrite=True)
+    out = save_policy_bundle(
+        bundle_dir, C, S, B, diagnostics=diag, overwrite=True,
+        wealth_grid=pc.wealth_grid,
+    )
     assert (out / "policy_arrays.npz").exists()
     assert (out / "diagnostics.pkl").exists()
     assert (out / "metadata.json").exists()
@@ -155,7 +158,10 @@ def test_inf_horizon_interrupt_returns_partial_bundle(tmp_path, monkeypatch):
     assert diag["policy_supnorm_history"].shape == (K_OK,)
 
     bundle_dir = tmp_path / "gate2_partial_bundle"
-    out = save_policy_bundle(bundle_dir, C, S, B, diagnostics=diag, overwrite=True)
+    out = save_policy_bundle(
+        bundle_dir, C, S, B, diagnostics=diag, overwrite=True,
+        wealth_grid=pc.wealth_grid,
+    )
     assert (out / "policy_arrays.npz").exists()
 
     C_r, S_r, B_r, diag_r, _ = load_policy_bundle(out)

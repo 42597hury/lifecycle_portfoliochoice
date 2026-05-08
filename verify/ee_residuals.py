@@ -58,6 +58,7 @@ from lifecycle.model import (
     SolverConfig,
 )
 from lifecycle.policy_io import load_policy_bundle
+from lifecycle.wealth_grid import disc_config_with_bundle_wealth_grid
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import (
     _pc_to_jnp,
@@ -137,7 +138,7 @@ def _rehydrate_solver_config(d: dict | None) -> SolverConfig:
     return SolverConfig(**kwargs)
 
 
-def _rebuild_model_and_pc(metadata: dict, verbose: bool = False):
+def _rebuild_model_and_pc(metadata: dict, bundle_path: Path, verbose: bool = False):
     """Rebuild model + precompute from bundle metadata."""
     run_config = metadata.get("run_config")
     if run_config is None:
@@ -154,6 +155,9 @@ def _rebuild_model_and_pc(metadata: dict, verbose: bool = False):
         raise ValueError("Bundle run_config missing 'discretization_config'.")
 
     disc_config = _rehydrate_disc_config(disc_config_dict)
+    disc_config = disc_config_with_bundle_wealth_grid(
+        disc_config, bundle_path, metadata
+    )
     solver_config = _rehydrate_solver_config(run_config.get("solver_config"))
 
     var_config = build_nominal_system1_var_config_hardcoded()
@@ -679,7 +683,9 @@ def main():
 
     print("\nRebuilding model + precompute from bundle metadata...", flush=True)
     t0 = time.time()
-    model, pc, solver_config, run_config = _rebuild_model_and_pc(metadata, verbose=False)
+    model, pc, solver_config, run_config = _rebuild_model_and_pc(
+        metadata, bundle_path, verbose=False
+    )
     delta = solver_config.delta_bequest if solver_config.delta_bequest >= 0.0 else DELTA_BEQUEST
     print(
         f"  Setup wall: {time.time() - t0:.1f}s; "

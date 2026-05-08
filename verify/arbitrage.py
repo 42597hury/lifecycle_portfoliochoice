@@ -78,6 +78,7 @@ import numpy as np
 
 from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.policy_io import load_policy_bundle
+from lifecycle.wealth_grid import disc_config_with_bundle_wealth_grid
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.var import build_nominal_system1_var_config_hardcoded
 
@@ -143,6 +144,9 @@ def _build_pc_from_bundle(bundle_path: Path, verbose: bool):
             "Bundle run_config missing base_config or discretization_config."
         )
     disc_config = _rehydrate_disc_config(disc_config_dict)
+    disc_config = disc_config_with_bundle_wealth_grid(
+        disc_config, bundle_path, metadata
+    )
     var_config = build_nominal_system1_var_config_hardcoded()
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)

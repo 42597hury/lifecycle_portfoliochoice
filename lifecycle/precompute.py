@@ -25,6 +25,12 @@ from lifecycle.discretization import (
     get_state_quadrature, _normalize_ret_nodes,
 )
 from lifecycle.mortality import calibrate_earnings_dependent_mortality
+from lifecycle.wealth_grid import (
+    legacy_log1p_wealth_grid,
+    load_wealth_grid_file,
+    validate_wealth_grid,
+    wealth_grid_hash,
+)
 
 
 # =============================================================================
@@ -122,6 +128,9 @@ class Precompute(NamedTuple):
 
     # Grids
     wealth_grid: np.ndarray
+    wealth_grid_hash: str
+    wealth_grid_kind: str
+    wealth_grid_source: str | None
     savings_max: float
     s_grid: np.ndarray
     ages: np.ndarray
@@ -231,11 +240,28 @@ def build_precompute(model, disc_config=None, verbose=True):
     if effective_savings_max > disc_config.wealth_max:
         raise ValueError("savings_max cannot exceed wealth_max; widen wealth_max instead")
 
-    wealth_grid = np.expm1(np.linspace(
-        np.log1p(disc_config.wealth_min),
-        np.log1p(disc_config.wealth_max),
-        disc_config.n_wealth,
-    ))
+    wealth_grid_path = getattr(disc_config, "wealth_grid_path", None)
+    if wealth_grid_path is None:
+        wealth_grid = legacy_log1p_wealth_grid(
+            disc_config.n_wealth,
+            disc_config.wealth_min,
+            disc_config.wealth_max,
+        )
+        wealth_grid_kind = "log1p"
+        wealth_grid_source = None
+    else:
+        wealth_grid_source = str(wealth_grid_path)
+        wealth_grid = load_wealth_grid_file(wealth_grid_source)
+        validate_wealth_grid(
+            wealth_grid,
+            n_wealth=disc_config.n_wealth,
+            wealth_min=disc_config.wealth_min,
+            wealth_max=disc_config.wealth_max,
+            source=f"custom wealth grid {wealth_grid_source}",
+        )
+        wealth_grid_kind = "custom"
+    wealth_grid = np.ascontiguousarray(wealth_grid, dtype=np.float64)
+    w_grid_hash = wealth_grid_hash(wealth_grid)
     savings_max = effective_savings_max
     s_grid = np.expm1(np.linspace(
         np.log1p(disc_config.savings_min),
@@ -409,6 +435,9 @@ def build_precompute(model, disc_config=None, verbose=True):
         model=model,
         n_ret_nodes_1d=n_ret_nodes_1d,
         wealth_grid=wealth_grid,
+        wealth_grid_hash=w_grid_hash,
+        wealth_grid_kind=wealth_grid_kind,
+        wealth_grid_source=wealth_grid_source,
         savings_max=savings_max,
         s_grid=s_grid,
         ages=ages,
@@ -635,7 +664,15 @@ def _print_precompute_summary(pc):
     state_Z_axes = _format_lobatto_axes(getattr(pc.disc_config, "state_lobatto_Z", None))
     print(f"State quad   : {K_state_str} nodes/dim"
           f"  ->  {pc.n_state_quad} joint nodes" + state_Z_axes)
-    print(f"Wealth grid  : {pc.n_w} points  [{pc.wealth_grid[0]:.3e}, {pc.wealth_grid[-1]:.3e}]")
+    grid_suffix = (
+        f", source={pc.wealth_grid_source}"
+        if pc.wealth_grid_kind == "custom"
+        else ""
+    )
+    print(
+        f"Wealth grid  : {pc.n_w} points  [{pc.wealth_grid[0]:.3e}, "
+        f"{pc.wealth_grid[-1]:.3e}]  kind={pc.wealth_grid_kind}{grid_suffix}"
+    )
     print(f"Savings grid : {pc.n_s} points  [{pc.s_grid[0]:.3e}, {pc.s_grid[-1]:.3e}]")
     print(f"mu_r         : {pc.mu_r.shape}"
           f"  ({pc.N_state * pc.N_state * pc.model.n_ret:,} values)")

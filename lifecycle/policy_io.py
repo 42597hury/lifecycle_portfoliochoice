@@ -21,6 +21,12 @@ from typing import Any
 
 import numpy as np
 
+from lifecycle.wealth_grid import (
+    DEFAULT_WEALTH_GRID_FILE,
+    wealth_grid_hash,
+    wealth_grid_spacing_stats,
+)
+
 
 def _dictify_namedtuples(value: Any) -> Any:
     """Recursively replace NamedTuple instances with plain dicts.
@@ -77,6 +83,7 @@ def save_policy_bundle(
     *,
     overwrite: bool = False,
     compress: bool = True,
+    wealth_grid: np.ndarray | None = None,
 ) -> Path:
     """
     Save policy outputs to disk for reuse.
@@ -118,10 +125,13 @@ def save_policy_bundle(
     arrays_path = out / "policy_arrays.npz"
     diag_path = out / "diagnostics.pkl"
     meta_path = out / "metadata.json"
+    wealth_grid_path = out / DEFAULT_WEALTH_GRID_FILE
 
     paths = [arrays_path, meta_path]
     if diagnostics is not None:
         paths.append(diag_path)
+    if wealth_grid is not None:
+        paths.append(wealth_grid_path)
     if not overwrite:
         existing = [p for p in paths if p.exists()]
         if existing:
@@ -134,6 +144,20 @@ def save_policy_bundle(
         np.savez_compressed(arrays_path, C_mat=C_mat, S_mat=S_mat, B_mat=B_mat)
     else:
         np.savez(arrays_path, C_mat=C_mat, S_mat=S_mat, B_mat=B_mat)
+
+    wealth_grid_arr = None
+    if wealth_grid is not None:
+        wealth_grid_arr = np.ascontiguousarray(wealth_grid, dtype=np.float64)
+        if wealth_grid_arr.ndim != 1:
+            raise ValueError(
+                f"wealth_grid must be one-dimensional; got {wealth_grid_arr.shape}."
+            )
+        if wealth_grid_arr.size != C_mat.shape[-1]:
+            raise ValueError(
+                f"wealth_grid size {wealth_grid_arr.size} does not match "
+                f"policy wealth axis {C_mat.shape[-1]}."
+            )
+        np.save(wealth_grid_path, wealth_grid_arr)
 
     if diagnostics is not None:
         with diag_path.open("wb") as f:
@@ -167,6 +191,33 @@ def save_policy_bundle(
         "compressed": bool(compress),
         "wealth_dynamics_spec": str(spec),
     }
+    if wealth_grid_arr is not None:
+        grid_hash = wealth_grid_hash(wealth_grid_arr)
+        grid_kind = None
+        grid_source = None
+        if diagnostics is not None:
+            grid_kind = diagnostics.get("wealth_grid_kind")
+            grid_source = diagnostics.get("wealth_grid_source")
+        if grid_kind is None and run_config is not None:
+            disc_cfg = run_config.get("discretization_config") if isinstance(run_config, dict) else None
+            if isinstance(disc_cfg, dict):
+                grid_kind = "custom" if disc_cfg.get("wealth_grid_path") is not None else "log1p"
+                grid_source = disc_cfg.get("wealth_grid_path")
+        grid_kind = "custom" if grid_kind is None else str(grid_kind)
+        stats = wealth_grid_spacing_stats(wealth_grid_arr)
+        metadata.update({
+            "wealth_grid_file": wealth_grid_path.name,
+            "wealth_grid_hash": grid_hash,
+            "wealth_grid_kind": grid_kind,
+            "wealth_grid_source": None if grid_source is None else str(grid_source),
+            "wealth_grid_min": float(wealth_grid_arr[0]),
+            "wealth_grid_max": float(wealth_grid_arr[-1]),
+            "wealth_grid_n": int(wealth_grid_arr.size),
+            "wealth_grid_min_diff64": stats["min_diff64"],
+            "wealth_grid_min_diff32": stats["min_diff32"],
+            "wealth_grid_min_rel_diff32": stats["min_rel_diff32"],
+            "wealth_grid_n_nonpositive_diff32": stats["n_nonpositive_diff32"],
+        })
     if diagnostics is not None:
         metadata["diagnostics_summary"] = _to_jsonable(diagnostics)
     if run_config is not None:

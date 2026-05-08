@@ -250,6 +250,7 @@ def solve_one(method: str, n_z: int, bundle_dir: Path, overwrite: bool) -> dict[
         diagnostics=diag,
         run_config=run_config_snapshot,
         overwrite=True,
+        wealth_grid=pc.wealth_grid,
     )
     return load_bundle_payload(bundle_dir)
 
@@ -351,4 +352,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

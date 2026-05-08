@@ -30,6 +30,7 @@ from lifecycle.solver import (
     _pc_to_jnp,
     _precompute_per_is_tensors,
 )
+from lifecycle.wealth_grid import wealth_grid_hash
 
 
 DEFAULT_TOL = 1e-6
@@ -452,6 +453,12 @@ def _build_diagnostics(
         "backtrack_iter_histogram": nb_hist,
         "newton_iter_p99": float(ni_hist["p99"]),
         "n_backtrack_total_p99": float(nb_hist["p99"]),
+        "wealth_grid_hash": getattr(pc, "wealth_grid_hash", wealth_grid_hash(pc.wealth_grid)),
+        "wealth_grid_kind": getattr(pc, "wealth_grid_kind", "log1p"),
+        "wealth_grid_source": getattr(pc, "wealth_grid_source", None),
+        "wealth_grid_min": float(np.asarray(pc.wealth_grid)[0]),
+        "wealth_grid_max": float(np.asarray(pc.wealth_grid)[-1]),
+        "wealth_grid_n": int(np.asarray(pc.wealth_grid).size),
     }
     diagnostics.update(_compute_z_invariance(C, S, B))
     diagnostics.update(_compute_wealth_homogeneity(C, S, B, pc.wealth_grid, trim_wealth_points))

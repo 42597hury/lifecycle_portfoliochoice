@@ -37,6 +37,7 @@ import numpy as np
 from jax import jit, pmap, vmap
 
 from lifecycle.model import DELTA_BEQUEST, SolveControl, SolverConfig
+from lifecycle.wealth_grid import legacy_log1p_wealth_grid, wealth_grid_hash
 
 # =============================================================================
 # Exit codes
@@ -201,7 +202,7 @@ def _mask_unsolved_ages_in_place(C_mat, S_mat, B_mat, solved_age_mask):
     B_mat[unsolved] = np.nan
 
 
-def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
+def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics, wealth_grid):
     from lifecycle.policy_io import save_policy_bundle
     Cs, Ss, Bs = _prepare_policy_snapshot(
         C_mat, S_mat, B_mat, diagnostics["solved_age_mask"]
@@ -209,7 +210,57 @@ def _save_policy_checkpoint(checkpoint_path, C_mat, S_mat, B_mat, diagnostics):
     return save_policy_bundle(
         checkpoint_path, Cs, Ss, Bs,
         diagnostics=diagnostics, overwrite=True,
+        wealth_grid=np.asarray(wealth_grid, dtype=np.float64),
     )
+
+
+def _ensure_checkpoint_wealth_grid_compatible(ckpt_dir, metadata, ckpt_diag, pc):
+    """Refuse same-shape checkpoint resumes across different wealth grids."""
+    current_hash = getattr(pc, "wealth_grid_hash", wealth_grid_hash(pc.wealth_grid))
+    ckpt_hash = None
+    if isinstance(metadata, dict):
+        ckpt_hash = metadata.get("wealth_grid_hash")
+    if ckpt_hash is None and isinstance(ckpt_diag, dict):
+        ckpt_hash = ckpt_diag.get("wealth_grid_hash")
+    if ckpt_hash is not None:
+        if str(ckpt_hash) != str(current_hash):
+            raise RuntimeError(
+                f"Checkpoint wealth-grid hash mismatch at {ckpt_dir}: "
+                f"checkpoint={ckpt_hash}, current={current_hash}. "
+                "Different interior wealth nodes; refuse to resume."
+            )
+        return
+
+    current_kind = getattr(pc, "wealth_grid_kind", "log1p")
+    if current_kind == "custom":
+        raise RuntimeError(
+            f"Checkpoint at {ckpt_dir} has no wealth_grid_hash, while the "
+            "current run uses a custom wealth grid. Refuse to resume."
+        )
+
+    disc = None
+    if isinstance(ckpt_diag, dict):
+        disc = ckpt_diag.get("disc_config")
+    if disc is None and isinstance(metadata, dict):
+        disc = (metadata.get("run_config", {}) or {}).get("discretization_config")
+    if hasattr(disc, "_asdict"):
+        disc = disc._asdict()
+    if not isinstance(disc, dict):
+        raise RuntimeError(
+            f"Checkpoint at {ckpt_dir} has no wealth_grid_hash and no saved "
+            "discretization config from which to infer the legacy log1p grid. "
+            "Refuse to resume."
+        )
+    legacy = legacy_log1p_wealth_grid(
+        int(disc["n_wealth"]), float(disc["wealth_min"]), float(disc["wealth_max"])
+    )
+    inferred_hash = wealth_grid_hash(legacy)
+    if inferred_hash != str(current_hash):
+        raise RuntimeError(
+            f"Checkpoint at {ckpt_dir} is a legacy log1p-grid checkpoint, but "
+            f"its inferred hash {inferred_hash} differs from current "
+            f"{current_hash}. Refuse to resume."
+        )
 
 
 def _materialize_policy_lists(C_list, S_list, B_list, shape, solved_age_mask):
@@ -2550,7 +2601,7 @@ def run_lifecycle_solver(
         if (ckpt_dir / "policy_arrays.npz").exists():
             from lifecycle.policy_io import load_policy_bundle
             try:
-                Cc, Sc, Bc, ckpt_diag, _ = load_policy_bundle(ckpt_dir)
+                Cc, Sc, Bc, ckpt_diag, ckpt_metadata = load_policy_bundle(ckpt_dir)
             except Exception as exc:
                 raise RuntimeError(
                     f"Found checkpoint at {ckpt_dir} but failed to load it: {exc}. "
@@ -2562,6 +2613,9 @@ def run_lifecycle_solver(
                     f"got {Cc.shape}, expected {shape}. "
                     "Different grid/quadrature/system — refuse to resume."
                 )
+            _ensure_checkpoint_wealth_grid_compatible(
+                ckpt_dir, ckpt_metadata, ckpt_diag, pc
+            )
             ckpt_mask = None
             if ckpt_diag is not None:
                 ckpt_mask = ckpt_diag.get("solved_age_mask")
@@ -2762,6 +2816,7 @@ def run_lifecycle_solver(
                         wall_time_sec=time.time() - t_start,
                         checkpoint_save_count=checkpoint_save_count,
                         checkpoint_path=checkpoint_path,
+                        pc=pc,
                     )
                     # Histograms also at periodic checkpoints, so partial
                     # bundles carry max_iter calibration data even when the
@@ -2778,7 +2833,7 @@ def run_lifecycle_solver(
                         C_list, S_list, B_list, shape, solved_age_mask,
                     )
                     last_saved_bundle_path = str(_save_policy_checkpoint(
-                        checkpoint_path, C_ckpt, S_ckpt, B_ckpt, diag,
+                        checkpoint_path, C_ckpt, S_ckpt, B_ckpt, diag, pc.wealth_grid,
                     ))
                     last_saved_nonterminal_count = solved_nonterminal_count
                     if verbose >= 1:
@@ -2812,6 +2867,7 @@ def run_lifecycle_solver(
         wall_time_sec=total,
         checkpoint_save_count=checkpoint_save_count + (1 if final_save_needed else 0),
         checkpoint_path=checkpoint_path,
+        pc=pc,
     )
     diagnostics = _build_diagnostics(**diag_kwargs)
 
@@ -2836,7 +2892,7 @@ def run_lifecycle_solver(
 
     if final_save_needed:
         last_saved_bundle_path = str(_save_policy_checkpoint(
-            checkpoint_path, C_mat, S_mat, B_mat, diagnostics,
+            checkpoint_path, C_mat, S_mat, B_mat, diagnostics, pc.wealth_grid,
         ))
         checkpoint_save_count += 1
 
@@ -2947,6 +3003,7 @@ def _build_diagnostics(
     *, solved_age_mask, ages, age_max_foc, age_newton_fail,
     solver_config, disc_config, solve_control,
     solve_status, wall_time_sec, checkpoint_save_count, checkpoint_path,
+    pc=None,
 ):
     solved_idx = np.flatnonzero(solved_age_mask)
     solved_ages = ages[solved_idx] if solved_idx.size > 0 else np.array([], dtype=np.int64)
@@ -2954,7 +3011,7 @@ def _build_diagnostics(
     oldest_solved_age = int(solved_ages.max()) if solved_ages.size > 0 else None
     is_partial = solve_status != "complete" or solved_idx.size != len(ages)
 
-    return {
+    diagnostics = {
         "age_max_foc": age_max_foc.copy(),
         "age_newton_fail": age_newton_fail.copy(),
         "total_newton_failures": int(age_newton_fail.sum()),
@@ -2973,3 +3030,13 @@ def _build_diagnostics(
         "checkpoint_save_count": int(checkpoint_save_count),
         "checkpoint_path": checkpoint_path,
     }
+    if pc is not None:
+        diagnostics.update({
+            "wealth_grid_hash": getattr(pc, "wealth_grid_hash", wealth_grid_hash(pc.wealth_grid)),
+            "wealth_grid_kind": getattr(pc, "wealth_grid_kind", "log1p"),
+            "wealth_grid_source": getattr(pc, "wealth_grid_source", None),
+            "wealth_grid_min": float(np.asarray(pc.wealth_grid)[0]),
+            "wealth_grid_max": float(np.asarray(pc.wealth_grid)[-1]),
+            "wealth_grid_n": int(np.asarray(pc.wealth_grid).size),
+        })
+    return diagnostics

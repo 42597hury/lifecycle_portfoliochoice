@@ -221,6 +221,7 @@ def run_one_cell(tag, state_grid_sizes):
         diagnostics=diag,
         run_config=run_config_snapshot,
         overwrite=True,
+        wealth_grid=pc.wealth_grid,
     )
     print(f"  Saved local bundle: {bundle_dir}", flush=True)
 

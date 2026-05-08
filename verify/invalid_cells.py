@@ -40,6 +40,7 @@ import numpy as np
 
 from lifecycle.model import SolverConfig
 from lifecycle.policy_io import load_policy_bundle
+from lifecycle.wealth_grid import load_wealth_grid_from_bundle
 
 
 # Defaults match _diag_invalid_cells on main: |alpha_s| > 20, |alpha_b| > 50.
@@ -214,24 +215,6 @@ def _rehydrate_solver_config(d: dict | None) -> SolverConfig:
     return SolverConfig(**kwargs)
 
 
-def _wealth_grid_from_metadata(metadata: dict) -> np.ndarray | None:
-    """Pull the bundle's wealth grid out of metadata if available so we can
-    compute savings = wealth - c without rebuilding the precompute."""
-    run_config = metadata.get("run_config", {}) or {}
-    disc = run_config.get("discretization_config")
-    if not isinstance(disc, dict):
-        return None
-    n_w = disc.get("n_wealth")
-    w_min = disc.get("wealth_min")
-    w_max = disc.get("wealth_max")
-    if n_w is None or w_min is None or w_max is None:
-        return None
-    # Solver builds wealth_grid as linspace(wealth_min, wealth_max, n_wealth);
-    # this matches lifecycle/precompute's construction (same as in
-    # verify/ee_residuals.py's pcj.wealth_grid).
-    return np.linspace(float(w_min), float(w_max), int(n_w), dtype=np.float64)
-
-
 # =============================================================================
 # Main
 # =============================================================================
@@ -274,11 +257,13 @@ def main() -> int:
 
     # Wealth grid for savings = w - c (optional: skipped if not in metadata,
     # in which case n_tiny_savings is reported as 0 with a note).
-    wealth_grid = _wealth_grid_from_metadata(metadata)
-    if wealth_grid is None:
+    try:
+        wealth_grid = load_wealth_grid_from_bundle(bundle_path, metadata)
+    except FileNotFoundError as exc:
+        wealth_grid = None
         print(
-            "  NOTE: wealth grid not in metadata; tiny_savings count will be 0. "
-            "Re-save bundle with current verify/benchmark_bundle.py to populate.",
+            f"  NOTE: wealth grid unavailable ({exc}); tiny_savings count will be 0. "
+            "Re-save bundle with current save_policy_bundle to populate wealth_grid.npy.",
             flush=True,
         )
 

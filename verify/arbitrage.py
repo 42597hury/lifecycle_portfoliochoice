@@ -80,7 +80,8 @@ from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.policy_io import load_policy_bundle
 from lifecycle.wealth_grid import disc_config_with_bundle_wealth_grid
 from lifecycle.precompute import build_model, build_precompute
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from verify._diag_helpers import build_bundle_var_config
+from lifecycle.var import build_real_full_var_config_hardcoded
 
 
 # =============================================================================
@@ -147,7 +148,7 @@ def _build_pc_from_bundle(bundle_path: Path, verbose: bool):
     disc_config = disc_config_with_bundle_wealth_grid(
         disc_config, bundle_path, metadata
     )
-    var_config = build_nominal_system1_var_config_hardcoded()
+    var_config = build_bundle_var_config(metadata, bundle_path)
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)
     return model, pc, disc_config, metadata
@@ -229,7 +230,10 @@ def _build_pc_from_config(config_path: Path, verbose: bool):
             f"(disc_config / disc_config_template / DISC_CONFIG)."
         )
 
-    var_config = build_nominal_system1_var_config_hardcoded()
+    # No bundle metadata at the .py-config path; default to the headline
+    # Full real-yields VAR. Configs that explicitly set a different system
+    # would need to supply their own var_config — out of scope here.
+    var_config = build_real_full_var_config_hardcoded()
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)
     return model, pc, disc_config
@@ -250,13 +254,15 @@ def _build_gross_cloud_per_state(model, pc) -> tuple[np.ndarray, np.ndarray, np.
     R_bond  : (N_state, n_state_quad, n_ret_quad)
     weights : (n_state_quad, n_ret_quad)  joint quadrature weights, sum to 1
 
-    Identical math to the solver's ``_build_step_log_returns`` (rtb-as-state):
-      - R_bill[k_v, k_r] = exp(s_next[k_v, rtb_idx])  (constant across k_r)
+    Identical math to the solver's ``_build_step_log_returns`` (post real-
+    yields pivot, 2026-05-08): the bill is real-risk-free with
+      - R_bill[i_s, k_v, k_r] = exp(state_grid[i_s, y_1_idx])
+        (constant across k_v AND k_r — no innovation enters the bill leg)
       - R_stock = R_bill * exp(log_x_s)
       - R_bond  = R_bill * exp(log_x_b)
     where log_x_s, log_x_b are the (xr, xb) log-excess returns at each node.
     NumPy-only — no JAX needed; the cloud is small (N_state * n_state_quad *
-    n_ret_quad ~ a few million float64 entries even for 9^4 grids).
+    n_ret_quad ~ a few million float64 entries even for 5^3 grids).
     """
     state_grid = np.asarray(pc.state_grid, dtype=np.float64)         # (N_state, n_state)
     const_r = np.asarray(pc.const_r, dtype=np.float64)               # (n_ret,)
@@ -267,7 +273,13 @@ def _build_gross_cloud_per_state(model, pc) -> tuple[np.ndarray, np.ndarray, np.
     Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)              # (n_state, n_state)
     v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)               # (n_state_quad, n_state)
 
-    rtb_idx = int(model.rtb_index_in_state)
+    y_1_idx = model.y_1_index_in_state
+    if y_1_idx is None:
+        raise RuntimeError(
+            "model.y_1_index_in_state is None — the real-yields pivot requires "
+            "y_1 to be a state-grid axis for the diagnostic bill leg."
+        )
+    y_1_idx = int(y_1_idx)
     ret_names = list(model.ret_names)
     xr_pos = ret_names.index("xr")
     xb_pos = ret_names.index("xb")
@@ -276,16 +288,20 @@ def _build_gross_cloud_per_state(model, pc) -> tuple[np.ndarray, np.ndarray, np.
     base_mu_r = const_r[None, :] + state_grid @ A_r.T                # (N_state, n_ret)
     mu_r_per = base_mu_r[:, None, :] + M_v_nodes[None, :, :]         # (N_state, n_state_quad, n_ret)
 
-    # s_next[i_s, k_v, :] = Phi_0 + Phi_11 @ s_t + v[k_v]
+    # s_next[i_s, k_v, :] = Phi_0 + Phi_11 @ s_t + v[k_v] -- still computed for
+    # any caller that wants to inspect the next-period state, but the bill no
+    # longer reads from s_next: it's deterministic in the CURRENT state's y_1.
     s_next = (
         Phi_0[None, None, :]
         + state_grid[:, None, :] @ Phi_11.T[None, :, :]
         + v_nodes[None, :, :]
     )                                                                # (N_state, n_state_quad, n_state)
-    log_R_bill_kv = s_next[:, :, rtb_idx]                            # (N_state, n_state_quad)
 
-    # Broadcast across k_r — bill is realised at the state node, identical for all return nodes.
-    R_bill = np.exp(log_R_bill_kv)[:, :, None]                       # (N_state, n_state_quad, 1)
+    # Real-yields bill: log_R_bill = state_grid[i_s, y_1_idx] (constant across
+    # k_v AND k_r). Broadcast to (N_state, n_state_quad, 1) so callers don't
+    # special-case the bill axis.
+    log_R_bill_is = state_grid[:, y_1_idx]                           # (N_state,)
+    R_bill = np.exp(log_R_bill_is)[:, None, None]                    # (N_state, 1, 1)
 
     # log_x_s[i_s, k_v, k_r] = mu_r_per[i_s, k_v, xr_pos] + ret_nodes[k_r, xr_pos]
     res_xs = ret_nodes[:, xr_pos]                                    # (n_ret_quad,)

@@ -2,10 +2,12 @@
 
 Ports scripts/diagnostics/_diag_euler_errors.py from the Numba `main` branch to
 the JAX branch with the right economics:
-  - 4-D state vector (cy, spr, rtb, y_1)
-  - rtb-as-state (log_R_bill = s_next[rtb_idx], not from return draws)
-  - CCV log-portfolio returns (matches solver._ccv_log_return_and_grad)
-  - Unbounded leverage (no alpha_s/alpha_b clipping anywhere)
+  - 3-axis real-yields state vector (cape, spr, y_1) for the Full System;
+    System 1 (y_1,) and System 2 (spr, y_1) are projections of this template.
+  - Bill is real-risk-free: log_R_bill at t+1 is the current state's y_1
+    component (deterministic; no return-draw, no rtb-as-state axis).
+  - CCV log-portfolio returns (matches solver._ccv_log_return_and_grad).
+  - Unbounded leverage (no alpha_s/alpha_b clipping anywhere).
 
 Pipeline:
   1. Load saved bundle; rehydrate model + solver-side precompute (pc_solver).
@@ -66,7 +68,7 @@ from lifecycle.solver import (
     retirement_foc_jac_ccv,
     working_foc_jac_ccv,
 )
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from verify._diag_helpers import build_bundle_var_config
 
 
 # Floor for log10|EE| aggregation: c_implied ~= c gives -inf which would
@@ -250,8 +252,7 @@ def _build_retirement_ee_kernel(pcj_solver, pcj_eval, model, sc, delta):
                 pcj_eval.ret_nodes,            # EVAL-rule
                 pcj_eval.const_r,              # model-level
                 pcj_eval.A_r,
-                s_next,
-                pcj_solver.rtb_idx,
+                pcj_solver.y_1_idx,            # bill = state[y_1_idx]
                 pcj_solver.xr_pos,
                 pcj_solver.xb_pos,
             )
@@ -366,8 +367,7 @@ def _build_working_ee_kernel(pcj_solver, pcj_eval, model, sc, delta,
                 state_coords,
                 pcj_eval.M_v_nodes, pcj_eval.ret_nodes,
                 pcj_eval.const_r, pcj_eval.A_r,
-                s_next,
-                pcj_solver.rtb_idx, pcj_solver.xr_pos, pcj_solver.xb_pos,
+                pcj_solver.y_1_idx, pcj_solver.xr_pos, pcj_solver.xb_pos,
             )
 
             # c_corners_T: (n_state_quad_eval, n_z, n_corners, n_w)
@@ -734,7 +734,7 @@ def main():
     delta = solver_config.delta_bequest if solver_config.delta_bequest >= 0.0 else DELTA_BEQUEST
 
     print("Rebuilding model + solver-side precompute...", flush=True)
-    var_config = build_nominal_system1_var_config_hardcoded()
+    var_config = build_bundle_var_config(metadata, bundle_path)
     model = build_model(base_config, var_config, verbose=False)
     pc_solver = build_precompute(model, disc_solver, verbose=False)
 

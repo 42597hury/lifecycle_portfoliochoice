@@ -5,6 +5,12 @@ the FOC at every solved cell using the same FOC kernels (retirement_foc_jac_ccv 
 working_foc_jac_ccv) the solver used. Reports per-age residual statistics and saves a
 JSON summary alongside the bundle at ``<bundle>/ee_residuals.json``.
 
+Real-yields pivot (2026-05-08): rebuilds the precompute against the new 3-axis
+real-yields model (state = (cape, spr, y_1)). The bundle's metadata determines
+which System (1 / 2 / Full) builder to use. Pre-pivot 4-axis bundles cannot
+be rehydrated on this code path; the helper raises a clear error pointing at
+the pivot handoff doc.
+
 Usage
 -----
     python verify/ee_residuals.py <bundle-name-or-path>
@@ -12,10 +18,10 @@ Usage
 Examples
 --------
     # Bundle name resolved under ./saved_runs/
-    python verify/ee_residuals.py system_iv_full_var_unconstrained_cholesky_grid9x9x9x9_nz11_jax_benchmark
+    python verify/ee_residuals.py full_system_grid5x5x5_nz11_y1lob_calib1
 
     # Or full path
-    python verify/ee_residuals.py saved_runs/system_iv_full_var_..._jax_benchmark
+    python verify/ee_residuals.py saved_runs/full/full_system_grid5x5x5_nz11_y1lob_calib1
 
 Output
 ------
@@ -67,7 +73,7 @@ from lifecycle.solver import (
     retirement_foc_jac_ccv,
     working_foc_jac_ccv,
 )
-from lifecycle.var import build_nominal_system1_var_config_hardcoded
+from verify._diag_helpers import build_bundle_var_config
 
 
 # =============================================================================
@@ -160,7 +166,7 @@ def _rebuild_model_and_pc(metadata: dict, bundle_path: Path, verbose: bool = Fal
     )
     solver_config = _rehydrate_solver_config(run_config.get("solver_config"))
 
-    var_config = build_nominal_system1_var_config_hardcoded()
+    var_config = build_bundle_var_config(metadata, bundle_path)
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)
     return model, pc, solver_config, run_config

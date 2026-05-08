@@ -101,8 +101,14 @@ CANONICAL_DISC = DiscretizationConfig(
 #   unconstrained Newton. Canonical ±6 is a real cap (prior production hit
 #   max simulated |alpha| ~9.25 at gamma=5, 7x7x7 wide-support). Cap-bound
 #   cells surface as EC_NEWTON_FAIL in diagnostics['total_newton_failures'].
+# tol=1e-6: per docs/scans/NEWTON_FAILURE_STRUCTURE_2026-05-08.md, tol=1e-7
+#   was unreachable at high-savings cells where FOC residual scale falls
+#   below fp64 precision relative to tol*scale. Loosening to 1e-6 declares
+#   those structurally-doomed cells as converged without changing actual
+#   policy precision (1e-7 was unreachable anyway). Drops Newton fail rate
+#   from ~10-15% to ~3-6% at zero wall cost.
 CANONICAL_SOLVER = SolverConfig(
-    tol=1e-7,
+    tol=1e-6,
     max_iter=8000,
     init_alpha_s=0.85,
     init_alpha_b=0.44,

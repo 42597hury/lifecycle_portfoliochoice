@@ -1211,20 +1211,22 @@ def _build_arithmetic_returns_at_i_s(i_s, pc):
     ret_weights = np.asarray(pc.ret_weights, dtype=float)
 
     model = pc.model
-    rtb_idx = int(model.rtb_index_in_state)
+    if model.y_1_index_in_state is None:
+        raise ValueError(
+            "diagnostics scenario builder requires y_1_index_in_state on "
+            "the state grid (real-yields bill anchor)."
+        )
+    y_1_idx = int(model.y_1_index_in_state)
     xr_pos = int(model.ret_names.index("xr"))
     xb_pos = int(model.ret_names.index("xb"))
-    Phi_0_state = np.asarray(model.Phi_0_state, dtype=float)
-    Phi_11 = np.asarray(model.Phi_11, dtype=float)
-    v_nodes = np.asarray(pc.v_nodes, dtype=float)
 
     base_mu_r = const_r + A_r @ state_grid[i_s]            # (n_ret,)
     mu_r_per = base_mu_r[None, :] + M_v_nodes              # (n_state_quad, n_ret)
-    # rtb is in the state vector — read its realisation per quadrature node.
-    s_next_kv = Phi_0_state[None, :] + state_grid[i_s] @ Phi_11.T + v_nodes
-    log_R_bill_kv = s_next_kv[:, rtb_idx]                  # (n_state_quad,)
-    log_R_bill = np.broadcast_to(log_R_bill_kv[:, None],
-                                  (log_R_bill_kv.shape[0], ret_nodes.shape[0]))
+    # Real-yields bill: log_R_bill_{t+1} = state_t[y_1_idx] (deterministic).
+    log_R_bill = np.broadcast_to(
+        state_grid[i_s, y_1_idx],
+        (M_v_nodes.shape[0], ret_nodes.shape[0]),
+    )
     log_x_s    = mu_r_per[:, xr_pos:xr_pos+1] + ret_nodes[None, :, xr_pos]
     log_x_b    = mu_r_per[:, xb_pos:xb_pos+1] + ret_nodes[None, :, xb_pos]
 
@@ -1250,11 +1252,12 @@ def _evaluate_terminal_foc_at_policy(i_s, alpha_s, alpha_b, s_val,
     state_grid_i = pcj.state_grid[i_s]
     base_mu_r = pcj.const_r + pcj.A_r @ state_grid_i
     mu_r_per = base_mu_r[None, :] + pcj.M_v_nodes
-    # log_R_bill from next-period state vector (rtb-as-state)
-    s_next_kv = pcj.Phi_0_state[None, :] + state_grid_i @ pcj.Phi_11.T + pcj.v_nodes
-    log_R_bill_kv = s_next_kv[:, pcj.rtb_idx]
-    log_R_bill = jnp.broadcast_to(log_R_bill_kv[:, None],
-                                   (log_R_bill_kv.shape[0], pcj.ret_nodes.shape[0]))
+    # Real-yields bill: log_R_bill_{t+1} = state_t[y_1_idx] (deterministic).
+    n_state_quad = pcj.M_v_nodes.shape[0]
+    n_ret_quad = pcj.ret_nodes.shape[0]
+    log_R_bill = jnp.broadcast_to(
+        state_grid_i[pcj.y_1_idx], (n_state_quad, n_ret_quad)
+    )
     log_x_s    = mu_r_per[:, pcj.xr_pos, None] + pcj.ret_nodes[None, :, pcj.xr_pos]
     log_x_b    = mu_r_per[:, pcj.xb_pos, None] + pcj.ret_nodes[None, :, pcj.xb_pos]
 

@@ -6,9 +6,11 @@ Canonical model only:
   - Shifted-bequest (luxury form, De Nardi 2004; Catherine 2025 normalisation).
   - Unconstrained portfolio (no simplex projection, no leverage caps).
   - Linear interpolation everywhere (no PCHIP).
-  - ``n_state in {1, 2, 3, 4}`` post rtb-as-state migration. Realised
-    log_R_bill ( = rtb_{t+1}) is read from the next-period state vector at
-    ``model.rtb_index_in_state``; the return block is (xr, xb).
+  - ``n_state in {1, 2, 3}`` post real-yields pivot. The bill is real-risk-
+    free: ``log_R_bill_{t+1} = state_t[y_1_idx]`` is read off the CURRENT-
+    period state at ``model.y_1_index_in_state`` (deterministic given s_t,
+    no dependence on the next-period innovation). The return block is
+    (xr, xb), still integrated via the (k_v, k_r) joint quadrature.
 
 Public entrypoint:
     run_lifecycle_solver(model, pc, solver_config, n_s_points, verbose, solve_control)
@@ -812,19 +814,19 @@ def terminal_foc_jac_ccv(
 # =============================================================================
 
 def _build_step_log_returns(state_grid_i, M_v_nodes, ret_nodes,
-                             const_r, A_r, s_next, rtb_idx, xr_pos, xb_pos):
+                             const_r, A_r, y_1_idx, xr_pos, xb_pos):
     """Per-i_s log-return scenario tensors of shape ``(n_state_quad, n_ret_quad)``.
 
-    Post rtb-as-state migration:
-      - ``log_R_bill`` is read from the next-period state vector at
-        ``rtb_idx``: shape ``(n_state_quad,)``, broadcast to
-        ``(n_state_quad, n_ret_quad)`` via ``[:, None]`` so the FOC kernel
-        signatures stay unchanged.
-      - ``mu_r`` covers only the return block (xr, xb); ``xr_pos`` and
-        ``xb_pos`` index into ``ret_names``.
-
-    ``s_next`` shape: ``(n_state_quad, n_state)`` — passed in (computed once
-    per i_s in ``_build_step_state_brackets``).
+    Real-yields pivot:
+      - ``log_R_bill_{t+1} = state_grid_i[y_1_idx]`` — DETERMINISTIC given
+        the current state, broadcast to ``(n_state_quad, n_ret_quad)`` so
+        the FOC kernel signatures stay unchanged. The bill no longer
+        depends on the next-period state innovation v_{t+1}, so this
+        function does not need ``s_next``.
+      - ``log_x_s = mu_xs(s_i, v) + res_xs[k_r]`` and ``log_x_b`` similarly:
+        excess log returns over the bill, carrying both the state-
+        innovation (k_v) and residual (k_r) shocks.
+      - ``xr_pos`` / ``xb_pos`` index into ``ret_names``.
     """
     base_mu_r = const_r + A_r @ state_grid_i              # (n_ret,)
     mu_r_per = base_mu_r[None, :] + M_v_nodes              # (n_state_quad, n_ret)
@@ -832,11 +834,12 @@ def _build_step_log_returns(state_grid_i, M_v_nodes, ret_nodes,
     mu_xb = mu_r_per[:, xb_pos]
     res_xs = ret_nodes[:, xr_pos]
     res_xb = ret_nodes[:, xb_pos]
-    # rtb is in the state vector — read its realisation at each k_v.
-    log_R_bill_kv = s_next[:, rtb_idx]                     # (n_state_quad,)
+
+    n_state_quad = M_v_nodes.shape[0]
     n_ret_quad = ret_nodes.shape[0]
-    log_R_bill = jnp.broadcast_to(log_R_bill_kv[:, None],
-                                   (log_R_bill_kv.shape[0], n_ret_quad))
+    log_R_bill = jnp.broadcast_to(
+        state_grid_i[y_1_idx], (n_state_quad, n_ret_quad)
+    )
     log_x_s = mu_xs[:, None] + res_xs[None, :]
     log_x_b = mu_xb[:, None] + res_xb[None, :]
     return log_R_bill, log_x_s, log_x_b
@@ -1392,11 +1395,10 @@ def _solve_working_at_cell(
 
     # Pre-gather c_next at multilinear-state corners for this i_s, transposed
     # so k_v leads (matches the outer vmap in working_foc_jac_ccv). The Newton
-    # inner loop reads via dynamic_slice instead of a 4-axis advanced gather.
+    # inner loop reads via dynamic_slice instead of a 3-axis advanced gather.
     # Memory: per-cell (n_z, n_state_quad, n_corners, n_w) where n_corners =
     # 2**n_state; under vmap this batches to (n_cells, ...). At n_state=3 the
-    # per-cell footprint is ~3MB; at n_state=4 it's ~6MB before fusion — verify
-    # peak HBM on the first 4-D GPU run before running canonical.
+    # per-cell footprint is ~3MB before fusion (real-yields headline).
     # Cast to gather_dtype lets XLA fuse the gather + transpose + dtype convert
     # into a single load chain (verify in HLO at gate 3). c_next storage stays fp64.
     c_corners = c_next[:, j_corners_i, :]                 # (n_z, n_state_quad, n_corners, n_w)
@@ -1447,30 +1449,27 @@ def _all_is_log_returns_numpy(pcj):
     shipping to devices. Mirrors `_build_step_log_returns` but vectorised over
     all source states.
 
-    Post rtb-as-state: log_R_bill[i_s, k_v, :] = state_next[i_s, k_v, rtb_idx]
-    broadcast across the k_r axis (shape (N_state, n_state_quad, n_ret_quad)).
+    Real-yields pivot: log_R_bill[i_s, :, :] = state_grid[i_s, y_1_idx]
+    (deterministic given current state) — broadcast across both the k_v and
+    k_r axes to shape (N_state, n_state_quad, n_ret_quad). The state-
+    transition tensor s_next is no longer needed for the bill leg.
     """
     state_grid_np = np.asarray(pcj.state_grid, dtype=float)
     const_r_np = np.asarray(pcj.const_r, dtype=float)
     A_r_np = np.asarray(pcj.A_r, dtype=float)
     M_v_nodes_np = np.asarray(pcj.M_v_nodes, dtype=float)
     ret_nodes_np = np.asarray(pcj.ret_nodes, dtype=float)
-    Phi_0_np = np.asarray(pcj.Phi_0_state, dtype=float)
-    Phi_11_np = np.asarray(pcj.Phi_11, dtype=float)
-    v_nodes_np = np.asarray(pcj.v_nodes, dtype=float)
 
     base_mu_r = const_r_np[None, :] + state_grid_np @ A_r_np.T   # (N_state, n_ret)
     mu_r_per = base_mu_r[:, None, :] + M_v_nodes_np[None, :, :]  # (N_state, n_state_quad, n_ret)
 
-    # s_next[i_s, k_v, :] = Phi_0_state + Phi_11 @ s_t + v[k_v]
-    s_next = (Phi_0_np[None, None, :]
-              + state_grid_np[:, None, :] @ Phi_11_np.T[None, :, :]
-              + v_nodes_np[None, :, :])
-    log_R_bill_kv = s_next[:, :, pcj.rtb_idx]                    # (N_state, n_state_quad)
-
+    n_state = state_grid_np.shape[0]
+    n_state_quad = M_v_nodes_np.shape[0]
     n_ret_quad = ret_nodes_np.shape[0]
-    log_R_bill = np.broadcast_to(log_R_bill_kv[:, :, None],
-                                  log_R_bill_kv.shape + (n_ret_quad,))
+    log_R_bill_is = state_grid_np[:, pcj.y_1_idx]                # (N_state,)
+    log_R_bill = np.broadcast_to(
+        log_R_bill_is[:, None, None], (n_state, n_state_quad, n_ret_quad)
+    )
 
     res_xs = ret_nodes_np[:, pcj.xr_pos]                         # (n_ret_quad,)
     res_xb = ret_nodes_np[:, pcj.xb_pos]
@@ -1506,8 +1505,8 @@ def _precompute_per_is_tensors(pcj):
         )
         log_R_bill, log_x_s, log_x_b = _build_step_log_returns(
             s_i, pcj.M_v_nodes, pcj.ret_nodes,
-            pcj.const_r, pcj.A_r, s_next,
-            pcj.rtb_idx, pcj.xr_pos, pcj.xb_pos,
+            pcj.const_r, pcj.A_r,
+            pcj.y_1_idx, pcj.xr_pos, pcj.xb_pos,
         )
         return log_R_bill, log_x_s, log_x_b, j_corners, w_corners
 
@@ -1552,8 +1551,10 @@ PCJax = namedtuple("PCJax", [
     "annuity_factors",
     "sigma2_xr", "sigma2_xb", "sigma_xrxb",
     "weight_kv_kr",
-    # rtb-as-state metadata (static ints; used by _build_step_log_returns)
-    "rtb_idx", "xr_pos", "xb_pos",
+    # Real-yields metadata (static ints; used by _build_step_log_returns).
+    # y_1_idx is the position of the real bill yield in the state vector;
+    # log_R_bill_{t+1} = state_t[y_1_idx] (deterministic given current state).
+    "y_1_idx", "xr_pos", "xb_pos",
 ])
 
 ModelParams = namedtuple("ModelParams", [
@@ -1565,9 +1566,14 @@ def _pc_to_jnp(pc, delta):
     """Pack the precompute arrays the JAX kernels need into a PCJax pytree."""
     grids = list(pc.state_bracket_grids)
     n_state = len(grids)
-    if n_state < 1 or n_state > 4:
+    if n_state < 1 or n_state > 3:
         raise NotImplementedError(
-            f"JAX solver supports n_state in {{1, 2, 3, 4}} (got {n_state})."
+            f"JAX solver supports n_state in {{1, 2, 3}} (got {n_state})."
+        )
+    if pc.model.y_1_index_in_state is None:
+        raise ValueError(
+            "Real-yields solver requires y_1_index_in_state on the state "
+            "grid (the real bill is pinned to y_1_t); model has it None."
         )
     axis_grids = tuple(jnp.asarray(g) for g in grids)
     axis_sizes = tuple(int(g.shape[0]) for g in grids)
@@ -1609,7 +1615,7 @@ def _pc_to_jnp(pc, delta):
         Phi_0_state=jnp.asarray(np.asarray(pc.model.Phi_0_state, dtype=np.float64)),
         Phi_11=jnp.asarray(np.asarray(pc.model.Phi_11, dtype=np.float64)),
         weight_kv_kr=weight_kv_kr,
-        rtb_idx=int(pc.model.rtb_index_in_state),
+        y_1_idx=int(pc.model.y_1_index_in_state),
         xr_pos=int(xr_pos),
         xb_pos=int(xb_pos),
     )

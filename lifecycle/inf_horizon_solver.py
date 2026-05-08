@@ -141,25 +141,27 @@ def _markowitz_cold_start(model, pc):
         raise ValueError("Quadrature weights must sum to a positive finite number")
     weight_vec = weight_vec / weight_sum
 
-    rtb_idx = int(model.rtb_index_in_state)
+    if model.y_1_index_in_state is None:
+        raise ValueError(
+            "inf_horizon cold-start requires y_1_index_in_state on the "
+            "state grid (real-yields bill anchor)."
+        )
+    y_1_idx = int(model.y_1_index_in_state)
     xr_pos = int(model.ret_names.index("xr"))
     xb_pos = int(model.ret_names.index("xb"))
-    Phi_0_state = np.asarray(model.Phi_0_state, dtype=np.float64)
-    Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)
-    v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)
 
     for i_s in range(N_state):
         base_mu_r = pc.const_r + pc.A_r @ pc.state_grid[i_s]
-        # rtb realisation per state-quadrature node lives in s_next:
-        s_next_kv = Phi_0_state[None, :] + pc.state_grid[i_s] @ Phi_11.T + v_nodes
+        # Real-yields bill: log_R_bill_{t+1} = state_t[y_1_idx], constant
+        # across the state-innovation quadrature node k_v.
+        log_R_bill_i = float(pc.state_grid[i_s, y_1_idx])
+        R_bill = np.exp(log_R_bill_i)
 
         returns = np.empty((weight_vec.size, 3), dtype=np.float64)
         row = 0
         for k_v in range(len(pc.v_weights)):
             mu_stock = base_mu_r[xr_pos] + pc.M_v_nodes[k_v, xr_pos]
             mu_bond = base_mu_r[xb_pos] + pc.M_v_nodes[k_v, xb_pos]
-            log_R_bill_kv = float(s_next_kv[k_v, rtb_idx])
-            R_bill = np.exp(log_R_bill_kv)
             exp_mu_stock = np.exp(mu_stock)
             exp_mu_bond = np.exp(mu_bond)
             for k_r in range(len(pc.ret_weights)):
@@ -329,17 +331,20 @@ def _compute_stability_proxy(model, pc, solver_config, S, B, trim_wealth_points)
     sigma2_xb = float(pc.sigma2_xb)
     sigma_xrxb = float(pc.sigma_xrxb)
 
-    rtb_idx = int(model.rtb_index_in_state)
+    if model.y_1_index_in_state is None:
+        raise ValueError(
+            "inf_horizon Z-proxy requires y_1_index_in_state on the "
+            "state grid (real-yields bill anchor)."
+        )
+    y_1_idx = int(model.y_1_index_in_state)
     xr_pos = int(model.ret_names.index("xr"))
     xb_pos = int(model.ret_names.index("xb"))
-    Phi_0_state = np.asarray(model.Phi_0_state, dtype=np.float64)
-    Phi_11 = np.asarray(model.Phi_11, dtype=np.float64)
-    v_nodes = np.asarray(pc.v_nodes, dtype=np.float64)
 
     for i_s in range(pc.N_state):
         s_i = pc.state_grid[i_s]
         base_mu_r_i = pc.const_r + pc.A_r @ s_i
-        s_next_kv = Phi_0_state[None, :] + s_i @ Phi_11.T + v_nodes
+        # Real-yields bill: deterministic given current state.
+        log_R_bill = float(s_i[y_1_idx])
         alpha_s = float(S[i_z, i_s, i_w])
         alpha_b = float(B[i_z, i_s, i_w])
 
@@ -347,7 +352,6 @@ def _compute_stability_proxy(model, pc, solver_config, S, B, trim_wealth_points)
         for k_v, w_v in enumerate(pc.v_weights):
             mu_r_stock = base_mu_r_i[xr_pos] + pc.M_v_nodes[k_v, xr_pos]
             mu_r_bond = base_mu_r_i[xb_pos] + pc.M_v_nodes[k_v, xb_pos]
-            log_R_bill = float(s_next_kv[k_v, rtb_idx])
             for k_r, p_ret in enumerate(pc.ret_weights):
                 log_x_s = mu_r_stock + pc.ret_nodes[k_r, xr_pos]
                 log_x_b = mu_r_bond + pc.ret_nodes[k_r, xb_pos]

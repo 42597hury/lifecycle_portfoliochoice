@@ -74,9 +74,9 @@ class LifecyclePortfolioModel(NamedTuple):
     M: np.ndarray
     Sigma_r_cond: np.ndarray
 
-    y_1_index_in_state: int | None      # Index of y_1 in state vector if present on the grid; None if y_1 is supplied as a scalar fallback
+    y_1_index_in_state: int | None      # Index of y_1 in state vector. In the real-yields pivot y_1 is the real bill yield and IS the bill anchor (R_bill_{t+1} = y_1_t); must not be None for a solvable model. None is permitted only for legacy var_configs that supply y_1 as a scalar fallback.
     spr_index_in_state: int | None      # Index of spr in state vector if present on the grid; None if spread is supplied as a scalar fallback
-    rtb_index_in_state: int             # Index of rtb in state vector. rtb-as-state migration requires rtb to live on the grid; the solver and simulator read realised rtb_{t+1} from state_{t+1}[rtb_index_in_state].
+    rtb_index_in_state: int | None      # Index of rtb in state vector under the legacy nominal rtb-as-state model. None in the real-yields pivot, where the bill anchor is y_1 (real bill yield) and there is no separate rtb axis.
     y_1_scalar_fallback: float | None   # Required iff y_1_index_in_state is None; sample mean of y_1 used by the bequest annuity factor
     spr_scalar_fallback: float | None   # Required iff spr_index_in_state is None; sample mean of spread used by the bequest annuity factor
 

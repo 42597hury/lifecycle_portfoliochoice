@@ -83,11 +83,13 @@ class Precompute(NamedTuple):
     Financial state (VAR):
       state_grid   (N_state, n_state)   joint state grid; row i = slow-state vector
       Pi_state     (N_state, N_state)   Pi_state[i,j] = P(s_{t+1}=j | s_t=i)
-      mu_r         (N_state, N_state, n_ret)  with n_ret == 2 post rtb-as-state
+      mu_r         (N_state, N_state, n_ret)  with n_ret == 2
                                         mu_r[i,j,0] = E[xr | s_t=i, s_{t+1}=j]  log excess stock return
                                         mu_r[i,j,1] = E[xb | s_t=i, s_{t+1}=j]  log excess bond return
-                                        rtb is no longer here — read realised rtb
-                                        from state_grid[j, rtb_index_in_state] directly.
+                                        Bill is real-risk-free in the real-yields
+                                        pivot: log_R_bill_{t+1} = state_t[y_1_idx]
+                                        is read off the CURRENT-period state, no
+                                        bill row in mu_r.
       ret_nodes    (n_ret_quad, n_ret)  residual log-return shocks drawn from N(0, Sigma_r_cond)
       ret_weights  (n_ret_quad,)        quadrature weights; sum=1
 
@@ -687,8 +689,11 @@ def _print_precompute_summary(pc):
               f"  ({pc.model.state_names[pc.model.spr_index_in_state]})")
     else:
         print(f"spr (scalar)     : {pc.model.spr_scalar_fallback:.4%}")
-    print(f"rtb idx in state : {pc.model.rtb_index_in_state}"
-          f"  ({pc.model.state_names[pc.model.rtb_index_in_state]})")
+    if pc.model.rtb_index_in_state is not None:
+        print(f"rtb idx in state : {pc.model.rtb_index_in_state}"
+              f"  ({pc.model.state_names[pc.model.rtb_index_in_state]})")
+    else:
+        print("rtb idx in state : None  (real-yields setup; bill anchor is y_1)")
     print(f"annuity_factors      : {pc.annuity_factors.shape}  range=[{pc.annuity_factors.min():.2f}, {pc.annuity_factors.max():.2f}]")
     print(f"working_income       : {pc.working_income.shape}  (n_age x n_z x n_eps)")
     print(f"working_income_next  : {pc.working_income_next.shape}  (n_age x n_z x n_eta x n_eps)")
@@ -714,10 +719,13 @@ def build_model(base_config, var_config, verbose=True):
         verbose=verbose,
     )
 
-    # rtb-as-state drift detector. The OPTION-B failure mode (rtb left in
-    # returns and pi added as a state) collapses Sigma_r_cond's smallest
-    # eigenvalue to ~3e-7 along the rtb axis. The PROPOSED partition has
-    # smallest eig ~5e-4. The 1e-5 threshold sits comfortably between them.
+    # Conditional return-block rank-deficiency check. Originally added as the
+    # rtb-as-state drift detector for the legacy nominal model (OPTION-B
+    # failure: rtb in returns + pi as state collapsed Sigma_r_cond's smallest
+    # eigenvalue to ~3e-7). In the real-yields pivot rtb is gone and the
+    # return block is just (xr, xb), but a near-zero eigenvalue here still
+    # signals a misspecified partition or a quadrature path that would
+    # divide by ~0 inside the inner expectation.
     src = parts["Sigma_r_cond"]
     if src.size > 0:
         eig_min = float(np.min(np.linalg.eigvalsh(0.5 * (src + src.T))))
@@ -727,8 +735,8 @@ def build_model(base_config, var_config, verbose=True):
             suspect = ret_names[diag_idx] if diag_idx < len(ret_names) else f"ret[{diag_idx}]"
             _warnings.warn(
                 f"Sigma_r_cond smallest eigenvalue {eig_min:.2e} is below 1e-5; "
-                f"likely rank-deficiency along the {suspect!r} axis. This is the "
-                f"OPTION-B drift signature — verify rtb is in the state block.",
+                f"likely rank-deficiency along the {suspect!r} axis. Verify the "
+                "state/return partition.",
                 RuntimeWarning, stacklevel=2,
             )
 
@@ -780,20 +788,28 @@ def build_model(base_config, var_config, verbose=True):
 
     rtb_idx_raw = var_config.get("rtb_index_in_state", None)
     if rtb_idx_raw is None:
-        raise ValueError(
-            "var_config must provide rtb_index_in_state (rtb-as-state migration "
-            "requires rtb to live on the state grid)"
-        )
-    rtb_index_in_state = int(rtb_idx_raw)
-    if rtb_index_in_state < 0 or rtb_index_in_state >= parts["n_state"]:
-        raise ValueError(
-            f"rtb_index_in_state ({rtb_index_in_state}) out of bounds "
-            f"for state vector of size {parts['n_state']}"
-        )
-    if y_1_index_in_state is not None and rtb_index_in_state == y_1_index_in_state:
-        raise ValueError("rtb_index_in_state and y_1_index_in_state must be distinct")
-    if spr_index_in_state is not None and rtb_index_in_state == spr_index_in_state:
-        raise ValueError("rtb_index_in_state and spr_index_in_state must be distinct")
+        # Real-yields pivot: there is no rtb axis. The bill is real-risk-free
+        # and pinned to y_1 directly (R_bill_{t+1} = y_1_t). Require y_1 to
+        # live on the state grid so the solver/simulator can read the bill
+        # rate from the current state.
+        if y_1_index_in_state is None:
+            raise ValueError(
+                "var_config has rtb_index_in_state=None (real-yields setup) "
+                "but also y_1_index_in_state=None. The real-yields model "
+                "requires y_1 to live on the state grid as the bill anchor."
+            )
+        rtb_index_in_state = None
+    else:
+        rtb_index_in_state = int(rtb_idx_raw)
+        if rtb_index_in_state < 0 or rtb_index_in_state >= parts["n_state"]:
+            raise ValueError(
+                f"rtb_index_in_state ({rtb_index_in_state}) out of bounds "
+                f"for state vector of size {parts['n_state']}"
+            )
+        if y_1_index_in_state is not None and rtb_index_in_state == y_1_index_in_state:
+            raise ValueError("rtb_index_in_state and y_1_index_in_state must be distinct")
+        if spr_index_in_state is not None and rtb_index_in_state == spr_index_in_state:
+            raise ValueError("rtb_index_in_state and spr_index_in_state must be distinct")
 
     return LifecyclePortfolioModel(
         beta=float(base_config["beta"]),

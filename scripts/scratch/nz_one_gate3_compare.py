@@ -44,7 +44,7 @@ def _solve(n_z: int):
     var_config = build_nominal_system1_var_config_hardcoded()
     model = build_model(BASE_CONFIG, var_config, verbose=False)
     pc = build_precompute(model, disc, verbose=False)
-    print(f"\n=== n_z={n_z}  pc.z_grid={pc.z_grid}  pc.dz={pc.dz}  pc.Pi_z=\n{pc.Pi_z}")
+    print(f"\n=== n_z={n_z}  pc.z_grid={pc.z_grid}  pc.dz={pc.dz}  pc.init_z_probs={pc.init_z_probs}")
 
     C, S, B, diag = run_infinite_horizon_solver(
         model, pc,

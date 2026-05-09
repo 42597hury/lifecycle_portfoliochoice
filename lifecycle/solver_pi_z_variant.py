@@ -1,9 +1,19 @@
-"""Prototype lifecycle solver variant using the precomputed ``Pi_z`` chain.
+"""Prototype lifecycle solver variant using the persistent-z ``Pi_z`` chain.
 
 This module intentionally leaves :mod:`lifecycle.solver` untouched.  The public
 entry point, :func:`run_lifecycle_solver_pi_z`, wraps the production
 orchestrator and swaps only the working-age kernel builder.  Retirement and
 terminal-age kernels are reused verbatim.
+
+NOTE (2026-05-09): ``pc.Pi_z`` was dropped from the production ``Precompute``
+NamedTuple — it was reducible at the canonical ``(rho=0.991, n_z=11,
+n_stds=3.0)`` and was off the production hot path (see
+``docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md`` MED-1). The variant
+solver now constructs its own ``Pi_z`` locally from ``(model, disc_config)``
+via :func:`discretize_income_ar1_mixture`. The same reducibility caveat that
+prompted the drop applies here: callers using this variant at canonical
+``rho=0.991`` should reduce ``disc_config.n_stds`` (e.g. to ``2.25``) so the
+upper-tail bin probabilities don't underflow.
 """
 from __future__ import annotations
 
@@ -17,16 +27,38 @@ import numpy as np
 from jax import jit, pmap, vmap
 
 from lifecycle import solver as _base
+from lifecycle.discretization import discretize_income_ar1_mixture
 
 
 PCJaxPi = namedtuple("PCJaxPi", _base.PCJax._fields + ("Pi_z",))
 _ORIGINAL_PC_TO_JNP = _base._pc_to_jnp
 
 
+def _build_pi_z_local(pc):
+    """Construct ``Pi_z`` locally for the variant solver.
+
+    Pulled from ``(pc.model, pc.disc_config)`` since ``Pi_z`` was dropped
+    from the production ``Precompute`` (see module docstring).
+    """
+    model = pc.model
+    disc = pc.disc_config
+    _, Pi_z = discretize_income_ar1_mixture(
+        rho=model.rho,
+        p=model.pz,
+        mu1=model.mu_eta1,
+        sigma1=model.sigma_eta1,
+        mu2=model.mu_eta2,
+        sigma2=model.sigma_eta2,
+        N=disc.n_z,
+        n_stds=disc.n_stds,
+    )
+    return Pi_z
+
+
 def _pc_to_jnp_with_pi_z(pc, delta):
     """Extend the production PCJax bundle with ``Pi_z`` for the variant."""
     pcj = _ORIGINAL_PC_TO_JNP(pc, delta)
-    return PCJaxPi(*pcj, jnp.asarray(pc.Pi_z))
+    return PCJaxPi(*pcj, jnp.asarray(_build_pi_z_local(pc)))
 
 
 def _build_discrete_income_next_table(pc):

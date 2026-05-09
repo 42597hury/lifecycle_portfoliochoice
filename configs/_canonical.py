@@ -143,7 +143,6 @@ CANONICAL_SOLVER = SolverConfig(
     max_iter=8000,
     init_alpha_s=0.85,
     init_alpha_b=0.44,
-    step_damp_unconstrained=0.3,
     use_line_search=True,
     delta_bequest=0.0,
     gather_precision="f32",

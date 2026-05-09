@@ -62,7 +62,7 @@ print(f"Devices: {jax.devices()}  (vmap-only path)")
 print(f"Built model: n_age={pc.n_age}, n_z={pc.n_z}, N_state={pc.N_state}, n_w={pc.n_w}")
 print(f"Total cells per age: n_z * N_state = {pc.n_z * pc.N_state}")
 
-base_sc = CANONICAL_SOLVER._replace(max_iter=50, max_iter_unconstrained=50)
+base_sc = CANONICAL_SOLVER._replace(max_iter=50)
 
 
 def solve_with(n_chunks):

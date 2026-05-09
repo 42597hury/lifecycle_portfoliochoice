@@ -82,8 +82,7 @@ def build_runner(gather_precision):
     so f32/f64 are independent JIT traces.
     """
     sc = CANONICAL_SOLVER._replace(
-        max_iter=100, max_iter_unconstrained=100,
-        gather_precision=gather_precision,
+        max_iter=100, gather_precision=gather_precision,
     )
     delta = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
     pcj = _pc_to_jnp(pc, delta)

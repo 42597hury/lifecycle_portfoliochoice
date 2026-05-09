@@ -94,7 +94,7 @@ def test_lifecycle_bit_identity_back_to_back():
     different-dtype concatenate that flows back into the policy math).
     """
     model, pc = _tiny_lifecycle_setup()
-    sc = CANONICAL_SOLVER._replace(max_iter=50, max_iter_unconstrained=50)
+    sc = CANONICAL_SOLVER._replace(max_iter=50)
 
     C1, S1, B1, _ = run_lifecycle_solver(model, pc, sc, verbose=0)
     C2, S2, B2, _ = run_lifecycle_solver(model, pc, sc, verbose=0)
@@ -113,7 +113,7 @@ def test_lifecycle_under_budgeted_newton_registers_failures():
     several should fail to converge and total_newton_failures must be > 0.
     """
     model, pc = _tiny_lifecycle_setup()
-    sc = CANONICAL_SOLVER._replace(max_iter=3, max_iter_unconstrained=3)
+    sc = CANONICAL_SOLVER._replace(max_iter=3)
 
     _, _, _, diag = run_lifecycle_solver(model, pc, sc, verbose=0)
 
@@ -150,7 +150,7 @@ def test_lifecycle_well_budgeted_newton_has_few_failures():
     when the budget is tight.
     """
     model, pc = _tiny_lifecycle_setup()
-    sc = CANONICAL_SOLVER._replace(max_iter=200, max_iter_unconstrained=200)
+    sc = CANONICAL_SOLVER._replace(max_iter=200)
 
     _, _, _, diag = run_lifecycle_solver(model, pc, sc, verbose=0)
 
@@ -173,7 +173,6 @@ def _inf_horizon_solver_config(max_iter_newton: int) -> SolverConfig:
     return SolverConfig(
         wealth_dynamics_spec="ccv_log",
         max_iter=max_iter_newton,
-        max_iter_unconstrained=max_iter_newton,
         delta_bequest=0.0,
         gather_precision="f32",
         cell_vmap_chunks=1,

@@ -65,8 +65,7 @@ solver_config = CANONICAL_SOLVER._replace(
     # Newton failures will show in diag["total_newton_failures"] if any cell
     # actually needs more.
     max_iter=400,
-    max_iter_unconstrained=400,
-)
+    )
 solve_control = SolveControl(
     youngest_age_to_solve=67,
     save_on_interrupt=False,

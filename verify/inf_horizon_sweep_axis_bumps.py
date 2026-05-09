@@ -84,7 +84,6 @@ def make_disc(state_quad, ret_quad):
 SOLVER_CONFIG = CANONICAL_SOLVER._replace(
     wealth_dynamics_spec="ccv_log",
     max_iter=100,
-    max_iter_unconstrained=100,
     delta_bequest=0.0,
     gather_precision="f32",
     cell_vmap_chunks=1,

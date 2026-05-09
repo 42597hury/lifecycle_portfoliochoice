@@ -60,7 +60,7 @@ print(f"  n_eta={disc.n_eta_nodes}, n_eps={disc.n_eps_nodes}")
 print(f"devices: {jax.devices()}")
 
 sc = CANONICAL_SOLVER._replace(
-    max_iter=30, max_iter_unconstrained=30, gather_precision="f64",
+    max_iter=30, gather_precision="f64",
 )
 delta = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
 pcj = _pc_to_jnp(pc, delta)

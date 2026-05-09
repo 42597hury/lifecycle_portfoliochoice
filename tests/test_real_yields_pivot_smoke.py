@@ -80,7 +80,7 @@ def _smoke_base_config():
 
 
 def _smoke_solver_config():
-    return CANONICAL_SOLVER._replace(max_iter=200, max_iter_unconstrained=200)
+    return CANONICAL_SOLVER._replace(max_iter=200)
 
 
 @pytest.mark.parametrize(

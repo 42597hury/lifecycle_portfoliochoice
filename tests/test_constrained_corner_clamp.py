@@ -363,7 +363,7 @@ def test_corner_solution_at_lowest_wealth_grid_point():
     model = build_model(base, meta["var_config"], verbose=False)
     pc = build_precompute(model, meta["disc_config"], verbose=False)
 
-    sc = CANONICAL_SOLVER._replace(max_iter=200, max_iter_unconstrained=200)
+    sc = CANONICAL_SOLVER._replace(max_iter=200)
     C_mat, S_mat, B_mat, _diag = run_lifecycle_solver(
         model, pc, sc, verbose=0,
     )

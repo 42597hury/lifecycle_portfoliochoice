@@ -36,7 +36,7 @@ model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, disc, verbose=True)
 
 # max_iter=100 (canonical's 8000 was overkill; chunk-2 verified same policy)
-sc = CANONICAL_SOLVER._replace(max_iter=100, max_iter_unconstrained=100)
+sc = CANONICAL_SOLVER._replace(max_iter=100)
 
 print("\nSolving full lifecycle (~7-12 min expected)...", flush=True)
 t0 = time.time()

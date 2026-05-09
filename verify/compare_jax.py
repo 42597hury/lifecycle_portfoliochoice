@@ -34,7 +34,7 @@ var_config = build_real_full_var_config_hardcoded()
 model = build_model(tiny_base, var_config, verbose=False)
 pc = build_precompute(model, disc, verbose=False)
 
-sc = CANONICAL_SOLVER._replace(max_iter=100, max_iter_unconstrained=100)
+sc = CANONICAL_SOLVER._replace(max_iter=100)
 print(f"JAX solving (n_age={pc.n_age}, n_z={pc.n_z}, N_state={pc.N_state}, n_w={pc.n_w})...")
 C, S, B, _ = run_lifecycle_solver(model, pc, sc, verbose=0)
 

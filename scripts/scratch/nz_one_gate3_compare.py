@@ -36,7 +36,6 @@ def _solve(n_z: int):
     sc = CANONICAL_SOLVER._replace(
         wealth_dynamics_spec="ccv_log",
         max_iter=20,
-        max_iter_unconstrained=20,
         delta_bequest=0.0,
         gather_precision="f32",
         cell_vmap_chunks=1,

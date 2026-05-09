@@ -47,7 +47,7 @@ model = build_model(small_base, var_config, verbose=False)
 pc = build_precompute(model, small_disc, verbose=False)
 
 MAX_ITER = 50
-sc = CANONICAL_SOLVER._replace(max_iter=MAX_ITER, max_iter_unconstrained=MAX_ITER)
+sc = CANONICAL_SOLVER._replace(max_iter=MAX_ITER)
 
 # Patch _egm_scan_cell to return n_iters_egm in full instead of max
 import jax.numpy as jnp

@@ -415,7 +415,6 @@ def build_probe_model(args):
     pc = build_precompute(model, disc, verbose=False)
     sc = CANONICAL_SOLVER._replace(
         max_iter=args.max_iter,
-        max_iter_unconstrained=args.max_iter,
         gather_precision="f32",
         use_fori_newton=True,
     )

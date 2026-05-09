@@ -44,7 +44,7 @@ print(f"Built model: n_age={pc.n_age}, n_z={pc.n_z}, N_state={pc.N_state}, n_w={
 
 # Baseline: all fp64.
 sc_f64 = CANONICAL_SOLVER._replace(
-    max_iter=100, max_iter_unconstrained=100, gather_precision="f64",
+    max_iter=100, gather_precision="f64",
 )
 t0 = time.time()
 C64, S64, B64, _ = run_lifecycle_solver(model, pc, sc_f64, verbose=0)
@@ -53,7 +53,7 @@ print(f"f64 baseline solve: {t_f64:.1f}s")
 
 # Test: fp32 gather.
 sc_f32 = CANONICAL_SOLVER._replace(
-    max_iter=100, max_iter_unconstrained=100, gather_precision="f32",
+    max_iter=100, gather_precision="f32",
 )
 t0 = time.time()
 C32, S32, B32, _ = run_lifecycle_solver(model, pc, sc_f32, verbose=0)

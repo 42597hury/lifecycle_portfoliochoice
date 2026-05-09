@@ -54,7 +54,7 @@ def main(label: str):
     model = build_model(BASE_CONFIG, var_config, verbose=False)
     pc = build_precompute(model, tiny_disc, verbose=False)
 
-    sc = CANONICAL_SOLVER._replace(max_iter=30, max_iter_unconstrained=30)
+    sc = CANONICAL_SOLVER._replace(max_iter=30)
     solve_control = SolveControl(youngest_age_to_solve=62)
 
     t0 = time.time()

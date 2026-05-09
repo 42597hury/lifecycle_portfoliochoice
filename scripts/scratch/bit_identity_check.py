@@ -33,7 +33,7 @@ var_config = build_nominal_system1_var_config_hardcoded()
 model = build_model(small_base, var_config, verbose=False)
 pc = build_precompute(model, small_disc, verbose=False)
 
-sc = CANONICAL_SOLVER._replace(max_iter=50, max_iter_unconstrained=50)
+sc = CANONICAL_SOLVER._replace(max_iter=50)
 
 t0 = time.time()
 C, S, B, diag = run_lifecycle_solver(model, pc, sc, verbose=0)

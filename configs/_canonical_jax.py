@@ -84,7 +84,6 @@ CANONICAL_DISC = _NUMBA_CANONICAL_DISC._replace(
 # Diff from _canonical.CANONICAL_SOLVER:
 #   max_iter              : 8000 → 30    (fori_loop is wall cost; v0.2 bump
 #                                         from 20, see changelog)
-#   max_iter_unconstrained: 5000 → 30    (legacy alias; pin both for safety)
 #   tol                   : 1e-7 → 1e-6  (v0.2 loosen; tol controls the
 #                                         convergence mask, not wall — under
 #                                         fori_loop cells always run all
@@ -107,7 +106,6 @@ CANONICAL_DISC = _NUMBA_CANONICAL_DISC._replace(
 # 50. Wall cost scales as (1 + max_iter*11), so 30→50 is ~1.67× slower.
 CANONICAL_SOLVER = _NUMBA_CANONICAL_SOLVER._replace(
     max_iter=30,
-    max_iter_unconstrained=30,
     tol=1e-6,
     use_fori_newton=True,
     wealth_dynamics_spec="ccv_log",

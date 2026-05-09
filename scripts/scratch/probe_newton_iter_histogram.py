@@ -51,7 +51,7 @@ model = build_model(small_base, var_config, verbose=False)
 pc = build_precompute(model, small_disc, verbose=False)
 
 MAX_ITER = 50
-sc = CANONICAL_SOLVER._replace(max_iter=MAX_ITER, max_iter_unconstrained=MAX_ITER)
+sc = CANONICAL_SOLVER._replace(max_iter=MAX_ITER)
 
 print(f"Probe config: n_age={pc.n_age}, n_z={pc.n_z}, N_state={pc.N_state}, "
       f"n_w={pc.n_w}, n_savings={pc.n_s}, max_iter={MAX_ITER}")

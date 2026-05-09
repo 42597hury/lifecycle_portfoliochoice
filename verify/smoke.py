@@ -44,7 +44,7 @@ print(f"Devices: {len(__import__('jax').devices())}")
 # max_iter=8000 (canonical) is overkill on a smooth FOC; under fori_loop
 # every iter is wall cost, so keep this tight. 30 leaves ~5x margin over
 # typical convergence (5-10 iters/cell with backward-age warm-start).
-sc = CANONICAL_SOLVER._replace(max_iter=30, max_iter_unconstrained=30)
+sc = CANONICAL_SOLVER._replace(max_iter=30)
 
 # Solve full retirement (67..99) + 5 working years (62..66) = 38 ages.
 solve_control = SolveControl(youngest_age_to_solve=62)

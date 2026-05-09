@@ -137,10 +137,6 @@ class SolverConfig(NamedTuple):
     # --- Newton iteration ---
     tol: float = 1e-7                          # FOC convergence tolerance
     max_iter: int = 5000                       # max Newton outer iterations
-    # Legacy alias: pre-rewrite this was ``max_iter_unconstrained``. The JAX
-    # solver's run_lifecycle_solver still reads ``max_iter_unconstrained`` for
-    # backwards compatibility with old configs; new code should use ``max_iter``.
-    max_iter_unconstrained: int = 5000
     # Newton outer/inner loop implementation.
     # When True, use lax.fori_loop + masked updates (GPU-friendly: deterministic
     # dispatch graph, no warp divergence). When False, use lax.while_loop with
@@ -156,7 +152,6 @@ class SolverConfig(NamedTuple):
     init_alpha_b: float = 0.4                  # initial bond weight guess
 
     # --- Step control ---
-    step_damp_unconstrained: float = 0.3       # legacy; line search supersedes this
     grad_step_size: float = 0.05               # gradient descent step when Jacobian singular
 
     # --- Backtracking line search ---

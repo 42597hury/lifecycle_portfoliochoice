@@ -62,7 +62,7 @@ pc = build_precompute(model, small_disc, verbose=False)
 print(f"Devices: {jax.devices()}  (vmap-only path)")
 print(f"Built model: n_age={pc.n_age}, n_z={pc.n_z}, N_state={pc.N_state}, n_w={pc.n_w}")
 
-sc = CANONICAL_SOLVER._replace(max_iter=50, max_iter_unconstrained=50)
+sc = CANONICAL_SOLVER._replace(max_iter=50)
 
 t0 = time.time()
 C, S, B, diag = run_lifecycle_solver(model, pc, sc, verbose=1)

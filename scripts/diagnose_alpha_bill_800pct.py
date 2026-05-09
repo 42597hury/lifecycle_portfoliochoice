@@ -39,7 +39,6 @@ solver_cfg = CANONICAL_SOLVER._replace(
     delta_bequest=0.0,                # the suspect setting
     wealth_dynamics_spec="ccv_log",
     max_iter=100,
-    max_iter_unconstrained=100,
     gather_precision="f32",
 )
 

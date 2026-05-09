@@ -64,7 +64,6 @@ print("Kernel coverage: terminal, retirement, boundary, working")
 
 base_sc = CANONICAL_SOLVER._replace(
     max_iter=5,
-    max_iter_unconstrained=5,
     max_backtrack_iter=2,
     gather_precision="f64",
 )

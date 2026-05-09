@@ -25,6 +25,7 @@ from lifecycle.discretization import (
     get_state_quadrature, _normalize_ret_nodes,
 )
 from lifecycle.mortality import calibrate_earnings_dependent_mortality
+from lifecycle.numerics import _normal_bin_probs
 from lifecycle.wealth_grid import (
     legacy_log1p_wealth_grid,
     load_wealth_grid_file,
@@ -95,7 +96,12 @@ class Precompute(NamedTuple):
 
     Income:
       z_grid       (n_z,)               persistent income states (log, mean-zero)
-      Pi_z         (n_z, n_z)           Pi_z[i,j] = P(z_{t+1}=j | z_t=i)
+      init_z_probs (n_z,)               P(z_0 = z_grid[i]) under the unconditional
+                                        (stationary) Gaussian approximation. Used
+                                        ONLY by the simulator's array-init fallback
+                                        and as a stationary-distribution for the
+                                        ``initial_z='stationary'`` cross-check;
+                                        replaces the legacy reducible Pi_z.
       eps_nodes    (n_eps,)             Gauss-Hermite nodes for transitory shock eps
       eps_weights  (n_eps,)             quadrature weights; sum=1, E[eps]=0 enforced
 
@@ -180,7 +186,7 @@ class Precompute(NamedTuple):
 
     # Income discretization
     z_grid: np.ndarray
-    Pi_z: np.ndarray
+    init_z_probs: np.ndarray
     eps_nodes: np.ndarray
     eps_weights: np.ndarray
     eta_nodes: np.ndarray
@@ -248,6 +254,16 @@ def build_precompute(model, disc_config=None, verbose=True):
             disc_config.n_wealth,
             disc_config.wealth_min,
             disc_config.wealth_max,
+        )
+        validate_wealth_grid(
+            wealth_grid,
+            n_wealth=disc_config.n_wealth,
+            wealth_min=disc_config.wealth_min,
+            wealth_max=disc_config.wealth_max,
+            source=(
+                f"legacy log1p grid n={disc_config.n_wealth}, "
+                f"[{disc_config.wealth_min}, {disc_config.wealth_max}]"
+            ),
         )
         wealth_grid_kind = "log1p"
         wealth_grid_source = None

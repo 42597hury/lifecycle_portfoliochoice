@@ -91,8 +91,10 @@ BASE_CONFIG = {
 #   the kink to avoid the meaningless blend region. With the clamp now
 #   in place, wealth_min can drop below typical first-real-W_implied,
 #   exposing the corner to downstream consumers (simulator, EE residuals,
-#   arbitrage diagnostics). f32 spacing safety: 180 log-spaced points
-#   0.01..750 give min diff_f32 = 6.47e-4 (~650x above 1e-6 floor).
+#   arbitrage diagnostics). f32 spacing safety: 180 log1p-spaced points
+#   0.01..750 give min_rel_diff32 = 3.77e-2 (~40,000x above the
+#   8*eps_f32 ~= 9.5e-7 floor); enforced at runtime by
+#   validate_wealth_grid() in precompute.py.
 #   Initial-wealth defaults across notebooks/tests/scripts are 0.1..10.0
 #   AWI — all >=10x above the floor.
 CANONICAL_DISC = DiscretizationConfig(

@@ -135,3 +135,31 @@ def test_checkpoint_wealth_grid_guard_rejects_hashless_custom(tmp_path):
     )
     with pytest.raises(RuntimeError, match="custom wealth grid"):
         _ensure_checkpoint_wealth_grid_compatible(tmp_path, {}, {}, pc)
+
+
+def test_canonical_log1p_grid_passes_fp32_validator():
+    """The canonical log1p constructor produces an fp32-safe grid at the
+    current canonical (n_wealth=180, wealth_min=0.01, wealth_max=750.0).
+
+    Regression guard for FP32_PLACEMENT_REVIEW_2026-05-09 finding F1: the
+    log1p path in precompute.py used to skip validate_wealth_grid; now it
+    runs the same gate as the custom-grid path. This test asserts the
+    canonical passes with substantial headroom (not just barely)."""
+    grid = legacy_log1p_wealth_grid(180, 0.01, 750.0)
+    stats = validate_wealth_grid(
+        grid,
+        n_wealth=180,
+        wealth_min=0.01,
+        wealth_max=750.0,
+        source="canonical log1p (regression guard)",
+    )
+    # Probe (FP32_PLACEMENT_REVIEW §F1) measured min_rel_diff32 = 3.77e-2
+    # at canonical. Demand >= 1e-3 to catch a grid that *barely* passes
+    # rather than one with the observed ~40,000x headroom.
+    assert stats["min_rel_diff32"] > 1e-3, (
+        f"canonical log1p min_rel_diff32 = {stats['min_rel_diff32']:.3e} "
+        f"is too close to the f32 floor; investigate before lowering "
+        f"wealth_min further or bumping n_wealth"
+    )
+    assert stats["n_nonpositive_diff32"] == 0
+    assert stats["min_diff64"] > 1e-8

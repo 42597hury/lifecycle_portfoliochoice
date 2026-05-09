@@ -218,11 +218,20 @@ class SolverConfig(NamedTuple):
     # --- Mixed precision toggle ---
     # When "f64" (default): all solver arithmetic in fp64. Bit-identical to the
     # pre-toggle baseline.
-    # When "f32": the c_corners gather + multilinear/bilinear interpolation
-    # (in both _interp_c_and_mpc_at_cell and the inline per_kv_kr inside
-    # retirement_foc_jac_ccv) runs in fp32; results cast back to fp64 BEFORE
-    # any CRRA / FOC / Newton arithmetic. Captures memory-bandwidth savings
-    # without precision loss in convergence-critical paths.
+    # When "f32": the multilinear/bilinear interpolation boundary runs in fp32;
+    # results cast back to fp64 BEFORE any CRRA / FOC / Newton arithmetic.
+    # Captures memory-bandwidth savings without precision loss in
+    # convergence-critical paths.
+    #
+    # Cast scope (closed set; see _cast_for_gather, solver.py):
+    #   IN  (f64 -> f32): c_corners (working & retirement), w_corners,
+    #                     wealth_grid, frac_z, x_next_scalar
+    #   OUT (f32 -> f64): c_g, mpc_g (immediately before the min_consumption
+    #                     floor and [0,1] MPC clip)
+    # Boundary closes inside _interp_c_and_mpc_at_cell (solver.py:954-955)
+    # and the inline per_kv_kr in retirement_foc_jac_ccv (solver.py:1025-1026).
+    # Nothing fp32 ever exits the multilinear closure.
+    #
     # WARNING: f32 path produces alphas that differ from f64 by ~1e-5 relative
     # (real arithmetic noise, not just bit-shuffle). Bit-identity test does
     # not apply; agreement test at 1e-4 relative does.

@@ -953,6 +953,10 @@ def _interp_c_and_mpc_at_cell(c_corners_kv, w_corners_kv,
     # (CRRA, Newton residual) consumes c / mpc in fp64.
     c = c_g.astype(jnp.float64)
     mpc = mpc_g.astype(jnp.float64)
+    # Trace-time invariant: CRRA amplification at gamma=5, c~0.1 turns
+    # fp32's ~1e-7 noise into ~1e-2 mu noise (above Newton tol). Asserts
+    # fire once at JIT compilation; zero runtime cost.
+    assert c.dtype == jnp.float64 and mpc.dtype == jnp.float64
 
     c = jnp.maximum(c, min_consumption)
     mpc = jnp.clip(mpc, 0.0, 1.0)
@@ -1024,6 +1028,9 @@ def retirement_foc_jac_ccv(
         # Cast back to fp64 BEFORE floor / clip. FOC arithmetic below is fp64.
         c = c_g.astype(jnp.float64)
         mpc = mpc_g.astype(jnp.float64)
+        # Trace-time invariant (matches _interp_c_and_mpc_at_cell): downstream
+        # FOC consumes c/mpc as fp64. Fires at JIT trace; zero runtime cost.
+        assert c.dtype == jnp.float64 and mpc.dtype == jnp.float64
         c = jnp.maximum(c, min_consumption)
         mpc = jnp.clip(mpc, 0.0, 1.0)
         return c, mpc

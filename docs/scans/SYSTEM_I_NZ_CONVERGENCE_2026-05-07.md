@@ -22,10 +22,12 @@ buys nothing. **Verdict: REJECTED.**
 
 | Verdict component | Outcome |
 |---|---|
-| Grid-policy convergence | **RED**. n_z=10 deviates 28% (relative sup-norm) from n_z=70 in C, 34% in α_s, 42% in α_b. |
-| Sim-path Euler residuals | **RED**. Working-age mean log10\|EE\| degrades by ~1.8 dex from n_z=70 to n_z=10 (≈63× larger residual). |
-| Newton convergence (max\_iter cap) | **YELLOW.** Histogram shows max\_iter=100 was hit on at least one savings node in every (z, state) cell of every bundle. Most of these are at the tiny-savings boundary where the policy is sentinel-replaced; sim-EE confirms unconstrained-cell policies are still numerically reasonable. |
-| **Recommendation** | **Use n_z=30 as the smallest defensible setting; n_z=70 for canonical/publication. n_z=10 is unsafe even for ablation runs.** |
+| Grid-policy convergence (sup-norm) | **RED for n_z=10** (28 % rel C, 37 pp α_s); **YELLOW for n_z=15** (10 % rel C, 18 pp α_s); GREEN for n_z=30 (3 % rel C). |
+| Sim-path Euler residuals (unconstrained, p95) | n_z=10 working **2.6 %** rel c-error; n_z=15 **1.0 %**; n_z=30 **0.45 %**; n_z=70 **0.21 %**. Retirement an order of magnitude smaller. |
+| Where the worst sup-norm cells live | At z ≈ +1.5σ to +1.9σ (z = +2.7 to +3.5), young working ages 22-25, two wealth modes (max-W for C; lower-middle-W for shares). These cells are **rare in any realised simulated panel** (the 45-year working horizon never reaches the stationary right tail; realised std(z) at age 65 ≈ 1.4 vs stationary 1.87). Sup-norm metrics over-weight them; realised-panel statistics are dominated by typical cells. |
+| Calibration provenance | Matches Catherine (2025) "Interest-Rate Risk and Household Portfolios" and the underlying Guvenen-Karahan-Ozkan-Song (2021, Econometrica) mixture estimates — see [CALIBRATION_VERIFICATION_2026-05-08.md](CALIBRATION_VERIFICATION_2026-05-08.md). |
+| Newton convergence (max\_iter cap) | **YELLOW.** Histogram shows max\_iter=100 hit on at least one savings node in every (z, state) cell of every bundle. Concentrated at the tiny-savings boundary where the policy is sentinel-replaced; sim-EE confirms unconstrained-cell policies are still numerically reasonable. Independent of n_z. |
+| **Recommendation** | **n_z=15 for typical-household statistics on ablation sweeps; n_z=30 if any tail moments enter; n_z=70 for canonical/publication. n_z=10 is unsafe on every metric.** |
 
 ---
 
@@ -60,29 +62,48 @@ For each n_z×{C,α_s,α_b} pair, the per-age / per-z / per-wealth max collapses
 the 4-D divergence tensor to a 1-D profile. Peaks (cell where the worst
 absolute divergence lives):
 
-| n_z | array | peak age | peak z idx (of 70) | peak wealth idx (of 180) |
-|---:|---|---:|---:|---:|
-| 10 | C   | 24 (early working) | 57 (z ≈ +0.6 σ) | 179 (max wealth) |
-| 10 | α_s | 25 | 59 | 60 (lower-middle wealth) |
-| 10 | α_b | 25 | 59 | 60 |
-| 15 | C   | 24 | 57 | 179 |
-| 15 | α_s | 23 | 62 | 63 |
-| 30 | C   | 24 | 58 | 179 |
-| 30 | α_s | 22 (start of life) | 63 | 63 |
+| n_z | array | peak age | peak z idx (of 70) | z value | peak wealth idx (of 180) |
+|---:|---|---:|---:|---:|---:|
+| 10 | C   | 24 (early working) | 57 | +2.74 (≈+1.47σ_z) | 179 (max wealth) |
+| 10 | α_s | 25 | 59 | +2.99 (≈+1.60σ_z) | 60 (lower-middle wealth) |
+| 10 | α_b | 25 | 59 | +2.99 | 60 |
+| 15 | C   | 24 | 57 | +2.74 | 179 |
+| 15 | α_s | 23 | 62 | +3.35 (≈+1.79σ_z) | 63 |
+| 30 | C   | 24 | 58 | +2.87 | 179 |
+| 30 | α_s | 22 (start of life) | 63 | +3.48 (≈+1.86σ_z) | 63 |
 
 **Interpretation:**
 - **Young working ages** (22–25) carry the most divergence because the
-  z-distribution disperses fastest there (working-age z innovations
-  haven't yet saturated the stationary distribution).
-- **Right tail of z** (z ≈ +0.5 σ to +1 σ) is where coarse z-grids
-  systematically misplace the policy — moderately-high realised income
-  with the deterministic age-earnings interaction creates rapidly
-  varying optimal-consumption surfaces that linear interpolation between
-  10 z-nodes can't track.
-- **Two wealth modes:** for C the worst cell is at maximum wealth; for
-  α_s/α_b it's at the lower-middle wealth band (~33% of grid range)
-  where portfolio choice is most sensitive to expected human-wealth
-  realisations.
+  z-distribution disperses fastest there: at the start of life everyone
+  starts at z=0, and working-age innovations haven't yet propagated.
+- **Right tail of z** (z ≈ +1.5σ_z to +1.9σ_z, i.e. z ≈ +2.7 to +3.5 in log
+  units) is where coarse z-grids systematically misplace the policy.
+  Linear interpolation between 10 z-grid nodes cannot resolve the policy
+  curvature there, where the interaction between high realised income
+  and the deterministic age-earnings profile produces rapid variation.
+- **Two wealth modes:** for C the worst cell is at maximum wealth (smooth-V
+  region, no constraint binds); for α_s / α_b it's at lower-middle wealth
+  (~33 % of grid range) where the household is closer to the
+  borrowing-constraint corner and V has kink structure.
+
+**Economic-relevance caveat for the right-tail divergence.** The
+calibration's stationary std of z is ≈ 1.87 in log units (from
+`std(eta) ≈ 0.250` and `ρ = 0.991`), which would imply ~5.6 % of households
+sit at z ≥ +1.5σ in the **stationary** distribution. That stationary
+asymptote is, however, never reached: with `ρ = 0.991` the half-life of z is
+77 years, so over a 45-year working life the **realised** cross-sectional
+std at age 65 is only ≈ 1.4, and including the transitory ε the realised
+std(log y) at retirement is ≈ 1.05 — consistent with SCF/SSA empirical
+dispersion. The cells where the worst-case n_z=10 errors live (z = +2.7 to
++3.5, i.e. labour income 15–32 × population mean) are therefore **rare in
+any actual simulated panel**, not because the calibration is over-dispersed
+but because the working horizon is too short to reach the upper tail. Sup-norm
+metrics weight those cells equally with modal cells; sim-EE residuals on
+realised paths (§3) and stationary-mass-weighted RMS down-weight them by
+roughly an order of magnitude. The calibration itself is consistent with
+Catherine (2025) "Interest-Rate Risk and Household Portfolios" and the
+underlying Guvenen-Karahan-Ozkan-Song (2021, Econometrica) mixture
+estimates — see `docs/scans/CALIBRATION_VERIFICATION_2026-05-08.md`.
 
 See [figures/per_age_divergence.png](figures/per_age_divergence.png),
 [figures/per_z_divergence.png](figures/per_z_divergence.png),
@@ -226,29 +247,54 @@ the same set of boundary cells.
 
 ## §5 — Verdict and recommendation
 
-> **n_z=10 is RED** — under-converged on every metric. Do not use for
-> publication, do not use as the methodology default for the System II / III
-> / IV ablation sweeps without re-checking each one.
+The verdict has two readings, depending on whether you weight cells by
+sup-norm (worst-cell-anywhere) or by realised-panel relevance
+(stationary-mass × finite-horizon truncation; see the
+economic-relevance caveat in §2).
+
+> **n_z=10 is RED on both readings.**
+> - Per-cell: 28 % rel sup-norm in C, 37 pp / 30 pp in α_s / α_b.
+> - On realised paths: working-age sim-EE p95 = 2.6 % relative c-error
+>   on the central-95 % of cells; mean ≈ 0.77 %. ~63× larger working-age
+>   Euler residual than the n_z=70 reference.
+> - Do not use for publication, do not use as the System II/III/IV
+>   ablation default without re-checking.
 >
-> **n_z=15 is YELLOW** — visibly above the asymptote (10% relative C
-> divergence, ≈0.32 dex worse than n_z=70 in working-age sim-EE). Acceptable
-> only for fast scoping where a 10% policy error is tolerable.
+> **n_z=15 is YELLOW per-cell, plausibly GREEN for typical-household
+> statistics.**
+> - Per-cell: 10 % rel sup-norm in C, 18 pp / 15 pp in α_s / α_b.
+> - On realised paths: working-age sim-EE p95 = 1.0 %, mean ≈ 0.32 %.
+> - The worst sup-norm cells live at z ≈ +1.5σ to +1.9σ — the right
+>   tail of the *stationary* distribution, which the working-age horizon
+>   never reaches. Realised-panel statistics see the typical-cell errors
+>   (RMS ~5.5 % in C, 1.7 pp in α_s) rather than the sup-norm ones.
+> - Defensible for any quantity computed at sample means / typical-z
+>   conditioning. Tight for headline portfolio shares if any tail moments
+>   enter (e.g. top-decile-conditional α_s).
 >
-> **n_z=30 is GREEN-with-caveat** — 2.9% relative C divergence vs n_z=70,
-> within ~0.4 dex of the n_z=70 sim-EE residuals on working ages.
-> Defensible for ablation sweeps where computational budget matters.
+> **n_z=30 is GREEN on both readings.** 2.9 % rel sup-norm in C, ~0.5 pp
+> typical share error, working-age sim-EE p95 = 0.45 %. Defensible for
+> ablation sweeps with one fewer dex of headroom than n_z=70.
 >
 > **n_z=70 is the canonical-quality setting.** Sim-EE residuals at n_z=70
-> are dominated by the Newton iter cap (§4), not by z-resolution; further
-> n_z refinement past 70 will not improve them.
+> are dominated by the Newton iter cap (§4) and possibly by `n_eta_nodes=3`
+> mixture quadrature, not by z-resolution; further n_z refinement past 70
+> will not improve them.
 
 **Operational recommendation:**
-- For System I/II/III/IV ablation runs: **n_z=30 minimum, n_z=70 if
-  publication-targeting.**
-- For the canonical thesis baseline: **n_z=70.**
-- The hoped-for 7× compute saving from stopping at n_z=10 is unsafe.
-  The realistic saving is `wall(n_z=30)/wall(n_z=70) ≈ 72.4 / 146.0 ≈ 2×`
-  for System I; expect similar ratios for the other systems.
+- For ablation sweeps targeting **typical-household** moments (means,
+  medians, quartile statistics on simulated panels): **n_z=15 acceptable**;
+  n_z=30 preferred if compute allows.
+- For ablation sweeps that report **tail moments** (top-decile or
+  top-quintile conditional statistics): **n_z=30 minimum**, n_z=70
+  preferred.
+- For the **canonical thesis baseline / publication-grade** numbers:
+  **n_z=70.**
+- The hoped-for 7× compute saving from stopping at n_z=10 is unsafe on
+  every metric. Realistic savings: `wall(n_z=15)/wall(n_z=70) ≈ 0.30`
+  (3.4× faster) for typical-household work; `wall(n_z=30)/wall(n_z=70)
+  ≈ 0.50` (2× faster) for tail-statistics work. Expect similar ratios for
+  Systems II / III / IV.
 
 ---
 

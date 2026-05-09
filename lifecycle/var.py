@@ -421,10 +421,11 @@ def build_real_full_var_config(
       §2.2.r: lagged xr, xb columns of Phi are zero exactly.
       §2.2.μ: Phi_0 = (I − Phi_1) μ̂_y by mean-pinning.
 
-    Real-yield setup: y_1 and spr are constructed via Fisher decomposition
-    using Homer-Sylla (2005) backward weighted inflation expectation for
-    the bill leg and a static AR(1) cumulative-20 forecast for the bond
-    leg. See data/build_var_dataset.py.
+    Real-yield setup: AR(1)-matched 10-year RLONG baseline. January states use
+    inflation information through December t-1. The one-year bill yield
+    subtracts the AR(1) one-year inflation forecast; the 10-year Shiller RLONG
+    yield subtracts the same AR(1)'s average 10-year forecast. See
+    data/build_var_dataset_ar1_10y.py.
 
     cape = -log(Shiller CAPE), Jan-of-year, from ie_data.xls. Equity predictor.
 
@@ -512,16 +513,17 @@ def build_real_system1_var_config(
 # =============================================================================
 # HARDCODED FALLBACK PARAMETERS for the FULL system
 # =============================================================================
-# Estimated from data/var_dataset.csv (1920-2011, T=92) under the headline
-# real-yield setup (Homer-Sylla bill expectation + AR(1) cumulative bond
-# expectation, lambda_n = 0).
+# Estimated from data/var_dataset.csv (1920-2011, T=92) under the AR(1)-matched
+# 10-year RLONG real-yield baseline. January t yields use inflation information
+# through December t-1. The baseline bond leg is a 10-year constant-duration
+# return built from Shiller RLONG.
 #
 #   Columns         : [cape, spr, y_1, xr, xb]
 #   State indices   : [0, 1, 2]    (cape, spr, y_1)
 #   Return indices  : [3, 4]       (xr, xb)
 #   Restrictions    : §2.2.r (lagged xr, xb -> 0) + §2.2.μ (mean-pinned)
-#   Stationarity    : max |eig(Phi)| = 0.9525
-#   R² by equation  : cape=0.80, spr=0.67, y_1=0.62, xr=0.07, xb=0.25
+#   Stationarity    : max |eig(Phi)| = 0.9296
+#   R2 by equation  : cape=0.80, spr=0.37, y_1=0.65, xr=0.10, xb=0.13
 # =============================================================================
 
 _FULL_COLS  = ["cape", "spr", "y_1", "xr", "xb"]
@@ -530,38 +532,39 @@ _RET_IDX    = [3, 4]
 
 _Z_BAR = np.array([
     -2.727442332889471910e+00,   # cape  = -log(Shiller CAPE)
-    +2.341884578426967067e-02,   # spr   = +2.34pp  real spread
-    +1.263250569328265918e-02,   # y_1   = +1.26%   real short yield
+    +7.180901395220774461e-03,   # spr   = +0.72pp  real spread
+    +2.022602699339295929e-02,   # y_1   = +2.02%   real short yield
     +5.184427359929520002e-02,   # xr    = +5.18%   excess stock return
-    +2.143529218902298986e-02,   # xb    = +2.14%   excess real bond return
+    +6.143380025557598940e-03,   # xb    = +0.61%   excess real bond return
 ])
 
 # Phi[i, j] = coefficient on lagged z_j in equation for z_i. Restricted: xr, xb columns = 0.
 _PHI = np.array([
-    [+8.832144696639269155e-01, -2.775343935654446259e-01, +1.595080358125571668e-02, +0.000000000000000000e+00, +0.000000000000000000e+00],  # cape
-    [+7.334869933878162239e-04, +9.099185412730056433e-01, +1.763557433593782864e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # spr
-    [-5.067987491988315898e-04, +3.745633199622572240e-02, +7.993772820498267206e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # y_1
-    [+9.556619861421875028e-02, -6.266992437178200426e-01, -1.155295325295173203e+00, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xr
-    [+3.712368145963413301e-04, +1.436352743475807214e+00, +1.898838846619773368e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xb
+    [+8.759362478655253748e-01, -5.163931341757732607e-01, +4.441976985185568799e-02, +0.000000000000000000e+00, +0.000000000000000000e+00],  # cape
+    [-2.818301196100140519e-03, +6.616657057278459986e-01, +5.591716885498079076e-02, +0.000000000000000000e+00, +0.000000000000000000e+00],  # spr
+    [+4.122109969344095112e-03, +2.476827528735099371e-01, +8.798696810275914437e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # y_1
+    [+1.081430908280127667e-01, +7.102820514848678934e-01, -1.028677026482095247e+00, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xr
+    [-1.018710825647135658e-02, +1.504733123895914071e+00, +4.058602057859728163e-01, +0.000000000000000000e+00, +0.000000000000000000e+00],  # xb
 ])
 
 _CONST = (np.eye(5) - _PHI) @ _Z_BAR
 
 _OMEGA = np.array([
-    [+3.743240230977754046e-02, +1.061954486414440563e-03, -6.472767250849701618e-04, -3.455844145214870961e-02, -4.494915301210509161e-03],  # cape
-    [+1.061954486414440563e-03, +3.624013083062108446e-04, -3.463957515682325548e-04, -8.782016414966449785e-04, -1.995354939761590017e-04],  # spr
-    [-6.472767250849701618e-04, -3.463957515682325548e-04, +3.805285847057932633e-04, +5.319354214209602843e-04, -3.278827790411425113e-04],  # y_1
-    [-3.455844145214870961e-02, -8.782016414966449785e-04, +5.319354214209602843e-04, +3.495782907063437611e-02, +3.775511638115449861e-03],  # xr
-    [-4.494915301210509161e-03, -1.995354939761590017e-04, -3.278827790411425113e-04, +3.775511638115449861e-03, +5.905398985233042790e-03],  # xb
+    [+3.740610670869618654e-02, +4.994846251472590632e-04, -3.048967629412476432e-04, -3.426422321715918984e-02, -1.024576436349333534e-03],  # cape
+    [+4.994846251472590632e-04, +2.169655764353713395e-04, -2.279620378420310330e-04, -1.735279347423760116e-04, +1.085369725852409600e-04],  # spr
+    [-3.048967629412476432e-04, -2.279620378420310330e-04, +3.120208525031241214e-04, +2.267369326126219341e-05, -6.172400383356130239e-04],  # y_1
+    [-3.426422321715918984e-02, -1.735279347423760116e-04, +2.267369326126219341e-05, +3.412626603147003029e-02, +8.061635851310839252e-04],  # xr
+    [-1.024576436349333534e-03, +1.085369725852409600e-04, -6.172400383356130239e-04, +8.061635851310839252e-04, +3.620976983901966120e-03],  # xb
 ])
 
 
 def build_real_full_var_config_hardcoded():
     """Fallback for the full headline system when var_dataset.csv is unavailable.
 
-    Real-yield setup, state = (cape, spr, y_1), returns = (xr, xb).
+    AR(1)-matched 10-year RLONG real-yield setup, state = (cape, spr, y_1),
+    returns = (xr, xb).
     Estimated from data/var_dataset.csv (1920-2011, T=92).
-      max |eig(Phi)| = 0.9525, R²(xb) = 0.247.
+      max |eig(Phi)| = 0.9296, R2(xb) = 0.129.
     """
     print("Using HARDCODED VAR parameters (FULL real-yield system, 5-var, 1920-2011 T=92).")
     return {

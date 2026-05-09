@@ -1,11 +1,14 @@
 # Lifecycle Portfolio Choice Model
 
-Annual-frequency life-cycle portfolio model with three assets (T-bills, stocks,
-20-year nominal AAA bonds), VAR(1) return dynamics, mixture-normal labour
-income, earnings-dependent mortality, and a Catherine (2025) bequest motive.
+Annual-frequency life-cycle portfolio model with three assets (real bills,
+stocks, and a 10-year real bond exposure constructed from Shiller RLONG), VAR(1)
+return dynamics, mixture-normal labour income, earnings-dependent mortality,
+and a Catherine (2025) bequest motive.
 The agent lives from age 22 to 99, retires at 67, and chooses
 `(c_t, α_s, α_b)` each year. Calibration follows Catherine (2025) on income
-and bequests; the VAR is estimated from 1963–2025 annual data.
+and bequests; the financial VAR baseline is estimated on 1920-2011 annual data.
+Real yields use AR(1)-matched inflation expectations with January timing aligned
+to December `t-1` CPI information.
 
 This repo is the code companion to a master's thesis in economics.
 
@@ -19,8 +22,8 @@ from lifecycle.policy_io import save_policy_bundle, load_policy_bundle
 from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
 from lifecycle.predictability_ablation import prepare_predictability_system
 
-# 1. Estimate the VAR (or pick an ablation: "I", "II", "III", "IV")
-system = prepare_predictability_system("IV", csv_path="data/var_dataset.csv",
+# 1. Estimate the VAR (or pick an ablation: "1", "2", "full")
+system = prepare_predictability_system("full", csv_path="data/var_dataset.csv",
                                         disc_config_template=CANONICAL_DISC)
 
 # 2. Build the model and precompute grids/quadrature/lookup tables
@@ -137,7 +140,7 @@ End-to-end runbook: [docs/agents/AWS_WORKFLOW.md](docs/agents/AWS_WORKFLOW.md).
 ├── numerics.py                shared PCHIP + bin-prob helpers
 ├── plots.py                   pre/post-solve figures
 ├── policy_io.py               bundle save/load
-├── predictability_ablation.py systems I-IV
+├── predictability_ablation.py systems 1, 2, full
 │
 ├── configs/                   canonical config + sweep cells
 │   ├── _canonical.py          single source of truth

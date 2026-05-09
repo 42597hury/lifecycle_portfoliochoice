@@ -7,7 +7,7 @@
 ## 0. Executive Summary
 
 This document specifies the complete design of a lifecycle portfolio choice model with
-three assets (stocks, nominal bonds, bills) and VAR(1) return dynamics. The model separates
+three assets (stocks, real bonds, real bills) and VAR(1) return dynamics. The model separates
 the VAR state vector into **state variables** (discretized on the DP grid) and **returns**
 (integrated out using their conditional distribution given the state transition).
 
@@ -72,7 +72,7 @@ b(W, y_1, spr) = b_bar * (max(W,0) / A(y_1, spr) + delta)^(1-gamma) / (1-gamma)
 where:
   C_bar      = max(W,0) / A(y_1, spr) + delta     shifted flow-equivalent consumption
   A(y_1,spr) = sum_{k=1}^{b_bar} (1 + y(k))^{-k}  annuity factor
-  y(k)       = y_1 + spr * min(k-1, 19) / 19      interpolated yield
+  y(k)       = y_1 + spr * (k-1) / (b_bar-1)      interpolated yield
   b_bar      = 10                                  bequest horizon in years
   delta      = DELTA_BEQUEST                       luxury shift (lifecycle/model.py)
 ```
@@ -86,11 +86,10 @@ estate; the shift only changes the agent's preferences, not the realised
 estate at death.
 
 The annuity factor A prices a 10-year consumption stream using a linearly
-interpolated term structure between the 1-year yield y_1 and the 20-year AAA
-yield y_20 = y_1 + spr. For k=1, y(1) = y_1; for k=20, y(20) = y_20; for
-k > 20, y(k) = y_20 (capped, no extrapolation). With b_bar=10, only yields
-up to k=10 matter. Uses discrete compounding (1+y)^{-k} to match the codebase
-convention.
+interpolated term structure between the 1-year yield y_1 and the bequest-horizon
+yield y_bar = y_1 + spr. Under the active baseline, b_bar=10 and spr is the
+Shiller RLONG 10-year real spread. Uses discrete compounding (1+y)^{-k} to
+match the codebase convention.
 
 **Calibration:** `gamma = 5`, `beta = 0.96`, `b_bar = 10`, `delta = DELTA_BEQUEST`.
 
@@ -146,17 +145,18 @@ chi_vec, diagnostics)`.
 
 | Asset | Return | Risk | Role |
 |-------|--------|------|------|
-| Bills | `R_bill = exp(rtb)` | Uncertain (inflation risk) | Safe-ish asset, numeraire |
-| Stocks | `R_stock = R_bill * exp(xr)` | Risky (excess return uncertain) | Equity exposure |
-| Nominal bonds | `R_bond = R_bill * exp(xb)` | Risky (excess return uncertain) | Duration exposure |
+| Real bills | `R_bill = exp(y_1)` | Riskless conditional on state | Numeraire / safe asset |
+| Stocks | `R_stock = exp(y_1 + xr)` | Risky excess return | Equity exposure |
+| Real bonds | `R_bond = exp(y_1 + xb)` | Risky excess return | Duration exposure |
 
-**All three returns are uncertain.** The bill rate `rtb = log(1+y_1) - pi` is
-uncertain because realized inflation is unknown at decision time. Excess returns
-`xr` and `xb` are nominal-minus-nominal (CCV convention): they subtract the log
-nominal bill return `log(1+y_1)`, so inflation appears in `rtb` only.
+The current real-yields baseline has no separate `rtb` return variable. The
+one-year real bill yield `y_1,t` is a state variable and is the known real bill
+return from `t` to `t+1`. Stock and bond risks enter through the two excess
+return variables `xr` and `xb`.
 
-**Recovery identities:** `R_bill = exp(rtb)`, `R_stock = exp(rtb + xr)`,
-`R_bond = exp(rtb + xb)`. All three use the SAME quadrature node (joint draw).
+**Recovery identities:** `R_bill = exp(y_1)`, `R_stock = exp(y_1 + xr)`,
+`R_bond = exp(y_1 + xb)`. The return quadrature integrates over the joint
+two-dimensional excess-return shock `(xr, xb)`.
 
 The agent chooses portfolio weights `(alpha_stock, alpha_bond)` with the remainder
 `alpha_bill = 1 - alpha_stock - alpha_bond` invested in bills.
@@ -173,18 +173,19 @@ alpha_stock + alpha_bond <= 1     (alpha_bill >= 0, no borrowing)
 ```
 Start of period t:
   - Agent observes state (W_t, s_t, z_t)
-  - s_t = (y_1_t, spr_t, cy_t) -- observable financial states (known at end of year t)
+  - s_t = (cape_t, spr_t, y_1_t) -- observable financial states
   - Agent chooses consumption c_t and portfolio (alpha_stock, alpha_bond)
   - Savings: a_t = W_t - c_t
 
 Between t and t+1:
   - State innovation v^s_{t+1} drawn; next state s_{t+1} = Phi_0_state + Phi_11 @ s_t + v^s
-  - Returns realized: rtb_{t+1}, xr_{t+1}, xb_{t+1}
-    conditional on (s_t, v^s): (rtb,xr,xb) ~ N(mu_r, Sigma_r_cond)
+  - Returns realized: xr_{t+1}, xb_{t+1}
+    conditional on (s_t, v^s): (xr,xb) ~ N(mu_r, Sigma_r_cond)
     where mu_r = Phi_0_ret + Phi_21 @ s_t + M @ v^s
+    and log_R_bill_{t+1} = y_1,t
   - Income realized: Y_{t+1} depends on age (see below)
   - Portfolio gross real return:
-      R_port = alpha_s * exp(rtb+xr) + alpha_b * exp(rtb+xb) + alpha_bill * exp(rtb)
+      R_port = alpha_s * exp(y_1+xr) + alpha_b * exp(y_1+xb) + alpha_bill * exp(y_1)
 
 Start of period t+1:
   - Cash-on-hand: W_{t+1} = a_t * R_port + Y_{t+1}
@@ -326,18 +327,17 @@ pension payment at 68).
 
 ### 2.1 Full VAR(1) Specification
 
-The financial state vector has 6 variables at **annual frequency**:
+The financial VAR has 5 variables at **annual frequency**:
 
 ```
-z_t = [y_1_t, spr_t, cy_t, rtb_t, xr_t, xb_t]
+z_t = [cape_t, spr_t, y_1_t, xr_t, xb_t]
 
 Variable ordering:
-  Index 0: y_1    -- 1-year nominal Treasury yield (annual decimal)
-  Index 1: spr    -- yield spread: AAA 20yr - y_1 (annual decimal)
-  Index 2: cy     -- log earnings yield: -log(CAPE)
-  Index 3: rtb    -- real bill return: log(1+y_1) - pi (annual log)
-  Index 4: xr     -- excess nominal stock return (annual log)
-  Index 5: xb     -- excess nominal bond return (annual log)
+  Index 0: cape   -- log earnings yield, -log(Shiller CAPE)
+  Index 1: spr    -- real 10-year spread, y_10_real - y_1
+  Index 2: y_1    -- one-year real log bill yield/return
+  Index 3: xr     -- stock excess log return
+  Index 4: xb     -- 10-year real bond excess log return
 ```
 
 Dynamics:
@@ -345,14 +345,14 @@ Dynamics:
 z_{t+1} = c + Phi @ z_t + eps_{t+1}
 
 where:
-  c = (I - Phi) @ z_bar     intercept (6,)
-  Phi                        transition matrix (6,6)
-  eps_{t+1} ~ N(0, Omega)   innovation covariance (6,6)
-  z_bar                      unconditional means (6,)
+  c = (I - Phi) @ z_bar     intercept (5,)
+  Phi                        transition matrix (5,5)
+  eps_{t+1} ~ N(0, Omega)   innovation covariance (5,5)
+  z_bar                      unconditional means (5,)
 ```
 
 **Estimation:** The VAR is estimated using the CCV (2003) constrained estimator
-directly at **annual frequency** (T=63 observations, 1963--2025) from
+directly at **annual frequency** (T=92 observations, 1920--2011) from
 `data/var_dataset.csv`. The restriction is that only lagged state variables enter
 each equation -- lagged return columns of Phi are zero by construction.
 
@@ -366,33 +366,35 @@ each equation -- lagged return columns of Phi are zero by construction.
 This guarantees `(I - Phi)^{-1} @ const = z_bar = sample_mean` **exactly**,
 eliminating grid-centering drift.
 
-**Data construction:** Stock returns use Shiller's nominal P and D columns
-directly (CPI-free). Inflation enters only via FRED CPIAUCSL in the rtb
-definition. Bond returns use the CCV loglinear approximation for a 20-year
-AAA par bond. See `data/build_var_dataset.py` and `contextfiles/RETURNS.md`.
+**Data construction:** Real yields use static full-sample AR(1) inflation
+expectations fit on Shiller December-over-December CPI inflation. January `t`
+states use December `t-1` information. The one-year bill subtracts the AR(1)
+one-year forecast and Shiller RLONG subtracts the same AR(1)'s average 10-year
+forecast. Bond returns use the Campbell-Lo-MacKinlay constant-duration
+approximation on the constructed 10-year real yield. See
+`data/build_var_dataset_ar1_10y.py` and `docs/RETURNS.md`.
 
 Note: ages 22-99 gives 78 annual periods.
 
 ### 2.2 Partition into State Variables and Returns
 
-We partition the 6-variable system into:
+We partition the 5-variable system into:
 
 ```
-State variables: s_t = (y_1_t, spr_t, cy_t)     indices [0, 1, 2]
-Returns:         r_t = (rtb_t, xr_t, xb_t)      indices [3, 4, 5]
+State variables: s_t = (cape_t, spr_t, y_1_t)   indices [0, 1, 2]
+Returns:         r_t = (xr_t, xb_t)             indices [3, 4]
 ```
 
 **Key design choices:**
-- **No riskless asset.** `rtb` is a return variable (uncertain because of
-  inflation risk), not a state variable. The nominal bill yield `y_1` is known
-  at decision time, but the real return is uncertain.
-- **All excess returns are nominal minus nominal** (CCV convention): `xr` and `xb`
-  subtract `log(1+y_1)`. Inflation appears in `rtb` only.
-- **`spr = y_20 - y_1`** rather than `y_20` directly: more orthogonal to `y_1`,
-  better-conditioned estimation, more efficient Rouwenhorst grid.
-- **`cy = -log(CAPE)`** rather than `dp`: cyclically-adjusted earnings yield is a
-  stronger long-horizon equity predictor.
-- **20-year Moody's AAA par bond** with CCV loglinear approximation.
+- **Real bill anchor.** `y_1` is the real one-year log yield and equals the
+  deterministic bill return from `t` to `t+1`.
+- **Excess-return block only.** The return block contains `xr` and `xb`; there is
+  no separate `rtb` return dimension.
+- **`spr = y_10_real - y_1`** rather than `y_10_real` directly: more orthogonal
+  to the level, better-conditioned estimation, and a more efficient grid.
+- **`cape = -log(CAPE)`** is the equity valuation predictor.
+- **10-year real bond exposure** is constructed from Shiller RLONG after
+  AR(1)-matched inflation-expectation subtraction.
 
 **Key restriction:** Lagged returns do not predict anything (imposed by estimation):
 
@@ -400,9 +402,9 @@ Returns:         r_t = (rtb_t, xr_t, xb_t)      indices [3, 4, 5]
 Full Phi partitioned by (state, return) blocks:
 
         | Phi_11  Phi_12 |     Phi_11: (3,3) state -> state
-Phi =   | Phi_21  Phi_22 |     Phi_21: (3,3) state -> returns
-                                Phi_12: (3,3) returns -> state   [= 0 by restriction]
-                                Phi_22: (3,3) returns -> returns  [= 0 by restriction]
+Phi =   | Phi_21  Phi_22 |     Phi_21: (2,3) state -> returns
+                                Phi_12: (3,2) returns -> state   [= 0 by restriction]
+                                Phi_22: (2,2) returns -> returns  [= 0 by restriction]
 ```
 
 With this restriction:
@@ -416,15 +418,15 @@ Return equations:  r_{t+1} = Phi_0_ret   + Phi_21 @ s_t + v^r_{t+1}
 
 ```
          | Sigma_ss  Sigma_sr |     Sigma_ss: (3,3)  state-state
-Omega =  | Sigma_rs  Sigma_rr |     Sigma_rr: (3,3)  return-return
-                                    Sigma_rs: (3,3)  return-state cross
+Omega =  | Sigma_rs  Sigma_rr |     Sigma_rr: (2,2)  return-return
+                                    Sigma_rs: (2,3)  return-state cross
 ```
 
 Extracted as:
 ```python
 Sigma_ss = Omega[np.ix_(state_idx, state_idx)]   # (3,3)
-Sigma_rr = Omega[np.ix_(ret_idx,   ret_idx)]     # (3,3)
-Sigma_rs = Omega[np.ix_(ret_idx,   state_idx)]   # (3,3)
+Sigma_rr = Omega[np.ix_(ret_idx,   ret_idx)]     # (2,2)
+Sigma_rs = Omega[np.ix_(ret_idx,   state_idx)]   # (2,3)
 ```
 
 ### 2.4 Conditional Return Distribution
@@ -435,8 +437,8 @@ The return innovation decomposes as:
 v^r = M @ v^s + eps,     eps ~ N(0, Sigma_r_cond) independent of v^s
 
 where:
-  M = Sigma_rs @ inv(Sigma_ss)                    (3,3) conditioning matrix
-  Sigma_r_cond = Sigma_rr - M @ Sigma_sr          (3,3) residual covariance
+  M = Sigma_rs @ inv(Sigma_ss)                    (2,3) conditioning matrix
+  Sigma_r_cond = Sigma_rr - M @ Sigma_sr          (2,2) residual covariance
 ```
 
 **Conditioning on the state innovation v^s** (used by the solver):
@@ -466,13 +468,12 @@ E_{v^s}[mu_r] = Phi_0_ret + Phi_21 @ s_i     for each i
 
 **Key values (annual parameters):**
 ```
-M[xb, y_1]  = -8.72    (100bp rise in y_1 -> -8.7pp xb; bond duration)
-M[xb, spr]  = -8.51    (100bp rise in spr -> -8.5pp xb)
-M[xr, cy]   = -0.93    (mechanical CAPE/price relationship)
-M[rtb, y_1] = -0.94    (Fisher effect)
+M[xb, y_1]  = -6.96    (100bp state innovation in y_1 -> -7.0pp xb)
+M[xb, spr]  = -6.83    (100bp state innovation in spr -> -6.8pp xb)
+M[xr, cape] = -0.94    (state innovation covariance with stock returns)
 
 Variance explained by state conditioning:
-  rtb: 39.1%   xr: 96.2%   xb: 91.2%
+  xr: 93.2%   xb: 98.0%
 ```
 
 ### 2.5 Residual Return Variance and 3D Return Quadrature
@@ -480,21 +481,21 @@ Variance explained by state conditioning:
 The conditional distribution of returns given a state innovation is:
 
 ```
-(rtb, xr, xb) | (s_t, v^s) ~ N(mu_r, Sigma_r_cond)
+(xr, xb) | (s_t, v^s) ~ N(mu_r, Sigma_r_cond)
 
-Sigma_r_cond = Sigma_rr - M @ Sigma_rs'     (3,3) constant matrix
+Sigma_r_cond = Sigma_rr - M @ Sigma_rs'     (2,2) constant matrix
 ```
 
 The solver integrates over return residuals using tensor-product Gauss-Hermite
-quadrature on `Sigma_r_cond` (3x3). With K nodes per dimension, this produces
-K^3 joint residual-return nodes. At K=2, that's 8 nodes.
+quadrature on `Sigma_r_cond` (2x2). With K nodes per dimension, this produces
+K^2 joint residual-return nodes. At K=2, that's 4 nodes.
 
 Gross real returns at each return quadrature node k_r:
 
 ```
-R_bill[k_r]  = exp(mu_rtb  + ret_nodes[k_r, 0])
-R_stock[k_r] = R_bill * exp(mu_xr + ret_nodes[k_r, 1])
-R_bond[k_r]  = R_bill * exp(mu_xb + ret_nodes[k_r, 2])
+R_bill       = exp(y_1)
+R_stock[k_r] = R_bill * exp(mu_xr + ret_nodes[k_r, 0])
+R_bond[k_r]  = R_bill * exp(mu_xb + ret_nodes[k_r, 1])
 ```
 
 **Critical invariant:** all three returns for a single period use the SAME
@@ -502,7 +503,7 @@ return quadrature node k_r -- they are components of one joint draw.
 
 **Residual return std (after conditioning):**
 ```
-rtb: 1.54%   xr: 3.10%   xb: 2.26%
+xr: 4.82%   xb: 0.85%
 ```
 
 `Sigma_r_cond` is stored on the model object and used directly by the
@@ -517,11 +518,11 @@ def partition_var(Phi_full, Omega_full, z_bar, state_idx, ret_idx,
     Partition a full VAR(1) into state sub-VAR and return equations.
 
     Parameters:
-        Phi_full:        (6, 6) full transition matrix (annual)
-        Omega_full:      (6, 6) full innovation covariance (annual)
-        z_bar:           (6,) unconditional means (sample means, CCV convention)
-        state_idx:       [2, 1, 0]  (cy, spr, y_1) default since 2026-04-30; was [0,1,2]
-        ret_idx:         [3, 4, 5]  (rtb, xr, xb)
+        Phi_full:        (5, 5) full transition matrix (annual)
+        Omega_full:      (5, 5) full innovation covariance (annual)
+        z_bar:           (5,) unconditional means (sample means, CCV convention)
+        state_idx:       [0, 1, 2]  (cape, spr, y_1)
+        ret_idx:         [3, 4]     (xr, xb)
         variable_names:  optional list of names for diagnostics
 
     Returns: dict with keys:
@@ -575,25 +576,25 @@ class LifecyclePortfolioModel(NamedTuple):
 
     # === PARTITIONED VAR STRUCTURE (annual parameters) ===
     n_state: int              # Number of state variables (3)
-    n_ret: int                # Number of return variables (3)
-    state_names: tuple        # default ('cy', 'spr', 'y_1') since 2026-04-30; legacy ('y_1', 'spr', 'cy')
-    ret_names: tuple          # ('rtb', 'xr', 'xb')
+    n_ret: int                # Number of return variables (2)
+    state_names: tuple        # ('cape', 'spr', 'y_1')
+    ret_names: tuple          # ('xr', 'xb')
 
     z_bar_state: np.ndarray   # (3,) state unconditional means
-    z_bar_ret: np.ndarray     # (3,) return unconditional means
+    z_bar_ret: np.ndarray     # (2,) return unconditional means
 
     Phi_0_state: np.ndarray   # (3,) state intercepts
     Phi_11: np.ndarray        # (3, 3) state persistence
-    Phi_0_ret: np.ndarray     # (3,) return intercepts
-    Phi_21: np.ndarray        # (3, 3) state -> return loading
+    Phi_0_ret: np.ndarray     # (2,) return intercepts
+    Phi_21: np.ndarray        # (2, 3) state -> return loading
 
     Sigma_ss: np.ndarray      # (3, 3) state innovation covariance
-    Sigma_rr: np.ndarray      # (3, 3) return innovation covariance
-    Sigma_rs: np.ndarray      # (3, 3) return-state cross-covariance
-    M: np.ndarray             # (3, 3) conditioning matrix = Sigma_rs @ Sigma_ss^{-1}
-    Sigma_r_cond: np.ndarray  # (3, 3) residual return covariance
+    Sigma_rr: np.ndarray      # (2, 2) return innovation covariance
+    Sigma_rs: np.ndarray      # (2, 3) return-state cross-covariance
+    M: np.ndarray             # (2, 3) conditioning matrix = Sigma_rs @ Sigma_ss^{-1}
+    Sigma_r_cond: np.ndarray  # (2, 2) residual return covariance
 
-    y_1_index_in_state: int       # Index of y_1 within state vector (= 0)
+    y_1_index_in_state: int       # Index of y_1 within state vector (= 2)
     spr_index_in_state: int       # Index of spr within state vector (= 1)
 
     constrained: bool             # True = no short-selling/leverage
@@ -613,9 +614,9 @@ disc_config = DiscretizationConfig(
                                    # (lyapunov-axis mode). Per-axis added 2026-04-30.
     n_z=11,
     n_eps_nodes=5,
-    n_ret_nodes_1d=2,   # int K -> uniform K^n_ret nodes (legacy); also accepts a
-                        # tuple (K_rtb, K_xr, K_xb) for per-dimension refinement,
-                        # giving prod(K_i) joint nodes (e.g. (3,9,3) -> 81)
+    n_ret_nodes_1d=2,   # int K -> uniform K^n_ret nodes; also accepts a
+                        # tuple (K_xr, K_xb) for per-dimension refinement,
+                        # giving prod(K_i) joint nodes
     n_state_quad_nodes=3,  # GH order per state dimension for state innovation quadrature
 )
 
@@ -640,7 +641,7 @@ def annuity_factor(y_1, spr, b_bar):
     Annuity factor with linearly interpolated term structure.
 
     A = sum_{k=1}^{b_bar} (1 + y(k))^{-k}
-    where y(k) = y_1 + spr * min(k-1, 19) / 19
+    where y(k) = y_1 + spr * (k-1) / (b_bar-1)
 
     Uses discrete compounding (1+y)^{-k}.
     """
@@ -670,14 +671,13 @@ compute_pension_after_tax(z_grid, avg_det)  # SSA PIA on AIME = min(exp(z)*avg_d
 The workflow from raw data to model:
 
 ```python
-# Step 1: Estimate annual VAR from CSV (CCV constrained, restricted)
-var_config, fit_details, data = build_nominal_system1_var_config(
+# Step 1: Estimate annual VAR from CSV (restricted, mean-pinned)
+var_config, fit_details, data = build_real_full_var_config(
     csv_path="data/var_dataset.csv"
 )
-# columns = ['y_1', 'spr', 'cy', 'rtb', 'xr', 'xb']    # CSV column order, fixed
-# state_indices = [2, 1, 0]    (cy, spr, y_1) default since 2026-04-30
-#                              (legacy [0, 1, 2] = (y_1, spr, cy) was the pre-reorder default)
-# return_indices = [3, 4, 5]   (rtb, xr, xb)
+# columns = ['cape', 'spr', 'y_1', 'xr', 'xb']
+# state_indices = [0, 1, 2]    (cape, spr, y_1)
+# return_indices = [3, 4]      (xr, xb)
 
 # Step 2: Build model
 base_config = build_base_config_legacy_defaults()
@@ -703,27 +703,27 @@ C_mat, S_mat, B_mat, diagnostics = run_lifecycle_solver(
 ```
 
 **Fallback hardcoded parameters** live in `var.py` as module-level arrays
-(`_Z_BAR`, `_PHI`, `_OMEGA`). These are annual estimates from the 1963-2025 dataset.
+(`_Z_BAR`, `_PHI`, `_OMEGA`). These are annual estimates from the 1920-2011
+AR(1)-matched 10-year RLONG baseline.
 
 **Key annual parameter values:**
 
 ```
-z_bar = [+0.04849, +0.01992, -2.99287, +0.00913, +0.05547, +0.01427]
-        [ y_1,      spr,      cy,       rtb,      xr,       xb      ]
+z_bar = [-2.72744, +0.00718, +0.02023, +0.05184, +0.00614]
+        [ cape,     spr,      y_1,      xr,       xb      ]
 
-Annual means: y_1=4.85%  spr=1.99%  cy=-2.99  rtb=0.91%  xr=5.55%  xb=1.43%
+Annual means: cape=-2.73  spr=0.72%  y_1=2.02%  xr=5.18%  xb=0.61%
 
 Annual Phi_11 diagonal (state persistence):
-  y_1: 0.670   spr: 0.872   cy: 0.919
+  cape: 0.876   spr: 0.662   y_1: 0.880
 
-Phi_21 (return equations, 3x3):
-         L.y_1       L.spr       L.cy
-  rtb   +1.079      +0.857      -0.034
-  xr    -1.801      -0.523      +0.107
-  xb    +1.462      +4.492      -0.055
+Phi_21 (return equations, 2x3):
+         L.cape      L.spr       L.y_1
+  xr    +0.108      +0.710      -1.029
+  xb    -0.010      +1.505      +0.406
 
-M[xb, y_1] = -8.72   (bond duration; 100bp rise in y_1 -> -8.7pp xb)
-M[xb, spr] = -8.51   (100bp rise in spr -> -8.5pp xb)
+M[xb, y_1] = -6.96  (100bp state innovation in y_1 -> -7.0pp xb)
+M[xb, spr] = -6.83  (100bp state innovation in spr -> -6.8pp xb)
 ```
 
 ### 3.5 discretization.py -- Discretization Functions
@@ -785,11 +785,11 @@ build_state_grid(N_vec, mu_intercept, Phi, Sigma_innov, n_stds=3.0, mode="choles
     # for per-axis half-widths.
     # - cholesky mode: n_stds[d] is the half-width of Cholesky direction d
     #   in standardized u-coords. Cholesky directions mix physical state
-    #   variables; under the default ordering (cy, spr, y_1) -- 2026-04-30:
-    #     L[:, 0] = (+0.530,  0,       0)        # PURE cy (100%)
-    #     L[:, 1] = (-0.054, +0.0158,  0)        # mostly spr (~99%) + tiny cy leakage
-    #     L[:, 2] = (+0.378, -0.0187, +0.0165)   # y_1 with residual cy/spr coupling
-    #   So n_stds[0] is the clean cy knob, n_stds[1] is the clean spr knob;
+    #   variables; under the default ordering (cape, spr, y_1):
+    #     L[:, 0] is mostly the valuation/cape direction
+    #     L[:, 1] is mostly the spread direction
+    #     L[:, 2] is mostly the y_1 direction, with residual covariance coupling
+    #   So n_stds[0] is the valuation knob, n_stds[1] is the spread knob;
     #   n_stds[2] only controls the leftover y_1 variance.  Variable order
     #   matters: the variable listed first gets the "pure" Cholesky column.
     # - lyapunov-axis mode: n_stds[d] is the half-width of physical axis d in
@@ -847,8 +847,7 @@ s_grid:           (n_s,)          savings grid for EGM endogenous gridpoints
 ages:             (n_age,)        integer ages from start_age to terminal_age
 
 # === FINANCIAL STATE DISCRETIZATION ===
-state_grid:       (N_state, 3)    joint state grid; row i = state vector in MODEL ordering
-                                  (default [cy, spr, y_1] since 2026-04-30; legacy [y_1, spr, cy])
+state_grid:       (N_state, 3)    joint state grid; row i = (cape, spr, y_1)
 Pi_state:         (N_state, N_state)  transition matrix (retained, not used by solver)
 state_grids:      list[3]         marginal 1-D grids for each state variable
 state_indices:    (N_state, 3)    multi-index into marginal grids
@@ -860,24 +859,22 @@ v_weights:        (K_s^3,)        tensor-product weights, sum to 1
 n_state_quad:     int             total state quadrature nodes
 
 # === CONDITIONAL RETURNS ===
-mu_r:             (N_state, N_state, 3)
-                  mu_r[i, j, 0] = E[rtb | s_t=i, s_{t+1}=j]
-                  mu_r[i, j, 1] = E[xr  | s_t=i, s_{t+1}=j]
-                  mu_r[i, j, 2] = E[xb  | s_t=i, s_{t+1}=j]
-const_r:          (3,)            Phi_0_ret
-A_r:              (3, 3)          Phi_21
-M_v_nodes:        (K_s^3, 3)     v_nodes @ M.T (precomputed)
-ret_nodes:        (n_ret_quad, 3) residual log-return shocks around mu_r
+mu_r:             (N_state, N_state, 2)
+                  mu_r[i, j, 0] = E[xr | s_t=i, s_{t+1}=j]
+                  mu_r[i, j, 1] = E[xb | s_t=i, s_{t+1}=j]
+const_r:          (2,)            Phi_0_ret
+A_r:              (2, 3)          Phi_21
+M_v_nodes:        (K_s^3, 2)      v_nodes @ M.T (precomputed)
+ret_nodes:        (n_ret_quad, 2) residual log-return shocks around mu_r
 ret_weights:      (n_ret_quad,)   joint return quadrature weights; sum=1
-exp_ret_bill:     (n_ret_quad,)   exp(ret_nodes[:, 0])
-exp_ret_stock:    (n_ret_quad,)   exp(ret_nodes[:, 1])
-exp_ret_bond:     (n_ret_quad,)   exp(ret_nodes[:, 2])
+exp_ret_stock:    (n_ret_quad,)   exp(ret_nodes[:, 0])
+exp_ret_bond:     (n_ret_quad,)   exp(ret_nodes[:, 1])
                   n_ret_quad = prod(n_ret_nodes_1d).
-                  Scalar K_r -> K_r^3.  Tuple (K_rtb, K_xr, K_xb) -> K_rtb*K_xr*K_xb.
+                  Scalar K_r -> K_r^2. Tuple (K_xr, K_xb) -> K_xr*K_xb.
 
 # === BEQUEST ===
 annuity_factors:  (N_state,)      A(y_1, spr, b_bar) for each financial state
-                  Computed from state_grid[:, 0] (y_1) and state_grid[:, 1] (spr)
+                  Computed from the y_1 and spr state columns
 
 # === INCOME PROCESS ===
 z_grid:           (n_z,)          persistent income states (log, mean-zero)
@@ -911,12 +908,12 @@ def _precompute_conditional_returns(self):
       where  const = Phi_0_ret - M @ Phi_0_state
              A     = Phi_21    - M @ Phi_11
     """
-    const  = model.Phi_0_ret - model.M @ model.Phi_0_state  # (3,)
-    A      = model.Phi_21    - model.M @ model.Phi_11        # (3,3)
-    term_i = state_grid @ A.T        # (N_state, 3)
-    term_j = state_grid @ model.M.T  # (N_state, 3)
+    const  = model.Phi_0_ret - model.M @ model.Phi_0_state  # (2,)
+    A      = model.Phi_21    - model.M @ model.Phi_11        # (2,3)
+    term_i = state_grid @ A.T        # (N_state, 2)
+    term_j = state_grid @ model.M.T  # (N_state, 2)
     mu_r = const[None,None,:] + term_i[:,None,:] + term_j[None,:,:]
-    # Shape: (N_state, N_state, 3)
+    # Shape: (N_state, N_state, 2)
 ```
 
 Memory: N_state=125 -> 0.37 MB. N_state=343 -> 2.8 MB.
@@ -924,8 +921,7 @@ Memory: N_state=125 -> 0.37 MB. N_state=343 -> 2.8 MB.
 #### 3.6.3 Bequest Annuity Factor Precomputation
 
 ```python
-# y_1 is the 1st state variable (index 0 in state_names = ('y_1','spr','cy'))
-# spr is the 2nd state variable (index 1)
+# y_1 and spr are looked up by name/index from the VAR config.
 _y_1 = state_grid[:, model.y_1_index_in_state]
 _spr = state_grid[:, model.spr_index_in_state]
 self.annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
@@ -1003,7 +999,7 @@ V(W, i_s, i_z, t) = max_{c, alpha_s, alpha_b}  u(c)
 
 where:
   a       = W - c                                    savings
-  R_bill  = exp(mu_rtb + eps_rtb)                    real bill return (uncertain)
+  R_bill  = exp(y_1)                                 real bill return
   R_s     = R_bill * exp(mu_xr + eps_xr)             real stock return
   R_b     = R_bill * exp(mu_xb + eps_xb)             real bond return
   R_port  = alpha_s*R_s + alpha_b*R_b + alpha_bill*R_bill
@@ -1062,9 +1058,9 @@ mu_r   = const_r + A_r @ s_i + M_v_nodes[k_v]  (conditional return mean)
 For each return residual node k_r:
 
 ```
-R_bill = exp(mu_rtb + ret_nodes[k_r, 0])
-R_s    = R_bill * exp(mu_xr + ret_nodes[k_r, 1])
-R_b    = R_bill * exp(mu_xb + ret_nodes[k_r, 2])
+R_bill = exp(y_1)
+R_s    = R_bill * exp(mu_xr + ret_nodes[k_r, 0])
+R_b    = R_bill * exp(mu_xb + ret_nodes[k_r, 1])
 R_port = alpha_s * R_s + alpha_b * R_b + alpha_bill * R_bill
 ```
 
@@ -1337,19 +1333,18 @@ share ranges, EGM monotonicity, and policy sanity checks.
 
 | Array | Shape | Description |
 |-------|-------|-------------|
-| `state_grid` | (N_state, 3) | Joint state grid; row i = state vector in MODEL ordering (default [cy, spr, y_1] since 2026-04-30) |
+| `state_grid` | (N_state, 3) | Joint state grid; row i = `(cape, spr, y_1)` |
 | `v_nodes` | (K_s^3, 3) | State innovation quadrature nodes |
 | `v_weights` | (K_s^3,) | State quadrature weights |
-| `mu_r` | (N_state, N_state, 3) | Conditional return means (rtb, xr, xb) |
-| `M_v_nodes` | (K_s^3, 3) | v_nodes @ M.T (precomputed) |
-| `const_r` | (3,) | Phi_0_ret |
-| `A_r` | (3, 3) | Phi_21 |
-| `ret_nodes` | (n_ret_quad, 3) | Return residual quadrature nodes |
+| `mu_r` | (N_state, N_state, 2) | Conditional return means `(xr, xb)` |
+| `M_v_nodes` | (K_s^3, 2) | v_nodes @ M.T (precomputed) |
+| `const_r` | (2,) | Phi_0_ret |
+| `A_r` | (2, 3) | Phi_21 |
+| `ret_nodes` | (n_ret_quad, 2) | Return residual quadrature nodes |
 | `ret_weights` | (n_ret_quad,) | Return quadrature weights; sum=1 |
-| `exp_ret_bill` | (n_ret_quad,) | exp(ret_nodes[:, 0]) |
-| `exp_ret_stock` | (n_ret_quad,) | exp(ret_nodes[:, 1]) |
-| `exp_ret_bond` | (n_ret_quad,) | exp(ret_nodes[:, 2]) |
-| `n_ret_quad` | scalar int | `prod(n_ret_nodes_1d)`; e.g. scalar K -> K^3, tuple (3,9,3) -> 81 |
+| `exp_ret_stock` | (n_ret_quad,) | exp(ret_nodes[:, 0]) |
+| `exp_ret_bond` | (n_ret_quad,) | exp(ret_nodes[:, 1]) |
+| `n_ret_quad` | scalar int | `prod(n_ret_nodes_1d)`; e.g. scalar K -> K^2 |
 | `annuity_factors` | (N_state,) | A(y_1, spr, b_bar) annuity factor per state |
 | `z_grid` | (n_z,) | Persistent income states |
 | `eps_nodes/weights` | (n_eps,) | Judd-mixture for transitory shocks (n_eps = n_eps_nodes total) |
@@ -1365,18 +1360,17 @@ share ranges, EGM monotonicity, and policy sanity checks.
 |-------|-------|-------------|
 | `C_mat` | (n_age, n_z, N_state, n_w) | Optimal consumption |
 | `S_mat` | (n_age, n_z, N_state, n_w) | Optimal stock share |
-| `B_mat` | (n_age, n_z, N_state, n_w) | Optimal nominal bond share |
+| `B_mat` | (n_age, n_z, N_state, n_w) | Optimal real bond share |
 
 ### 5.3 VAR Variables
 
 | Variable | Description | Units | Sample mean |
 |----------|-------------|-------|-------------|
-| `y_1` | 1-year nominal Treasury yield | annual decimal | 4.85% |
-| `spr` | Yield spread (AAA 20yr - y_1) | annual decimal | 1.99% |
-| `cy` | Log earnings yield: -log(CAPE) | log level | -2.99 |
-| `rtb` | Real bill return | annual log | +0.91% |
-| `xr` | Excess nominal stock return | annual log | +5.55% |
-| `xb` | Excess nominal bond return | annual log | +1.43% |
+| `cape` | Log earnings yield: -log(CAPE) | log level | -2.73 |
+| `spr` | Real 10y spread: y_10_real - y_1 | log-yield spread | +0.72% |
+| `y_1` | 1-year real log bill yield/return | annual log return | +2.02% |
+| `xr` | Stock excess log return | annual log excess | +5.18% |
+| `xb` | 10-year real bond excess log return | annual log excess | +0.61% |
 
 ---
 
@@ -1385,16 +1379,16 @@ share ranges, EGM monotonicity, and policy sanity checks.
 ### 6.1 Inner Loop Cost
 
 Per Newton evaluation, the inner loop iterates over:
-- `n_state_quad` state innovation nodes (e.g. K_s=3 → 27) × `n_ret_quad` return
-  residual nodes (`prod(n_ret_nodes_1d)`; e.g. uniform K_r=2 → 8, asymmetric
-  (3,9,3) → 81)
-- Working age: additionally × n_eta persistent innovation nodes × n_eps transitory nodes
+- `n_state_quad` state innovation nodes (e.g. K_s=3 -> 27) times `n_ret_quad`
+  return residual nodes (`prod(n_ret_nodes_1d)`; e.g. uniform K_r=2 -> 4)
+- Working age: additionally times n_eta persistent innovation nodes times
+  n_eps transitory nodes
 
 | Config | Retirement | Working |
 |--------|-----------|---------|
-| K_s=3, K_r=2, n_eta=3, n_eps=5 (uniform) | 216 iters | 3,240 iters |
-| K_s=3, K_r=3, n_eta=3, n_eps=5 (production) | 729 iters | 10,935 iters |
-| K_s=3, K_r=(3,9,3), n_eta=5, n_eps=5 | 2,187 iters | 54,675 iters |
+| K_s=3, K_r=2, n_eta=3, n_eps=5 (uniform) | 108 iters | 1,620 iters |
+| K_s=3, K_r=3, n_eta=3, n_eps=5 | 243 iters | 3,645 iters |
+| K_s=3, K_r=(3,9), n_eta=5, n_eps=5 | 729 iters | 18,225 iters |
 
 (Income joint count under Judd-mixture is `n_eta_nodes × n_eps_nodes`
 total — half the marginal and a quarter the joint of the previous

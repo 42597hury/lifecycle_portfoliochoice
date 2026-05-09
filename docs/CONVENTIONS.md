@@ -43,8 +43,7 @@ START OF PERIOD t
 │
 │  Agent OBSERVES state:
 │    x_t  = cash-on-hand (wealth + income already received)
-│    s_t  = (cy, spr, y_1) financial state under default ordering (2026-04-30+);
-│                          legacy bundles use (y_1, spr, cy)
+│    s_t  = (cape, spr, y_1) financial state under the current baseline
 │    z_t  = persistent income state (log, mean-zero)
 │
 │  Agent CHOOSES:
@@ -61,8 +60,8 @@ START OF PERIOD t
 │
 │  2. Returns realized (conditional on s_t and v^s_{t+1}):
 │       μ_r = Φ_0_ret + Φ_21 @ s_t + M @ v^s_{t+1}
-│       (rtb, xr, xb) ~ N(μ_r, Σ_r_cond)
-│       R_bill  = exp(rtb)
+│       (xr, xb) ~ N(μ_r, Σ_r_cond)
+│       R_bill  = exp(y_1)
 │       R_stock = R_bill · exp(xr)
 │       R_bond  = R_bill · exp(xb)
 │       R_port  = α_s · R_stock + α_b · R_bond + α_bill · R_bill
@@ -176,20 +175,18 @@ sanity-checking.
 
 | Variable | Domain | Units | Example value |
 |----------|--------|-------|---------------|
-| `y_1` | State | Annual decimal yield | 0.0485 (= 4.85%) |
-| `spr` | State | Annual decimal spread | 0.0199 (= 1.99%) |
-| `cy` | State | Log level (= −log(CAPE)) | −2.99 |
-| `rtb` | Return | Annual log return | 0.0091 (= 0.91%) |
-| `xr` | Return | Annual log excess return | 0.0555 (= 5.55%) |
-| `xb` | Return | Annual log excess return | 0.0143 (= 1.43%) |
+| `cape` | State | Log level (= -log(CAPE)) | -2.73 |
+| `spr` | State | Real log-yield spread | 0.0072 (= 0.72%) |
+| `y_1` | State | Annual real log return | 0.0202 (= 2.02%) |
+| `xr` | Return | Annual log excess return | 0.0518 (= 5.18%) |
+| `xb` | Return | Annual log excess return | 0.0061 (= 0.61%) |
 
 **Key distinctions:**
-- `y_1` is a DECIMAL YIELD (not log, not percent). `y_1 = 0.05` means 5%.
-- `spr = y_20 − y_1` is also a decimal yield spread.
-- `cy = −log(CAPE)` is a log ratio, NOT a percentage.
-- `rtb`, `xr`, `xb` are LOG RETURNS (not levels, not percent).
-- Excess returns are **nominal minus nominal**: `xr = log(R_stock) − log(1+y_1)`.
-  Inflation enters ONLY through `rtb = log(1+y_1) − π`.
+- `y_1` is the real one-year log yield and the deterministic bill log return.
+- `spr = y_10_real - y_1` is a real log-yield spread.
+- `cape = -log(CAPE)` is a log ratio, NOT a percentage.
+- `xr` and `xb` are LOG EXCESS RETURNS (not levels, not percent).
+- There is no separate `rtb` return variable in the active real-yields model.
 
 **Compounding convention:** The annuity factor uses DISCRETE compounding
 `(1+y)^{−k}`, matching the codebase. Do NOT use `exp(−y·k)`.
@@ -226,17 +223,20 @@ R_port = α_s · R_stock + α_b · R_bond + α_bill · R_bill
 
 ## 5. Data Timing and Sampling
 
-Raw data is resampled to **end-of-December** values before constructing annual
-variables. The VAR is estimated directly at **annual frequency** (no quarterly
-intermediate step). Sample: 1963–2025 (T=63 observations).
+Raw financial data is sampled at **annual January** frequency. Inflation
+expectations use Shiller December-over-December CPI inflation, with January
+year `t` using December `t-1` information. The VAR is estimated directly at
+**annual frequency** (no quarterly intermediate step). Sample: 1920-2011
+(T=92 observations).
 
 **Variable timing within a calendar year t:**
-- State variables `(y_1_t, spr_t, cy_t)` are **levels** observed at end of year t
-- Return variables `(rtb_{t+1}, xr_{t+1}, xb_{t+1})` are **flows** realized
-  between end of year t and end of year t+1:
-  - `rtb_{t+1} = log(1 + y_1_t) − π_{t+1}`  (known nominal yield, uncertain inflation)
-  - `xr_{t+1} = log(P_{t+1} + D_{t+1}) − log(P_t) − log(1 + y_1_t)`
-  - `xb_{t+1}` = CCV loglinear approximation for 20-year AAA par bond
+- State variables `(cape_t, spr_t, y_1_t)` are observed in January year t.
+- Return variables `(xr_{t+1}, xb_{t+1})` are flows realized from January t to
+  January t+1:
+  - `log_R_bill,t+1 = y_1_t`
+  - `xr_{t+1} = log((P_{t+1}+D_{t+1})/P_t) - y_1_nom,t`
+  - `xb_{t+1}` is the CLM constant-duration return on the constructed 10-year
+    real yield minus `y_1_t`
 
 **CCV constrained estimation:** Pins `z̄ = sample_mean` exactly, ensuring
 the Rouwenhorst grid is centered on the unconditional mean. Only lagged STATE
@@ -262,11 +262,11 @@ There is no sub-annual time step anywhere in the model.
 
 | Convention | Details |
 |-----------|---------|
-| Bond duration | `M[xb, y_1] = −8.72`: a +100bp rise in y_1 → −8.7pp bond excess return |
-| Fisher effect | `M[rtb, y_1] = −0.94`: higher nominal yield → lower real bill return (inflation) |
-| CAPE link | `M[xr, cy] = −0.93`: higher cy (= lower CAPE) → lower stock excess return |
-| Spread sign | `spr = y_20 − y_1 > 0` normally (upward-sloping yield curve) |
-| cy sign | `cy = −log(CAPE) < 0` always (CAPE > 1 historically). More negative = more expensive market. |
+| Bond duration | `M[xb, y_1] = -6.96`: a +100bp y_1 state innovation maps to about -7.0pp xb |
+| Spread duration | `M[xb, spr] = -6.83`: a +100bp spread innovation maps to about -6.8pp xb |
+| CAPE link | `M[xr, cape] = -0.94`: stock returns covary strongly with valuation-state innovations |
+| Spread sign | `spr = y_10_real - y_1` is usually positive |
+| cape sign | `cape = -log(CAPE) < 0` always (CAPE > 1 historically). More negative = more expensive market. |
 | Utility | `u(c) = c^{1−γ}/(1−γ)` is NEGATIVE for γ > 1 (= 3). This is standard and correct. |
 | Bequest weight | `b̄ = 10` enters multiplicatively. Higher b̄ = stronger bequest motive. |
 

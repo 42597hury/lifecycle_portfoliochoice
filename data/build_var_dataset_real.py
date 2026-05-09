@@ -24,7 +24,24 @@ Five inflation-expectation methods available via --method:
                    NOT maturity-matched: same single E[pi] applied to all yields.
 
   eichengreen      Eichengreen (2015). 7-year equal-weighted backward average,
-                   INCLUDING current year t. NOT maturity-matched.
+                   INCLUDING current year t. Bill leg uses this; bond leg
+                   uses static AR(1) cumulative-n (maturity-matched
+                   compromise — Eichengreen himself does NOT maturity-match).
+
+  eichengreen_literal
+                   Eichengreen (2015) verbatim. The 7-year equal-weighted
+                   backward average (current year + past six) is applied to
+                   BOTH the 1-year bill and the 20-year bond, exactly as
+                   stated in his AEA P&P paper:
+                     "the yield on ten-year constant-maturity government
+                     bonds with and without adjustment for realized
+                     consumer price inflation, where the adjustment
+                     involves subtracting a seven-year moving average of
+                     CPI inflation (the current year and past six)."
+                   sigma(xb) blows up to ~30pp because CLM duration
+                   amplifies the forecast residual into bond returns.
+                   Use only for comparison; not recommended for portfolio
+                   modelling.
 
 Both methods set the inflation-risk premium lambda_n = 0 in the headline.
 A constant lambda_n offset can be applied via --lambda-bp.
@@ -219,7 +236,7 @@ def build(method: str, lambda_bp: float = 0.0, verbose: bool = True):
         df["E_pi_n"] = pi_bar_n     # cumulative expected inflation [t, t+n] (for long bond)
         df["forecast_method"] = "fisher_ar1"
 
-    elif method in ("homer_sylla", "hamilton", "eichengreen"):
+    elif method in ("homer_sylla", "hamilton", "eichengreen", "eichengreen_literal"):
         # Import works whether script is run as module or directly
         try:
             from data.inflation_expectations import (
@@ -254,10 +271,17 @@ def build(method: str, lambda_bp: float = 0.0, verbose: bool = True):
             E_pi_1 = _f_hh(pi_full, window=30)
             E_pi_n = _f_cum_roll(pi_full, n=N_BOND, window=30)   # method-consistent
             bond_method_note = "rolling AR(1) cumulative (method-consistent)"
-        else:   # eichengreen
+        elif method == "eichengreen":
             E_pi_1 = _f_eich(pi_full)
             E_pi_n = _f_cum(pi_full, n=N_BOND)
             bond_method_note = "static AR(1) cumulative (backward avg has no forward extension)"
+        else:   # eichengreen_literal
+            # Eichengreen (2015) verbatim: same 7-year MA applied to BOTH
+            # the bill and the 20-year bond. He does not maturity-match.
+            eich_series = _f_eich(pi_full)
+            E_pi_1 = eich_series
+            E_pi_n = eich_series
+            bond_method_note = "same Eichengreen 7-yr MA as bill (verbatim, no maturity match)"
 
         df["E_pi_1"] = E_pi_1.reindex(df.index)
         df["E_pi_n"] = E_pi_n.reindex(df.index)
@@ -349,7 +373,8 @@ def main():
     p = argparse.ArgumentParser(description="Build var_dataset_real.csv")
     p.add_argument("--method",
                    choices=["fisher_ar1", "fisher_var",
-                            "homer_sylla", "hamilton", "eichengreen"],
+                            "homer_sylla", "hamilton",
+                            "eichengreen", "eichengreen_literal"],
                    default="fisher_ar1")
     p.add_argument("--lambda-bp", type=float, default=0.0,
                    help="constant inflation risk premium in basis points (decimal log)")

@@ -321,7 +321,7 @@ def _solve_working_at_cell_pi_z(
         use_fori,
     )
     c_w, a_s_w, a_b_w = _base._lift_to_wealth_grid(
-        x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid
+        x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
     )
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]

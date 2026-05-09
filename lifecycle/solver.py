@@ -1260,8 +1260,41 @@ def _egm_scan_cell(
             n_iters_egm, n_backtrack_egm, exit_code_egm)
 
 
-def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid):
-    """Linear interp from EGM endogenous grid to fixed wealth grid."""
+def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption):
+    """Linear interp from EGM endogenous grid to fixed wealth grid, with a
+    constrained-corner clamp below the smallest "real" interior W_implied.
+
+    The EGM endogenous grid contains three classes of points:
+      1. ``x_egm[0] = egm_anchor`` (sentinel ~1e-10),
+      2. tiny-savings fallback points where ``s ≤ tiny_savings`` and
+         ``c = min_consumption`` is forced (alphas pinned to cold init),
+      3. real interior FOC solves where ``c = c_opt`` from a converged Newton.
+
+    Plain ``jnp.interp`` between (1)/(2) and (3) blends the artificial anchor
+    with the smallest unconstrained interior solution, producing
+    ``c < W`` and ``alpha != 0`` at low wealth — a meaningless linear
+    artefact, not the true borrowing-constrained corner.
+
+    This function detects the smallest "real" interior endogenous wealth
+    ``W_min_real = x_sorted[argmax(c_sorted > 2*min_consumption)]`` and
+    clamps wealth-grid points below it to the standard borrowing-
+    constrained corner:
+
+        c = W,    alpha_s = 0,    alpha_b = 0.
+
+    Reference: Carroll (2006) "The method of endogenous gridpoints" Econ
+    Letters; Druedahl & Jorgensen (2017) "A general endogenous grid
+    method..." J Econ Dyn Control. The recorded portfolio is a convention
+    since savings = W - c = 0 means nothing is invested; the FOC residual
+    at constrained cells does NOT have an Euler-equation interpretation
+    (downstream diagnostics like ``verify/ee_residuals.py`` should treat
+    constrained-cell residuals separately from interior cells).
+
+    JIT properties: ``argmax`` over a fixed-shape 1D array is a single
+    reduction; ``jnp.where`` is vectorised over wealth_grid. No new shapes
+    are introduced, so the change does not invalidate the JIT cache for
+    callers that pass the same shapes.
+    """
     order = jnp.argsort(x_egm)
     x_sorted = x_egm[order]
     c_sorted = c_egm[order]
@@ -1270,6 +1303,30 @@ def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid):
     c_w = jnp.interp(wealth_grid, x_sorted, c_sorted)
     a_s_w = jnp.interp(wealth_grid, x_sorted, a_s_sorted)
     a_b_w = jnp.interp(wealth_grid, x_sorted, a_b_sorted)
+
+    # Constrained-corner clamp.
+    # Both the anchor and tiny_savings fallback set c = min_consumption,
+    # so a strict ``> 2*min_consumption`` threshold cleanly separates real
+    # interior solves (c_opt is on the order of consumption units, far
+    # above the 1e-10 floor) from padded sentinels.
+    #
+    # Edge cases:
+    #   - All entries are non-real (extreme): ``argmax`` returns 0,
+    #     ``W_min_real = x_sorted[0] = anchor ~ 1e-10``; with any
+    #     reasonable wealth_min > 1e-10 the clamp is a no-op (acceptable
+    #     degenerate behaviour).
+    #   - All wealth-grid points lie at or above W_min_real: clamp is a
+    #     no-op; bit-identical to the pre-clamp interp output.
+    #   - ``min_consumption = 0``: threshold becomes ``c > 0`` — still
+    #     correct as long as real c_opt is strictly positive (the FOC
+    #     branch enforces ``c_opt = max(beta_e^(-1/gamma), 0)``).
+    is_real = c_sorted > 2.0 * min_consumption
+    first_real_idx = jnp.argmax(is_real)
+    W_min_real = x_sorted[first_real_idx]
+    constrained = wealth_grid < W_min_real
+    c_w = jnp.where(constrained, wealth_grid, c_w)
+    a_s_w = jnp.where(constrained, jnp.zeros_like(a_s_w), a_s_w)
+    a_b_w = jnp.where(constrained, jnp.zeros_like(a_b_w), a_b_w)
     return c_w, a_s_w, a_b_w
 
 
@@ -1310,7 +1367,9 @@ def _solve_terminal_at_i_s(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(
+        x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
+    )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
     # calls.
@@ -1373,7 +1432,9 @@ def _solve_retirement_at_cell(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(
+        x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
+    )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
     # calls.
@@ -1446,7 +1507,9 @@ def _solve_working_at_cell(
         tiny_savings, euler_inv_floor, min_consumption, egm_anchor,
         use_fori,
     )
-    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid)
+    c_w, a_s_w, a_b_w = _lift_to_wealth_grid(
+        x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
+    )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
     # calls.

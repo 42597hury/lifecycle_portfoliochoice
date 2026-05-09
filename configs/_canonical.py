@@ -67,11 +67,13 @@ BASE_CONFIG = {
 #   Axis 1 = spr   (term spread)
 #   Axis 2 = y_1   (real bill yield; bond-return refinement target, K-bump)
 #
-# state_grid_sizes / state_n_stds: PLACEHOLDERS per the real-yields pivot
-#   handoff. Validate before production by re-running the System I / Full
-#   sensitivity sweeps on the new VAR (analog of the old grid+nstd sweeps,
-#   but on (cape, spr, y_1) instead of (dp, spr, rtb, y_1)). The current
-#   defaults follow the handoff suggestion of (5,5,5) and (2.0, 2.25, 2.25).
+# state_grid_sizes / state_n_stds: per
+#   docs/scans/DISCRETIZED_VAR_FIDELITY_AUDIT_2026-05-09.md, the prior
+#   (2.0, 2.25, 2.25) bracket excluded ~9.16% of the VAR's stationary mass
+#   onto the truncation corners (per-axis tails 2.4-4.6%). Bumping to
+#   (3.0, 3.0, 3.0) drops joint excluded mass to ~0.81% (per-axis 0.27%)
+#   at zero compute cost (same number of cells, just wider bracketing).
+#   Validated as the canonical setting post-pivot.
 #
 # n_state_quad_nodes=(3, 3, 5): K-bump preserved on the y_1 axis (last),
 #   the long-standing bond-return refinement convention (M[xb, y_1] is the
@@ -110,7 +112,7 @@ CANONICAL_DISC = DiscretizationConfig(
     n_savings=180,
     state_grid_sizes=(5, 5, 5),
     state_grid_mode="cholesky",
-    state_n_stds=(2.0, 2.25, 2.25),
+    state_n_stds=(3.0, 3.0, 3.0),
     n_z=11,
     n_stds=3.0,
     n_eps_nodes=4,

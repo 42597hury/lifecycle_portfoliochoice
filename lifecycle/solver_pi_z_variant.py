@@ -285,6 +285,7 @@ def _solve_working_at_cell_pi_z(
     min_consumption,
     egm_anchor,
     use_fori,
+    use_line_search,
     gather_dtype,
 ):
     A_is = A_per_state[i_s]
@@ -351,6 +352,7 @@ def _solve_working_at_cell_pi_z(
         min_consumption,
         egm_anchor,
         use_fori,
+        use_line_search,
     )
     c_w, a_s_w, a_b_w = _base._lift_to_wealth_grid(
         x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
@@ -408,6 +410,7 @@ def _build_per_age_working_kernel_pi_z_pmap(
         sc.min_consumption,
         sc.egm_anchor,
         bool(sc.use_fori_newton),
+        bool(sc.use_line_search),
         gather_dtype,
     )
 
@@ -576,6 +579,7 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
         sc.min_consumption,
         sc.egm_anchor,
         bool(sc.use_fori_newton),
+        bool(sc.use_line_search),
         gather_dtype,
     )
 

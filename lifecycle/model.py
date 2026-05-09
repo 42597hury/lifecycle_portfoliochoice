@@ -155,8 +155,14 @@ class SolverConfig(NamedTuple):
     grad_step_size: float = 0.05               # gradient descent step when Jacobian singular
 
     # --- Backtracking line search ---
-    use_line_search: bool = True               # always True post-rewrite
-    max_backtrack_iter: int = 10               # max halvings
+    # When True (canonical default): each Newton iter wraps the step in a
+    # backtracking inner loop with up to ``max_backtrack_iter`` halvings.
+    # When False: the (capped) full Newton step is applied unconditionally,
+    # ``n_backtrack_total`` stays at zero, and ``max_backtrack_iter`` is
+    # ignored. Both branches are gated at JIT-trace time inside
+    # ``_newton_fori`` / ``_newton_while`` (Python bool, no runtime branch).
+    use_line_search: bool = True
+    max_backtrack_iter: int = 10               # max halvings (line-search ON only)
     line_search_max_step: float = 2.0          # raw Newton step cap
 
     # --- Thresholds ---
@@ -187,6 +193,18 @@ class SolverConfig(NamedTuple):
     # (gathered at mid-wealth). When False, every cell uses the canonical
     # scalar (init_alpha_s, init_alpha_b). Terminal age is always cold.
     use_backward_age_warm_start: bool = True
+
+    # --- Failed-cell warm-start fixup ---
+    # When True: after each age solves, replace EC_NEWTON_FAIL cells' stored α
+    # with the nearest-converged-below neighbor's α at the same (z, state)
+    # slice. This breaks the cascade where failed cells propagate their
+    # cold-init scalar to the next age's Variant B warm-start. Cells in the
+    # genuine failure region (high-W tail) still fail Newton, but record
+    # in-distribution policies for downstream interpolation. When False:
+    # failed cells keep their cold-init α, and Variant B propagates that
+    # scalar forward (cascades).
+    # See docs/handoff/HANDOFF_FAILED_CELL_NEIGHBOR_SEED_2026-05-09.md.
+    failure_seed_from_neighbor: bool = True
 
     # --- Cell-axis chunking (single-/multi-device memory bounding) ---
     # Splits the per-age vmap over (n_z * N_state) cells into this many

@@ -27,6 +27,7 @@ from lifecycle.solver import (
     EC_INTERIOR,
     ModelParams,
     _build_per_age_retirement_kernel,
+    _fixup_failed_cells,
     _pc_to_jnp,
     _precompute_per_is_tensors,
 )
@@ -653,6 +654,16 @@ def run_infinite_horizon_solver(
             share_supnorm_history.append(share_err)
 
             C_old, S_old, B_old = C_next, S_next, B_next
+            # Replace failed cells' stored α with a converged neighbor's α
+            # before threading the per-savings buffer to the next iter's
+            # Variant B init. Cells that fail at iter k get neighbor-seeded
+            # for iter k+1 — over many iterations the neighbor's α diffuses
+            # through the failure region, breaking the cold-init cascade.
+            if solver_config.failure_seed_from_neighbor:
+                as_grid_new_jnp, ab_grid_new_jnp = _fixup_failed_cells(
+                    as_grid_new_jnp, ab_grid_new_jnp, ec_jnp,
+                    solver_config.init_alpha_s, solver_config.init_alpha_b,
+                )
             # Roll the per-savings α-grid forward as the next iter's warm-start.
             # Reassigning the bindings releases the previous arrays.
             init_a_s_arr = as_grid_new_jnp

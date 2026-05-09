@@ -1211,17 +1211,16 @@ def _egm_scan_cell(
 ):
     """Solve the EGM portfolio FOC at every savings point IN PARALLEL.
 
-    Each savings point's Newton starts from the canonical cold init
-    ``(init_a_s, init_a_b)`` instead of warming from the previous savings
-    point's converged solution. This breaks the sequential dependency that
-    forced a ``lax.scan`` loop, letting JAX/XLA vmap the entire savings
-    sweep into a single batched kernel call.
+    ``init_a_s`` / ``init_a_b`` are per-savings-point arrays of shape
+    ``(n_savings,)`` matching ``s_grid``. The Newton seed at savings index
+    ``i`` is ``(init_a_s[i], init_a_b[i])``. Callers source these from the
+    previous (older) age's converged α at the **same** ``(z, state, s)``
+    cell, so the seed is the closest possible warm-start under backward
+    induction — strictly better than the (older) mid-wealth scalar that
+    was broadcast across the savings sweep.
 
-    The trade-off: cold-start Newton typically needs more iterations to
-    converge (the warm-start was buying ~5-15 iters/cell). The robustness
-    cost is that cells where the optimum is far from the cold init may
-    fail to converge if ``max_iter`` is too tight — bump max_iter and
-    track ``newton_failures`` post-hoc.
+    Cold init is expressed by passing ``jnp.full((n_savings,), scalar)``;
+    the savings vmap stays fully parallel either way.
 
     Returns ``(x_egm, c_egm, a_s_egm, a_b_egm, n_iters_egm, n_backtrack_egm,
     exit_code_egm)`` each shape ``(n_savings + 1,)``, with the first entry being
@@ -1229,14 +1228,14 @@ def _egm_scan_cell(
     exit_code padded with ``EC_INTERIOR`` since the anchor is not a real Newton
     call and downstream slices it off at ``[1:]``).
     """
-    def per_savings_point(s_val):
+    def per_savings_point(s_val, init_a_s_v, init_a_b_v):
         foc_fn = foc_factory(s_val)
         _, _, _, _, _, e0 = foc_fn(0.0, 0.0)
         scale = jnp.maximum(jnp.abs(e0), 1e-30)
 
         (a_s_opt, a_b_opt, V_dot, exit_code, _err,
          n_iter_used, n_bt_total) = newton_2d_with_line_search(
-            foc_fn, init_a_s, init_a_b, scale,
+            foc_fn, init_a_s_v, init_a_b_v, scale,
             tol, max_iter, max_backtrack_iter,
             line_search_max_step, singular_det,
             grad_step_size, grad_denom_eps,
@@ -1247,12 +1246,14 @@ def _egm_scan_cell(
 
         tiny = s_val <= tiny_savings
         c_out = jnp.where(tiny, min_consumption, c_opt)
-        a_s_out = jnp.where(tiny, init_a_s, a_s_opt)
-        a_b_out = jnp.where(tiny, init_a_b, a_b_opt)
+        a_s_out = jnp.where(tiny, init_a_s_v, a_s_opt)
+        a_b_out = jnp.where(tiny, init_a_b_v, a_b_opt)
         x_out = c_out + s_val
         return x_out, c_out, a_s_out, a_b_out, n_iter_used, n_bt_total, exit_code
 
-    x_arr, c_arr, a_s_arr, a_b_arr, ni_arr, nb_arr, ec_arr = vmap(per_savings_point)(s_grid)
+    x_arr, c_arr, a_s_arr, a_b_arr, ni_arr, nb_arr, ec_arr = vmap(per_savings_point)(
+        s_grid, init_a_s, init_a_b,
+    )
 
     x_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=x_arr.dtype), x_arr])
     c_egm = jnp.concatenate([jnp.array([egm_anchor], dtype=c_arr.dtype), c_arr])
@@ -1344,7 +1345,7 @@ def _lift_to_wealth_grid(x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consum
 def _solve_terminal_at_i_s(
     log_R_bill_i, log_x_s_i, log_x_b_i, weight_kv_kr,
     A_is, s_grid, wealth_grid,
-    init_a_s, init_a_b,
+    init_a_s, init_a_b,                            # both shape (n_savings,)
     gamma, beta, b_bar, delta,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     tol, max_iter, max_backtrack_iter,
@@ -1379,11 +1380,16 @@ def _solve_terminal_at_i_s(
     )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
-    # calls.
+    # calls. The α-grid outputs are the next age's per-savings-point warm-start
+    # source — same shape and slicing convention as the iter counters.
+    a_s_grid_per_s = a_s_egm[1:]
+    a_b_grid_per_s = a_b_egm[1:]
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
     exit_code_per_s = exit_code_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
+    return (c_w, a_s_w, a_b_w,
+            a_s_grid_per_s, a_b_grid_per_s,
+            n_iters_per_s, n_backtrack_per_s, exit_code_per_s)
 
 
 def _solve_retirement_at_cell(
@@ -1392,7 +1398,7 @@ def _solve_retirement_at_cell(
     j_corners_i, w_corners_i,               # (n_state_quad, n_corners) — pre-gathered for this i_s
     weight_kv_kr, A_per_state,
     s_grid, wealth_grid,
-    init_a_s, init_a_b,
+    init_a_s, init_a_b,                            # both shape (n_savings,)
     gamma, beta, b_bar, delta,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     tol, max_iter, max_backtrack_iter,
@@ -1444,11 +1450,16 @@ def _solve_retirement_at_cell(
     )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
-    # calls.
+    # calls. The α-grid outputs are the next age's per-savings-point warm-start
+    # source — same shape and slicing convention as the iter counters.
+    a_s_grid_per_s = a_s_egm[1:]
+    a_b_grid_per_s = a_b_egm[1:]
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
     exit_code_per_s = exit_code_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
+    return (c_w, a_s_w, a_b_w,
+            a_s_grid_per_s, a_b_grid_per_s,
+            n_iters_per_s, n_backtrack_per_s, exit_code_per_s)
 
 
 def _solve_working_at_cell(
@@ -1461,7 +1472,7 @@ def _solve_working_at_cell(
     j_corners_i, w_corners_i,               # (n_state_quad, n_corners) — pre-gathered for this i_s
     weight_kv_kr, A_per_state,
     s_grid, wealth_grid,
-    init_a_s, init_a_b,
+    init_a_s, init_a_b,                            # both shape (n_savings,)
     gamma, beta, b_bar, delta,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     tol, max_iter, max_backtrack_iter,
@@ -1519,11 +1530,16 @@ def _solve_working_at_cell(
     )
     # Drop the s=0 anchor (padded with 0 iters / 0 backtracks / EC_INTERIOR;
     # no Newton solve happens there) so diagnostics reflect only real Newton
-    # calls.
+    # calls. The α-grid outputs are the next age's per-savings-point warm-start
+    # source — same shape and slicing convention as the iter counters.
+    a_s_grid_per_s = a_s_egm[1:]
+    a_b_grid_per_s = a_b_egm[1:]
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
     exit_code_per_s = exit_code_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
+    return (c_w, a_s_w, a_b_w,
+            a_s_grid_per_s, a_b_grid_per_s,
+            n_iters_per_s, n_backtrack_per_s, exit_code_per_s)
 
 
 def _all_is_log_returns_numpy(pcj):
@@ -1716,9 +1732,15 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
     """Build a pmap'd terminal kernel that returns ``(N_state_padded, n_w)``
     arrays. Padding is invisible at the call site — caller slices to
     ``[:N_state]`` after gather.
+
+    Terminal stays on the canonical scalar cold init — there is no previous
+    (older) age to source per-savings warm-starts from. The scalar is broadcast
+    into a ``(n_savings,)`` array internally so ``_egm_scan_cell`` sees the
+    same shape contract as the non-terminal kernels.
     """
-    init_a_s = jnp.float64(sc.init_alpha_s)
-    init_a_b = jnp.float64(sc.init_alpha_b)
+    n_savings = int(pcj.s_grid.shape[0])
+    init_a_s_per_s = jnp.full((n_savings,), sc.init_alpha_s, dtype=jnp.float64)
+    init_a_b_per_s = jnp.full((n_savings,), sc.init_alpha_b, dtype=jnp.float64)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
@@ -1771,7 +1793,7 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
             return _solve_terminal_at_i_s(
                 log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
                 pcj.s_grid, pcj.wealth_grid,
-                init_a_s, init_a_b,
+                init_a_s_per_s, init_a_b_per_s,
                 mp.gamma, mp.beta, mp.b_bar, mp.delta,
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
@@ -1809,6 +1831,7 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
             return tuple(collapse_chunk(k) for k in range(len(chunk_results[0])))
 
         (c_pm, as_pm, ab_pm,
+         as_grid_pm, ab_grid_pm,
          ni_pm, nb_pm, ec_pm) = per_dev_solve(log_R_bill_pm, log_x_s_pm, log_x_b_pm, ann_pm)
 
         # Stay on device — caller threads jnp arrays through to the next kernel.
@@ -1818,6 +1841,7 @@ def _build_per_age_terminal_kernel_pmap(pcj, mp, sc, n_dev):
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(as_grid_pm), collapse(ab_grid_pm),
             collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
@@ -1982,9 +2006,13 @@ def _chunked_vmap_runner(jit_chunk_fn, z_idx_padded, is_idx_padded,
 def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
     """Single-device terminal kernel. Drops the pmap padding/reshape/collapse
     so XLA can fuse the per-i_s solve into one kernel. Output: ``(N_state, n_w)``.
+
+    Terminal stays on the canonical scalar cold init — see the pmap builder
+    for the per-savings broadcast rationale.
     """
-    init_a_s = jnp.float64(sc.init_alpha_s)
-    init_a_b = jnp.float64(sc.init_alpha_b)
+    n_savings = int(pcj.s_grid.shape[0])
+    init_a_s_per_s = jnp.full((n_savings,), sc.init_alpha_s, dtype=jnp.float64)
+    init_a_b_per_s = jnp.full((n_savings,), sc.init_alpha_b, dtype=jnp.float64)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
               sc.line_search_max_step, sc.singular_det, sc.grad_step_size,
               sc.grad_denom_eps, sc.tiny_savings, sc.euler_inv_floor,
@@ -2023,7 +2051,7 @@ def _build_per_age_terminal_kernel_vmap_only(pcj, mp, sc):
         return _solve_terminal_at_i_s(
             log_Rb, lxs, lxb, pcj.weight_kv_kr, A,
             pcj.s_grid, pcj.wealth_grid,
-            init_a_s, init_a_b,
+            init_a_s_per_s, init_a_b_per_s,
             mp.gamma, mp.beta, mp.b_bar, mp.delta,
             pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
             *static,
@@ -2083,12 +2111,16 @@ def _build_per_age_retirement_kernel(pcj, mp, sc, n_dev, n_z, N_state, per_is_te
 def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_is_tensors):
     """Build a pmap'd retirement kernel. Returns a callable
     ``call(c_next, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr)
-    -> (n_z, N_state, n_w)``.
+    -> tuple of (n_z, N_state, n_w / n_savings)`` arrays (see below).
 
-    ``init_a_s_arr``/``init_a_b_arr`` are (n_z, N_state, n_w) policy arrays
-    from the previous (older) age. The Newton init at cell (z_idx, i_s) is
-    gathered as ``[z_idx, i_s, w_ref_idx]`` (mid-wealth slice), giving each
-    cell a single warm-started scalar shared across the savings vmap.
+    ``init_a_s_arr``/``init_a_b_arr`` are ``(n_z, N_state, n_savings)`` arrays
+    of converged α at each savings grid point of the previous (older) age. The
+    Newton init at cell (z_idx, i_s) is the per-savings vector
+    ``init_a_s_arr[z_idx, i_s, :]`` — fed straight into the savings vmap so
+    every savings point gets the closest possible warm-start. The kernel also
+    returns the freshly-solved ``a_s_grid``/``a_b_grid`` per cell (shape
+    ``(n_z, N_state, n_savings)``) so the orchestrator can use them as the
+    next age's source.
     """
     gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
@@ -2101,9 +2133,6 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
     # Per-i_s precompute is supplied by the caller (single trace shared across
     # retirement / working / boundary builders).
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
-
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
 
     n_chunks = int(sc.cell_vmap_chunks)
     if n_chunks == 1:
@@ -2128,8 +2157,8 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
         init_a_s_arr, init_a_b_arr,
     ):
         def per_cell(z_idx, i_s):
-            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
             return _solve_retirement_at_cell(
                 z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
                 log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
@@ -2150,7 +2179,9 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = runner(
                 c_next_jnp, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
             )
@@ -2158,24 +2189,29 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
+         as_grid_pm, ab_grid_pm,
          ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
-        # (n_dev, per_dev, n_w) -> (pad_n, n_w) -> (n_cells, n_w) -> (n_z, N_state, n_w)
-        # Stay on device.
+        # (n_dev, per_dev, *) -> (pad_n, *) -> (n_cells, *) -> (n_z, N_state, *)
+        # Stay on device. Trailing axis is n_w for policy outputs and n_savings
+        # for the α-grid / iter-counter outputs.
         def collapse(a):
             flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
             return jnp.reshape(flat[:n_cells], (n_z, N_state) + a.shape[2:])
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(as_grid_pm), collapse(ab_grid_pm),
             collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
@@ -2202,9 +2238,6 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
-
     n_chunks = int(sc.cell_vmap_chunks)
     z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_chunked_index_arrays(
         n_z, N_state, n_chunks,
@@ -2212,8 +2245,8 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
     def per_cell(z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
                  init_a_s_arr, init_a_b_arr):
-        init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-        init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+        init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+        init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
         return _solve_retirement_at_cell(
             z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
             log_R_bill_all[i_s], log_x_s_all[i_s], log_x_b_all[i_s],
@@ -2251,7 +2284,9 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
         def call(c_next_jnp, pension_next_by_z, psi_per_z,
                   init_a_s_arr, init_a_b_arr):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = per_chunk(
                 c_next_jnp, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
                 z_full, is_full,
@@ -2260,6 +2295,8 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
@@ -2275,7 +2312,9 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z,
               init_a_s_arr, init_a_b_arr):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+        (c_flat, s_flat, b_flat,
+         as_grid_flat, ab_grid_flat,
+         ni_flat, nb_flat, ec_flat) = runner(
             c_next_jnp, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2283,6 +2322,8 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+            jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
             jnp.reshape(ec_flat, (n_z, N_state, -1)),
@@ -2307,9 +2348,12 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
     (work -> retirement, ``use_pension_next == True``) is a separate trace
     selected by the orchestrator.
 
-    Newton init at each (z_idx, i_s) cell is gathered from
-    ``init_a_s_arr[z_idx, i_s, w_ref_idx]`` (and similarly for a_b),
-    where ``init_*_arr`` is the previous (older) age's converged policy.
+    Newton init at each (z_idx, i_s) cell is the per-savings vector
+    ``init_a_s_arr[z_idx, i_s, :]`` (and similarly for a_b), where
+    ``init_*_arr`` is the previous (older) age's converged α-grid (shape
+    ``(n_z, N_state, n_savings)``). The kernel returns the freshly-solved
+    α-grid alongside the wealth-grid policies so the orchestrator can roll
+    it forward as the next age's init.
     """
     gather_dtype = _resolve_gather_dtype(sc)
     static = (sc.tol, sc.max_iter, sc.max_backtrack_iter,
@@ -2322,9 +2366,6 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
     # Per-i_s precompute is supplied by the caller (single trace shared across
     # retirement / working / boundary builders).
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
-
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
 
     n_chunks = int(sc.cell_vmap_chunks)
     if n_chunks == 1:
@@ -2369,8 +2410,8 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
                 # Working: gather the precomputed table at z_idx (shape (n_eta, n_eps)).
                 income_table = income_next_table_z[z_idx]
 
-            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
 
             return _solve_working_at_cell(
                 z_idx, i_s, c_next,
@@ -2400,7 +2441,9 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
         init_a_s_arr, init_a_b_arr,
     ):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = runner(
                 c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
             )
@@ -2408,23 +2451,28 @@ def _build_per_age_working_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, use_pen
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
         (c_pm, as_pm, ab_pm,
+         as_grid_pm, ab_grid_pm,
          ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
-        # Stay on device.
+        # Stay on device. Trailing axis is n_w for policy outputs and n_savings
+        # for α-grid / iter counters.
         def collapse(a):
             flat = jnp.reshape(a, (pad_n,) + a.shape[2:])
             return jnp.reshape(flat[:n_cells], (n_z, N_state) + a.shape[2:])
 
         return (
             collapse(c_pm), collapse(as_pm), collapse(ab_pm),
+            collapse(as_grid_pm), collapse(ab_grid_pm),
             collapse(ni_pm), collapse(nb_pm), collapse(ec_pm),
         )
 
@@ -2451,9 +2499,6 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
-
     n_chunks = int(sc.cell_vmap_chunks)
     z_idx_padded, is_idx_padded, n_cells, chunk_size = _build_chunked_index_arrays(
         n_z, N_state, n_chunks,
@@ -2476,8 +2521,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
         else:
             income_table = income_next_table_z[z_idx]
 
-        init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-        init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+        init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+        init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
 
         return _solve_working_at_cell(
             z_idx, i_s, c_next,
@@ -2520,7 +2565,9 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         ):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = per_chunk(
                 c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
                 init_a_s_arr, init_a_b_arr,
                 z_full, is_full,
@@ -2529,6 +2576,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
@@ -2545,7 +2594,9 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
         c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
         init_a_s_arr, init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+        (c_flat, s_flat, b_flat,
+         as_grid_flat, ab_grid_flat,
+         ni_flat, nb_flat, ec_flat) = runner(
             c_next_jnp, income_next_table, pension_next_by_z, psi_per_z,
             init_a_s_arr, init_a_b_arr,
         )
@@ -2553,6 +2604,8 @@ def _build_per_age_working_kernel_vmap_only(pcj, mp, sc, n_z, N_state, use_pensi
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+            jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
             jnp.reshape(ec_flat, (n_z, N_state, -1)),
@@ -2758,10 +2811,20 @@ def run_lifecycle_solver(
     i_s_med = int(np.ravel_multi_index(mid_per_axis, state_axis_sizes))
 
     # ---- Terminal age ----
+    # ``as_grid_prev``/``ab_grid_prev`` is the rolling buffer of the previous
+    # (older) age's converged α at each savings grid point — the per-savings
+    # warm-start source for the next age. Only the immediately-prior age is
+    # ever needed, so we keep one pair on device instead of an ``n_age`` list.
+    n_savings = pcj.s_grid.shape[0]
+    as_grid_prev = None
+    ab_grid_prev = None
+
     if not solved_age_mask[-1]:
         if verbose >= 1:
             print(f"\n  Terminal condition (age {terminal_age}) ... ", end="", flush=True)
-        c_T, s_T, b_T, ni_T, nb_T, ec_T = terminal_kernel()
+        (c_T, s_T, b_T,
+         as_grid_T, ab_grid_T,
+         ni_T, nb_T, ec_T) = terminal_kernel()
         # Broadcast across z (terminal policy is z-invariant — bequest only).
         # jnp.broadcast_to stays on device. On the pmap path (n_dev > 1) the
         # next kernel reads it via in_axes=None and materialises lazily; on
@@ -2771,6 +2834,14 @@ def run_lifecycle_solver(
         C_list[-1] = jnp.broadcast_to(c_T[None, :, :], (n_z, N_state, n_w))
         S_list[-1] = jnp.broadcast_to(s_T[None, :, :], (n_z, N_state, n_w))
         B_list[-1] = jnp.broadcast_to(b_T[None, :, :], (n_z, N_state, n_w))
+        # Seed the per-savings warm-start buffer from the terminal α-grid,
+        # broadcast across z (same z-invariance as the policy arrays).
+        as_grid_prev = jnp.broadcast_to(
+            as_grid_T[None, :, :], (n_z, N_state, n_savings),
+        )
+        ab_grid_prev = jnp.broadcast_to(
+            ab_grid_T[None, :, :], (n_z, N_state, n_savings),
+        )
         # Terminal iter counts are (N_state,) — z-invariant. Materialise to
         # NumPy now (~5KB) so the orchestrator's aggregator never holds a
         # device array for them. Exit codes are also (N_state, n_savings).
@@ -2807,9 +2878,12 @@ def run_lifecycle_solver(
     # Backward-age warm-start init arrays. When the toggle is off, every cell
     # at every age is seeded from the canonical scalar (init_alpha_s,
     # init_alpha_b); we express that through the same kernel signature by
-    # passing constant (n_z, N_state, n_w) arrays so the kernel trace is
-    # identical regardless of the toggle.
-    init_arr_shape = (n_z, N_state, n_w)
+    # passing constant (n_z, N_state, n_savings) arrays so the kernel trace is
+    # identical regardless of the toggle. The same constants are used as the
+    # fallback when ``as_grid_prev is None`` after a checkpoint resume — the
+    # transition age pays one cold solve, then Variant B kicks back in from
+    # the next age (which sees a freshly-computed ``as_grid_prev``).
+    init_arr_shape = (n_z, N_state, n_savings)
     cold_init_a_s_arr = jnp.full(init_arr_shape, sc.init_alpha_s, dtype=jnp.float64)
     cold_init_a_b_arr = jnp.full(init_arr_shape, sc.init_alpha_b, dtype=jnp.float64)
 
@@ -2826,19 +2900,23 @@ def run_lifecycle_solver(
             # c_next_jnp is the previous age's policy, already on device.
             c_next_jnp = C_list[t + 1]
 
-            # Backward-age warm-start: previous (older) age's converged policy
-            # at the same (z, state) cell, gathered at mid-wealth inside the
-            # kernel. Toggle off -> uniform cold init across all cells.
-            if sc.use_backward_age_warm_start:
-                init_a_s_arr = S_list[t + 1]
-                init_a_b_arr = B_list[t + 1]
+            # Per-savings backward-age warm-start: previous (older) age's
+            # converged α at the same (z, state, s) cell. Toggle off -> uniform
+            # cold init across all cells. ``as_grid_prev is None`` happens only
+            # at the first age after a checkpoint resume (α-grids aren't
+            # persisted) — fall back to cold for that single transition age.
+            if sc.use_backward_age_warm_start and as_grid_prev is not None:
+                init_a_s_arr = as_grid_prev
+                init_a_b_arr = ab_grid_prev
             else:
                 init_a_s_arr = cold_init_a_s_arr
                 init_a_b_arr = cold_init_a_b_arr
 
             if age >= retire_age:
                 pension_next = pension_table_jnp[t + 1, :]
-                c_t, s_t, b_t, ni_t, nb_t, ec_t = retirement_kernel(
+                (c_t, s_t, b_t,
+                 as_grid_t, ab_grid_t,
+                 ni_t, nb_t, ec_t) = retirement_kernel(
                     c_next_jnp, pension_next, psi_t, init_a_s_arr, init_a_b_arr,
                 )
                 label = "RETIRE"
@@ -2847,14 +2925,18 @@ def run_lifecycle_solver(
                 if use_pen:
                     pension_next = pension_table_jnp[t + 1, :]
                     income_table = jnp.zeros((n_z, pc.n_eta, pc.n_eps))   # ignored on this branch
-                    c_t, s_t, b_t, ni_t, nb_t, ec_t = boundary_kernel(
+                    (c_t, s_t, b_t,
+                     as_grid_t, ab_grid_t,
+                     ni_t, nb_t, ec_t) = boundary_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
                 else:
                     pension_next = pension_dummy_z_jnp
                     income_table = working_income_next_jnp[t + 1]  # (n_z, n_eta, n_eps)
-                    c_t, s_t, b_t, ni_t, nb_t, ec_t = working_kernel(
+                    (c_t, s_t, b_t,
+                     as_grid_t, ab_grid_t,
+                     ni_t, nb_t, ec_t) = working_kernel(
                         c_next_jnp, income_table, pension_next, psi_t,
                         init_a_s_arr, init_a_b_arr,
                     )
@@ -2864,6 +2946,12 @@ def run_lifecycle_solver(
             C_list[t] = c_t
             S_list[t] = s_t
             B_list[t] = b_t
+            # Roll the per-savings α-grid forward as the next (younger) age's
+            # warm-start source. Reassigning the binding releases the previous
+            # age's array — peak buffer footprint is one (n_z, N_state,
+            # n_savings) pair.
+            as_grid_prev = as_grid_t
+            ab_grid_prev = ab_grid_t
             # Iter counts are tiny (n_z * N_state ints) — materialise per age
             # so device memory isn't pinned by the histogram aggregator.
             newton_iter_per_age[t] = np.asarray(ni_t)

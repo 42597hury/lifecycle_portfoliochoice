@@ -355,10 +355,14 @@ def _solve_working_at_cell_pi_z(
     c_w, a_s_w, a_b_w = _base._lift_to_wealth_grid(
         x_egm, c_egm, a_s_egm, a_b_egm, wealth_grid, min_consumption,
     )
+    a_s_grid_per_s = a_s_egm[1:]
+    a_b_grid_per_s = a_b_egm[1:]
     n_iters_per_s = n_iters_egm[1:]
     n_backtrack_per_s = n_backtrack_egm[1:]
     exit_code_per_s = exit_code_egm[1:]
-    return c_w, a_s_w, a_b_w, n_iters_per_s, n_backtrack_per_s, exit_code_per_s
+    return (c_w, a_s_w, a_b_w,
+            a_s_grid_per_s, a_b_grid_per_s,
+            n_iters_per_s, n_backtrack_per_s, exit_code_per_s)
 
 
 def _build_per_age_working_kernel_pi_z(
@@ -409,9 +413,6 @@ def _build_per_age_working_kernel_pi_z_pmap(
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
-
     n_chunks = int(sc.cell_vmap_chunks)
     if n_chunks == 1:
         n_cells = n_z * N_state
@@ -452,8 +453,8 @@ def _build_per_age_working_kernel_pi_z_pmap(
             else:
                 income_table = income_next_table_z[z_idx]
 
-            init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-            init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+            init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+            init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
 
             return _solve_working_at_cell_pi_z(
                 z_idx,
@@ -500,7 +501,9 @@ def _build_per_age_working_kernel_pi_z_pmap(
         init_a_b_arr,
     ):
         if n_chunks != 1:
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = runner(
                 c_next_jnp,
                 income_next_table,
                 pension_next_by_z,
@@ -512,12 +515,16 @@ def _build_per_age_working_kernel_pi_z_pmap(
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
             )
 
-        c_pm, as_pm, ab_pm, ni_pm, nb_pm, ec_pm = per_dev_solve(
+        (c_pm, as_pm, ab_pm,
+         as_grid_pm, ab_grid_pm,
+         ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm,
             is_pm,
             c_next_jnp,
@@ -536,6 +543,8 @@ def _build_per_age_working_kernel_pi_z_pmap(
             collapse(c_pm),
             collapse(as_pm),
             collapse(ab_pm),
+            collapse(as_grid_pm),
+            collapse(ab_grid_pm),
             collapse(ni_pm),
             collapse(nb_pm),
             collapse(ec_pm),
@@ -572,9 +581,6 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
 
     log_R_bill_all, log_x_s_all, log_x_b_all, j_corners_all, w_corners_all = per_is_tensors
 
-    n_w = pcj.wealth_grid.shape[0]
-    w_ref_idx = n_w // 2
-
     n_chunks = int(sc.cell_vmap_chunks)
     z_idx_padded, is_idx_padded, n_cells, chunk_size = _base._build_chunked_index_arrays(
         n_z, N_state, n_chunks
@@ -598,8 +604,8 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
         else:
             income_table = income_next_table_z[z_idx]
 
-        init_a_s_cell = init_a_s_arr[z_idx, i_s, w_ref_idx]
-        init_a_b_cell = init_a_b_arr[z_idx, i_s, w_ref_idx]
+        init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
+        init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
 
         return _solve_working_at_cell_pi_z(
             z_idx,
@@ -666,7 +672,9 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
             init_a_s_arr,
             init_a_b_arr,
         ):
-            c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = per_chunk(
+            (c_flat, s_flat, b_flat,
+             as_grid_flat, ab_grid_flat,
+             ni_flat, nb_flat, ec_flat) = per_chunk(
                 c_next_jnp,
                 income_next_table,
                 pension_next_by_z,
@@ -680,6 +688,8 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
                 jnp.reshape(s_flat, (n_z, N_state, -1)),
                 jnp.reshape(b_flat, (n_z, N_state, -1)),
+                jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+                jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
                 jnp.reshape(ni_flat, (n_z, N_state, -1)),
                 jnp.reshape(nb_flat, (n_z, N_state, -1)),
                 jnp.reshape(ec_flat, (n_z, N_state, -1)),
@@ -699,7 +709,9 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
         init_a_s_arr,
         init_a_b_arr,
     ):
-        c_flat, s_flat, b_flat, ni_flat, nb_flat, ec_flat = runner(
+        (c_flat, s_flat, b_flat,
+         as_grid_flat, ab_grid_flat,
+         ni_flat, nb_flat, ec_flat) = runner(
             c_next_jnp,
             income_next_table,
             pension_next_by_z,
@@ -711,6 +723,8 @@ def _build_per_age_working_kernel_pi_z_vmap_only(
             jnp.reshape(c_flat, (n_z, N_state, -1)),
             jnp.reshape(s_flat, (n_z, N_state, -1)),
             jnp.reshape(b_flat, (n_z, N_state, -1)),
+            jnp.reshape(as_grid_flat, (n_z, N_state, -1)),
+            jnp.reshape(ab_grid_flat, (n_z, N_state, -1)),
             jnp.reshape(ni_flat, (n_z, N_state, -1)),
             jnp.reshape(nb_flat, (n_z, N_state, -1)),
             jnp.reshape(ec_flat, (n_z, N_state, -1)),

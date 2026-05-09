@@ -106,21 +106,25 @@ def solve_one_age(gather_precision):
     Returns (C, S, B) for age 64 (shape (n_z, N_state, n_w)).
     """
     pcj, mp, sc, terminal_kernel, retirement_kernel = build_runner(gather_precision)
-    # Terminal age (z-invariant by construction). Kernel returns 6 values
-    # (c, s, b, n_iters_per_s, n_backtrack_per_s, exit_code_per_s) per
-    # current solver.py.
-    c_T, s_T, b_T, _ni_T, _nb_T, _ec_T = terminal_kernel()
+    # Terminal kernel now returns 8 values
+    # (c, s, b, a_s_grid, a_b_grid, n_iters_per_s, n_backtrack_per_s, exit_code_per_s).
+    # The α-grids are the per-savings warm-start source for the next age.
+    (c_T, s_T, b_T,
+     as_grid_T, ab_grid_T,
+     _ni_T, _nb_T, _ec_T) = terminal_kernel()
     c_T_zb = jnp.broadcast_to(c_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
-    s_T_zb = jnp.broadcast_to(s_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
-    b_T_zb = jnp.broadcast_to(b_T[None, :, :], (pc.n_z, pc.N_state, pc.n_w))
+    as_grid_zb = jnp.broadcast_to(as_grid_T[None, :, :], (pc.n_z, pc.N_state, pc.n_s))
+    ab_grid_zb = jnp.broadcast_to(ab_grid_T[None, :, :], (pc.n_z, pc.N_state, pc.n_s))
 
     # Pension table is needed for retirement. Take age 65 (terminal) row from pc.
     pension_table = jnp.asarray(pc.pension_after_tax)
     psi_t = jnp.asarray(pc.survival_probs_2d)[pc.n_age - 2, :]   # age 64 row
     pension_next = pension_table[pc.n_age - 1, :]                 # age 65 row
 
-    c_64, s_64, b_64, _ni_64, _nb_64, _ec_64 = retirement_kernel(
-        c_T_zb, pension_next, psi_t, s_T_zb, b_T_zb,
+    (c_64, s_64, b_64,
+     _as_grid_64, _ab_grid_64,
+     _ni_64, _nb_64, _ec_64) = retirement_kernel(
+        c_T_zb, pension_next, psi_t, as_grid_zb, ab_grid_zb,
     )
     # Block until done so timing is meaningful.
     c_64 = jax.device_get(c_64)
@@ -168,9 +172,10 @@ print("\n[gate 3] HLO inspection of f32 retirement kernel ...")
 # cell-index slices the K=1 fast-path supplies as `z_idx_padded[:n_cells]`
 # and `is_idx_padded[:n_cells]` (int64, shape (n_cells,)).
 pcj32 = _pc_to_jnp(pc, DELTA_BEQUEST)
-init_arr_shape = (pc.n_z, pc.N_state, pc.n_w)
+c_arr_shape = (pc.n_z, pc.N_state, pc.n_w)
+init_arr_shape = (pc.n_z, pc.N_state, pc.n_s)
 n_cells = pc.n_z * pc.N_state
-dummy_c = jnp.zeros(init_arr_shape, dtype=jnp.float64)
+dummy_c = jnp.zeros(c_arr_shape, dtype=jnp.float64)
 dummy_pension = jnp.zeros(pc.n_z, dtype=jnp.float64)
 dummy_psi = jnp.ones(pc.n_z, dtype=jnp.float64)
 dummy_init_s = jnp.full(init_arr_shape, 0.5, dtype=jnp.float64)

@@ -562,13 +562,30 @@ def run_infinite_horizon_solver(
     pension_zero = jnp.zeros(pc.n_z, dtype=jnp.float64)
     psi_one = jnp.ones(pc.n_z, dtype=jnp.float64)
 
+    # Per-savings backward-iter warm-start buffer (mirrors run_lifecycle_solver's
+    # ``as_grid_prev``/``ab_grid_prev``). For iteration 0 we have no per-savings
+    # α-grid — the prepared ``S_old``/``B_old`` policies live on the *wealth*
+    # grid. Mid-wealth gather + broadcast across the savings axis gives the same
+    # iter-0 init the previous (Variant A) code used; iter 1+ then rolls forward
+    # the kernel's per-savings α-grid output (Variant B).
+    w_ref_idx = pc.n_w // 2
+    init_a_s_arr = jnp.broadcast_to(
+        jnp.asarray(S_old[:, :, w_ref_idx])[:, :, None],
+        (pc.n_z, pc.N_state, pc.n_s),
+    )
+    init_a_b_arr = jnp.broadcast_to(
+        jnp.asarray(B_old[:, :, w_ref_idx])[:, :, None],
+        (pc.n_z, pc.N_state, pc.n_s),
+    )
+
     if run_smoke_test:
         # One warm-up call to JIT-compile the kernel before timing the loop.
-        # Seeds the Newton init from the prepared (warm) S_old/B_old, matching
-        # the convention used inside the iteration loop below.
-        _c, _s, _b, _ni, _nb, _ec = retirement_kernel(
+        # Same init source as iter 0 below — mid-wealth gather of S_old/B_old.
+        (_c, _s, _b,
+         _as_grid, _ab_grid,
+         _ni, _nb, _ec) = retirement_kernel(
             jnp.asarray(C_old), pension_zero, psi_one,
-            jnp.asarray(S_old), jnp.asarray(B_old),
+            init_a_s_arr, init_a_b_arr,
         )
         np.asarray(_c)  # block until ready
 
@@ -602,16 +619,15 @@ def run_infinite_horizon_solver(
     try:
         for it in range(max_iter):
             c_old_jnp = jnp.asarray(C_old)
-            # Newton init at each cell is gathered from the previous iteration's
-            # converged share policy at mid-wealth (the kernel's convention). This
-            # mirrors run_lifecycle_solver's use_backward_age_warm_start=True
-            # behavior in the time dimension. Cost: 2x extra device upload per
-            # iteration; gain: typically 3-8 Newton iters/cell once near the fixed
-            # point, vs much higher under cold init.
-            s_old_jnp = jnp.asarray(S_old)
-            b_old_jnp = jnp.asarray(B_old)
-            c_new_jnp, s_new_jnp, b_new_jnp, ni_jnp, nb_jnp, ec_jnp = retirement_kernel(
-                c_old_jnp, pension_zero, psi_one, s_old_jnp, b_old_jnp,
+            # Per-savings backward-iter warm-start: iter 0 starts from a
+            # mid-wealth-gather broadcast (Variant A — see pre-loop setup);
+            # iter 1+ uses the previous iteration's converged per-savings α-grid
+            # (Variant B). Mirrors run_lifecycle_solver's per-savings warm-start
+            # in the time dimension.
+            (c_new_jnp, s_new_jnp, b_new_jnp,
+             as_grid_new_jnp, ab_grid_new_jnp,
+             ni_jnp, nb_jnp, ec_jnp) = retirement_kernel(
+                c_old_jnp, pension_zero, psi_one, init_a_s_arr, init_a_b_arr,
             )
             C_new = np.asarray(c_new_jnp)
             S_new = np.asarray(s_new_jnp)
@@ -637,6 +653,10 @@ def run_infinite_horizon_solver(
             share_supnorm_history.append(share_err)
 
             C_old, S_old, B_old = C_next, S_next, B_next
+            # Roll the per-savings α-grid forward as the next iter's warm-start.
+            # Reassigning the bindings releases the previous arrays.
+            init_a_s_arr = as_grid_new_jnp
+            init_a_b_arr = ab_grid_new_jnp
             n_iter_done = it + 1
             stop_err = max(xi_err, share_err)
 
@@ -738,22 +758,25 @@ def compile_inner_kernel_smoke_test(
         pcj, mp, solver_config, n_dev, pc.n_z, pc.N_state, per_is_tensors,
     )
 
-    expected_shape = (pc.n_z, pc.N_state, pc.n_w)
+    c_shape = (pc.n_z, pc.N_state, pc.n_w)
+    init_arr_shape = (pc.n_z, pc.N_state, pc.n_s)
     C_old = np.broadcast_to(
-        pc.wealth_grid.reshape(1, 1, -1), expected_shape,
+        pc.wealth_grid.reshape(1, 1, -1), c_shape,
     ).astype(np.float64, copy=True)
     pension_zero = jnp.zeros(pc.n_z, dtype=jnp.float64)
     psi_one = jnp.ones(pc.n_z, dtype=jnp.float64)
     # Smoke-test has no policy in hand to warm-start from, so seed from the
     # canonical cold scalars (mirrors run_lifecycle_solver's
     # use_backward_age_warm_start=False path).
-    init_a_s_arr = jnp.full(expected_shape, float(solver_config.init_alpha_s), dtype=jnp.float64)
-    init_a_b_arr = jnp.full(expected_shape, float(solver_config.init_alpha_b), dtype=jnp.float64)
+    init_a_s_arr = jnp.full(init_arr_shape, float(solver_config.init_alpha_s), dtype=jnp.float64)
+    init_a_b_arr = jnp.full(init_arr_shape, float(solver_config.init_alpha_b), dtype=jnp.float64)
 
     if verbose:
         print("Compiling JAX retirement kernel for the inf-horizon benchmark...")
     t0 = time.time()
-    c_new, s_new, b_new, _ni, _nb, _ec = retirement_kernel(
+    (c_new, s_new, b_new,
+     _as_grid, _ab_grid,
+     _ni, _nb, _ec) = retirement_kernel(
         jnp.asarray(C_old), pension_zero, psi_one,
         init_a_s_arr, init_a_b_arr,
     )

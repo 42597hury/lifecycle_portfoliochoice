@@ -115,10 +115,13 @@ def per_is_egm_full(i_s):
             )
         return foc_fn
 
+    n_savings = int(s_grid.shape[0])
+    init_a_s_per_s = jnp.full((n_savings,), sc.init_alpha_s, dtype=jnp.float64)
+    init_a_b_per_s = jnp.full((n_savings,), sc.init_alpha_b, dtype=jnp.float64)
     (x_egm, c_egm, a_s_egm, a_b_egm,
      n_iters_egm, n_backtrack_egm, _exit_code_egm) = _egm_scan_cell(
         foc_factory, s_grid,
-        sc.init_alpha_s, sc.init_alpha_b,
+        init_a_s_per_s, init_a_b_per_s,
         mp.gamma, mp.beta,
         sc.tol, sc.max_iter, sc.max_backtrack_iter,
         sc.line_search_max_step, sc.singular_det,

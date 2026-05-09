@@ -80,11 +80,15 @@ BASE_CONFIG = {
 # n_z=11, n_eps_nodes=4, n_eta_nodes=3: validated under the System I
 #   nz / eta-eps sensitivity sweeps (carry over from the legacy canonical).
 #
-# wealth_min: kept at 0.13 (skips the EGM constrained region, see
-#   docs/STATE_SPACE.md §wealth_min).
+# wealth_min: 0.05 AWI (~$2.7k 2019). Lower bound of the wealth grid
+#   covers the borrowing-constrained region (the EGM constrained branch
+#   is solved, NOT skipped). Matches the inf-horizon sweep convention.
+#   Previously 0.13 (which silently skipped the kink); the lower floor
+#   exposes the constrained branch to the solver and makes the canonical
+#   constraint set fully visible. See docs/STATE_SPACE.md §wealth_min.
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
-    wealth_min=0.13,
+    wealth_min=0.05,
     wealth_max=750.0,
     n_savings=180,
     state_grid_sizes=(5, 5, 5),

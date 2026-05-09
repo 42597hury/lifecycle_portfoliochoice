@@ -169,14 +169,33 @@ def _build_pc_from_bundle(bundle_path: Path, verbose: bool):
 _CONFIG_NAMES = {
     "base_config", "BASE_CONFIG",
     "disc_config", "disc_config_template", "DISC_CONFIG",
+    "CANONICAL_DISC", "CANONICAL_SOLVER",
 }
 
 
+def _rhs_has_call(node) -> bool:
+    """True if the AST expression contains any function call. Used to gate
+    side-effecting assignments like ``model = build_model(...)`` and
+    ``C, S, B, diag = run_lifecycle_solver(...)`` while still allowing
+    ``CANONICAL_DISC = DiscretizationConfig(...)`` (target whitelisted).
+    """
+    import ast
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            return True
+    return False
+
+
 def _is_config_assign(stmt) -> bool:
-    """Whitelist: keep only assignments whose target is one of the known
-    config names. Skips ``model = build_model(...)``, ``pc = build_precompute(...)``,
-    and especially ``C, S, B, diag = run_lifecycle_solver(...)`` — none of
-    which are config definitions."""
+    """Keep an assignment if EITHER its target is in ``_CONFIG_NAMES`` OR
+    its RHS is pure-literal (no function calls). The pure-literal branch
+    catches the variable-shorthand pattern at the top of ``_canonical.py``
+    (e.g. ``gamma, beta, b_bar = 5.0, 0.96, 10``) which feeds the
+    BASE_CONFIG dict literal below it. Skips:
+      - model = build_model(...)
+      - pc = build_precompute(...)
+      - C, S, B, diag = run_lifecycle_solver(...)
+    """
     import ast
     if isinstance(stmt, ast.Assign):
         names = []
@@ -187,9 +206,13 @@ def _is_config_assign(stmt) -> bool:
                 for elt in tgt.elts:
                     if isinstance(elt, ast.Name):
                         names.append(elt.id)
-        return any(n in _CONFIG_NAMES for n in names)
+        if any(n in _CONFIG_NAMES for n in names):
+            return True
+        return not _rhs_has_call(stmt.value)
     if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        return stmt.target.id in _CONFIG_NAMES
+        if stmt.target.id in _CONFIG_NAMES:
+            return True
+        return stmt.value is not None and not _rhs_has_call(stmt.value)
     return False
 
 
@@ -234,12 +257,13 @@ def _build_pc_from_config(config_path: Path, verbose: bool):
         namespace.get("disc_config")
         or namespace.get("disc_config_template")
         or namespace.get("DISC_CONFIG")
+        or namespace.get("CANONICAL_DISC")
     )
     if base_config is None or disc_config is None:
         raise ValueError(
             f"Config {config_path} must define one of "
             f"(base_config / BASE_CONFIG) AND one of "
-            f"(disc_config / disc_config_template / DISC_CONFIG)."
+            f"(disc_config / disc_config_template / DISC_CONFIG / CANONICAL_DISC)."
         )
 
     # No bundle metadata at the .py-config path; default to the headline

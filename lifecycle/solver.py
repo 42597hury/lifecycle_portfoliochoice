@@ -498,9 +498,16 @@ def _newton_while(
         det = Jss * Jbb - Jsb * Jsb
         is_singular = jnp.abs(det) < singular_det
 
+        # Singular-Jacobian fallback: descent step on Φ = 0.5*‖f‖². Steepest
+        # descent direction is -∇Φ = -J^T f, which degenerates to ~0 when J
+        # is near-singular (which is exactly when this branch fires). The
+        # standard ad-hoc fallback drops J^T and uses -η · f / ‖f‖ — a step
+        # *against* the residual. The leading minus is load-bearing; an
+        # ascent step would be silently rejected by the line search and the
+        # cell would stall instead of converging.
         grad_norm = err + grad_denom_eps
-        step_s_grad = grad_step_size * fs / grad_norm
-        step_b_grad = grad_step_size * fb / grad_norm
+        step_s_grad = -grad_step_size * fs / grad_norm
+        step_b_grad = -grad_step_size * fb / grad_norm
 
         inv_d = 1.0 / jnp.where(is_singular, 1.0, det)
         step_s_newton = -(Jbb * fs - Jsb * fb) * inv_d
@@ -682,9 +689,16 @@ def _newton_fori(
         det = Jss * Jbb - Jsb * Jsb
         is_singular = jnp.abs(det) < singular_det
 
+        # Singular-Jacobian fallback: descent step on Φ = 0.5*‖f‖². Steepest
+        # descent direction is -∇Φ = -J^T f, which degenerates to ~0 when J
+        # is near-singular (which is exactly when this branch fires). The
+        # standard ad-hoc fallback drops J^T and uses -η · f / ‖f‖ — a step
+        # *against* the residual. The leading minus is load-bearing; an
+        # ascent step would be silently rejected by the line search and the
+        # cell would stall instead of converging.
         grad_norm = err + grad_denom_eps
-        step_s_grad = grad_step_size * fs / grad_norm
-        step_b_grad = grad_step_size * fb / grad_norm
+        step_s_grad = -grad_step_size * fs / grad_norm
+        step_b_grad = -grad_step_size * fb / grad_norm
 
         inv_d = 1.0 / jnp.where(is_singular, 1.0, det)
         step_s_newton = -(Jbb * fs - Jsb * fb) * inv_d

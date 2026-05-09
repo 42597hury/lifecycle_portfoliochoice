@@ -587,3 +587,117 @@ def build_real_full_var_config_hardcoded():
         "residual_correlation":   None,
         "equation_r2":            None,
     }
+
+
+def zero_bond_excess_mean_var_config(var_config, target_mean=0.0):
+    """Return a copy of ``var_config`` with the bond excess-return mean shifted.
+
+    This is an experiment knob, not the headline calibration. It preserves the
+    bond-return dynamics around the mean: the ``xb`` row of ``Phi`` and the full
+    residual covariance ``Omega`` are left unchanged. Only the unconditional
+    mean of ``xb`` is shifted, and ``const = (I - Phi) z_bar`` is recomputed so
+    the restricted, mean-pinned VAR remains internally coherent.
+
+    With ``target_mean=0`` the bond has zero unconditional excess log return
+    but keeps the same state dependence, volatility, and covariance structure.
+    """
+    cfg = dict(var_config)
+    z_bar = np.asarray(var_config["z_bar"], dtype=float).copy()
+    Phi = np.asarray(var_config["Phi"], dtype=float).copy()
+    Omega = np.asarray(var_config["Omega"], dtype=float).copy()
+
+    names = list(var_config["variable_names"])
+    if "xb" not in names:
+        raise ValueError("zero_bond_excess_mean_var_config requires an 'xb' variable")
+    xb_idx = names.index("xb")
+    old_mean = float(z_bar[xb_idx])
+    z_bar[xb_idx] = float(target_mean)
+
+    cfg["z_bar"] = z_bar
+    cfg["Phi"] = Phi
+    cfg["Omega"] = Omega
+    cfg["const"] = (np.eye(len(z_bar)) - Phi) @ z_bar
+    cfg["estimation"] = f"{var_config.get('estimation', 'unknown')}_xb_mean_shift"
+    cfg["xb_original_mean"] = old_mean
+    cfg["xb_target_mean"] = float(target_mean)
+    return cfg
+
+
+def _var_stationary_covariance(Phi, Omega):
+    """Stationary covariance of ``z' = const + Phi z + eps``."""
+    Phi = np.asarray(Phi, dtype=float)
+    Omega = np.asarray(Omega, dtype=float)
+    k = Phi.shape[0]
+    vec = np.linalg.solve(
+        np.eye(k * k) - np.kron(Phi, Phi),
+        Omega.reshape(k * k, order="F"),
+    )
+    cov = vec.reshape((k, k), order="F")
+    return 0.5 * (cov + cov.T)
+
+
+def zero_bond_simple_excess_mean_var_config(var_config, target_simple_mean=0.0):
+    """Return a copy of ``var_config`` with zero expected simple bond excess return.
+
+    The VAR return variable ``xb`` is a log excess return. Under the local
+    lognormal approximation, setting ``E[exp(xb)] - 1`` to ``target_simple_mean``
+    requires:
+
+        E[xb] = log(1 + target_simple_mean) - 0.5 * Var(xb).
+
+    The variance is the VAR-implied stationary variance of ``xb``. As with
+    ``zero_bond_excess_mean_var_config``, only the mean/intercept changes; the
+    ``xb`` row of ``Phi`` and all covariance entries stay unchanged.
+    """
+    names = list(var_config["variable_names"])
+    if "xb" not in names:
+        raise ValueError("zero_bond_simple_excess_mean_var_config requires an 'xb' variable")
+    xb_idx = names.index("xb")
+    cov = _var_stationary_covariance(var_config["Phi"], var_config["Omega"])
+    xb_var = float(cov[xb_idx, xb_idx])
+    if 1.0 + float(target_simple_mean) <= 0.0:
+        raise ValueError("target_simple_mean must be greater than -1")
+    target_log_mean = float(np.log1p(target_simple_mean) - 0.5 * xb_var)
+    cfg = zero_bond_excess_mean_var_config(var_config, target_mean=target_log_mean)
+    cfg["xb_stationary_variance"] = xb_var
+    cfg["xb_target_simple_mean"] = float(target_simple_mean)
+    cfg["xb_target_log_mean"] = target_log_mean
+    return cfg
+
+
+def build_real_full_var_config_zero_bond_excess_mean(target_mean=0.0):
+    """Full real-yield VAR experiment with zero mean bond excess return.
+
+    Same state vector and same ``xb`` dynamics as the hardcoded headline VAR,
+    except the unconditional mean of ``xb`` is set to ``target_mean``.
+    """
+    cfg = build_real_full_var_config_hardcoded()
+    out = zero_bond_excess_mean_var_config(cfg, target_mean=target_mean)
+    print(
+        "Using ZERO-BOND-PREMIUM experiment: "
+        f"E[xb] {out['xb_original_mean'] * 100:+.3f}pp -> "
+        f"{out['xb_target_mean'] * 100:+.3f}pp; dynamics/covariance unchanged."
+    )
+    return out
+
+
+def build_real_full_var_config_zero_bond_simple_excess_mean(target_simple_mean=0.0):
+    """Full real-yield VAR experiment with zero simple bond excess return.
+
+    Same state vector and same ``xb`` dynamics as the hardcoded headline VAR,
+    except the unconditional mean of ``xb`` is shifted so
+    ``E[exp(xb)] - 1 = target_simple_mean`` under the stationary lognormal
+    approximation.
+    """
+    cfg = build_real_full_var_config_hardcoded()
+    out = zero_bond_simple_excess_mean_var_config(
+        cfg, target_simple_mean=target_simple_mean
+    )
+    print(
+        "Using ZERO-SIMPLE-BOND-PREMIUM experiment: "
+        f"E[xb] {out['xb_original_mean'] * 100:+.3f}pp -> "
+        f"{out['xb_target_log_mean'] * 100:+.3f}pp, "
+        f"E[exp(xb)]-1 -> {out['xb_target_simple_mean'] * 100:+.3f}pp; "
+        "dynamics/covariance unchanged."
+    )
+    return out

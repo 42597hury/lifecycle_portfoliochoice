@@ -170,6 +170,7 @@ _CONFIG_NAMES = {
     "base_config", "BASE_CONFIG",
     "disc_config", "disc_config_template", "DISC_CONFIG",
     "CANONICAL_DISC", "CANONICAL_SOLVER",
+    "var_config",
 }
 
 
@@ -267,9 +268,9 @@ def _build_pc_from_config(config_path: Path, verbose: bool):
         )
 
     # No bundle metadata at the .py-config path; default to the headline
-    # Full real-yields VAR. Configs that explicitly set a different system
-    # would need to supply their own var_config — out of scope here.
-    var_config = build_real_full_var_config_hardcoded()
+    # Full real-yields VAR unless the config explicitly supplies a var_config
+    # experiment.
+    var_config = namespace.get("var_config") or build_real_full_var_config_hardcoded()
     model = build_model(base_config, var_config, verbose=verbose)
     pc = build_precompute(model, disc_config, verbose=verbose)
     return model, pc, disc_config

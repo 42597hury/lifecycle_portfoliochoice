@@ -51,6 +51,7 @@ from lifecycle.var import build_real_full_var_config_hardcoded
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.solver import run_lifecycle_solver
 from lifecycle.simulation import simulate_lifecycle
+from lifecycle.policy_io import save_policy_bundle
 
 
 # =============================================================================
@@ -258,18 +259,37 @@ print(
 # Save artefacts and tear down checkpoint
 # =============================================================================
 
-out_policies = "verify_canonical_e2e_preflight_policies.npz"
-np.savez(
-    out_policies,
-    C=C_C, S=S_C, B=B_C,
-    wealth_grid=np.asarray(pc.wealth_grid),
-    z_grid=np.asarray(pc.z_grid),
-    ages=np.asarray(pc.ages),
+BUNDLE_NAME = "canonical_e2e_preflight"
+BUNDLE_DIR = os.path.join("saved_runs", BUNDLE_NAME)
+run_config_snapshot = {
+    "base_config": dict(BASE_CONFIG),
+    "discretization_config": disc._asdict(),
+    "solver_config": sc._asdict(),
+    "predictability_ablation": {
+        "system_code": "full",
+        "system_label": "full_system_real",
+        "system_title": "Full System (real)",
+        "state_names": ["cape", "spr", "y_1"],
+    },
+    "bundle_name": BUNDLE_NAME,
+    "wall_time_seconds": float(wall_A + wall_B + wall_C),
+    "preflight_passes": {
+        "wall_A_continuous_min": wall_A / 60,
+        "wall_B_partial_min": wall_B / 60,
+        "wall_C_resume_min": wall_C / 60,
+    },
+}
+bundle_path = save_policy_bundle(
+    BUNDLE_DIR, C_C, S_C, B_C,
+    diagnostics=diag_C, run_config=run_config_snapshot,
+    overwrite=True, wealth_grid=pc.wealth_grid,
 )
-out_sim = "verify_canonical_e2e_preflight_sim.npz"
+print(f"\nSaved bundle: {bundle_path}", flush=True)
+
+# Sim panel — separate file alongside the bundle for downstream use.
+out_sim = os.path.join(BUNDLE_DIR, "preflight_sim.npz")
 np.savez(out_sim, **{k: v for k, v in sim.items() if isinstance(v, np.ndarray)})
-print(f"\nSaved: {out_policies}", flush=True)
-print(f"Saved: {out_sim}", flush=True)
+print(f"Saved sim:    {out_sim}", flush=True)
 
 shutil.rmtree(ckpt_dir, ignore_errors=True)
 print(f"Removed checkpoint dir: {ckpt_dir}", flush=True)

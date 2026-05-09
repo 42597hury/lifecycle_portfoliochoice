@@ -377,7 +377,16 @@ def build_precompute(model, disc_config=None, verbose=True):
     annuity_factors = annuity_factor(_y_1, _spr, model.b_bar)
 
     # --- Income discretization ---
-    z_grid, Pi_z = discretize_income_ar1_mixture(
+    # Pi_z dropped from Precompute: it was reducible at canonical
+    # (rho=0.991, n_z=11, n_stds=3.0) and was off the production hot path
+    # (the solver consumes pcj.eta_nodes; the simulator under
+    # initial_z='stationary' uses _normal_bin_probs). See
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md MED-1.
+    # Construction here returns z_grid only; the transition matrix is
+    # discarded. The variant solver (lifecycle/solver_pi_z_variant.py) and
+    # any other consumer that genuinely needs Pi_z must construct it
+    # locally from (model, disc_config).
+    z_grid, _ = discretize_income_ar1_mixture(
         rho=model.rho,
         p=model.pz,
         mu1=model.mu_eta1,
@@ -387,6 +396,34 @@ def build_precompute(model, disc_config=None, verbose=True):
         N=disc_config.n_z,
         n_stds=disc_config.n_stds,
     )
+
+    # Stationary distribution of z (Gaussian approximation): used by the
+    # simulator's array-init fallback and any caller that wants a one-shot
+    # P(z_0) draw without invoking the (reducible) Pi_z chain.
+    mu_eta_eff = (
+        model.pz * model.mu_eta1
+        + (1.0 - model.pz)
+        * (-(model.pz / (1.0 - model.pz)) * model.mu_eta1)
+    )
+    var_eta_eff = (
+        model.pz * (model.sigma_eta1 ** 2 + (model.mu_eta1 - mu_eta_eff) ** 2)
+        + (1.0 - model.pz)
+        * (
+            model.sigma_eta2 ** 2
+            + (-(model.pz / (1.0 - model.pz)) * model.mu_eta1 - mu_eta_eff) ** 2
+        )
+    )
+    if (1.0 - model.rho ** 2) > 1e-14:
+        sigma_z_uncond = float(np.sqrt(var_eta_eff / (1.0 - model.rho ** 2)))
+    else:
+        sigma_z_uncond = float(np.sqrt(var_eta_eff))
+    if z_grid.size > 1 and sigma_z_uncond > 0.0:
+        init_z_probs = _normal_bin_probs(
+            z_grid, mean=0.0, std=sigma_z_uncond
+        ).astype(np.float64)
+    else:
+        # n_z == 1: degenerate distribution at the single node.
+        init_z_probs = np.ones(z_grid.size, dtype=np.float64)
 
     eps_nodes, eps_weights = get_eps_quadrature_corrected(model, n_nodes=disc_config.n_eps_nodes)
     eta_nodes, eta_weights = get_eta_quadrature_mixture(model, n_nodes=disc_config.n_eta_nodes)
@@ -487,7 +524,7 @@ def build_precompute(model, disc_config=None, verbose=True):
         sigma_xrxb=sigma_xrxb,
         annuity_factors=annuity_factors,
         z_grid=z_grid,
-        Pi_z=Pi_z,
+        init_z_probs=init_z_probs,
         eps_nodes=eps_nodes,
         eps_weights=eps_weights,
         eta_nodes=eta_nodes,
@@ -827,6 +864,34 @@ def build_model(base_config, var_config, verbose=True):
         if spr_index_in_state is not None and rtb_index_in_state == spr_index_in_state:
             raise ValueError("rtb_index_in_state and spr_index_in_state must be distinct")
 
+    # Derive mu_eta2 and mu_eps2 from the zero-mean constraint
+    # E[eta] = E[eps] = 0:
+    #     mu_eta2 = -(pz / (1 - pz)) * mu_eta1
+    #     mu_eps2 = -(pe / (1 - pe)) * mu_eps1
+    # The single source of truth lives here in build_model. If a saved bundle's
+    # BASE_CONFIG still carries explicit mu_eta2/mu_eps2 keys (legacy bundles
+    # produced before docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md, Fix A),
+    # those keys are silently ignored: the derived values are authoritative.
+    pz_v = float(base_config["pz"])
+    mu_eta1_v = float(base_config["mu_eta1"])
+    pe_v = float(base_config["pe"])
+    mu_eps1_v = float(base_config["mu_eps1"])
+    mu_eta2_derived = -(pz_v / (1.0 - pz_v)) * mu_eta1_v
+    mu_eps2_derived = -(pe_v / (1.0 - pe_v)) * mu_eps1_v
+
+    # Self-check: zero-mean must hold to within machine epsilon. The derived
+    # expression is algebraically identity-zero for the mixture mean
+    # `pz*mu_eta1 + (1-pz)*mu_eta2`, so any failure here is a numerical bug in
+    # the construction above — not in user-facing parameters.
+    _e_eta = pz_v * mu_eta1_v + (1.0 - pz_v) * mu_eta2_derived
+    _e_eps = pe_v * mu_eps1_v + (1.0 - pe_v) * mu_eps2_derived
+    assert np.isclose(_e_eta, 0.0, atol=1e-12), (
+        f"internal: derived mu_eta2 violates zero-mean (E[eta] = {_e_eta:.3e})"
+    )
+    assert np.isclose(_e_eps, 0.0, atol=1e-12), (
+        f"internal: derived mu_eps2 violates zero-mean (E[eps] = {_e_eps:.3e})"
+    )
+
     return LifecyclePortfolioModel(
         beta=float(base_config["beta"]),
         gamma=float(base_config["gamma"]),
@@ -839,15 +904,15 @@ def build_model(base_config, var_config, verbose=True):
         b2=float(base_config["b2"]),
         b3=float(base_config["b3"]),
         rho=float(base_config["rho"]),
-        pz=float(base_config["pz"]),
-        mu_eta1=float(base_config["mu_eta1"]),
+        pz=pz_v,
+        mu_eta1=mu_eta1_v,
         sigma_eta1=float(base_config["sigma_eta1"]),
-        mu_eta2=float(base_config["mu_eta2"]),
+        mu_eta2=mu_eta2_derived,
         sigma_eta2=float(base_config["sigma_eta2"]),
-        pe=float(base_config["pe"]),
-        mu_eps1=float(base_config["mu_eps1"]),
+        pe=pe_v,
+        mu_eps1=mu_eps1_v,
         sigma_eps1=float(base_config["sigma_eps1"]),
-        mu_eps2=float(base_config["mu_eps2"]),
+        mu_eps2=mu_eps2_derived,
         sigma_eps2=float(base_config["sigma_eps2"]),
         n_state=parts["n_state"],
         n_ret=parts["n_ret"],

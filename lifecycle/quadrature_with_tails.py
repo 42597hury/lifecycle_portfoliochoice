@@ -325,15 +325,19 @@ if __name__ == "__main__":
     from lifecycle.precompute import build_model
     from lifecycle.discretization import get_return_quadrature, get_state_quadrature
 
+    # mu_eta2 / mu_eps2 are derived inside `build_model` from
+    # (pz, mu_eta1) and (pe, mu_eps1) per the zero-mean constraint
+    # E[eta] = E[eps] = 0 (Fix A in
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md), so we don't pass
+    # them here.
     BASE_CFG = {
         "beta": 0.96, "gamma": 5.0, "b_bar": 10,
         "start_age": 22, "retire_age": 67, "terminal_age": 99,
         "b0": -6.142, "b1": 0.3040, "b2": -0.051, "b3": 0.002586,
         "rho": 0.991, "pz": 0.176,
-        "mu_eta1": -0.524, "sigma_eta1": 0.113,
-        "mu_eta2": -(0.176 / (1.0 - 0.176)) * (-0.524), "sigma_eta2": 0.046,
+        "mu_eta1": -0.524, "sigma_eta1": 0.113, "sigma_eta2": 0.046,
         "pe": 0.044, "mu_eps1": 0.134, "sigma_eps1": 0.762,
-        "mu_eps2": 0.0,   "sigma_eps2": 0.055, "constrained": False,
+        "sigma_eps2": 0.055, "constrained": False,
     }
     model = build_model(BASE_CFG, build_nominal_system1_var_config_hardcoded(), verbose=False)
     Sigma_r_sym = 0.5 * (model.Sigma_r_cond + model.Sigma_r_cond.T)

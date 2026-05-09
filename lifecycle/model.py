@@ -46,12 +46,12 @@ class LifecyclePortfolioModel(NamedTuple):
     pz: float
     mu_eta1: float
     sigma_eta1: float
-    mu_eta2: float   # DERIVED (not free): pinned by E[eta]=0, so mu_eta2 = -(pz/(1-pz))*mu_eta1. Quadrature recomputes from this formula; stored value here is informational and may be ignored.
+    mu_eta2: float   # DERIVED (not free): pinned by E[eta]=0, so mu_eta2 = -(pz/(1-pz))*mu_eta1. AUTHORITATIVE: derived once inside `lifecycle.precompute.build_model` from (pz, mu_eta1) and consumed directly by every downstream site (eta quadrature, simulator, mortality calibration, diagnostics). See docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md (Fix A).
     sigma_eta2: float
     pe: float
     mu_eps1: float
     sigma_eps1: float
-    mu_eps2: float   # DERIVED (not free): pinned by E[eps]=0, so mu_eps2 = -(pe/(1-pe))*mu_eps1. Quadrature recomputes from this formula; stored value here is informational and may be ignored.
+    mu_eps2: float   # DERIVED (not free): pinned by E[eps]=0, so mu_eps2 = -(pe/(1-pe))*mu_eps1. AUTHORITATIVE: derived once inside `lifecycle.precompute.build_model` from (pe, mu_eps1) and consumed directly by every downstream site (eps quadrature, simulator, diagnostics). See docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md (Fix A).
     sigma_eps2: float
 
     # Partitioned VAR structure

@@ -248,8 +248,8 @@ def _build_simulate_kernel(
     survival_per_age,                # (n_age, n_z)
     is_working_per_age,              # (n_age,) bool
     is_pre_retire_boundary_per_age,  # (n_age,) bool
-    rho, pz, mu_eta1, sigma_eta1, sigma_eta2, mu_eta2_eff,
-    pe, mu_eps1, sigma_eps1, sigma_eps2, mu_eps2_eff,
+    rho, pz, mu_eta1, sigma_eta1, sigma_eta2, mu_eta2,
+    pe, mu_eps1, sigma_eps1, sigma_eps2, mu_eps2,
     n_age, n_z, n_ret, n_state,
     y_1_idx, xr_pos, xb_pos,
     sigma2_xr, sigma2_xb, sigma_xrxb,
@@ -379,7 +379,7 @@ def _build_simulate_kernel(
         eta = jnp.where(
             u[1] < pz,
             mu_eta1 + sigma_eta1 * std_eta,
-            mu_eta2_eff + sigma_eta2 * std_eta,
+            mu_eta2 + sigma_eta2 * std_eta,
         )
         z_next_working = rho * z_val + eta
         z_next = jnp.where(is_working_t, z_next_working, z_val)
@@ -389,7 +389,7 @@ def _build_simulate_kernel(
         eps_val = jnp.where(
             u[2] < pe,
             mu_eps1 + sigma_eps1 * std_eps,
-            mu_eps2_eff + sigma_eps2 * std_eps,
+            mu_eps2 + sigma_eps2 * std_eps,
         )
         y_gross = jnp.exp(log_det_next_t + z_next + eps_val)
         income_working = jax_disposable_income(y_gross)
@@ -579,8 +579,10 @@ def simulate_lifecycle(
 
     rng = np.random.default_rng(seed)
 
-    mu_eta2_eff = -(model.pz / (1.0 - model.pz)) * model.mu_eta1
-    mu_eps2_eff = -(model.pe / (1.0 - model.pe)) * model.mu_eps1
+    # mu_eta2 / mu_eps2 are now derived and stored authoritatively on the
+    # model NamedTuple by `lifecycle.precompute.build_model` (Fix A —
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md). The simulator reads
+    # them directly without a local recompute.
 
     # --- Initialise z (continuous) ---
     if isinstance(initial_z, str) and initial_z == "normal":
@@ -589,13 +591,32 @@ def simulate_lifecycle(
     elif isinstance(initial_z, str) and initial_z == "stationary":
         var_eta = (
             model.pz * (model.sigma_eta1 ** 2 + model.mu_eta1 ** 2)
-            + (1 - model.pz) * (model.sigma_eta2 ** 2 + mu_eta2_eff ** 2)
+            + (1 - model.pz) * (model.sigma_eta2 ** 2 + model.mu_eta2 ** 2)
         )
         sigma_z = np.sqrt(var_eta / (1.0 - model.rho ** 2))
         init_z_probs = _normal_bin_probs(pc.z_grid, mean=0.0, std=sigma_z)
         init_z_idx = rng.choice(pc.n_z, size=n_simulations, p=init_z_probs).astype(np.int32)
+    elif isinstance(initial_z, str) and initial_z == "median":
+        init_z_idx = np.full(n_simulations, pc.n_z // 2, dtype=np.int32)
+    elif isinstance(initial_z, str):
+        raise ValueError(
+            f"Unknown initialization method for initial_z: '{initial_z}'. "
+            "Expected 'normal', 'stationary', 'median', or an np.ndarray of "
+            "starting indices."
+        )
     else:
-        init_z_idx = initialize_states(n_simulations, pc.n_z, pc.Pi_z, initial_z, rng)
+        # Caller passed an explicit array of starting z-indices.
+        # NOTE: previously this branch fell through to initialize_states
+        # which used pc.Pi_z's stationary distribution; pc.Pi_z has been
+        # dropped (was reducible — see INCOME_PIPELINE_REVIEW_2026-05-09
+        # MED-1). Array-of-indices was always the intended use of this
+        # branch.
+        arr = np.asarray(initial_z, dtype=np.int32)
+        if arr.shape[0] != n_simulations:
+            raise ValueError(
+                f"initial_z array has length {arr.shape[0]}, expected {n_simulations}."
+            )
+        init_z_idx = arr
     init_z_val = pc.z_grid[init_z_idx].astype(np.float64)
 
     init_state_idx = _resolve_initial_state_indices(n_simulations, pc, initial_state, rng)
@@ -607,7 +628,7 @@ def simulate_lifecycle(
         init_eps_val = np.where(
             init_eps_uniform < model.pe,
             model.mu_eps1 + model.sigma_eps1 * init_eps_normal,
-            mu_eps2_eff + model.sigma_eps2 * init_eps_normal,
+            model.mu_eps2 + model.sigma_eps2 * init_eps_normal,
         )
         init_y_gross = np.exp(pc.log_det_profile[0] + init_z_val + init_eps_val)
         initial_income_arr = disposable_income_working(init_y_gross)
@@ -718,12 +739,12 @@ def simulate_lifecycle(
         mu_eta1=jnp.float64(model.mu_eta1),
         sigma_eta1=jnp.float64(model.sigma_eta1),
         sigma_eta2=jnp.float64(model.sigma_eta2),
-        mu_eta2_eff=jnp.float64(mu_eta2_eff),
+        mu_eta2=jnp.float64(model.mu_eta2),
         pe=jnp.float64(model.pe),
         mu_eps1=jnp.float64(model.mu_eps1),
         sigma_eps1=jnp.float64(model.sigma_eps1),
         sigma_eps2=jnp.float64(model.sigma_eps2),
-        mu_eps2_eff=jnp.float64(mu_eps2_eff),
+        mu_eps2=jnp.float64(model.mu_eps2),
         n_age=int(n_age), n_z=int(pc.n_z), n_ret=int(n_ret),
         n_state=n_state_int,
         y_1_idx=y_1_idx, xr_pos=xr_pos, xb_pos=xb_pos,

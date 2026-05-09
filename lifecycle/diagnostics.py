@@ -131,8 +131,9 @@ def diagnose_income_pre(model, pc):
                + (1.0 - model.pz) * (model.mu_eta2**4 + 6 * model.mu_eta2**2 * model.sigma_eta2**2 + 3 * model.sigma_eta2**4))
     _true_kurt = _e_eta4 / max(var_eta**2, 1e-15)
 
-    # Transitory shock moments
-    mu_eps2_eff = -(model.pe / (1.0 - model.pe)) * model.mu_eps1
+    # Transitory shock moments. After Fix A
+    # (docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md), `model.mu_eps2` is
+    # the authoritative zero-mean-enforced value; no local recompute needed.
     eps_mean = float(np.sum(pc.eps_nodes * pc.eps_weights))
     eps_var = float(np.sum(pc.eps_nodes**2 * pc.eps_weights))
     e_exp_eps = float(np.sum(np.exp(pc.eps_nodes) * pc.eps_weights))
@@ -150,9 +151,8 @@ def diagnose_income_pre(model, pc):
     print(f"  z_grid     : {pc.n_z} points  [{pc.z_grid.min():.4f}, {pc.z_grid.max():.4f}]   +/-{z_cover:.2f} sigma")
     print()
     print(f"  pe            = {model.pe:.3f}   (probability of large-shock component)")
-    print(f"  Component 1:  mu_eps1    = {model.mu_eps1:+.4f},  sigma_eps1 = {model.sigma_eps1:.4f}")
-    print(f"  Component 2:  mu_eps2_eff = {mu_eps2_eff:+.4f}  (zero-mean enforced)")
-    print(f"               sigma_eps2 = {model.sigma_eps2:.4f}")
+    print(f"  Component 1:  mu_eps1 = {model.mu_eps1:+.4f},  sigma_eps1 = {model.sigma_eps1:.4f}")
+    print(f"  Component 2:  mu_eps2 = {model.mu_eps2:+.4f},  sigma_eps2 = {model.sigma_eps2:.4f}")
     print(f"  E[eps]        = {eps_mean:.2e}   (should be ~ 0)")
     print(f"  Var[eps]      = {eps_var:.5f}   Std[eps] = {np.sqrt(eps_var):.5f}")
     print(f"  eps_nodes     : {pc.n_eps} nodes  [{pc.eps_nodes.min():.4f}, {pc.eps_nodes.max():.4f}]")
@@ -534,49 +534,39 @@ def diagnose_income_pre(model, pc):
           "Pension available at all retirement ages",
           f"need index {pc.n_age - 1} in axis 0 of shape {pc.pension_after_tax.shape}")
 
-    # ── z-Transition Quality (Pi_z, simulation-only) ────────────────────
-    _sub("z-Transition Quality (Pi_z, simulation-only)")
-    print(f"  NOTE: Pi_z is simulation-only -- the solver uses eta quadrature.\n")
+    # ── z-Initialisation Distribution (init_z_probs, simulation-only) ────
+    _sub("z-Initialisation Distribution (init_z_probs, simulation-only)")
+    print("  NOTE: pc.init_z_probs is the unconditional Gaussian discretisation\n"
+          "        of the persistent-z distribution. It replaces the legacy\n"
+          "        Pi_z transition matrix on the precompute (which was reducible\n"
+          "        at canonical (rho=0.991, n_z=11, n_stds=3.0); see\n"
+          "        docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md MED-1). The\n"
+          "        solver hot path consumes pcj.eta_nodes only.\n")
 
-    # Test 21: Pi_z row sums = 1
-    pi_z_ok = np.allclose(pc.Pi_z.sum(axis=1), 1.0, atol=1e-10)
-    _pi_z_dev = float(np.abs(pc.Pi_z.sum(axis=1) - 1.0).max())
+    # Test 21: init_z_probs sums to 1
+    _ipz_sum = float(np.sum(pc.init_z_probs))
+    pi_z_ok = abs(_ipz_sum - 1.0) < 1e-10
     _test(results, "pass" if pi_z_ok else "fail",
-          "Pi_z row sums = 1",
-          "Transition probabilities are valid",
-          f"max deviation = {_pi_z_dev:.2e}")
+          "init_z_probs sums to 1",
+          "Initial z-distribution is a valid probability mass function",
+          f"sum = {_ipz_sum:.12f}")
 
-    # Discretized transition moments from Pi_z at mid row
-    _dz_vals = pc.z_grid - pc.z_grid[iz0]
-    _disc_mean = float(np.dot(pc.Pi_z[iz0], pc.z_grid))
-    _disc_e2 = float(np.dot(pc.Pi_z[iz0], _dz_vals**2))
-    _disc_e1 = float(np.dot(pc.Pi_z[iz0], _dz_vals))
-    _disc_var = _disc_e2 - _disc_e1**2
-    _true_cond_mean = model.rho * pc.z_grid[iz0]
-
-    _p_down = float(sum(pc.Pi_z[iz0, j] for j in range(iz0)))
-    _p_stay = float(pc.Pi_z[iz0, iz0])
-    _p_up = float(sum(pc.Pi_z[iz0, j] for j in range(iz0 + 1, n_z)))
-
-    print(f"  At z = 0:  P(down) = {_p_down:.4f}, P(stay) = {_p_stay:.4f}, P(up) = {_p_up:.4f}")
-    print(f"  Conditional mean: E[z'|z=0] = {_disc_mean:+.5f} (true = {_true_cond_mean:+.5f})")
-    print(f"  Conditional var:  {_disc_var:.5f} (true = {var_eta:.5f})")
-
-    # Test 22: Upward transitions exist from mid state
-    _status22 = "pass" if _p_up > 1e-6 else "warn"
+    # Test 22: init_z_probs places mass on more than just the corner bins
+    _interior = float(np.sum(pc.init_z_probs[1:-1])) if n_z >= 3 else 0.0
+    _status22 = "pass" if _interior > 1e-6 else "warn"
     _test(results, _status22,
-          "Upward transitions exist from mid state",
-          "Simulation can represent income recovery",
-          f"P(up) = {_p_up:.4f}")
+          "init_z_probs has mass on interior nodes",
+          "Initial draws can land away from the grid boundary",
+          f"P(interior) = {_interior:.4f}")
 
-    # Test 23: No absorbing states in Pi_z
-    _escape_probs = np.array([1.0 - pc.Pi_z[i, i] for i in range(n_z)])
-    _n_absorbing = int(np.sum(_escape_probs < 1e-10))
-    _status23 = "pass" if _n_absorbing == 0 else "warn"
+    # Test 23: init_z_probs is centred near z=0 within one bin
+    _mean_z = float(np.dot(pc.init_z_probs, pc.z_grid))
+    _bin_step = float(pc.z_grid[1] - pc.z_grid[0]) if n_z > 1 else 0.0
+    _status23 = "pass" if abs(_mean_z) <= max(1e-6, _bin_step) else "warn"
     _test(results, _status23,
-          "No absorbing states in Pi_z",
-          "Simulation agents can leave boundary states",
-          f"{_n_absorbing} absorbing rows")
+          "init_z_probs centred near z=0",
+          "Stationary z-distribution should average to zero (mean-zero log-z)",
+          f"E[z_init] = {_mean_z:+.5f} (bin step = {_bin_step:.4f})")
 
     _summary("LABOUR INCOME & SOCIAL SECURITY", results)
     return results

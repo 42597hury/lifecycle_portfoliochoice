@@ -33,22 +33,28 @@ start_age, retire_age, terminal_age = 22, 67, 99
 b0, b1, b2, b3 = -6.142, 0.3040, -0.051, 0.002586
 rho, pz = 0.991, 0.176
 mu_eta1, sigma_eta1 = -0.524, 0.113
-mu_eta2 = -(pz / (1.0 - pz)) * mu_eta1
 sigma_eta2 = 0.046
 mu_eps1, sigma_eps1 = 0.134, 0.762
-mu_eps2, sigma_eps2 = 0.0, 0.055
+sigma_eps2 = 0.055
 pe = 0.044
 
+# NOTE: mu_eta2 and mu_eps2 are NOT free parameters; they are pinned by the
+# zero-mean constraint E[eta] = E[eps] = 0:
+#   mu_eta2 = -(pz / (1 - pz)) * mu_eta1
+#   mu_eps2 = -(pe / (1 - pe)) * mu_eps1
+# Both are derived inside `lifecycle.precompute.build_model` and stored on the
+# resulting `LifecyclePortfolioModel` as the authoritative source of truth
+# (see docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md, Fix A). They are
+# intentionally absent from BASE_CONFIG so callers cannot accidentally pin a
+# value that would silently violate the zero-mean constraint.
 BASE_CONFIG = {
     "beta": beta, "gamma": gamma, "b_bar": b_bar,
     "start_age": start_age, "retire_age": retire_age, "terminal_age": terminal_age,
     "b0": b0, "b1": b1, "b2": b2, "b3": b3,
     "rho": rho, "pz": pz,
-    "mu_eta1": mu_eta1, "sigma_eta1": sigma_eta1,
-    "mu_eta2": mu_eta2, "sigma_eta2": sigma_eta2,
+    "mu_eta1": mu_eta1, "sigma_eta1": sigma_eta1, "sigma_eta2": sigma_eta2,
     "pe": pe,
-    "mu_eps1": mu_eps1, "sigma_eps1": sigma_eps1,
-    "mu_eps2": mu_eps2, "sigma_eps2": sigma_eps2,
+    "mu_eps1": mu_eps1, "sigma_eps1": sigma_eps1, "sigma_eps2": sigma_eps2,
 }
 
 

@@ -429,16 +429,16 @@ def get_eps_quadrature_corrected(model, n_nodes=3):
     n_nodes is the TOTAL node count (no longer per-component K).
     Polynomial-exactness order = 2 * n_nodes - 1 against the mixture density.
 
-    NOTE: model.mu_eps2 is NOT used. Component 2's mean is computed internally
-    to enforce E[eps] = 0:  mu_eps2_effective = -(pe/(1-pe)) * mu_eps1.
-    Only model.sigma_eps2 is used from the component-2 parameters.
+    The mixture-component means come straight from `model`. The zero-mean
+    constraint mu_eps2 = -(pe/(1-pe)) * mu_eps1 is enforced upstream by
+    `lifecycle.precompute.build_model` (see Fix A in
+    docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md), so reading
+    `model.mu_eps2` directly is the single source of truth.
     """
     pe = float(model.pe)
-    mu1 = float(model.mu_eps1)
-    mu2_eff = -(pe / (1.0 - pe)) * mu1
     eps_nodes, eps_weights = _judd_mixture_quadrature(
         probs=[pe, 1.0 - pe],
-        mus=[mu1, mu2_eff],
+        mus=[float(model.mu_eps1), float(model.mu_eps2)],
         sigmas=[float(model.sigma_eps1), float(model.sigma_eps2)],
         n=n_nodes,
     )
@@ -455,16 +455,16 @@ def get_eta_quadrature_mixture(model, n_nodes=3):
     n_nodes is the TOTAL node count (no longer per-component K).
     Polynomial-exactness order = 2 * n_nodes - 1 against the mixture density.
 
-    NOTE: model.mu_eta2 is NOT used. Component 2's mean is computed internally
-    to enforce E[eta] = 0:  mu_eta2_effective = -(pz/(1-pz)) * mu_eta1.
-    Only model.sigma_eta2 is used from the component-2 parameters.
+    The mixture-component means come straight from `model`. The zero-mean
+    constraint mu_eta2 = -(pz/(1-pz)) * mu_eta1 is enforced upstream by
+    `lifecycle.precompute.build_model` (see Fix A in
+    docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md), so reading
+    `model.mu_eta2` directly is the single source of truth.
     """
     pz = float(model.pz)
-    mu1 = float(model.mu_eta1)
-    mu2_eff = -(pz / (1.0 - pz)) * mu1
     eta_nodes, eta_weights = _judd_mixture_quadrature(
         probs=[pz, 1.0 - pz],
-        mus=[mu1, mu2_eff],
+        mus=[float(model.mu_eta1), float(model.mu_eta2)],
         sigmas=[float(model.sigma_eta1), float(model.sigma_eta2)],
         n=n_nodes,
     )

@@ -85,12 +85,18 @@ def _reconstruct_z_grid(disc: dict[str, Any], nz_expected: int) -> np.ndarray:
         raise ValueError(
             f"Bundle metadata reports n_z={n_z_meta}, expected {nz_expected}"
         )
+    # mu_eta2 dropped from BASE_CONFIG; derive it from the zero-mean constraint
+    # -(pz/(1-pz))*mu_eta1 (see Fix A in
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md).
+    pz_v = float(BASE_CONFIG["pz"])
+    mu_eta1_v = float(BASE_CONFIG["mu_eta1"])
+    mu_eta2_v = -(pz_v / (1.0 - pz_v)) * mu_eta1_v
     z_grid, _Pi_z = discretize_income_ar1_mixture(
         rho=float(BASE_CONFIG["rho"]),
-        p=float(BASE_CONFIG["pz"]),
-        mu1=float(BASE_CONFIG["mu_eta1"]),
+        p=pz_v,
+        mu1=mu_eta1_v,
         sigma1=float(BASE_CONFIG["sigma_eta1"]),
-        mu2=float(BASE_CONFIG["mu_eta2"]),
+        mu2=mu_eta2_v,
         sigma2=float(BASE_CONFIG["sigma_eta2"]),
         N=n_z_meta,
         n_stds=float(disc["n_stds"]),

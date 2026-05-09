@@ -111,12 +111,18 @@ def _read_disc_config(bundle: Path, diagnostics: dict[str, Any] | None, metadata
 
 
 def reconstruct_z_grid(disc: dict[str, Any]) -> np.ndarray:
+    # mu_eta2 dropped from BASE_CONFIG and is now derived from the zero-mean
+    # constraint -(pz/(1-pz))*mu_eta1 (see Fix A in
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md).
+    pz_v = float(BASE_CONFIG["pz"])
+    mu_eta1_v = float(BASE_CONFIG["mu_eta1"])
+    mu_eta2_v = -(pz_v / (1.0 - pz_v)) * mu_eta1_v
     z_grid, _ = discretize_income_ar1_mixture(
         rho=float(BASE_CONFIG["rho"]),
-        p=float(BASE_CONFIG["pz"]),
-        mu1=float(BASE_CONFIG["mu_eta1"]),
+        p=pz_v,
+        mu1=mu_eta1_v,
         sigma1=float(BASE_CONFIG["sigma_eta1"]),
-        mu2=float(BASE_CONFIG["mu_eta2"]),
+        mu2=mu_eta2_v,
         sigma2=float(BASE_CONFIG["sigma_eta2"]),
         N=int(disc["n_z"]),
         n_stds=float(disc["n_stds"]),
@@ -171,14 +177,20 @@ def policy_metrics(candidate: dict[str, Any], reference: dict[str, Any]) -> dict
 
 
 def pi_z_transition_diagnostics(n_z_values: list[int], n_stds: float) -> dict[str, Any]:
+    # mu_eta2 dropped from BASE_CONFIG and is now derived from the zero-mean
+    # constraint -(pz/(1-pz))*mu_eta1 (see Fix A in
+    # docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md).
+    pz_v = float(BASE_CONFIG["pz"])
+    mu_eta1_v = float(BASE_CONFIG["mu_eta1"])
+    mu_eta2_v = -(pz_v / (1.0 - pz_v)) * mu_eta1_v
     rows: dict[str, Any] = {}
     for n_z in n_z_values:
         z, Pi = discretize_income_ar1_mixture(
             rho=float(BASE_CONFIG["rho"]),
-            p=float(BASE_CONFIG["pz"]),
-            mu1=float(BASE_CONFIG["mu_eta1"]),
+            p=pz_v,
+            mu1=mu_eta1_v,
             sigma1=float(BASE_CONFIG["sigma_eta1"]),
-            mu2=float(BASE_CONFIG["mu_eta2"]),
+            mu2=mu_eta2_v,
             sigma2=float(BASE_CONFIG["sigma_eta2"]),
             N=int(n_z),
             n_stds=float(n_stds),

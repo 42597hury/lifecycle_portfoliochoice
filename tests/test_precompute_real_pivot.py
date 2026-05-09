@@ -48,16 +48,17 @@ pytestmark = pytest.mark.skipif(
 # Minimal economic calibration. Pulled from configs/_canonical.py but
 # kept inline so the test does not depend on the canonical config that
 # Phase 5 will rewrite.
+# mu_eta2 / mu_eps2 are derived inside `build_model` from the zero-mean
+# constraint E[eta] = E[eps] = 0 (Fix A in
+# docs/scans/INCOME_PIPELINE_REVIEW_2026-05-09.md), so we don't pass them.
 _BASE_CONFIG = {
     "beta": 0.96, "gamma": 5.0, "b_bar": 10,
     "start_age": 22, "retire_age": 67, "terminal_age": 99,
     "b0": -6.142, "b1": 0.3040, "b2": -0.051, "b3": 0.002586,
     "rho": 0.991, "pz": 0.176,
-    "mu_eta1": -0.524, "sigma_eta1": 0.113,
-    "mu_eta2": -(0.176 / (1.0 - 0.176)) * (-0.524), "sigma_eta2": 0.046,
+    "mu_eta1": -0.524, "sigma_eta1": 0.113, "sigma_eta2": 0.046,
     "pe": 0.044,
-    "mu_eps1": 0.134, "sigma_eps1": 0.762,
-    "mu_eps2": 0.0, "sigma_eps2": 0.055,
+    "mu_eps1": 0.134, "sigma_eps1": 0.762, "sigma_eps2": 0.055,
 }
 
 

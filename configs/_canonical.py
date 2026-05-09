@@ -80,15 +80,24 @@ BASE_CONFIG = {
 # n_z=11, n_eps_nodes=4, n_eta_nodes=3: validated under the System I
 #   nz / eta-eps sensitivity sweeps (carry over from the legacy canonical).
 #
-# wealth_min: 0.05 AWI (~$2.7k 2019). Lower bound of the wealth grid
-#   covers the borrowing-constrained region (the EGM constrained branch
-#   is solved, NOT skipped). Matches the inf-horizon sweep convention.
-#   Previously 0.13 (which silently skipped the kink); the lower floor
-#   exposes the constrained branch to the solver and makes the canonical
-#   constraint set fully visible. See docs/STATE_SPACE.md §wealth_min.
+# wealth_min: 0.01 AWI (~$540 2019). Lower bound of the wealth grid;
+#   below the smallest real interior W_implied, the constrained-corner
+#   clamp in _lift_to_wealth_grid (Path B, commit e6b5448) sets c=W,
+#   alpha_s=alpha_b=0 — the standard borrowing-constrained corner per
+#   Carroll (2006) / Druedahl & Jorgensen (2017). Previous values
+#   (0.13, 0.05) were a legacy artefact: the constrained branch was
+#   never actually implemented, jnp.interp blended the artificial anchor
+#   with the smallest interior solution, so wealth_min had to stay above
+#   the kink to avoid the meaningless blend region. With the clamp now
+#   in place, wealth_min can drop below typical first-real-W_implied,
+#   exposing the corner to downstream consumers (simulator, EE residuals,
+#   arbitrage diagnostics). f32 spacing safety: 180 log-spaced points
+#   0.01..750 give min diff_f32 = 6.47e-4 (~650x above 1e-6 floor).
+#   Initial-wealth defaults across notebooks/tests/scripts are 0.1..10.0
+#   AWI — all >=10x above the floor.
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
-    wealth_min=0.05,
+    wealth_min=0.01,
     wealth_max=750.0,
     n_savings=180,
     state_grid_sizes=(5, 5, 5),

@@ -53,7 +53,7 @@ sc = SolverConfig(
     use_line_search=True,
     delta_bequest=0.0,
     gather_precision="f32",
-    cell_vmap_chunks=2,
+    cell_vmap_chunks=8,                # 4x more chunking vs 2 — g11 OOM'd at 38GB on A100-40GB
 )
 
 

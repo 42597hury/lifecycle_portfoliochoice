@@ -107,11 +107,12 @@ else:
 # === AGENT 5: checkpoint discriminant hash ===
 print("\n--- AGENT 5 (checkpoint discriminant hash) ---", flush=True)
 
-# Generate checkpoint path for sc_a
-ckpt_a = _default_checkpoint_path(disc_lc, int(solve_control.youngest_age_to_solve), solver_config=sc_a)
+# Generate checkpoint path for sc_a — signature: (model, disc, age, solver_config)
+age_arg = int(solve_control.youngest_age_to_solve)
+ckpt_a = _default_checkpoint_path(model, disc_lc, age_arg, solver_config=sc_a)
 # Modify init_alpha_s
 sc_b = sc_a._replace(init_alpha_s=0.50)
-ckpt_b = _default_checkpoint_path(disc_lc, int(solve_control.youngest_age_to_solve), solver_config=sc_b)
+ckpt_b = _default_checkpoint_path(model, disc_lc, age_arg, solver_config=sc_b)
 print(f"  sc_a (init_alpha_s=0.85) → ckpt: ...{ckpt_a[-30:]}", flush=True)
 print(f"  sc_b (init_alpha_s=0.50) → ckpt: ...{ckpt_b[-30:]}", flush=True)
 if ckpt_a == ckpt_b:
@@ -120,7 +121,7 @@ if ckpt_a == ckpt_b:
 print(f"  AGENT 5 (checkpoint hash): distinct paths for distinct sc  ✓", flush=True)
 
 # Verify same sc → same path (determinism)
-ckpt_a2 = _default_checkpoint_path(disc_lc, int(solve_control.youngest_age_to_solve), solver_config=sc_a)
+ckpt_a2 = _default_checkpoint_path(model, disc_lc, age_arg, solver_config=sc_a)
 if ckpt_a != ckpt_a2:
     print(f"  AGENT 5 FAIL: non-deterministic for same sc", flush=True)
     sys.exit(1)

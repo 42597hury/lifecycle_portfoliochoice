@@ -1,18 +1,19 @@
-"""IH g=10 NEW VAR (CCV nominal) theta sweep — parameterized.
+"""IH g=10 CCV nominal theta sweep — parameterized over (theta, dataset_dir).
 
 Usage:
-    python verify/test_inf_horizon_g10_ccv_nominal_theta_sweep.py 0.25
-    python verify/test_inf_horizon_g10_ccv_nominal_theta_sweep.py 0.50
-    python verify/test_inf_horizon_g10_ccv_nominal_theta_sweep.py 0.75
+    python ..._sweep.py 0.25                              # default ccv_nominal_yield_scaling
+    python ..._sweep.py 0.50 ccv_nominal_yield_scaling
+    python ..._sweep.py 0.75 ccv_nominal_yield_scaling_aaa20
+    python ..._sweep.py 1.00 ccv_nominal_yield_scaling_aaa10
 
-Same disc/solver as test_inf_horizon_g10_ccv_nominal_theta000_wmin01.py
-and test_inf_horizon_g10_ccv_nominal_theta100_wmin01.py — only theta varies.
+The dataset_dir is the directory name under data/ (without trailing slash).
+The CSV path resolves to data/<dataset_dir>/var_dataset_theta_{p_label}.csv.
 
-Together with the prior theta=0.0 and theta=1.0 bundles, this fills out
-a clean 5-point theta sweep: {0.00, 0.25, 0.50, 0.75, 1.00}.
+Bundle name reflects the dataset family + theta:
+    test_inf_horizon_g10_<family_short>_theta{NNN}_wmin01_qr33
 
-Bundle: saved_runs/inf_horizon/test_inf_horizon_g10_ccv_nominal_theta{NNN}_wmin01_qr33/
-where NNN is the integer percentage (e.g. theta=0.25 → theta025).
+where <family_short> is the dataset_dir with 'ccv_nominal_yield_scaling' →
+'ccv_nominal' and the suffix preserved (e.g. '_aaa20').
 
 Wall: ~3.4 min each.
 """
@@ -22,21 +23,28 @@ import numpy as np
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from configs._canonical import BASE_CONFIG, resolve_var_csv_path
+from configs._canonical import BASE_CONFIG
 from lifecycle.model import DiscretizationConfig, SolverConfig
 from lifecycle.var import build_real_full_var_config
+
+
+def _theta_label(theta: float) -> str:
+    return f"{float(theta):.2f}".replace("-", "m").replace(".", "p")
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
 
 
-if len(sys.argv) != 2:
-    print("usage: theta_sweep.py <theta>  (theta in 0.00..1.00)", file=sys.stderr)
+if len(sys.argv) < 2 or len(sys.argv) > 3:
+    print("usage: theta_sweep.py <theta> [<dataset_dir>]  (theta in 0..1; dataset_dir defaults to ccv_nominal_yield_scaling)", file=sys.stderr)
     sys.exit(2)
 TERM_PREMIUM_THETA = float(sys.argv[1])
-TERM_PREMIUM_DATASET = "ccv_nominal"
+DATASET_DIR = sys.argv[2] if len(sys.argv) == 3 else "ccv_nominal_yield_scaling"
+
+# Family short tag for bundle naming
+FAMILY_SHORT = DATASET_DIR.replace("ccv_nominal_yield_scaling", "ccv_nominal")
 THETA_TAG = f"theta{int(round(TERM_PREMIUM_THETA * 100)):03d}"
-SWEEP_TAG = f"ccv_nominal_{THETA_TAG}"
+SWEEP_TAG = f"{FAMILY_SHORT}_{THETA_TAG}"
 
 disc = DiscretizationConfig(
     n_wealth=100, wealth_min=0.10, wealth_max=750.0, n_savings=100,
@@ -65,7 +73,7 @@ print("=" * 70, flush=True)
 import jax
 print(f"JAX devices: {jax.devices()}", flush=True)
 
-csv_path = resolve_var_csv_path(TERM_PREMIUM_THETA, term_premium_dataset=TERM_PREMIUM_DATASET)
+csv_path = f"data/{DATASET_DIR}/var_dataset_theta_{_theta_label(TERM_PREMIUM_THETA)}.csv"
 print(f"\nVAR CSV: {csv_path}", flush=True)
 
 t0 = time.time()
@@ -113,7 +121,7 @@ run_config_snapshot = {
     "predictability_ablation": {"system_code": "full", "system_label": "full_system_real",
         "system_title": f"Full System (real, CCV nominal, theta={TERM_PREMIUM_THETA})",
         "state_names": ["cape", "spr", "y_1"]},
-    "term_premium_dataset": TERM_PREMIUM_DATASET,
+    "term_premium_dataset": DATASET_DIR,
     "term_premium_theta": float(TERM_PREMIUM_THETA),
     "var_csv_path": csv_path,
     "bundle_name": BUNDLE_NAME, "wall_time_seconds": float(solve_wall),

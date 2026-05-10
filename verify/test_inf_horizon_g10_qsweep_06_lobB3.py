@@ -29,7 +29,7 @@ disc = DiscretizationConfig(
     state_grid_sizes=(10, 10, 10), state_grid_mode="cholesky",
     state_n_stds=(3.0, 3.0, 3.0), n_z=1, n_stds=3.0,
     n_eps_nodes=4, n_eta_nodes=3,
-    n_ret_nodes_1d=(4, 4),
+    n_ret_nodes_1d=(4, 5),              # xb bumped 4->5 — Lobatto requires odd K in {3,5,7}
     ret_lobatto_Z=(None, 3.0),
     n_state_quad_nodes=(3, 3, 5), state_lobatto_Z=None,
 )

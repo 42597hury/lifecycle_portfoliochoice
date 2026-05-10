@@ -65,7 +65,7 @@ IH_MAX_ITER = 200
 IH_DAMPING = 0.5
 
 print("=" * 70, flush=True)
-print(f"IH g=10 NEW VAR ({TERM_PREMIUM_DATASET} theta={TERM_PREMIUM_THETA})", flush=True)
+print(f"IH g=10 NEW VAR ({DATASET_DIR} theta={TERM_PREMIUM_THETA})", flush=True)
 print(f"  qs={disc.n_state_quad_nodes}  qr={disc.n_ret_nodes_1d}  wmin={disc.wealth_min}", flush=True)
 print(f"  bundle suffix: {SWEEP_TAG}", flush=True)
 print("=" * 70, flush=True)

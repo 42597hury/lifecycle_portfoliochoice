@@ -19,11 +19,11 @@ from lifecycle.precompute import build_model, Precompute
 from lifecycle.solver import run_lifecycle_solver
 from lifecycle.simulation import simulate_lifecycle
 from lifecycle.policy_io import save_policy_bundle, load_policy_bundle
-from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER
+from configs._canonical import BASE_CONFIG, CANONICAL_DISC, CANONICAL_SOLVER, VAR_CSV_PATH
 from lifecycle.predictability_ablation import prepare_predictability_system
 
 # 1. Estimate the VAR (or pick an ablation: "1", "2", "full")
-system = prepare_predictability_system("full", csv_path="data/var_dataset.csv",
+system = prepare_predictability_system("full", csv_path=VAR_CSV_PATH,
                                         disc_config_template=CANONICAL_DISC)
 
 # 2. Build the model and precompute grids/quadrature/lookup tables
@@ -42,6 +42,16 @@ save_policy_bundle("saved_runs/my_run", C_mat, S_mat, B_mat,
 sim = simulate_lifecycle(C_mat, S_mat, B_mat, pc, model,
                           n_simulations=10_000, seed=42)
 ```
+
+To run a yield-stage term-premium counterfactual, first build the theta
+datasets:
+
+```powershell
+python data\build_var_dataset_term_premium_scale.py
+```
+
+Then set `TERM_PREMIUM_THETA` in a config and resolve the path with
+`resolve_var_csv_path(theta)`. See `configs/run_term_premium_theta0.py`.
 
 The orchestration notebook is [main.ipynb](main.ipynb).
 

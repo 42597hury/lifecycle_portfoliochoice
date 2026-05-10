@@ -4,7 +4,31 @@
 
 **Architecture.** [`configs/_canonical.py`](../configs/_canonical.py) holds every value. Each sweep cell in [`configs/sweep_main/`](../configs/sweep_main/) and the dev/smoke configs ([`configs/system_iv_5x5x5.py`](../configs/system_iv_5x5x5.py), [`configs/smoke_test.py`](../configs/smoke_test.py)) is a thin override of the canonical via `_replace(...)` on `CANONICAL_DISC` / `CANONICAL_SOLVER`. To dial a value across all cells, edit `_canonical.py` and re-run [`scripts/_gen_sweep_main.py`](../scripts/_gen_sweep_main.py).
 
-**System.** All production configs use `PREDICTABILITY_SYSTEM = "IV"` (the full nominal-yield-as-state, real-return-as-uncertain VAR; see [STATE_SPACE.md](STATE_SPACE.md)).
+**System.** The canonical production config uses `PREDICTABILITY_SYSTEM = "full"`:
+the 3-axis real-yields VAR with state `(cape, spr, y_1)` and returns
+`(xr, xb)`.
+
+**Term-premium theta.** `TERM_PREMIUM_THETA = None` uses the active empirical
+baseline at `data/var_dataset.csv`. Setting a numeric theta selects a generated
+yield-stage term-premium-scaling dataset through
+`resolve_var_csv_path(theta)`, for example
+`data/term_premium_scaling/var_dataset_theta_0p00.csv`.
+
+The theta datasets are created with:
+
+```text
+python data/build_var_dataset_term_premium_scale.py
+```
+
+Use the config helper when constructing a model:
+
+```python
+from configs._canonical import prepare_canonical_predictability_system
+
+system = prepare_canonical_predictability_system(term_premium_theta=0.0)
+var_config = system["var_config"]
+disc_config_template = system["disc_config"]
+```
 
 ---
 

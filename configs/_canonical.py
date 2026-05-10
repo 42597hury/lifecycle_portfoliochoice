@@ -1,12 +1,13 @@
 """Canonical production config — single source of truth.
 
 Every other config in `configs/` (the sweep cells in `sweep_main/` and the
-dev/smoke configs) imports the three exports below and overrides only the
+dev/smoke configs) imports the exports below and overrides only the
 fields it intentionally varies. Dialing the canonical here propagates to
 every cell on the next regen / next solve.
 
 Exports:
   - PREDICTABILITY_SYSTEM
+  - TERM_PREMIUM_THETA / VAR_CSV_PATH
   - BASE_CONFIG          (dict — economics)
   - CANONICAL_DISC       (DiscretizationConfig — discretization)
   - CANONICAL_SOLVER     (SolverConfig — numerical solver)
@@ -23,6 +24,53 @@ See `docs/CONFIG.md` for the rationale behind every value.
 from lifecycle.model import DiscretizationConfig, SolverConfig, SolveControl
 
 PREDICTABILITY_SYSTEM = "full"
+
+
+# --- Financial VAR data source ------------------------------------------------
+# TERM_PREMIUM_THETA selects the yield-stage term-premium scaling dataset:
+#   None -> active empirical baseline, data/var_dataset.csv
+#   0.0  -> no estimated real term premium, data/term_premium_scaling/...
+#   1.0  -> generated empirical endpoint, algebraically equal to the baseline
+#
+# The theta datasets are built by:
+#   python data/build_var_dataset_term_premium_scale.py
+TERM_PREMIUM_THETA = None
+
+
+def term_premium_theta_label(theta: float) -> str:
+    """File-safe theta label matching data/build_var_dataset_term_premium_scale.py."""
+    return f"{float(theta):.2f}".replace("-", "m").replace(".", "p")
+
+
+def resolve_var_csv_path(term_premium_theta: float | None = TERM_PREMIUM_THETA) -> str:
+    """Return the VAR CSV path implied by a term-premium theta selection."""
+    if term_premium_theta is None:
+        return "data/var_dataset.csv"
+    label = term_premium_theta_label(float(term_premium_theta))
+    return f"data/term_premium_scaling/var_dataset_theta_{label}.csv"
+
+
+VAR_CSV_PATH = resolve_var_csv_path(TERM_PREMIUM_THETA)
+
+
+def prepare_canonical_predictability_system(
+    *,
+    term_premium_theta: float | None = TERM_PREMIUM_THETA,
+    system: str | int = PREDICTABILITY_SYSTEM,
+    disc_config_template: DiscretizationConfig | None = None,
+    builder_kwargs: dict | None = None,
+):
+    """Build the VAR/discretization bundle for the configured theta dataset."""
+    from lifecycle.predictability_ablation import prepare_predictability_system
+
+    return prepare_predictability_system(
+        system,
+        csv_path=resolve_var_csv_path(term_premium_theta),
+        disc_config_template=(
+            CANONICAL_DISC if disc_config_template is None else disc_config_template
+        ),
+        builder_kwargs=builder_kwargs,
+    )
 
 
 # ── Economics ───────────────────────────────────────────────────────────────

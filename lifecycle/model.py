@@ -141,8 +141,35 @@ class SolverConfig(NamedTuple):
     edge_max_iter: int = 8                     # max iterations for 1D edge Newton
 
     # --- Initial guess ---
-    init_alpha_s: float = 0.1                  # initial stock weight guess
-    init_alpha_b: float = 0.4                  # initial bond weight guess
+    # NOTE: these scalars are COLD-START fallbacks only. They are consulted in
+    # exactly three places:
+    #   (1) The first per-savings cell of each (state, z) sweep inside the
+    #       lifecycle/IH inner kernels — terminal sweep in solver.py
+    #       (`_solve_terminal_age_step_quad_jit`-style block: `warm_s = ... .init_alpha_s`),
+    #       `_solve_retirement_step_quad_jit`, and `_solve_working_age_step_quad_jit`
+    #       (`last_a_s = sc.init_alpha_s`). Subsequent cells in the same sweep
+    #       are warm-started from the previous cell's optimum
+    #       (`warm_s = opt_s` / `last_a_s = opt_s`).
+    #   (2) The IH outer-loop initial-policy buffers when the corresponding
+    #       `warm_start_s` / `warm_start_b` argument is None (see
+    #       `_prepare_initial_policies` in lifecycle/inf_horizon_solver.py:
+    #       the `S_old is None` / `B_old is None` branches), AND in the
+    #       inner-kernel smoke test (`compile_inner_kernel_smoke_test`) which
+    #       cold-starts the next-period policy buffer with these scalars.
+    #   (3) Per-cell warm-start RESEED after an unconstrained Newton failure
+    #       (`EC_NEWTON_FAIL` branch in `_solve_retirement_step_quad_jit` and
+    #       `_solve_working_age_step_quad_jit`, search for `DI_WARM_RESET`):
+    #       the failed cell's warm-start is reset to these scalars before the
+    #       next savings index is solved.
+    # In iterative paths (lifecycle backward induction, IH outer loop), once
+    # iteration 0 completes, the per-(z, state, wealth) warm-start ARRAY
+    # (`c_next_full`, `s_next_full`, `b_next_full` in inf_horizon_solver.py;
+    # `policy_alpha_{s,b}` arrays in lifecycle solver) drives the inner kernel,
+    # and these scalars no longer influence the result. Tweaking them after
+    # iter 0 has converged the policy will NOT change anything except the
+    # value used by the per-cell reseed in case (3).
+    init_alpha_s: float = 0.1                  # cold-start stock weight (see note above)
+    init_alpha_b: float = 0.4                  # cold-start bond weight (see note above)
 
     # --- Step control ---
     step_damp_constrained: float = 0.2         # max Newton step length (constrained)

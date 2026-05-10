@@ -2126,6 +2126,11 @@ def solve_terminal_age(wealth_grid, savings_grid, annuity_factors,
         a_s_egm = np.empty(n_s)
         a_b_egm = np.empty(n_s)
 
+        # Cold-start scalars: consulted only at the first j_s of this state's
+        # sweep. After the first solve, `warm_s`/`warm_b` are overwritten by
+        # the previous cell's optimum below ("warm_s = opt_s"), so changing
+        # init_alpha_{s,b} after iter 0 has no effect on the converged policy.
+        # See SolverConfig field comment in lifecycle/model.py.
         warm_s = solver_config.init_alpha_s
         warm_b = solver_config.init_alpha_b
         any_fail = False
@@ -3110,6 +3115,14 @@ def _solve_retirement_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
         base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
         base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
 
+        # Cold-start scalars: consulted only at the first (z_i, s_i_idx) cell
+        # of this state's sweep. Subsequent cells use the previous cell's
+        # optimum (see "last_a_s = opt_s" near the bottom of the inner loop)
+        # as warm-start, so init_alpha_{s,b} has no effect on the converged
+        # policy after the very first solve in each state slab. The same
+        # values are also used as a per-cell RESEED on EC_NEWTON_FAIL (see
+        # `last_a_s = sc.init_alpha_s` block further down). See SolverConfig
+        # field comment in lifecycle/model.py.
         last_a_s = sc.init_alpha_s
         last_a_b = sc.init_alpha_b
 
@@ -3336,6 +3349,14 @@ def _solve_working_age_step_quad_jit(wealth_grid, savings_grid, z_grid, N_state,
         base_mu_r_i[1] = const_r[1] + A_r[1, 0] * s_i[0] + A_r[1, 1] * s_i[1] + A_r[1, 2] * s_i[2]
         base_mu_r_i[2] = const_r[2] + A_r[2, 0] * s_i[0] + A_r[2, 1] * s_i[1] + A_r[2, 2] * s_i[2]
 
+        # Cold-start scalars: consulted only at the first (z_i, s_i_idx) cell
+        # of this state's sweep. Subsequent cells use the previous cell's
+        # optimum (see "last_a_s = opt_s" near the bottom of the inner loop)
+        # as warm-start, so init_alpha_{s,b} has no effect on the converged
+        # policy after the very first solve in each state slab. The same
+        # values are also used as a per-cell RESEED on EC_NEWTON_FAIL (see
+        # `last_a_s = sc.init_alpha_s` block further down). See SolverConfig
+        # field comment in lifecycle/model.py.
         last_a_s = sc.init_alpha_s
         last_a_b = sc.init_alpha_b
 

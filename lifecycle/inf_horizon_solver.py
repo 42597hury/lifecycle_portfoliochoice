@@ -467,6 +467,11 @@ def _prepare_initial_policies(
             expected_shape,
         ).astype(np.float64, copy=True)
 
+    # init_alpha_{s,b} populate the cold-start policy arrays only when no
+    # warm_start_{s,b} is provided. Once the IH outer loop begins iterating,
+    # the per-(z, state, wealth) policy ARRAY (S_old/B_old) is updated in
+    # place each iteration, so these scalars do not influence the result
+    # past iter 0. See SolverConfig field comment in lifecycle/model.py.
     if S_old is None:
         S_old = np.full(expected_shape, float(solver_config.init_alpha_s), dtype=np.float64)
     if B_old is None:

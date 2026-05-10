@@ -60,8 +60,11 @@ def _print_progress_line(
     """Render one compact progress line in-place for long notebook/script runs.
 
     The Newton-failure column from the Numba era is gone — the per-iteration
-    failure count is recorded in the diagnostics dict instead
-    (``newton_failures_per_iter``); ``total_newton_failures`` is the sum.
+    strict-tolerance-miss count is recorded in the diagnostics dict instead
+    (``newton_strict_tol_misses_per_iter``); ``total_newton_strict_tol_misses``
+    is the sum. (Aliased as ``newton_failures_per_iter`` /
+    ``total_newton_failures`` for backwards compatibility — see
+    ``_build_diagnostics`` for the rename rationale.)
     """
     line = (
         f"\rih iter {iter_idx:4d} | xi {xi_err:.2e} | share {share_err:.2e} | stop {stop_err:.2e}"
@@ -432,10 +435,34 @@ def _build_diagnostics(
         backtrack_iter_per_iter[:n_iter_done],
     )
 
-    failures_per_iter_arr = np.asarray(
+    # ``newton_failures_per_iter`` counts cells whose Newton ``exit_code !=
+    # EC_INTERIOR`` — i.e., did not satisfy ``err < tol * scale`` by the time
+    # the FORI Newton loop wrapped at ``solver_config.max_iter``. Despite the
+    # historical name, this is NOT a divergence count: the
+    # ``newton_iter_histogram`` (correct) routinely shows p99=2 max=10 while
+    # this counter saturates near ``N_state * IH_max_iter``, because the
+    # FORI exit-code is set purely from the final-residual check (see
+    # ``_newton_fori`` / ``_newton_while`` in lifecycle/solver.py — both
+    # collapse "ls_failed early-out" and "max_iter cap miss" into the same
+    # ``EC_NEWTON_FAIL``). Real divergence almost never happens; what this
+    # tally measures is "FORI strict-tolerance misses".
+    #
+    # New canonical key: ``total_newton_strict_tol_misses`` /
+    # ``newton_strict_tol_misses_per_iter``. The old keys
+    # ``total_newton_failures`` / ``newton_failures_per_iter`` are retained
+    # as aliases for backwards compatibility with saved bundles, analysis
+    # scripts, and tests (~80 consumers across the repo). Prefer the new
+    # keys in new code.
+    #
+    # TODO(option-B): tease apart the two failure modes by introducing a
+    # distinct exit code for "ls_failed early-out" vs. "max_iter cap miss",
+    # then narrow this counter to genuine divergence. Out of scope for this
+    # rename pass — see fix(diagnostics) commit on
+    # fix/newton-failure-counter-semantics.
+    misses_per_iter_arr = np.asarray(
         newton_failures_per_iter[:n_iter_done], dtype=np.int64
     ).copy()
-    total_newton_failures = int(failures_per_iter_arr.sum()) if failures_per_iter_arr.size else 0
+    total_strict_tol_misses = int(misses_per_iter_arr.sum()) if misses_per_iter_arr.size else 0
 
     diagnostics: dict[str, Any] = {
         "converged": bool(converged),
@@ -452,8 +479,12 @@ def _build_diagnostics(
         "final_xi_supnorm": float(xi_hist[-1]) if n_iter_done else float("nan"),
         "final_share_supnorm": float(share_hist[-1]) if n_iter_done else float("nan"),
         "final_stopping_supnorm": float(max(xi_hist[-1], share_hist[-1])) if n_iter_done else float("nan"),
-        "total_newton_failures": total_newton_failures,
-        "newton_failures_per_iter": failures_per_iter_arr,
+        # Canonical (post-rename) keys.
+        "total_newton_strict_tol_misses": total_strict_tol_misses,
+        "newton_strict_tol_misses_per_iter": misses_per_iter_arr,
+        # Deprecated aliases — same values, kept for backwards compatibility.
+        "total_newton_failures": total_strict_tol_misses,
+        "newton_failures_per_iter": misses_per_iter_arr,
         "newton_iter_histogram": ni_hist,
         "backtrack_iter_histogram": nb_hist,
         "newton_iter_p99": float(ni_hist["p99"]),
@@ -600,9 +631,12 @@ def run_infinite_horizon_solver(
     # histogram"] (modulo per_age_* -> per_iter_* key rename).
     newton_iter_per_iter = []
     backtrack_iter_per_iter = []
-    # Per-iteration Newton failure count (cells where Newton did not converge
-    # within max_iter — exit_code != EC_INTERIOR). Summed into
-    # ``total_newton_failures`` for the diagnostics dict.
+    # Per-iteration Newton strict-tolerance-miss count (cells whose FORI Newton
+    # exit_code != EC_INTERIOR — i.e., did not hit ``err < tol * scale`` by the
+    # FORI cap; this conflates "ls_failed early-out" and "max_iter cap miss",
+    # see _build_diagnostics for the semantic note). Summed into
+    # ``total_newton_strict_tol_misses`` (and aliased as
+    # ``total_newton_failures``) in the diagnostics dict.
     newton_failures_per_iter: list[int] = []
     converged = False
     n_iter_done = 0

@@ -1,0 +1,41 @@
+theta,check,ok,message
+0.0,T,True,T=92 expected 92
+0.0,columns,True,"['cape', 'spr', 'y_1', 'xr', 'xb']"
+0.0,no_nan,True,output has no NaN
+0.0,theta_yield_identity,True,max abs=0.000e+00
+0.0,spr_identity,True,max abs=0.000e+00
+0.0,nominal_tp_identity,True,max abs=0.000e+00
+0.0,var_inflation_identity,True,max abs=0.000e+00
+0.0,xb_lagged_bill,True,max abs=0.000e+00
+0.25,T,True,T=92 expected 92
+0.25,columns,True,"['cape', 'spr', 'y_1', 'xr', 'xb']"
+0.25,no_nan,True,output has no NaN
+0.25,theta_yield_identity,True,max abs=0.000e+00
+0.25,spr_identity,True,max abs=0.000e+00
+0.25,nominal_tp_identity,True,max abs=0.000e+00
+0.25,var_inflation_identity,True,max abs=0.000e+00
+0.25,xb_lagged_bill,True,max abs=0.000e+00
+0.5,T,True,T=92 expected 92
+0.5,columns,True,"['cape', 'spr', 'y_1', 'xr', 'xb']"
+0.5,no_nan,True,output has no NaN
+0.5,theta_yield_identity,True,max abs=0.000e+00
+0.5,spr_identity,True,max abs=0.000e+00
+0.5,nominal_tp_identity,True,max abs=0.000e+00
+0.5,var_inflation_identity,True,max abs=0.000e+00
+0.5,xb_lagged_bill,True,max abs=0.000e+00
+0.75,T,True,T=92 expected 92
+0.75,columns,True,"['cape', 'spr', 'y_1', 'xr', 'xb']"
+0.75,no_nan,True,output has no NaN
+0.75,theta_yield_identity,True,max abs=0.000e+00
+0.75,spr_identity,True,max abs=0.000e+00
+0.75,nominal_tp_identity,True,max abs=0.000e+00
+0.75,var_inflation_identity,True,max abs=0.000e+00
+0.75,xb_lagged_bill,True,max abs=0.000e+00
+1.0,T,True,T=92 expected 92
+1.0,columns,True,"['cape', 'spr', 'y_1', 'xr', 'xb']"
+1.0,no_nan,True,output has no NaN
+1.0,theta_yield_identity,True,max abs=0.000e+00
+1.0,spr_identity,True,max abs=0.000e+00
+1.0,nominal_tp_identity,True,max abs=0.000e+00
+1.0,var_inflation_identity,True,max abs=0.000e+00
+1.0,xb_lagged_bill,True,max abs=0.000e+00

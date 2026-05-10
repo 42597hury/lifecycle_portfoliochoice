@@ -27,14 +27,20 @@ PREDICTABILITY_SYSTEM = "full"
 
 
 # --- Financial VAR data source ------------------------------------------------
-# TERM_PREMIUM_THETA selects the yield-stage term-premium scaling dataset:
+# TERM_PREMIUM_THETA selects a yield-stage term-premium scaling dataset:
 #   None -> active empirical baseline, data/var_dataset.csv
-#   0.0  -> no estimated real term premium, data/term_premium_scaling/...
-#   1.0  -> generated empirical endpoint, algebraically equal to the baseline
+#   0.0  -> no estimated long-yield residual
+#   1.0  -> full selected long-yield residual
 #
-# The theta datasets are built by:
+# TERM_PREMIUM_DATASET selects which family of theta datasets is used:
+#   "ar1_real"    -> data/term_premium_scaling/...
+#   "ccv_nominal" -> data/ccv_nominal_yield_scaling/...
+#
+# The theta datasets are built by either:
 #   python data/build_var_dataset_term_premium_scale.py
+#   python data/build_var_dataset_ccv_nominal_yield_theta.py
 TERM_PREMIUM_THETA = None
+TERM_PREMIUM_DATASET = "ar1_real"
 
 
 def term_premium_theta_label(theta: float) -> str:
@@ -42,20 +48,32 @@ def term_premium_theta_label(theta: float) -> str:
     return f"{float(theta):.2f}".replace("-", "m").replace(".", "p")
 
 
-def resolve_var_csv_path(term_premium_theta: float | None = TERM_PREMIUM_THETA) -> str:
+def resolve_var_csv_path(
+    term_premium_theta: float | None = TERM_PREMIUM_THETA,
+    *,
+    term_premium_dataset: str = TERM_PREMIUM_DATASET,
+) -> str:
     """Return the VAR CSV path implied by a term-premium theta selection."""
     if term_premium_theta is None:
         return "data/var_dataset.csv"
     label = term_premium_theta_label(float(term_premium_theta))
-    return f"data/term_premium_scaling/var_dataset_theta_{label}.csv"
+    if term_premium_dataset == "ar1_real":
+        return f"data/term_premium_scaling/var_dataset_theta_{label}.csv"
+    if term_premium_dataset == "ccv_nominal":
+        return f"data/ccv_nominal_yield_scaling/var_dataset_theta_{label}.csv"
+    raise ValueError(f"Unknown term_premium_dataset: {term_premium_dataset!r}")
 
 
-VAR_CSV_PATH = resolve_var_csv_path(TERM_PREMIUM_THETA)
+VAR_CSV_PATH = resolve_var_csv_path(
+    TERM_PREMIUM_THETA,
+    term_premium_dataset=TERM_PREMIUM_DATASET,
+)
 
 
 def prepare_canonical_predictability_system(
     *,
     term_premium_theta: float | None = TERM_PREMIUM_THETA,
+    term_premium_dataset: str = TERM_PREMIUM_DATASET,
     system: str | int = PREDICTABILITY_SYSTEM,
     disc_config_template: DiscretizationConfig | None = None,
     builder_kwargs: dict | None = None,
@@ -65,7 +83,10 @@ def prepare_canonical_predictability_system(
 
     return prepare_predictability_system(
         system,
-        csv_path=resolve_var_csv_path(term_premium_theta),
+        csv_path=resolve_var_csv_path(
+            term_premium_theta,
+            term_premium_dataset=term_premium_dataset,
+        ),
         disc_config_template=(
             CANONICAL_DISC if disc_config_template is None else disc_config_template
         ),

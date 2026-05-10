@@ -93,7 +93,17 @@ def _compute_w_floor_from_policy(C_old: np.ndarray, wealth_grid: np.ndarray) -> 
     # non-constrained index. For cells without a band the resulting w_per_cell
     # is wealth_grid[0] — wrong; the np.where below zeros it.
     first_unc = np.argmax(not_constrained, axis=2)           # (n_z, N_state) int
-    w_per_cell = np.asarray(wealth_grid, dtype=np.float64)[first_unc]
+    # v4 bump: advance one cell past first_unc. v3 at wmin=0.01 returned
+    # wealth_grid[1]=0.0798 (= first_unc=1, single-cell band at i=0). Clipping
+    # x_next to that value still lands inside the [wg[0], wg[1]] kink-edge
+    # interp bracket via fp32 searchsorted boundary effects (H1 in the floor
+    # agent's brief), so the kink slope leaks into Newton's Jacobian.
+    # Bumping to wealth_grid[first_unc+1] lands solidly on the smooth
+    # [wg[first_unc], wg[first_unc+1]] interior pair. Clipped at n_w-1 so the
+    # last grid point stays in-range for the edge case.
+    n_w = int(wealth_grid.shape[0])
+    first_safe = np.minimum(first_unc + 1, n_w - 1)
+    w_per_cell = np.asarray(wealth_grid, dtype=np.float64)[first_safe]
     out = np.where(has_band, w_per_cell, 0.0)
     return np.ascontiguousarray(out.astype(np.float64))
 

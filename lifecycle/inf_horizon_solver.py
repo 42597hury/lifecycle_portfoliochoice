@@ -68,12 +68,25 @@ def _compute_w_floor_from_policy(C_old: np.ndarray, wealth_grid: np.ndarray) -> 
     docs/handoff/HANDOFF_KINK_FIX_REGRESSION_AT_WMIN_010.md). v2 keeps the
     floor per-cell and substitutes 0 for cells with no constrained band.
 
+    v3 vs v2 (cloud Gate A re-run on 2026-05-10): v2 used strict ``==`` to
+    detect constrained cells. The lift's ``jnp.where`` clamp writes ``wealth_grid``
+    bit-exactly in fp64, but with ``gather_precision="f32"`` the kernel
+    re-materialises ``c_w`` through an fp32 path before it lands back in the IH
+    outer loop, so bit-equality with the fp64 ``wealth_grid`` is lost on the
+    round-trip. Empirically the helper produced ``has_band.mean() = 0``
+    universally at wmin=0.01 and v2 was a no-op there. v3 detects constrained
+    cells with ``np.isclose(atol=1e-8)``: above fp32 ULP at the relevant
+    W~0.01-0.15 range, but well below the >=1e-3 gap to any interior ``c_opt``
+    at low W (CRRA gives ``c ~ 0.05W`` interior), so zero false-positive risk.
+
     Returns
     -------
     np.ndarray of shape ``(n_z, N_state)`` and dtype float64. Each entry is the
     per-cell w_floor; cells with no constrained band carry ``0.0``.
     """
-    constrained = (C_old == wealth_grid[None, None, :])      # (n_z, N_state, n_w)
+    constrained = np.isclose(
+        C_old, wealth_grid[None, None, :], atol=1e-8, rtol=0.0,
+    )                                                        # (n_z, N_state, n_w)
     has_band = constrained.any(axis=2)                       # (n_z, N_state) bool
     not_constrained = ~constrained
     # argmax of all-True returns 0; argmax otherwise returns the first

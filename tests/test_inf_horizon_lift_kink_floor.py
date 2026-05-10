@@ -142,6 +142,60 @@ def test_w_floor_helper_dtype_and_shape_contract():
     assert out.flags["C_CONTIGUOUS"]
 
 
+def test_w_floor_helper_tolerates_fp32_roundtrip_noise():
+    """v3 regression test: when ``gather_precision='f32'`` the kernel
+    re-materialises ``c_w`` through an fp32 path before returning to the IH
+    outer loop, so bit-equality with the fp64 ``wealth_grid`` is lost on the
+    round-trip. The helper must still detect constrained cells.
+
+    Reproduces the Gate A symptom: at wmin=0.01 v2's strict-equality check
+    yielded ``has_band.mean() = 0`` universally, making the entire fix a no-op.
+    v3 detects within ``atol=1e-8`` of ``wealth_grid``, which catches values
+    quantised by an fp32 round-trip at the low-W range where the kink lives.
+    """
+    wealth_grid = np.array([0.01, 0.07984, 0.1543, 0.2390, 0.5, 1.0])
+    n_z, N_state = 1, 3
+    C = np.full((n_z, N_state, wealth_grid.size), 0.5 * wealth_grid)
+    # Cell (0,0) has 2 constrained cells, but the values are fp32-noised — NOT
+    # bit-equal to wealth_grid in fp64. Simulates the real round-trip the
+    # kernel produces.
+    fp32_noise = wealth_grid[:2].astype(np.float32).astype(np.float64)
+    C[0, 0, :2] = fp32_noise
+    # Confirm the simulated noise actually breaks strict equality (so the test
+    # is exercising the v3 fix, not silently degenerating to v2's contract).
+    assert not np.array_equal(C[0, 0, :2], wealth_grid[:2]), (
+        "fp32 round-trip should yield non-bit-equal values; test is mis-set"
+    )
+    out = _compute_w_floor_from_policy(C, wealth_grid)
+    assert out[0, 0] == wealth_grid[2], (
+        f"v3 must detect the fp32-noised constrained band; got {out[0,0]}, "
+        f"expected wealth_grid[2]={wealth_grid[2]}"
+    )
+    assert out[0, 1] == 0.0
+    assert out[0, 2] == 0.0
+
+
+def test_w_floor_helper_does_not_misclassify_interior_at_low_w():
+    """Tolerance trade-off check: an interior cell with ``c_opt`` close-but-not-
+    equal to ``wealth_grid`` (e.g. very low W where CRRA gives c~0.05W, so
+    c_opt and W differ by 95%) must NOT be classified as constrained.
+
+    The fp32-noise tolerance is 1e-8; interior c_opt is on the order of
+    0.05*wealth_grid (typically >=1e-3 different from wealth_grid at low W) —
+    several orders of magnitude above the tolerance. False-positive risk
+    should be zero.
+    """
+    wealth_grid = np.array([0.01, 0.08, 0.15, 0.25])
+    n_z, N_state = 1, 2
+    # Cell (0,0): all interior, c = 0.05 * W (CRRA-like). Differences from
+    # wealth_grid are 0.0095, 0.076, 0.1425, 0.2375 — all >> atol=1e-8.
+    C = np.full((n_z, N_state, wealth_grid.size), 0.05 * wealth_grid)
+    out = _compute_w_floor_from_policy(C, wealth_grid)
+    assert np.all(out == 0.0), (
+        f"interior cells must not be misclassified as constrained; got {out!r}"
+    )
+
+
 # -----------------------------------------------------------------------------
 # End-to-end plumbing smoke
 # -----------------------------------------------------------------------------

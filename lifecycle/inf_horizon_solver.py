@@ -706,6 +706,20 @@ def run_infinite_horizon_solver(
             # See _compute_w_floor_from_policy docstring for the v1 regression
             # this addresses (global max homogenisation at wmin=0.10).
             w_floor_arr = _compute_w_floor_from_policy(C_old, np.asarray(pc.wealth_grid))
+            # TEMP H1/H2/H3 DIAGNOSTIC — remove after kink-fix v3 lands
+            _wg_arr = np.asarray(pc.wealth_grid)
+            _has_band_frac = float((w_floor_arr > 0).mean())
+            _wf_nonzero = w_floor_arr[w_floor_arr > 0]
+            _wf_min = float(_wf_nonzero.min()) if _wf_nonzero.size else 0.0
+            _wf_p50 = float(np.median(_wf_nonzero)) if _wf_nonzero.size else 0.0
+            _wf_max = float(_wf_nonzero.max()) if _wf_nonzero.size else 0.0
+            print(
+                f"[KINK-DIAG iter {it}] has_band frac={_has_band_frac:.3f}  "
+                f"w_floor>0 [min, p50, max] = [{_wf_min:.4f}, {_wf_p50:.4f}, {_wf_max:.4f}]  "
+                f"wg[:4] = [{_wg_arr[0]:.4f}, {_wg_arr[1]:.4f}, {_wg_arr[2]:.4f}, {_wg_arr[3]:.4f}]",
+                flush=True,
+            )
+            # END TEMP DIAGNOSTIC
             w_floor_jnp = jnp.asarray(w_floor_arr)
             # Per-savings backward-iter warm-start: iter 0 starts from a
             # mid-wealth-gather broadcast (Variant A — see pre-loop setup);

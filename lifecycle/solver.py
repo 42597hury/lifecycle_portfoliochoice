@@ -25,6 +25,7 @@ Module-level setup (jax x64 + virtual CPU device count) lives in
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from collections import namedtuple
@@ -113,21 +114,102 @@ def _interp_progress_policy_at_wealth(policy_by_wealth, w_grid, wealth):
 # Solve-control / checkpoint helpers
 # =============================================================================
 
-def _default_checkpoint_path(_model, disc_config, youngest_age_to_solve):
+def _checkpoint_discriminant_hash(model, solver_config):
+    """Short stable hex digest of (solver_config, var_identity).
+
+    Two runs with different SolverConfig fields that meaningfully alter
+    Newton/EGM behaviour, OR with different VAR matrices on `model`,
+    must produce different digests so the auto-derived checkpoint path
+    does not collide. Floats are canonicalised via "%.6g" formatting
+    BEFORE hashing so trivial fp-noise does not perturb the digest.
+    Output is 8 hex chars (32 bits).
+
+    Covered fields:
+        SolverConfig: tol, max_iter, init_alpha_s, init_alpha_b,
+                      delta_bequest, gather_precision,
+                      wealth_dynamics_spec, cell_vmap_chunks
+        VAR identity: Phi_0_state, Phi_11, Phi_0_ret, Phi_21,
+                      Sigma_ss, Sigma_rr, Sigma_rs (the model-side
+                      projection of var_config used by the solver)
+    """
+    if solver_config is None:
+        solver_config = SolverConfig()
+
+    def _fmt(v):
+        if isinstance(v, float):
+            return format(v, ".6g")
+        return repr(v)
+
+    solver_fields = (
+        "tol",
+        "max_iter",
+        "init_alpha_s",
+        "init_alpha_b",
+        "delta_bequest",
+        "gather_precision",
+        "wealth_dynamics_spec",
+        "cell_vmap_chunks",
+    )
+    parts = [f"{name}={_fmt(getattr(solver_config, name, None))}" for name in solver_fields]
+    solver_summary = "|".join(parts)
+
+    h = hashlib.blake2b(digest_size=4)
+    h.update(solver_summary.encode("utf-8"))
+    h.update(b"||VAR||")
+    for attr in (
+        "Phi_0_state",
+        "Phi_11",
+        "Phi_0_ret",
+        "Phi_21",
+        "Sigma_ss",
+        "Sigma_rr",
+        "Sigma_rs",
+    ):
+        arr = getattr(model, attr, None)
+        if arr is None:
+            h.update(f"{attr}=None|".encode("utf-8"))
+            continue
+        a = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
+        h.update(f"{attr}:{a.shape}|".encode("utf-8"))
+        h.update(a.tobytes())
+    return h.hexdigest()
+
+
+def _default_checkpoint_path(model, disc_config, youngest_age_to_solve, solver_config=None):
+    """Build a natural default bundle path for partial-solve checkpoints.
+
+    The path encodes a short stable hash of (SolverConfig, VAR identity) so a
+    run with a different solver_config or var_config does NOT auto-resume from
+    a checkpoint produced under different settings (which previously caused
+    silent regressions reporting all-zero Newton histograms).
+
+    `solver_config=None` falls back to SolverConfig() so callers that don't
+    have a solver_config still produce a stable digest. See
+    `_checkpoint_discriminant_hash` for the discriminant fields.
+    """
     grid_sizes = "x".join(str(v) for v in disc_config.state_grid_sizes)
     age_suffix = (
         f"_to_age{int(youngest_age_to_solve)}"
         if youngest_age_to_solve is not None
         else "_partial"
     )
+    discriminant = _checkpoint_discriminant_hash(model, solver_config)
     name = (
         f"jax_{disc_config.state_grid_mode}"
         f"_grid{grid_sizes}_nz{disc_config.n_z}{age_suffix}"
+        f"_h{discriminant}"
     )
     return str(Path("saved_runs") / "checkpoints" / name)
 
 
-def _normalize_solve_control(model, pc, solve_control):
+def _normalize_solve_control(model, pc, solve_control, solver_config=None):
+    """Validate and normalize SolveControl inputs.
+
+    `solver_config` is optional for backward compatibility (existing direct
+    callers in tests pass only model/pc/solve_control). When supplied, it is
+    threaded into the auto-derived `checkpoint_path` so that runs with
+    different SolverConfig fields do not collide on a single checkpoint.
+    """
     if solve_control is None:
         return SolveControl(), False
     if not isinstance(solve_control, SolveControl):
@@ -163,7 +245,9 @@ def _normalize_solve_control(model, pc, solve_control):
     if checkpoint_path is None and (
         youngest is not None or every is not None or solve_control.save_on_interrupt
     ):
-        checkpoint_path = _default_checkpoint_path(model, pc.disc_config, youngest)
+        checkpoint_path = _default_checkpoint_path(
+            model, pc.disc_config, youngest, solver_config=solver_config
+        )
 
     if checkpoint_path is not None:
         checkpoint_path = str(Path(checkpoint_path))
@@ -2797,7 +2881,9 @@ def run_lifecycle_solver(
         )
     delta = sc.delta_bequest if sc.delta_bequest >= 0.0 else DELTA_BEQUEST
 
-    solve_control, control_active = _normalize_solve_control(model, pc, solve_control)
+    solve_control, control_active = _normalize_solve_control(
+        model, pc, solve_control, solver_config=sc
+    )
 
     if verbose >= 1:
         n_dev_log = len(jax.devices())

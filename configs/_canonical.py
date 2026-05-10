@@ -136,6 +136,19 @@ BASE_CONFIG = {
 #   Axis 1 = spr   (term spread)
 #   Axis 2 = y_1   (real bill yield; bond-return refinement target, K-bump)
 #
+# wealth_min knobs: lifecycle and infinite-horizon paths use different floors
+#   until the IH outer-loop lift-kink instability is structurally fixed.
+#   See docs/handoff/HANDOFF_IH_LIFT_KINK_STRUCTURAL_FIX.md for the issue and
+#   the eventual unification plan. Lifecycle keeps wealth_min=0.01 (canonical;
+#   see the wealth_min comment further below for why this is load-bearing for
+#   the Path B constrained-corner clamp + SCF-mass simulator exposure). IH
+#   scripts call ih_disc_template() to lift the floor to 0.10 as a bandaid
+#   against the lift-kink instability that produces non-monotone bond
+#   policies near the bottom of the wealth grid in stationary equilibrium.
+LIFECYCLE_WEALTH_MIN = 0.01   # canonical, exposes Path B constrained-corner clamp
+IH_WEALTH_MIN = 0.10          # bandaid for IH outer-loop kink instability
+                              # (see docs/handoff/HANDOFF_IH_LIFT_KINK_STRUCTURAL_FIX.md)
+#
 # state_grid_sizes / state_n_stds: per
 #   docs/scans/DISCRETIZED_VAR_FIDELITY_AUDIT_2026-05-09.md, the prior
 #   (2.0, 2.25, 2.25) bracket excluded ~9.16% of the VAR's stationary mass
@@ -176,7 +189,7 @@ BASE_CONFIG = {
 #   AWI — all >=10x above the floor.
 CANONICAL_DISC = DiscretizationConfig(
     n_wealth=180,
-    wealth_min=0.01,
+    wealth_min=LIFECYCLE_WEALTH_MIN,
     wealth_max=750.0,
     n_savings=180,
     state_grid_sizes=(5, 5, 5),
@@ -191,6 +204,17 @@ CANONICAL_DISC = DiscretizationConfig(
     n_state_quad_nodes=(3, 3, 5),
     state_lobatto_Z=None,
 )
+
+
+def ih_disc_template() -> DiscretizationConfig:
+    """Return CANONICAL_DISC with wealth_min lifted to IH_WEALTH_MIN.
+
+    Bandaid for the infinite-horizon outer-loop lift-kink instability; see
+    docs/handoff/HANDOFF_IH_LIFT_KINK_STRUCTURAL_FIX.md. Inf-horizon scripts
+    should use this rather than CANONICAL_DISC directly until the structural
+    fix lands and the floor can be unified back to LIFECYCLE_WEALTH_MIN.
+    """
+    return CANONICAL_DISC._replace(wealth_min=IH_WEALTH_MIN)
 
 
 # ── Numerical solver ────────────────────────────────────────────────────────

@@ -42,6 +42,50 @@ COLD_START_COV_RIDGE = 1e-10
 
 
 # =============================================================================
+# Lift-kink V'(W') quadrature floor (per docs/handoff/HANDOFF_IH_LIFT_KINK_*)
+# =============================================================================
+
+def _compute_w_floor_from_policy(C_old: np.ndarray, wealth_grid: np.ndarray) -> np.ndarray:
+    """Per-cell floor for the V'(W') quadrature clip in the IH outer loop.
+
+    The lifted policy out of ``_lift_to_wealth_grid`` sets ``c[i] = wealth_grid[i]``
+    exactly at constrained-corner cells (the ``jnp.where`` clamp in
+    lifecycle/solver.py). Per cell ``(i_z, i_s)``: find the first non-constrained
+    wealth-grid index; the floor for that cell is ``wealth_grid[first_unc]``.
+    Cells with no constrained band at all get a 0 floor — a true no-op under
+    ``jnp.maximum(x_next, 0.0)`` because retirement W' realisations are always
+    non-negative.
+
+    The kernel applies ``x_next = jnp.maximum(x_next, w_floor_cell)`` before the
+    V'(W') interp (in retirement_foc_jac_ccv), pushing W'-realizations off the
+    kink-edge cell pair so Newton's Jacobian sees the smooth interior MPC
+    instead of the constrained-corner slope-1 tangent. Lifecycle still calls
+    the kernel with a zeros-array w_floor; the clip is a no-op there.
+
+    v2 vs v1 (commit ``2d33c95``, reverted at ``5dafd0b``): v1 returned a
+    global scalar ``max`` across cells. At ``wmin=0.10`` that homogenises a
+    rare-cell floor onto every other cell and breaks convergence (see
+    docs/handoff/HANDOFF_KINK_FIX_REGRESSION_AT_WMIN_010.md). v2 keeps the
+    floor per-cell and substitutes 0 for cells with no constrained band.
+
+    Returns
+    -------
+    np.ndarray of shape ``(n_z, N_state)`` and dtype float64. Each entry is the
+    per-cell w_floor; cells with no constrained band carry ``0.0``.
+    """
+    constrained = (C_old == wealth_grid[None, None, :])      # (n_z, N_state, n_w)
+    has_band = constrained.any(axis=2)                       # (n_z, N_state) bool
+    not_constrained = ~constrained
+    # argmax of all-True returns 0; argmax otherwise returns the first
+    # non-constrained index. For cells without a band the resulting w_per_cell
+    # is wealth_grid[0] — wrong; the np.where below zeros it.
+    first_unc = np.argmax(not_constrained, axis=2)           # (n_z, N_state) int
+    w_per_cell = np.asarray(wealth_grid, dtype=np.float64)[first_unc]
+    out = np.where(has_band, w_per_cell, 0.0)
+    return np.ascontiguousarray(out.astype(np.float64))
+
+
+# =============================================================================
 # Progress printing
 # =============================================================================
 
@@ -654,6 +698,15 @@ def run_infinite_horizon_solver(
     try:
         for it in range(max_iter):
             c_old_jnp = jnp.asarray(C_old)
+            # v2 lift-kink fix: per-cell V'(W') quadrature floor. Cells with a
+            # constrained-corner band get wealth_grid[first_unc]; cells without
+            # get 0.0 (no-op clip under jnp.maximum(x_next, 0.0) since W' >= 0).
+            # The (n_z, N_state) array crosses the kernel as a broadcast; the
+            # per-cell scalar is extracted inside the kernel's per_cell fn.
+            # See _compute_w_floor_from_policy docstring for the v1 regression
+            # this addresses (global max homogenisation at wmin=0.10).
+            w_floor_arr = _compute_w_floor_from_policy(C_old, np.asarray(pc.wealth_grid))
+            w_floor_jnp = jnp.asarray(w_floor_arr)
             # Per-savings backward-iter warm-start: iter 0 starts from a
             # mid-wealth-gather broadcast (Variant A — see pre-loop setup);
             # iter 1+ uses the previous iteration's converged per-savings α-grid
@@ -663,6 +716,7 @@ def run_infinite_horizon_solver(
              as_grid_new_jnp, ab_grid_new_jnp,
              ni_jnp, nb_jnp, ec_jnp) = retirement_kernel(
                 c_old_jnp, pension_zero, psi_one, init_a_s_arr, init_a_b_arr,
+                w_floor_jnp,
             )
             C_new = np.asarray(c_new_jnp)
             S_new = np.asarray(s_new_jnp)

@@ -1,9 +1,10 @@
 """Build CCV-style nominal-yield theta real-bond VAR datasets.
 
 This is the cleaner Campbell-Chan-Viceira-style construction discussed in the
-thesis notes.  It keeps the observed Shiller nominal long yield in the
-construction, but it removes external inflation-expectation models from the
-main real-yield step.
+thesis notes. It keeps an observed nominal long yield in the construction, but
+it removes external inflation-expectation models from the main real-yield step.
+The default long yield is Shiller's RLONG series with n=10, but the command
+line can switch to Moody's AAA and/or a different constant maturity horizon.
 
 Construction VAR:
 
@@ -21,28 +22,37 @@ The construction VAR is mean-pinned, unrestricted VAR(1):
 From this VAR:
 
     y_1_real,t    = E_t[rtb_{t+1}]
-    y_10_real_EH,t = (1/10) sum_{j=1}^{10} E_t[rtb_{t+j}]
-    y_10_nom_EH,t  = (1/10) sum_{j=0}^{9} E_t[y_1_nom,t+j]
+    y_n_real_EH,t = (1/n) sum_{j=1}^{n} E_t[rtb_{t+j}]
+    y_n_nom_EH,t  = (1/n) sum_{j=0}^{n-1} E_t[y_1_nom,t+j]
 
 The observed nominal long-yield residual is:
 
-    TP_nom,t = y_10_nom_obs,t - y_10_nom_EH,t.
+    TP_nom,t = y_n_nom_obs,t - y_n_nom_EH,t.
 
 Under the CCV assumption that the inflation risk premium is zero or constant,
 time variation in TP_nom,t is treated as the long-bond premium residual.  For
 theta in [0, 1]:
 
-    y_10_real_theta,t = y_10_real_EH,t + theta * TP_nom,t.
+    y_n_real_theta,t = y_n_real_EH,t + theta * TP_nom,t.
 
 For each theta, the script recomputes:
 
-    spr_theta,t = y_10_real_theta,t - y_1_real,t
-    xb_theta,t  = r_10_theta,t - y_1_real,t-1
+    spr_theta,t = y_n_real_theta,t - y_1_real,t
+    r_n_theta,t = n * y_n_real_theta,t-1 - (n-1) * y_n_real_theta,t
+    xb_theta,t  = r_n_theta,t - y_1_real,t-1
 
-using the same 10-year Campbell-Lo-MacKinlay-style constant-maturity return
-formula as the active real-yield baseline.
+This follows CCV (NBER 8566) Appendix C exactly. The hypothetical real bill
+has yield y_1_real,t = E_t[rtb_{t+1}] and is locally risk-free in real terms:
+its time-t yield equals its realized real return over [t, t+1], so the bill's
+return next period is y_1_real,t. The hypothetical real long bond is a
+zero-coupon claim with one-period log return r_{n,t+1} = n*y_t - (n-1)*y_{t+1}.
+Excess return subtracts the bill's return, i.e. the lagged real bill yield.
+The construction VAR's first variable rtb is used only for econometric
+estimation (so that H_1 * E_t(z_{t+1}) returns expected real-bill returns);
+it does not appear in the final excess-return formula.
 
-Outputs are written under data/ccv_nominal_yield_scaling/.
+Outputs are written under data/ccv_nominal_yield_scaling/ for the default
+Shiller-10 build, and under source/maturity-specific directories otherwise.
 """
 from __future__ import annotations
 
@@ -57,7 +67,6 @@ import pandas as pd
 
 from build_var_dataset_ar1_10y import (
     HERE,
-    IE_DATA_XLS,
     N_BOND,
     SAMPLE_END,
     SAMPLE_START,
@@ -75,12 +84,37 @@ from build_var_dataset_term_premium_scale import (
 
 
 OUT_DIR = HERE / "ccv_nominal_yield_scaling"
+AAA_CSV = THESIS / "AAA.csv"
 DEFAULT_THETAS = (0.0, 0.25, 0.50, 0.75, 1.0)
+LONG_YIELD_SOURCES = ("shiller", "aaa")
 CONSTRUCTION_COLS = ("rtb", "xr", "y_1_nom", "spr_nom", "cape")
 FINAL_COLS = ("cape", "spr", "y_1", "xr", "xb")
 
 
-def build_nominal_construction_panel() -> tuple[pd.DataFrame, pd.DataFrame]:
+def default_output_dir(long_yield_source: str, n_bond: int) -> Path:
+    """Default output location for one long-yield source/maturity pair."""
+    if long_yield_source == "shiller" and int(n_bond) == N_BOND:
+        return OUT_DIR
+    return HERE / f"ccv_nominal_yield_scaling_{long_yield_source}{int(n_bond)}"
+
+
+def load_aaa_january() -> pd.Series:
+    """Load Moody's AAA January yields in percent."""
+    aaa = pd.read_csv(AAA_CSV)
+    aaa["observation_date"] = pd.to_datetime(aaa["observation_date"])
+    aaa["AAA"] = pd.to_numeric(aaa["AAA"], errors="coerce")
+    aaa["year"] = aaa["observation_date"].dt.year
+    aaa["month"] = aaa["observation_date"].dt.month
+    jan = aaa[aaa["month"] == 1].copy()
+    if jan.duplicated("year").any():
+        raise ValueError("Multiple January observations per year in AAA.csv")
+    return jan.set_index("year")["AAA"].rename("AAA")
+
+
+def build_nominal_construction_panel(
+    *,
+    long_yield_source: str = "shiller",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return the annual construction VAR panel and raw diagnostics.
 
     Row t uses returns realized over [t-1,t] and yield states observed at t.
@@ -89,14 +123,25 @@ def build_nominal_construction_panel() -> tuple[pd.DataFrame, pd.DataFrame]:
     chap = load_chap26()
     shiller = load_shiller_monthly()
     cape_jan = load_cape_january(shiller)
+    long_yield_source = str(long_yield_source).lower()
+    if long_yield_source not in LONG_YIELD_SOURCES:
+        raise ValueError(
+            f"long_yield_source must be one of {LONG_YIELD_SOURCES}, "
+            f"got {long_yield_source!r}"
+        )
 
     df = chap.copy()
     df["CAPE"] = cape_jan.reindex(df.index)
     df["pi"] = np.log(df["CPI"] / df["CPI"].shift(1))
     df["y_1_nom"] = np.log1p(df["R"] / 100.0)
-    df["y_10_nom_obs"] = np.log1p(df["RLONG"] / 100.0)
+    if long_yield_source == "shiller":
+        df["long_yield_pct"] = df["RLONG"]
+    else:
+        df["long_yield_pct"] = load_aaa_january().reindex(df.index)
+    df["y_10_nom_obs"] = np.log1p(df["long_yield_pct"] / 100.0)
     df["spr_nom"] = df["y_10_nom_obs"] - df["y_1_nom"]
     df["cape"] = -np.log(df["CAPE"])
+    df["long_yield_source"] = long_yield_source
 
     stock_gross = (df["P"] + df["D"]) / df["P"].shift(1)
     df["xr"] = np.log(stock_gross) - df["y_1_nom"].shift(1)
@@ -105,8 +150,10 @@ def build_nominal_construction_panel() -> tuple[pd.DataFrame, pd.DataFrame]:
     z_panel = df.loc[:, list(CONSTRUCTION_COLS)].copy()
     diag = df.loc[:, [
         "P", "D", "R", "RLONG", "CPI", "CAPE", "pi",
-        "y_1_nom", "y_10_nom_obs", "spr_nom", "cape", "rtb", "xr",
+        "long_yield_pct", "y_1_nom", "y_10_nom_obs", "spr_nom",
+        "cape", "rtb", "xr",
     ]].copy()
+    diag["long_yield_source"] = long_yield_source
     return z_panel, diag
 
 
@@ -188,9 +235,16 @@ def average_expected_variable(
     )
 
 
-def build_components() -> tuple[pd.DataFrame, dict[str, object]]:
+def build_components(
+    *,
+    n_bond: int = N_BOND,
+    long_yield_source: str = "shiller",
+) -> tuple[pd.DataFrame, dict[str, object]]:
     """Build full-year component table before theta slicing."""
-    z_panel, raw = build_nominal_construction_panel()
+    n_bond = int(n_bond)
+    z_panel, raw = build_nominal_construction_panel(
+        long_yield_source=long_yield_source,
+    )
     sample = z_panel.loc[SAMPLE_START:SAMPLE_END].dropna().astype(float)
     var = estimate_mean_pinned_var(sample)
 
@@ -199,15 +253,17 @@ def build_components() -> tuple[pd.DataFrame, dict[str, object]]:
         z_panel, var, "rtb", first_horizon=1, count=1
     )
     comp["y_10_real_EH"] = average_expected_variable(
-        z_panel, var, "rtb", first_horizon=1, count=N_BOND
+        z_panel, var, "rtb", first_horizon=1, count=n_bond
     )
     comp["y_10_nom_EH"] = average_expected_variable(
-        z_panel, var, "y_1_nom", first_horizon=0, count=N_BOND
+        z_panel, var, "y_1_nom", first_horizon=0, count=n_bond
     )
     comp["pi_10_VAR"] = comp["y_10_nom_EH"] - comp["y_10_real_EH"]
     comp["term_prem_nom"] = comp["y_10_nom_obs"] - comp["y_10_nom_EH"]
     comp["y_10_real_obs_implied"] = comp["y_10_real_EH"] + comp["term_prem_nom"]
     comp["spr_real_obs_implied"] = comp["y_10_real_obs_implied"] - comp["y_1_real"]
+    comp["maturity_n"] = n_bond
+    comp["long_yield_source"] = str(long_yield_source).lower()
 
     return comp, var
 
@@ -215,14 +271,20 @@ def build_components() -> tuple[pd.DataFrame, dict[str, object]]:
 def build_theta_dataset(
     components: pd.DataFrame,
     theta: float,
+    *,
+    n_bond: int = N_BOND,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build one theta-specific lifecycle-ready dataset and diagnostics."""
     theta = float(theta)
+    n_bond = int(n_bond)
     y_theta = components["y_10_real_EH"] + theta * components["term_prem_nom"]
-    r_theta, duration_theta = constant_maturity_return_from_log_yield(y_theta, N_BOND)
+    r_theta, duration_theta = constant_maturity_return_from_log_yield(
+        y_theta, n_bond, zero_coupon=True
+    )
 
     diag = components.copy()
     diag["theta"] = theta
+    diag["maturity_n"] = n_bond
     diag["y_10_real_theta"] = y_theta
     diag["spr_theta"] = y_theta - components["y_1_real"]
     diag["r_10_real_theta"] = r_theta
@@ -407,13 +469,22 @@ def write_outputs(
     thetas: list[float],
     *,
     out_dir: Path = OUT_DIR,
+    n_bond: int = N_BOND,
+    long_yield_source: str = "shiller",
     estimate_final_var: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     """Build all requested theta datasets and write diagnostics."""
+    n_bond = int(n_bond)
+    long_yield_source = str(long_yield_source).lower()
     out_dir.mkdir(parents=True, exist_ok=True)
-    components, var = build_components()
+    components, var = build_components(
+        n_bond=n_bond,
+        long_yield_source=long_yield_source,
+    )
 
     coef_table, var_summary = construction_var_tables(var)
+    var_summary["maturity_n"] = n_bond
+    var_summary["long_yield_source"] = long_yield_source
     coef_table.to_csv(out_dir / "construction_var_coefficients.csv", index=False)
     var_summary.to_csv(out_dir / "construction_var_summary.csv", index=False)
 
@@ -421,6 +492,7 @@ def write_outputs(
         "rtb", "xr", "cape", "y_1_nom", "spr_nom", "y_10_nom_obs",
         "y_1_real", "y_10_real_EH", "y_10_nom_EH", "pi_10_VAR",
         "term_prem_nom", "y_10_real_obs_implied", "spr_real_obs_implied",
+        "long_yield_pct", "maturity_n", "long_yield_source",
     ]
     components.loc[SAMPLE_START:SAMPLE_END, component_cols].to_csv(
         out_dir / "ccv_nominal_components.csv"
@@ -430,7 +502,7 @@ def write_outputs(
     theta_outputs: dict[float, pd.DataFrame] = {}
     all_checks = []
     for theta in thetas:
-        out, diag = build_theta_dataset(components, theta)
+        out, diag = build_theta_dataset(components, theta, n_bond=n_bond)
         checks = verify_theta_dataset(theta, out, diag)
         all_checks.extend(
             {"theta": theta, "check": name, "ok": ok, "message": msg}
@@ -474,8 +546,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--out-dir",
-        default=str(OUT_DIR),
-        help="Output directory. Default: data/ccv_nominal_yield_scaling.",
+        default=None,
+        help=(
+            "Output directory. Default: data/ccv_nominal_yield_scaling for "
+            "Shiller/10y, otherwise data/ccv_nominal_yield_scaling_<source><n>."
+        ),
+    )
+    parser.add_argument(
+        "--long-yield-source",
+        choices=LONG_YIELD_SOURCES,
+        default="shiller",
+        help="Nominal long-yield source. Default: shiller RLONG.",
+    )
+    parser.add_argument(
+        "--n-bond",
+        type=int,
+        default=N_BOND,
+        help="Bond maturity/horizon in years. Default: 10.",
     )
     parser.add_argument(
         "--no-final-var",
@@ -485,16 +572,27 @@ def main() -> None:
     args = parser.parse_args()
 
     thetas = sorted(dict.fromkeys(float(x) for x in args.theta))
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir is not None
+        else default_output_dir(args.long_yield_source, args.n_bond)
+    )
     moments, construction_summary, final_summary = write_outputs(
         thetas,
-        out_dir=Path(args.out_dir),
+        out_dir=out_dir,
+        n_bond=args.n_bond,
+        long_yield_source=args.long_yield_source,
         estimate_final_var=not args.no_final_var,
     )
 
     print("=" * 78)
     print("CCV NOMINAL-YIELD THETA REAL-BOND BUILD")
     print("=" * 78)
-    print(f"Sample: {SAMPLE_START}-{SAMPLE_END}, maturity n={N_BOND}, thetas={thetas}")
+    print(
+        f"Sample: {SAMPLE_START}-{SAMPLE_END}, "
+        f"long yield={args.long_yield_source}, maturity n={args.n_bond}, "
+        f"thetas={thetas}"
+    )
     print("Construction VAR variables:", ", ".join(CONSTRUCTION_COLS))
     row = construction_summary.iloc[0]
     print(
@@ -505,7 +603,7 @@ def main() -> None:
     print()
     print("Theta moments:")
     print(
-        f"  {'theta':>6s} {'E[y1]':>9s} {'E[y10]':>9s} {'E[spr]':>9s} "
+        f"  {'theta':>6s} {'E[y1]':>9s} {'E[yN]':>9s} {'E[spr]':>9s} "
         f"{'EJ[xb]':>9s} {'sd[xb]':>9s} {'Sh[xb]':>8s} {'Dur':>7s}"
     )
     for r in moments.itertuples(index=False):
@@ -538,7 +636,7 @@ def main() -> None:
                 f"{r.M_xb_y_1:10.3f}"
             )
     print()
-    print(f"Wrote outputs to: {Path(args.out_dir)}")
+    print(f"Wrote outputs to: {out_dir}")
 
 
 if __name__ == "__main__":

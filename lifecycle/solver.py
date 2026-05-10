@@ -436,9 +436,10 @@ def newton_2d_with_line_search(
     """2D Newton on (alpha_s, alpha_b) with optional backtracking line search.
 
     ``foc_fn(a_s, a_b) -> (fs, fb, Jss, Jbb, Jsb, e)``. Returns
-    ``(a_s, a_b, e, exit_code, err_norm, n_iter, n_backtrack_total)``,
-    where ``n_backtrack_total`` is the sum across all Newton iters of the
-    halvings the line search evaluated before finding an improving step.
+    ``(a_s, a_b, e, exit_code, err_norm, n_iter, n_backtrack_max)``,
+    where ``n_backtrack_max`` is the maximum-over-Newton-iters of the
+    halvings the line search evaluated before finding an improving step
+    (one scalar per cell, bounded by ``max_backtrack_iter``).
 
     ``use_fori`` is a Python bool selected at JIT-trace time:
       - True  -> ``lax.fori_loop`` + mask (GPU-friendly, deterministic dispatch,
@@ -451,7 +452,7 @@ def newton_2d_with_line_search(
                  ``max_backtrack_iter`` times until the step decreases ‖f‖.
                  Cells where no halving improves exit ``EC_NEWTON_FAIL``.
       - False -> apply the (capped) full Newton step unconditionally; no
-                 backtracking, no halvings counted. ``n_backtrack_total``
+                 backtracking, no halvings counted. ``n_backtrack_max``
                  always reads zero. Cells where the full step does not
                  reach ``tol * scale`` within ``max_iter`` exit
                  ``EC_NEWTON_FAIL``. ``max_backtrack_iter`` is ignored.
@@ -492,7 +493,7 @@ def _newton_while(
 
     When ``use_line_search`` is True (default), the body wraps each step in
     a backtracking inner loop. When False, the full (capped) step is applied
-    unconditionally and ``n_backtrack_total`` stays zero.
+    unconditionally and ``n_backtrack_max`` stays zero.
     """
     fs0, fb0, Jss0, Jbb0, Jsb0, e0 = foc_fn(init_a_s, init_a_b)
     err0 = jnp.sqrt(fs0 * fs0 + fb0 * fb0)
@@ -502,16 +503,16 @@ def _newton_while(
         fs0, fb0, Jss0, Jbb0, Jsb0,
         e0, err0,
         jnp.int32(0),
-        jnp.int32(0),                  # n_backtrack_total (summed across iters)
+        jnp.int32(0),                  # n_backtrack_max (max-over-iters; bounded by max_backtrack_iter)
         err0 < tol * scale,
     )
 
     def cond_fn(state):
-        *_, k, _n_bt_total, done = state
+        *_, k, _n_bt_max, done = state
         return jnp.logical_and(jnp.logical_not(done), k < max_iter)
 
     def body_fn(state):
-        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_total, _ = state
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_max, _ = state
 
         det = Jss * Jbb - Jsb * Jsb
         is_singular = jnp.abs(det) < singular_det
@@ -613,16 +614,20 @@ def _newton_while(
             new_done = new_err < tol * scale
             n_bt_increment = jnp.int32(0)
 
+        # Per-cell histogram semantic: track the MAX halvings used in any single
+        # Newton step within this cell, bounded by ``max_backtrack_iter``. Summing
+        # across iters would let the diagnostic exceed the cap and conflate
+        # "many small line searches" with "one hard line search".
         return (
             new_a_s, new_a_b, new_fs, new_fb,
             new_Jss, new_Jbb, new_Jsb,
-            new_e, new_err, k + 1, n_bt_total + n_bt_increment, new_done,
+            new_e, new_err, k + 1, jnp.maximum(n_bt_max, n_bt_increment), new_done,
         )
 
     final = lax.while_loop(cond_fn, body_fn, init_state)
-    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_total, _done = final
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, k, n_bt_max, _done = final
     exit_code = jnp.where(err < tol * scale, EC_INTERIOR, EC_NEWTON_FAIL)
-    return a_s, a_b, e, exit_code, err / scale, k, n_bt_total
+    return a_s, a_b, e, exit_code, err / scale, k, n_bt_max
 
 
 def _backtracking_fori(
@@ -707,11 +712,12 @@ def _newton_fori(
     update. GPU-friendly (no warp divergence, deterministic dispatch).
 
     When ``use_line_search`` is True (default), each iter wraps the step in
-    ``_backtracking_fori`` and accumulates halvings into ``n_backtrack_total``.
-    When False, the full (capped) step is applied unconditionally; no
-    backtracking is run, ``n_backtrack_total`` stays at zero, and a cell
-    stops being active only when it converges on the full step (no
-    ``ls_failed`` exit). ``max_backtrack_iter`` is ignored.
+    ``_backtracking_fori`` and tracks the MAX halvings across active iters
+    in ``n_backtrack_max`` (bounded by ``max_backtrack_iter``). When False,
+    the full (capped) step is applied unconditionally; no backtracking is
+    run, ``n_backtrack_max`` stays at zero, and a cell stops being active
+    only when it converges on the full step (no ``ls_failed`` exit).
+    ``max_backtrack_iter`` is ignored.
     """
     fs0, fb0, Jss0, Jbb0, Jsb0, e0 = foc_fn(init_a_s, init_a_b)
     err0 = jnp.sqrt(fs0 * fs0 + fb0 * fb0)
@@ -721,13 +727,13 @@ def _newton_fori(
         fs0, fb0, Jss0, Jbb0, Jsb0,
         e0, err0,
         jnp.int32(0),                  # n_iters_used (active iters only)
-        jnp.int32(0),                  # n_backtrack_total (sum across active iters)
+        jnp.int32(0),                  # n_backtrack_max (max-over-active-iters; bounded by max_backtrack_iter)
         err0 < tol * scale,            # converged
         jnp.bool_(False),              # ls_failed
     )
 
     def fori_body(_i, state):
-        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_total, converged, ls_failed = state
+        a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_max, converged, ls_failed = state
         is_active = jnp.logical_not(jnp.logical_or(converged, ls_failed))
 
         det = Jss * Jbb - Jsb * Jsb
@@ -780,7 +786,7 @@ def _newton_fori(
         else:
             # No-line-search path: apply the full (capped) Newton step
             # unconditionally. No backtracking, no extra foc_fn calls,
-            # ``n_backtrack_total`` stays at zero. ``ls_failed`` cannot fire
+            # ``n_backtrack_max`` stays at zero. ``ls_failed`` cannot fire
             # (it is masked False). Cells that don't converge under the full
             # step keep iterating until ``max_iter`` and exit EC_NEWTON_FAIL.
             new_a_s, new_a_b = a_s_full, a_b_full
@@ -792,6 +798,9 @@ def _newton_fori(
             n_bt_increment = jnp.int32(0)
 
         # Mask: hold all fields constant for cells already converged or failed.
+        # n_bt_max is the per-cell histogram value: track max halvings used in
+        # any single active Newton step (bounded by max_backtrack_iter). For
+        # inactive cells the increment is masked to 0 so the running max holds.
         return (
             jnp.where(is_active, new_a_s, a_s),
             jnp.where(is_active, new_a_b, a_b),
@@ -803,15 +812,15 @@ def _newton_fori(
             jnp.where(is_active, new_e, e),
             jnp.where(is_active, new_err, err),
             n_used + jnp.where(is_active, jnp.int32(1), jnp.int32(0)),
-            n_bt_total + jnp.where(is_active, n_bt_increment, jnp.int32(0)),
+            jnp.maximum(n_bt_max, jnp.where(is_active, n_bt_increment, jnp.int32(0))),
             jnp.where(is_active, new_converged, converged),
             jnp.where(is_active, new_ls_failed, ls_failed),
         )
 
     final = lax.fori_loop(0, max_iter, fori_body, init_state)
-    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_total, converged, _ls_failed = final
+    a_s, a_b, fs, fb, Jss, Jbb, Jsb, e, err, n_used, n_bt_max, converged, _ls_failed = final
     exit_code = jnp.where(converged, EC_INTERIOR, EC_NEWTON_FAIL)
-    return a_s, a_b, e, exit_code, err / scale, n_used, n_bt_total
+    return a_s, a_b, e, exit_code, err / scale, n_used, n_bt_max
 
 
 # =============================================================================

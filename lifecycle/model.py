@@ -158,7 +158,7 @@ class SolverConfig(NamedTuple):
     # When True (canonical default): each Newton iter wraps the step in a
     # backtracking inner loop with up to ``max_backtrack_iter`` halvings.
     # When False: the (capped) full Newton step is applied unconditionally,
-    # ``n_backtrack_total`` stays at zero, and ``max_backtrack_iter`` is
+    # ``n_backtrack_max`` stays at zero, and ``max_backtrack_iter`` is
     # ignored. Both branches are gated at JIT-trace time inside
     # ``_newton_fori`` / ``_newton_while`` (Python bool, no runtime branch).
     use_line_search: bool = True

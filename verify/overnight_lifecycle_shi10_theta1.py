@@ -25,7 +25,7 @@ TERM_PREMIUM_THETA = 1.0
 disc = DiscretizationConfig(
     n_wealth=100, wealth_min=0.01, wealth_max=500.0, n_savings=100,
     state_grid_sizes=(12, 12, 12), state_grid_mode="cholesky",
-    state_n_stds=(3.0, 3.0, 3.0), n_z=30, n_stds=3.0,
+    state_n_stds=(3.0, 3.0, 3.0), n_z=20, n_stds=3.0,
     n_eps_nodes=4, n_eta_nodes=3,
     n_ret_nodes_1d=(4, 4), ret_lobatto_Z=None,
     n_state_quad_nodes=(4, 4, 4), state_lobatto_Z=None,

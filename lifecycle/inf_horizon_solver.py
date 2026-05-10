@@ -507,9 +507,9 @@ def run_infinite_horizon_solver(
     verbose: bool = True,
     show_progress: bool = False,
     progress_every: int = 1,
-    progress_probe_wealth: float | None = None,
-    progress_probe_state_idx: int | None = None,
-    progress_probe_z_idx: int | None = None,
+    progress_probe_wealth: float | None = 22.0,   # SCF-median anchor; default ON so tail watchers see center-cell policies
+    progress_probe_state_idx: int | None = None,  # None → per-axis state center via ravel_multi_index (line 304-306)
+    progress_probe_z_idx: int | None = None,      # None → n_z // 2 (median z if heterogeneous)
 ):
     """Solve the stationary no-income, no-mortality benchmark by fixed-point
     iteration of the JAX retirement kernel.

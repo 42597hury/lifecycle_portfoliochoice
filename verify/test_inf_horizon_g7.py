@@ -1,15 +1,18 @@
-"""Inf-horizon test at state_grid=(7,7,7), state_n_stds=(3,3,3).
+"""Inf-horizon test at state_grid=(7,7,7), state_n_stds=(3,3,3), theta=0.
 
-Smaller-state inf-horizon (343 cells vs 729 at g=9). Whether it converges
-or diverges, the bundle + diagnostics get saved, so this is a low-cost
-sanity probe of the inf-horizon path.
+Uses the term-premium-theta=0.0 dataset (no estimated real term premium —
+the bond's unconditional excess return is roughly zero in level terms).
+Should be MORE likely to converge than the empirical baseline because the
+giant predictable bond return at corner cells is what drove divergence at
+g9 (alpha_b corner extremes blowing up iter-to-iter).
 
 Wall budget:
   ~7s/iter x 50 iters = ~6 min (worst case if no convergence).
   Likely converges or diverges within ~30 iters → ~3-4 min.
 
 Compare against:
-  - saved_runs/inf_horizon/test_inf_horizon_g9/  (diverged at iter 50, stop=10.8)
+  - saved_runs/inf_horizon/test_inf_horizon_g9/  (empirical baseline,
+    diverged at iter 50, stop=10.8)
 """
 import os
 import time
@@ -23,7 +26,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from configs._canonical import BASE_CONFIG
 from lifecycle.model import DiscretizationConfig, SolverConfig
-from lifecycle.var import build_real_full_var_config_hardcoded
+from lifecycle.var import build_real_full_var_config_term_premium_theta
 from lifecycle.precompute import build_model, build_precompute
 from lifecycle.inf_horizon_solver import run_infinite_horizon_solver
 from lifecycle.policy_io import save_policy_bundle
@@ -64,18 +67,22 @@ IH_TOL = 1e-5
 IH_MAX_ITER = 50
 IH_DAMPING = 1.0
 IH_PROGRESS_EVERY = 1
+TERM_PREMIUM_THETA = 0.0   # zero estimated real term premium variant
 
 
 print("=" * 70, flush=True)
-print("TEST INF-HORIZON g=7  —  state_grid=(7,7,7), state_n_stds=(3,3,3), n_z=1, max_iter=10", flush=True)
+print(f"TEST INF-HORIZON g=7 (theta={TERM_PREMIUM_THETA})", flush=True)
+print(f"  state_grid=(7,7,7), state_n_stds=(3,3,3), n_z=1, max_iter=10", flush=True)
 print("=" * 70, flush=True)
 
 import jax
 print(f"JAX devices: {jax.devices()}", flush=True)
 
-print("\nBuilding model + precompute...", flush=True)
+print(f"\nBuilding model + precompute (theta={TERM_PREMIUM_THETA})...", flush=True)
 t0 = time.time()
-var_config = build_real_full_var_config_hardcoded()
+var_config, _fit_obj, _data = build_real_full_var_config_term_premium_theta(
+    theta=TERM_PREMIUM_THETA,
+)
 model = build_model(BASE_CONFIG, var_config, verbose=False)
 pc = build_precompute(model, disc, verbose=True)
 print(f"Setup wall: {time.time() - t0:.1f}s", flush=True)
@@ -151,7 +158,7 @@ if bth is not None:
 print(f"  Total Newton failures: {diag.get('total_newton_failures', '?')}", flush=True)
 
 
-BUNDLE_NAME = "test_inf_horizon_g7"
+BUNDLE_NAME = f"test_inf_horizon_g7_theta{int(TERM_PREMIUM_THETA*100):03d}"
 BUNDLE_DIR = os.path.join("saved_runs", "inf_horizon", BUNDLE_NAME)
 run_config_snapshot = {
     "base_config": dict(BASE_CONFIG),
@@ -165,9 +172,10 @@ run_config_snapshot = {
     "predictability_ablation": {
         "system_code": "full",
         "system_label": "full_system_real",
-        "system_title": "Full System (real)",
+        "system_title": f"Full System (real, term_premium_theta={TERM_PREMIUM_THETA})",
         "state_names": ["cape", "spr", "y_1"],
     },
+    "term_premium_theta": float(TERM_PREMIUM_THETA),
     "bundle_name": BUNDLE_NAME,
     "wall_time_seconds": float(solve_wall),
     "solver_kind": "infinite_horizon",

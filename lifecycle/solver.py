@@ -1129,6 +1129,7 @@ def retirement_foc_jac_ccv(
     A_is,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     gamma, b_bar, delta, min_consumption,
+    w_floor=0.0,
     gather_dtype=jnp.float64,
 ):
     """Retirement FOC sums over ``(k_v, k_r)``: bequest + alive contributions.
@@ -1149,6 +1150,12 @@ def retirement_foc_jac_ccv(
     )                                              # (n_state_quad, n_ret_quad)
     sR_p = s_val * R_p
     x_next = sR_p + pension_next_z                 # (n_state_quad, n_ret_quad)
+    # IH-only floor: clip W'-realizations up to w_floor before the V'(W') interp
+    # so the slope-discontinuous kink-edge cell pair (constrained-corner band
+    # vs. first interior cell — see _lift_to_wealth_grid) doesn't pollute Newton's
+    # Jacobian when the kernel is iterated to a stationary fixed point. Lifecycle
+    # passes w_floor=0.0 (no-op since W' >= 0 always; bit-identical math).
+    x_next = jnp.maximum(x_next, w_floor)
 
     mu_bq, mup_bq = bequest_mu_and_mup(sR_p, A_is, gamma, b_bar, delta)
 
@@ -1572,6 +1579,7 @@ def _solve_retirement_at_cell(
     weight_kv_kr, A_per_state,
     s_grid, wealth_grid,
     init_a_s, init_a_b,                            # both shape (n_savings,)
+    w_floor,                                       # IH-only V'(W') quadrature floor; 0.0 in lifecycle
     gamma, beta, b_bar, delta,
     sigma2_xr, sigma2_xb, sigma_xrxb,
     tol, max_iter, max_backtrack_iter,
@@ -1605,6 +1613,7 @@ def _solve_retirement_at_cell(
                 pension_next_z, A_is,
                 sigma2_xr, sigma2_xb, sigma_xrxb,
                 gamma, b_bar, delta, min_consumption,
+                w_floor=w_floor,
                 gather_dtype=gather_dtype,
             )
         return foc_fn
@@ -2331,10 +2340,10 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
             _build_chunked_pmap_index_arrays(n_z, N_state, n_chunks, n_dev)
         )
 
-    @partial(pmap, in_axes=(0, 0, None, None, None, None, None))
+    @partial(pmap, in_axes=(0, 0, None, None, None, None, None, None))
     def per_dev_solve(
         z_block, is_block, c_next, pension_next_by_z, psi_per_z,
-        init_a_s_arr, init_a_b_arr,
+        init_a_s_arr, init_a_b_arr, w_floor,
     ):
         def per_cell(z_idx, i_s):
             init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
@@ -2346,6 +2355,7 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
                 pcj.weight_kv_kr, pcj.annuity_factors,
                 pcj.s_grid, pcj.wealth_grid,
                 init_a_s_cell, init_a_b_cell,
+                w_floor,
                 mp.gamma, mp.beta, mp.b_bar, mp.delta,
                 pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
                 *static,
@@ -2357,13 +2367,14 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
             per_dev_solve, z_chunks_pm, is_chunks_pm, n_cells, chunk_size, n_chunks,
         )
 
-    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr):
+    def call(c_next_jnp, pension_next_by_z, psi_per_z, init_a_s_arr, init_a_b_arr,
+             w_floor=jnp.float64(0.0)):
         if n_chunks != 1:
             (c_flat, s_flat, b_flat,
              as_grid_flat, ab_grid_flat,
              ni_flat, nb_flat, ec_flat) = runner(
                 c_next_jnp, pension_next_by_z, psi_per_z,
-                init_a_s_arr, init_a_b_arr,
+                init_a_s_arr, init_a_b_arr, w_floor,
             )
             return (
                 jnp.reshape(c_flat, (n_z, N_state, -1)),
@@ -2380,7 +2391,7 @@ def _build_per_age_retirement_kernel_pmap(pcj, mp, sc, n_dev, n_z, N_state, per_
          as_grid_pm, ab_grid_pm,
          ni_pm, nb_pm, ec_pm) = per_dev_solve(
             z_pm, is_pm, c_next_jnp, pension_next_by_z, psi_per_z,
-            init_a_s_arr, init_a_b_arr,
+            init_a_s_arr, init_a_b_arr, w_floor,
         )
         # (n_dev, per_dev, *) -> (pad_n, *) -> (n_cells, *) -> (n_z, N_state, *)
         # Stay on device. Trailing axis is n_w for policy outputs and n_savings
@@ -2425,7 +2436,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
     )
 
     def per_cell(z_idx, i_s, c_next, pension_next_by_z, psi_per_z,
-                 init_a_s_arr, init_a_b_arr):
+                 init_a_s_arr, init_a_b_arr, w_floor):
         init_a_s_cell = init_a_s_arr[z_idx, i_s, :]   # (n_savings,)
         init_a_b_cell = init_a_b_arr[z_idx, i_s, :]
         return _solve_retirement_at_cell(
@@ -2435,6 +2446,7 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
             pcj.weight_kv_kr, pcj.annuity_factors,
             pcj.s_grid, pcj.wealth_grid,
             init_a_s_cell, init_a_b_cell,
+            w_floor,
             mp.gamma, mp.beta, mp.b_bar, mp.delta,
             pcj.sigma2_xr, pcj.sigma2_xb, pcj.sigma_xrxb,
             *static,
@@ -2447,13 +2459,13 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
     # XLA-fusion ways even when the algorithm is the same.
     @jit
     def per_chunk(c_next, pension_next_by_z, psi_per_z,
-                   init_a_s_arr, init_a_b_arr, z_chunk, is_chunk):
+                   init_a_s_arr, init_a_b_arr, w_floor, z_chunk, is_chunk):
         return vmap(
-            per_cell, in_axes=(0, 0, None, None, None, None, None),
+            per_cell, in_axes=(0, 0, None, None, None, None, None, None),
         )(
             z_chunk, is_chunk,
             c_next, pension_next_by_z, psi_per_z,
-            init_a_s_arr, init_a_b_arr,
+            init_a_s_arr, init_a_b_arr, w_floor,
         )
 
     if n_chunks == 1:
@@ -2464,12 +2476,12 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
         is_full = is_idx_padded[:n_cells]
 
         def call(c_next_jnp, pension_next_by_z, psi_per_z,
-                  init_a_s_arr, init_a_b_arr):
+                  init_a_s_arr, init_a_b_arr, w_floor=jnp.float64(0.0)):
             (c_flat, s_flat, b_flat,
              as_grid_flat, ab_grid_flat,
              ni_flat, nb_flat, ec_flat) = per_chunk(
                 c_next_jnp, pension_next_by_z, psi_per_z,
-                init_a_s_arr, init_a_b_arr,
+                init_a_s_arr, init_a_b_arr, w_floor,
                 z_full, is_full,
             )
             return (
@@ -2492,12 +2504,12 @@ def _build_per_age_retirement_kernel_vmap_only(pcj, mp, sc, n_z, N_state, per_is
     )
 
     def call(c_next_jnp, pension_next_by_z, psi_per_z,
-              init_a_s_arr, init_a_b_arr):
+              init_a_s_arr, init_a_b_arr, w_floor=jnp.float64(0.0)):
         (c_flat, s_flat, b_flat,
          as_grid_flat, ab_grid_flat,
          ni_flat, nb_flat, ec_flat) = runner(
             c_next_jnp, pension_next_by_z, psi_per_z,
-            init_a_s_arr, init_a_b_arr,
+            init_a_s_arr, init_a_b_arr, w_floor,
         )
         return (
             jnp.reshape(c_flat, (n_z, N_state, -1)),

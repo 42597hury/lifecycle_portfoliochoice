@@ -42,6 +42,41 @@ COLD_START_COV_RIDGE = 1e-10
 
 
 # =============================================================================
+# Lift-kink V'(W') quadrature floor (per docs/handoff/HANDOFF_IH_LIFT_KINK_*)
+# =============================================================================
+
+def _compute_w_floor_from_policy(C_old: np.ndarray, wealth_grid: np.ndarray) -> float:
+    """Global W_min_real for the V'(W') quadrature clip in the IH outer loop.
+
+    The lifted policy out of ``_lift_to_wealth_grid`` sets ``c[i] = wealth_grid[i]``
+    exactly at constrained-corner cells (the ``jnp.where`` clamp in
+    lifecycle/solver.py). We detect those cells per ``(i_z, i_s)``, take the
+    first non-constrained wealth-grid index, and use the maximum across cells
+    as a single global floor passed into the next-iter kernel call.
+
+    The kernel applies ``x_next = jnp.maximum(x_next, w_floor)`` before the
+    V'(W') interp (retirement_foc_jac_ccv around line 1058 of solver.py), which
+    pushes W'-realizations off the kink-edge cell pair so Newton's Jacobian
+    sees the smooth interior MPC instead of the constrained-corner slope-1
+    tangent. Lifecycle still calls the kernel with the default ``w_floor=0.0``;
+    the clip is a no-op there because every retirement W' is non-negative.
+
+    Returns ``wealth_grid[0]`` (an effective no-op clip) when no cell has a
+    constrained-corner band, e.g. coarse grids where the FOC produces interior
+    solutions all the way down to wealth_min.
+    """
+    constrained = (C_old == wealth_grid[None, None, :])
+    not_constrained = ~constrained
+    # First non-constrained index per (i_z, i_s); argmax of bool array returns
+    # the first True. If a row is all-constrained or all-non-constrained both
+    # collapse to 0, which makes ``wealth_grid[0]`` the floor — i.e. an
+    # effective no-op clip for those cells.
+    first_unc = np.argmax(not_constrained, axis=2)
+    w_per_cell = wealth_grid[first_unc]
+    return float(np.max(w_per_cell))
+
+
+# =============================================================================
 # Progress printing
 # =============================================================================
 
@@ -613,11 +648,14 @@ def run_infinite_horizon_solver(
     if run_smoke_test:
         # One warm-up call to JIT-compile the kernel before timing the loop.
         # Same init source as iter 0 below — mid-wealth gather of S_old/B_old.
+        # w_floor=0.0 here matches the smoke-test contract (no-op clip); the
+        # iteration loop below recomputes the proper W_min_real per-iter.
         (_c, _s, _b,
          _as_grid, _ab_grid,
          _ni, _nb, _ec) = retirement_kernel(
             jnp.asarray(C_old), pension_zero, psi_one,
             init_a_s_arr, init_a_b_arr,
+            jnp.float64(0.0),
         )
         np.asarray(_c)  # block until ready
 
@@ -654,15 +692,18 @@ def run_infinite_horizon_solver(
     try:
         for it in range(max_iter):
             c_old_jnp = jnp.asarray(C_old)
-            # Per-savings backward-iter warm-start: iter 0 starts from a
-            # mid-wealth-gather broadcast (Variant A — see pre-loop setup);
-            # iter 1+ uses the previous iteration's converged per-savings α-grid
-            # (Variant B). Mirrors run_lifecycle_solver's per-savings warm-start
-            # in the time dimension.
+            # V'(W') quadrature floor — eliminates the lift-kink discontinuity
+            # at the constrained-corner boundary by clipping W'-realizations
+            # off the kink-edge cell pair. Global max across cells (handoff
+            # Open-question 2: start global, refine if needed). w_floor =
+            # wealth_grid[0] (no-op) at iter 0 if cold-start has no constrained
+            # band; proper floor kicks in once a lifted policy has been produced.
+            w_floor_val = _compute_w_floor_from_policy(C_old, np.asarray(pc.wealth_grid))
             (c_new_jnp, s_new_jnp, b_new_jnp,
              as_grid_new_jnp, ab_grid_new_jnp,
              ni_jnp, nb_jnp, ec_jnp) = retirement_kernel(
                 c_old_jnp, pension_zero, psi_one, init_a_s_arr, init_a_b_arr,
+                jnp.float64(w_floor_val),
             )
             C_new = np.asarray(c_new_jnp)
             S_new = np.asarray(s_new_jnp)
@@ -824,6 +865,7 @@ def compile_inner_kernel_smoke_test(
      _ni, _nb, _ec) = retirement_kernel(
         jnp.asarray(C_old), pension_zero, psi_one,
         init_a_s_arr, init_a_b_arr,
+        jnp.float64(0.0),
     )
     np.asarray(c_new)  # force completion
     elapsed = time.time() - t0

@@ -35,7 +35,7 @@ sc = SolverConfig(
     tol=1e-6, max_iter=15, max_backtrack_iter=5,
     init_alpha_s=0.85, init_alpha_b=0.44, use_line_search=True,
     delta_bequest=0.0, gather_precision="f32",
-    cell_vmap_chunks=8, wealth_dynamics_spec="ccv_log",
+    cell_vmap_chunks=64, wealth_dynamics_spec="ccv_log",
     use_backward_age_warm_start=True, failure_seed_from_neighbor=True,
 )
 

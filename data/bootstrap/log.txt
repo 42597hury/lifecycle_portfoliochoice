@@ -1,0 +1,44 @@
+========================================================================
+BOOTSTRAP VAR INFERENCE  (B=1000, ell_mean=8.0, mode=refit, seed=0)
+========================================================================
+Donor panel: 1920-2011, T=92
+Production AR(1): phi=0.3884, mu=2.1067%
+
+Computing production point estimates (identity resample, conditional AR(1))
+  lambda=0.00: T=91, E[xb]=-0.053pp, sd(xb)=5.909pp, Sh(xb)=+0.021, Phi_xb,spr=+0.000, state_max_eig=0.9344
+  lambda=0.50: T=91, E[xb]=+0.307pp, sd(xb)=5.800pp, Sh(xb)=+0.082, Phi_xb,spr=+1.110, state_max_eig=0.9344
+  lambda=1.00: T=91, E[xb]=+0.645pp, sd(xb)=6.377pp, Sh(xb)=+0.133, Phi_xb,spr=+1.502, state_max_eig=0.9344
+
+Drawing 1000 stationary-block index sets
+
+Running 1000 iterations serially
+  100/1000  (686 draws/s, ETA 1s)
+  200/1000  (666 draws/s, ETA 1s)
+  300/1000  (674 draws/s, ETA 1s)
+  400/1000  (709 draws/s, ETA 1s)
+  500/1000  (717 draws/s, ETA 1s)
+  600/1000  (733 draws/s, ETA 1s)
+  700/1000  (753 draws/s, ETA 0s)
+  800/1000  (762 draws/s, ETA 0s)
+  900/1000  (763 draws/s, ETA 0s)
+  1000/1000  (775 draws/s, ETA 0s)
+  iteration loop done in 1.3s (762 draws/s)
+
+Wrote draws:  data\bootstrap\var_bootstrap_draws.csv
+Wrote point:  data\bootstrap\var_bootstrap_point.csv
+
+Computing summaries
+  summary: data\bootstrap\summary.csv
+  summary_paired: data\bootstrap\summary_paired.csv
+  summary_stable: data\bootstrap\summary_stable.csv
+  summary_paired_stable: data\bootstrap\summary_paired_stable.csv
+  stability: data\bootstrap\stability.csv
+
+SELF-VERIFICATION CHECKS
+------------------------------------------------------------------------
+  [PASS] construction VAR P(max|eig|<1) = 1.000 (target >=0.95)
+  [PASS] restricted_eh zero check at lambda=0: 0/50 violations
+  [PASS] pairing sanity: corr(E_xb_1, E_xb_0) across draws = 0.559 (target >0)
+  [PASS] paired vs unpaired variance for E_xb(1)-E_xb(0): diff_var=1.370920e-05, marg_var_sum=2.012680e-05
+  [PASS] final VAR failure rate = 0.000 (target <0.02)
+  n_draws total = 1000, n_failed (any lambda) = 0

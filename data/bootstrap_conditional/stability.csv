@@ -1,0 +1,15 @@
+flag,lambda_val,value
+P_state_eig_lt_1,0.0,1.0
+P_state_eig_lt_1,0.5,1.0
+P_state_eig_lt_1,1.0,1.0
+P_construction_eig_lt_1,0.0,1.0
+P_construction_eig_lt_1,0.5,1.0
+P_construction_eig_lt_1,1.0,1.0
+P_Phi_xb_spr_pos,0.0,0.0
+P_Phi_xb_spr_pos,0.5,1.0
+P_Phi_xb_spr_pos,1.0,1.0
+P_final_var_failed,0.0,0.0
+P_final_var_failed,0.5,0.0
+P_final_var_failed,1.0,0.0
+P_E_xb_1_gt_0,,0.864
+P_Sharpe_xb_1_gt_0,,0.984

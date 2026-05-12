@@ -1,0 +1,44 @@
+========================================================================
+BOOTSTRAP VAR INFERENCE  (B=500, ell_mean=8.0, mode=conditional, seed=0)
+========================================================================
+Donor panel: 1920-2011, T=92
+Production AR(1): phi=0.3884, mu=2.1067%
+
+Computing production point estimates (identity resample, conditional AR(1))
+  lambda=0.00: T=91, E[xb]=-0.053pp, sd(xb)=5.909pp, Sh(xb)=+0.021, Phi_xb,spr=+0.000, state_max_eig=0.9344
+  lambda=0.50: T=91, E[xb]=+0.307pp, sd(xb)=5.800pp, Sh(xb)=+0.082, Phi_xb,spr=+1.110, state_max_eig=0.9344
+  lambda=1.00: T=91, E[xb]=+0.645pp, sd(xb)=6.377pp, Sh(xb)=+0.133, Phi_xb,spr=+1.502, state_max_eig=0.9344
+
+Drawing 500 stationary-block index sets
+
+Running 500 iterations serially
+  50/500  (950 draws/s, ETA 0s)
+  100/500  (998 draws/s, ETA 0s)
+  150/500  (994 draws/s, ETA 0s)
+  200/500  (961 draws/s, ETA 0s)
+  250/500  (913 draws/s, ETA 0s)
+  300/500  (908 draws/s, ETA 0s)
+  350/500  (929 draws/s, ETA 0s)
+  400/500  (949 draws/s, ETA 0s)
+  450/500  (957 draws/s, ETA 0s)
+  500/500  (964 draws/s, ETA 0s)
+  iteration loop done in 0.5s (948 draws/s)
+
+Wrote draws:  data\bootstrap_conditional\var_bootstrap_draws.csv
+Wrote point:  data\bootstrap_conditional\var_bootstrap_point.csv
+
+Computing summaries
+  summary: data\bootstrap_conditional\summary.csv
+  summary_paired: data\bootstrap_conditional\summary_paired.csv
+  summary_stable: data\bootstrap_conditional\summary_stable.csv
+  summary_paired_stable: data\bootstrap_conditional\summary_paired_stable.csv
+  stability: data\bootstrap_conditional\stability.csv
+
+SELF-VERIFICATION CHECKS
+------------------------------------------------------------------------
+  [PASS] construction VAR P(max|eig|<1) = 1.000 (target >=0.95)
+  [PASS] restricted_eh zero check at lambda=0: 0/50 violations
+  [PASS] pairing sanity: corr(E_xb_1, E_xb_0) across draws = 0.427 (target >0)
+  [PASS] paired vs unpaired variance for E_xb(1)-E_xb(0): diff_var=1.435446e-05, marg_var_sum=1.918771e-05
+  [PASS] final VAR failure rate = 0.000 (target <0.02)
+  n_draws total = 500, n_failed (any lambda) = 0
